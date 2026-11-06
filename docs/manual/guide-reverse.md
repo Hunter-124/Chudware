@@ -192,8 +192,10 @@ STEP 4 — RECONSTRUCT
   final pass and continue polling until done or failed. Brush exports splats, not a mesh.
   reveng_splat_to_mesh(session_id, method="auto") uses Gaussian-depth TSDF only when matching
   undistorted training poses are proven; without them it returns a Poisson fallback and
-  fallback_reason. method="poisson" explicitly selects the center-based method. Both are
-  approximate: examine the mesh for sheets/holes and independently measure critical features.
+  fallback_reason. method="poisson" explicitly selects the center-based method. The TSDF fuses
+  the whole splat's median depth from up to 120 views, drops the plane the subject stands on
+  (remove_floor=false for a flat subject) and takes minutes. Both are approximate: examine
+  the mesh for sheets/holes and independently measure critical features.
   What the stages mean:
   * SPARSE — structure-from-motion (COLMAP). Solves where each camera was and produces a sparse
     point cloud. If fewer than 60% register, a feed-forward fallback is attempted but only
@@ -297,7 +299,7 @@ REQUIREMENTS / AVAILABILITY — LANE B ONLY
     COLMAP_BIN     sparse SfM (COLMAP). Also found as `colmap` on PATH. Without it: no sparse,
                    therefore no dense and no splat.
     OPENMVS_BIN    dense point cloud + mesh (OpenMVS, AGPL-3.0, run as a subprocess). Installed by
-                   reveng_install_tools (the app also does it on first use); the env var / PATH override the managed copy.
+                   `python scripts/provision_reveng.py`; the env var / PATH override the managed copy.
     BRUSH_BIN      3D Gaussian Splatting trainer (Brush); visual PLY only, not a mesh exporter.
     MESHROOM_BIN   an existing Meshroom install, used by the legacy photogrammetry path.
     VGGT_WEIGHTS   feed-forward pose/geometry fallback for hard image sets.

@@ -95,7 +95,7 @@ def _skip_binary_records(stream, count, record_size):
     stream.seek(target)
 
 
-def _read_binary_model(root: Path):
+def _read_binary_model(root: Path, points_wanted=True):
     cameras, images, points = {}, {}, {}
     with (root / "cameras.bin").open("rb") as stream:
         for _ in range(_unpack(stream, "Q")[0]):
@@ -121,7 +121,7 @@ def _read_binary_model(root: Path):
                                           tuple(values[1:5]), tuple(values[5:8]))
             _skip_binary_records(stream, _unpack(stream, "Q")[0], 24)
     point_path = root / "points3D.bin"
-    if point_path.is_file():
+    if points_wanted and point_path.is_file():
         with point_path.open("rb") as stream:
             for _ in range(_unpack(stream, "Q")[0]):
                 values = _unpack(stream, "Q3d3BdQ")
@@ -132,7 +132,7 @@ def _read_binary_model(root: Path):
     return cameras, images, points
 
 
-def _read_text_model(root: Path):
+def _read_text_model(root: Path, points_wanted=True):
     cameras, images, points = {}, {}, {}
     with (root / "cameras.txt").open(encoding="utf-8") as stream:
         for line in stream:
@@ -158,7 +158,7 @@ def _read_text_model(root: Path):
             if stream.readline() == "":
                 raise ValueError(f"missing COLMAP points2D line for {fields[9]}")
     point_path = root / "points3D.txt"
-    if point_path.is_file():
+    if points_wanted and point_path.is_file():
         with point_path.open(encoding="utf-8") as stream:
             for line in stream:
                 if not line.strip() or line.lstrip().startswith("#"):
@@ -170,19 +170,20 @@ def _read_text_model(root: Path):
     return cameras, images, points
 
 
-def read_model(sparse_dir):
+def read_model(sparse_dir, *, points=True):
     """Read binary or text COLMAP cameras, registered images and 3D points.
 
     Return three dictionaries keyed by COLMAP ID, containing ModelCamera,
     ModelImage and ModelPoint3D records respectively. Poses are world-to-camera.
     Binary is preferred when both encodings exist. Poses-only text models are
-    supported even when points3D.txt is absent.
+    supported even when points3D.txt is absent; ``points=False`` skips the 3D points
+    (the third dictionary is then empty).
     """
     root = Path(sparse_dir)
     if all((root / (name + ".bin")).is_file() for name in ("cameras", "images")):
-        return _read_binary_model(root)
+        return _read_binary_model(root, points)
     if all((root / (name + ".txt")).is_file() for name in ("cameras", "images")):
-        return _read_text_model(root)
+        return _read_text_model(root, points)
     raise FileNotFoundError(f"COLMAP cameras and images model not found in {root}")
 
 

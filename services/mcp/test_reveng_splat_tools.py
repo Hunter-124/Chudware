@@ -199,6 +199,50 @@ def test_session_mesh_records_raw_approximate_artifact(tools, tmp_path, monkeypa
     assert session["stages"]["model"] == "idle"
 
 
+def test_background_session_mesh_reports_through_session_and_holds_claim(tools, tmp_path, monkeypatch):
+    import threading
+    import time
+    source = tmp_path / "source.ply"
+    _source(source)
+    sid = _call(tools, "reveng_import_splat", path=str(source))["session_id"]
+    release = threading.Event()
+    outcome = {"fail": False}
+
+    def mesh(cloud, out_path, **kwargs):
+        assert release.wait(10)
+        if outcome["fail"]:
+            return {"ok": False, "reason": "fusion_failed", "hint": "no opaque views"}
+        Path(out_path).write_text("mesh")
+        return {"ok": True, "approximate": True, "method": "tsdf", "triangles": 1}
+
+    def finished():
+        for _ in range(1000):
+            session = reveng_common._load_session(sid, merge_gaussian=False)
+            if session["mesh_job"]["status"] != "running" and reveng_common._mission_running(sid) is None:
+                return session
+            time.sleep(.01)
+        raise AssertionError("background mesh job did not finish")
+
+    monkeypatch.setattr(reveng_splat_tools, "splat_to_mesh", mesh)
+    assert _call(tools, "reveng_splat_to_mesh", path_or_session=sid, wait=False) == {
+        "ok": True, "session_id": sid, "pending": True}
+    assert reveng_common._load_session(sid, merge_gaussian=False)["mesh_job"]["status"] == "running"
+    # The job keeps the session claimed until it has recorded its result.
+    busy = _call(tools, "reveng_splat_to_mesh", path_or_session=sid)
+    assert not busy["ok"] and busy["reason"] == "mission_already_running"
+    release.set()
+    session = finished()
+    job = session["mesh_job"]
+    assert job["status"] == "done" and job["method"] == "tsdf"
+    assert session["artifacts"]["mesh_path"] == job["mesh_path"] and Path(job["mesh_path"]).is_file()
+    outcome["fail"] = True
+    assert _call(tools, "reveng_splat_to_mesh", path_or_session=sid, wait=False)["pending"]
+    job = finished()["mesh_job"]
+    assert job["status"] == "failed" and "fusion_failed" in job["error"]
+    refused = _call(tools, "reveng_splat_to_mesh", path_or_session=str(source), wait=False)
+    assert not refused["ok"] and refused["reason"] == "wait_false_requires_session"
+
+
 @pytest.mark.parametrize("association", ["matching", "supervised", "imported", "unmatched", "stale"])
 def test_auto_mesher_receives_only_matching_dataset_poses(tools, tmp_path, monkeypatch, association):
     source = tmp_path / "source.ply"

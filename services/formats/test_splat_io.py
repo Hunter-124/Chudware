@@ -308,7 +308,7 @@ def test_tsdf_is_default_with_registered_matching_model(tmp_path, monkeypatch):
     captured = {}
     mesh = types.SimpleNamespace(vertices=[1, 2, 3], triangles=[1])
 
-    def fuse(means, scales, rotations, opacity, colors, cameras, images, **kwargs):
+    def fuse(means, scales, rotations, opacity, cameras, images, **kwargs):
         captured.update(cameras=cameras, images=images, means=means, options=kwargs)
         return mesh, {"registered_views": 1, "selected_views": 1, "integrated_views": 1,
                       "voxel_size": .1}
@@ -322,7 +322,12 @@ def test_tsdf_is_default_with_registered_matching_model(tmp_path, monkeypatch):
     assert result["registered_views"] == result["integrated_views"] == 1
     assert "fallback_reason" not in result
     assert captured["cameras"][1].model == "PINHOLE" and captured["images"][1].camera_id == 1
-    assert len(captured["means"]) == result["filtered_points"]
+    # Fusion renders the whole splat (pruning only fixes the region), and that region
+    # encloses every pruned subject center.
+    assert len(captured["means"]) == result["input_gaussians"] == 80
+    lo, hi = captured["options"]["bounds"]
+    pruned = io.load_splat(result["pruned_splat_path"]).means
+    assert np.all((pruned >= lo) & (pruned <= hi))
     assert 0 < captured["options"]["time_budget"] <= splat_depth.TIME_BUDGET_SECONDS
 
 

@@ -19,7 +19,7 @@ import numpy as np
 
 MAX_POINTS = 2_000_000  # Also the native renderer's limit.
 MAX_BYTES = 2 * 1024 * 1024 * 1024
-MAX_COLMAP_MODEL_BYTES = 64 * 1024 * 1024
+MAX_COLMAP_MODEL_BYTES = 512 * 1024 * 1024  # Text cameras + images read for TSDF poses.
 _C0 = 0.28209479177387814
 _PLY_TYPES = {
     "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
@@ -418,13 +418,15 @@ def splat_to_mesh(cloud: GaussianCloud, out_path, *, method="auto", min_opacity=
     else:
         from services.vision.colmap_pipeline import read_model
         model_root = Path(sparse_dir)
-        extension = (".bin" if all((model_root / (name + ".bin")).is_file()
-                                    for name in ("cameras", "images")) else ".txt")
-        files = [model_root / (name + extension) for name in ("cameras", "images", "points3D")]
-        if sum(file.stat().st_size for file in files if file.is_file()) > MAX_COLMAP_MODEL_BYTES:
+        binary = all((model_root / (name + ".bin")).is_file() for name in ("cameras", "images"))
+        # Binary images skip their 2D keypoints by seeking; text images are read line by
+        # line, so only text cameras/images are bounded by size. 3D points are not read.
+        if not binary and sum(file.stat().st_size for file in
+                              (model_root / "cameras.txt", model_root / "images.txt")
+                              if file.is_file()) > MAX_COLMAP_MODEL_BYTES:
             raise ValueError("COLMAP model exceeds the bounded TSDF input size")
         try:
-            cameras, images, _ = read_model(model_root)
+            cameras, images, _ = read_model(model_root, points=False)
         except FileNotFoundError:
             fallback_reason = "matching COLMAP camera model was not found"
         else:

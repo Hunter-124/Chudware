@@ -150,7 +150,7 @@ def test_sdk_archive_reference_rejects_provenance_boundary_changes(reviewed, ori
 @pytest.mark.parametrize("declaration", [
     f"omp-rpc @ git+{OMP_REPOSITORY}@{SDK_COMMIT}#subdirectory=sdk/python/omp-rpc\n",
     f"omp-rpc @ git+{OMP_REPOSITORY}@main#subdirectory=sdk/python/omp-rpc\n",
-    f"omp-rpc @ git+{OMP_REPOSITORY}@v0.4.4#subdirectory=sdk/python/omp-rpc\n",
+    f"omp-rpc @ git+{OMP_REPOSITORY}@v{SDK_RUNTIME_VERSION}#subdirectory=sdk/python/omp-rpc\n",
     "omp-rpc @ https://example.invalid/omp_rpc-0.1.0-py3-none-any.whl\n",
     "omp-rpc @ file:///tmp/omp-source.tar.gz\n",
     f"inert-dependency @ {SDK_ARCHIVE}\n",
@@ -164,8 +164,8 @@ def test_other_direct_references_are_unreviewed_even_with_inactive_markers(revie
 
 
 @pytest.mark.parametrize(("field", "value"), [
-    ("version", "0.4.5"), ("version", None), ("version", ""),
-    ("version", "0.4.4/../other"), ("repository_commit", "2" * 40),
+    ("version", "18.13.4"), ("version", None), ("version", ""),
+    ("version", "18.13.3/../other"), ("repository_commit", "2" * 40),
 ])
 def test_sdk_archive_must_match_native_runtime_release_and_commit(reviewed, field, value):
     native = json.loads(reviewed["omp_lock"].read_text())
@@ -206,8 +206,6 @@ def test_additional_declarations_apply_the_same_archive_provenance_rules(reviewe
     with pytest.raises(WheelhouseError):
         with verified_wheelhouse(**inputs, additional_requirements=additional):
             pass
-
-
 
 
 def bind_provisioner(monkeypatch, inputs):

@@ -1065,6 +1065,7 @@ void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json ex
             opts["mode"] = copilotModeName(st.aiInteraction);
         modeName = opts["mode"].get<std::string>();
         if (!opts.contains("advisor")) opts["advisor"] = true;
+
         attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
     }
@@ -4348,7 +4349,9 @@ void requestStopRunFor(AppState& st, const std::string& convId) {
             it->errKind = ERR_NONE;  // user stop is not an error card
             // Finalize any live stream boxes so the busy mark / streaming chrome stops.
             finalizeStoppedTurnActivity(*it);
-            if (it->text.empty())
+            if (run->isCompaction)
+                it->text = "Compaction stopped.";
+            else if (it->text.empty())
                 it->text = "Stopped.";
             else if (it->text.find("(Stopped by you.)") == std::string::npos)
                 it->text += "\n\n(Stopped by you.)";

@@ -26,6 +26,11 @@ or `core.symlinks` override.
   ```powershell
   winget install Kitware.CMake Ninja-build.Ninja
   ```
+- **Python 3.13 x64** for the services and developer checks (use the same version as CI):
+  ```powershell
+  winget install --id Python.Python.3.13 --exact --scope user
+  py -3.13 --version
+  ```
 
 ## 2. Build trees
 
@@ -65,6 +70,8 @@ Windows portability notes baked into the build:
 - The JSON-heavy `doc/session.cpp` compiles with `/bigobj` on MSVC so native
   document persistence does not exceed the normal COFF section count.
 - The core and host targets link `nlohmann_json` explicitly (no ambient system include on Windows).
+- MSVC builds use `/bigobj` for `core/doc/session.cpp` and `host/src/ui/scenarios.cpp`,
+  whose generated object sections can exceed the default compiler limit.
 - `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
 
 ## 3b. Build the core WITH the OCCT geometry kernel
@@ -151,8 +158,10 @@ Development uses a plain virtual environment installed from `requirements.txt`:
 
 ```powershell
 py -3.13 -m venv .venv-mcp
-.venv-mcp\Scripts\python -m pip install -r requirements.txt pytest
+.venv-mcp\Scripts\python -m pip install -r requirements.txt pytest pytest-timeout
 $env:CHUDWARE_PYTHON = "$PWD\.venv-mcp\Scripts\python.exe"
+.venv-mcp\Scripts\python -m pip check
+.venv-mcp\Scripts\python scripts\mcp_runtime_audit.py --deps-only
 ```
 
 `CHUDWARE_PYTHON` tells the build and staging scripts which interpreter hosts the
@@ -165,6 +174,25 @@ Native Windows Python cannot run `scripts/testbox.py` because it imports POSIX
 `fcntl`. Run isolated suites from a supported POSIX environment or host instead;
 see [Running tests](../../CONTRIBUTING.md#running-tests). Windows native build and
 test coverage also runs on GitHub Actions.
+
+### Launch a developer build with the service runtime
+
+After building and provisioning above, run from the checkout root in PowerShell:
+
+```powershell
+$env:CHUDWARE_REPO = (Get-Location).Path
+$env:CHUDWARE_PYTHON = "$PWD\.venv-mcp\Scripts\python.exe"
+$runtime = & $env:CHUDWARE_PYTHON scripts\pin_omp.py ensure --target windows-x86_64 --cache-dir "$env:LOCALAPPDATA\Chudware\omp"
+if ($LASTEXITCODE -ne 0) { throw "OMP provisioning failed" }
+$env:CHUDWARE_OMP_BIN = ($runtime | ConvertFrom-Json).path
+& .\dist\Chudware\chudware.exe
+```
+
+The first `ensure` downloads the pinned executable; subsequent launches verify the
+cache. Provider login is a separate user action in Settings; provisioning does not
+authenticate or send a prompt. These environment variables apply to this shell and its
+children, not every application on the machine. Keep the checkout root as `CHUDWARE_REPO`
+when running a staged developer build so Python services resolve from the complete source tree.
 
 ### Optional: offline wheelhouse mode
 
@@ -193,3 +221,8 @@ interpreter must import `packaging/requirements-release.txt` for those sidecars 
 - **`freecad_parity`** — historically this ctest case differed between MSVC and GCC on
   the point-on-ellipse solver case. Check the latest Windows CI row before treating a failure
   there as a new regression.
+- **pip cache deserialization / missing unpacked metadata** — if a fresh venv encounters
+  `Cache entry deserialization failed` or a missing `pip-unpack-...\*.metadata`, retry
+  the install with `--no-cache-dir`. Do not delete another environment or its package
+  cache. Transient DNS/TLS failures are download failures, not missing package versions;
+  preserve the pinned requirements and SDK SHA-256 checks when retrying.

@@ -3865,8 +3865,6 @@ def _session_identity_from_state(state: Mapping[str, Any]) -> dict[str, Any]:
     return identity
 
 
-
-
 def _active_branch(entries: Any, leaf_id: Any) -> list[Mapping[str, Any]]:
     """Root-to-leaf path of a runtime ``get_entries`` listing; abandoned siblings excluded."""
     if not isinstance(entries, list):

@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -42,6 +45,67 @@ struct WizardState {
 };
 
 WizardState s_wizard;
+
+// The GL thread owns the list; each worker waits for the preceding write before starting
+// its own. This preserves request order even if the GUI stops drawing with writes pending.
+// The list is initialized only when first needed, after the app's config-warning drain has
+// initialized the config lock; its futures are therefore destroyed before that lock.
+bool s_completionPending = false;
+
+std::vector<std::shared_future<bool>>& completionWrites() {
+    static std::vector<std::shared_future<bool>> writes;
+    return writes;
+}
+
+void warnCompletionSaveFailed(AppState& st) {
+    const char* message =
+        "Setup progress could not be saved; the welcome may appear again next time.";
+    st.toast(ToastLevel::Warn, message);
+    st.addLog(std::string("[warn] ") + message);
+}
+
+void queueCompletion(AppState& st, const char* workspace) {
+    auto& writes = completionWrites();
+    const std::shared_future<bool> previous = writes.empty() ? std::shared_future<bool>{}
+                                                             : writes.back();
+    try {
+        const std::string selectedWorkspace = workspace ? workspace : "";
+        // Reserve before launching, so an allocation failure cannot destroy and wait on
+        // a just-launched future on the GUI thread.
+        if (writes.size() == writes.capacity())
+            writes.reserve(std::max(std::size_t{1}, writes.capacity() * 2));
+        writes.push_back(std::async(std::launch::async, [previous, selectedWorkspace] {
+            if (previous.valid()) previous.wait();
+            return persistOnboardingCompletion(selectedWorkspace.empty()
+                                                    ? nullptr : selectedWorkspace.c_str());
+        }).share());
+        s_completionPending = true;
+    } catch (...) {
+        // A thread launch failure must not keep the user out of local CAD.
+        warnCompletionSaveFailed(st);
+    }
+}
+
+void pollCompletion(AppState& st) {
+    if (!s_completionPending) return;
+    auto& writes = completionWrites();
+    std::size_t finished = 0;
+    for (const auto& write : writes) {
+        if (write.wait_for(std::chrono::seconds(0)) != std::future_status::ready) break;
+        bool saved = false;
+        try {
+            saved = write.get();
+        } catch (...) {
+            // Treat an unexpected writer exception like any other failed save.
+        }
+        if (!saved) warnCompletionSaveFailed(st);
+        ++finished;
+    }
+    writes.erase(writes.begin(), writes.begin() + finished);
+    s_completionPending = !writes.empty();
+}
+
+void finishWizard(AppState& st);
 
 // Steps: 0 = power the copilot, 1 = live test, 2 = starting workspace.
 constexpr int kStepCount = 3;
@@ -404,14 +468,10 @@ void finishWizard(AppState& st) {
     const char* workspace = s_wizard.chosenWorkspace >= 0
                                 ? kWorkspaces[s_wizard.chosenWorkspace].configName
                                 : nullptr;
-    // Do not block entry on disk I/O. The config writer reports asynchronous failures;
-    // a rejected patch is reported here, and the welcome may reappear on the next launch.
-    if (!queueOnboardingCompletion(workspace))
-        st.toast(ToastLevel::Warn,
-                 "Setup progress could not be saved; the welcome may appear again next time.");
+    queueCompletion(st, workspace);
     if (s_wizard.chosenWorkspace >= 0)
         st.activeWorkspace = kWorkspaces[s_wizard.chosenWorkspace].workspace;
-    s_wizard.completedVersion = kOnboardingVersion;  // This session, not a durability claim.
+    s_wizard.completedVersion = kOnboardingVersion;  // Session only until the write succeeds.
     s_wizard.open = false;
     s_wizard.requestOpen = false;
     std::memset(s_wizard.key, 0, sizeof(s_wizard.key));
@@ -446,6 +506,10 @@ bool persistOnboardingCompletion(const char* startingWorkspace) {
     return queueOnboardingCompletion(startingWorkspace) && flushConfigWrites();
 }
 
+bool onboardingCompletionWritePending() {
+    return s_completionPending;
+}
+
 void forceOnboardingForScenario(int step) {
     s_wizard.requestOpen = true;
     s_wizard.open = true;
@@ -453,6 +517,8 @@ void forceOnboardingForScenario(int step) {
 }
 
 void drawOnboarding(AppState& st, bool appBusy) {
+    // Keep draining after the wizard closes. This must run even if the modal is not open.
+    pollCompletion(st);
     // The gateway already authenticates web users. This wizard provisions desktop
     // provider access; it must never open while browser state is loading.
     if (webBuild()) return;

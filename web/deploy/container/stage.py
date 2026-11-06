@@ -11,6 +11,7 @@ import sys
 
 
 
+
 def copy_tree(source: Path, destination: Path) -> None:
     # Match generated build directories, not runtime sources such as buildgraph.
     shutil.copytree(source, destination, symlinks=False, dirs_exist_ok=True,

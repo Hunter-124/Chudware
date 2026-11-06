@@ -129,7 +129,6 @@ show session mesh and sparse previews in the browser. Splat training is disabled
 because the actor sandbox does not expose a GPU. Workspace uploads default to
 100 MiB (`CHUDWARE_WEB_MAX_UPLOAD_BYTES`); session artifact previews are limited
 to 2 GiB and also require sufficient browser memory.
-
 For optional owner-operated paid hosting, [contact the project](https://chudware.com/contact).
 Payment covers operation, convenience and support for the open-source project; it
 never unlocks native or self-hosted software. No checkout, price, automatic provisioning

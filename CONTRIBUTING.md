@@ -118,7 +118,6 @@ disposable quota roots and may skip without them; ordinary unit tests do not pro
 kernel sandbox coverage.
 
 Other checks:
-
   - Browser client: `./build.sh wasm` builds and stages the bundle and runs the asset
     parity check. It needs emsdk; the container build supplies its pinned toolchain.
   - Container or gateway behavior: use a disposable Compose project/volumes, never a

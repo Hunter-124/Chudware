@@ -96,6 +96,7 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
 - Embedded BREP base64 decoding uses an unsigned rolling bit accumulator. Signed
   overflow/left shifts are undefined in C++17 even when only the low output byte
   is retained; preserve the unsigned accumulator when changing persistence code.
+
 - **Preflight is bounded advisory work.** `preflight_ops` spends at most a 10 000 ms candidate
   budget via `doc_dry_run_ops(budget_ms=...)`; the scratch rebuild runs in an expendable
   process group, never an unbounded parent fallback. Expiry reports

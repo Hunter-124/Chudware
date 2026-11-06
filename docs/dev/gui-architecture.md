@@ -49,12 +49,16 @@ These files are shared by many features; change them deliberately and keep edits
 
 ## Account-optional startup
 
-Local CAD does not require a Chudware account, AI-provider credentials or internet access.
-The welcome's primary **Start without an account** action enters Model immediately;
-Copilot sign-in remains optional and is available later in Settings → Providers.
-Completion queues a merge-preserving config write without waiting for disk I/O on the UI
-thread. A failed write warns but does not block modeling; the welcome can reappear after
-restart if the completion was not saved.
+Desktop onboarding offers **Start without an account** as the immediate path to Model:
+local CAD needs no account, API key or internet connection. Copilot provider sign-in and
+testing are optional during setup and remain available through Settings → Providers.
+Completing the wizard marks the current session complete immediately; its durable config
+merge runs on a background worker. Completion writes are serialized, with the latest queued
+workspace choice winning, and are polled every frame even after the modal closes. A failed
+write warns the user without blocking CAD; onboarding may appear again on the next launch.
+The config-corruption warning drain waits until that background write finishes because it
+shares the config-writer lock. The public persistence helper remains synchronous for
+callers that need to know when the write has completed.
 
 Deferred viewport focus must wait while any popup is open: ImGui window focus can dismiss
 the first-run or recovery modal. Verify a normal fresh-profile launch as well as the
@@ -66,6 +70,9 @@ its headless regression executable. Keep desktop lifecycle/worker/rendering depe
 out of this fragment; the regression must link on MSVC without relying on ELF section
 garbage collection or desktop-symbol stubs.
 
+Tab-switch timings go to `AppState::addLog` and the in-app console, not unconditionally to
+stderr on the GUI thread. `CHUDWARE_LOG_FILE` can opt into the existing file tee when
+diagnosing an issue; that tee itself performs file I/O.
 
 ## Verification: lint and the scenario harness
 
@@ -415,6 +422,8 @@ feature ops consume it. Background tabs keep their parsed mesh on `DocSession::c
   the clear region between the overlay columns each frame and calls
   `Renderer::setFramingRegion(shiftX, shiftY, scale)` (a lens shift; picking and overlays
   follow). Wheel/area zoom pivot on that region's centre.
+- **Focus and popups.** A deferred viewport focus request remains pending while any popup is
+  open at any level; applying it earlier can dismiss first-run or recovery modals.
 - Pane controls that stand for a face call `ui::claimViewportHoverFace(body, face)` every
   hovered frame; UI code never writes `AppState::hover` directly.
 - **CAM overlays** are drawn by `viewport_panel.cpp` through `Overlays` inside the renderer's

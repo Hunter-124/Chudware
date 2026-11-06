@@ -11,6 +11,7 @@ dimensions rather than treating the result as a disposable mesh. You can also wo
 in the desktop interface or connect an external agent through MCP.
 
 ![Chudware modeling workspace](docs/media/modeling.png)
+Website: <https://chudware.com> · [Development history](https://github.com/Hunter-124/Chudware/commits/master/)
 
 ![Sequence of captured modeling steps in Chudware](docs/media/modeling.gif)
 
@@ -170,6 +171,26 @@ Tool and backend availability still depend on the active build and configuration
   the specified historical build, not blanket evidence for every version or solver. The
   [simulation credibility program](docs/simulation/ACCREDITATION_PROGRAM.md) is a proposed,
   incomplete program, not an external accreditation.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| [core/](core) | Native engine and `chudware-hostd` daemon |
+| [host/](host) | Native and WASM GUI and renderer |
+| [services/](services) | IPC, worker, MCP, agent host, installer and domain services |
+| [contracts/](contracts/README.md) | Interface contracts |
+| [corpora/](corpora/README.md), [fixtures/](fixtures), [samples/](samples) | Test fixtures and sample parts |
+| [docs/](docs/README.md) | Design documents, references and developer notes |
+| [packaging/](packaging) | Native installers and release packaging |
+| [scripts/](scripts), [tools/](tools) | Build, audit and developer tools |
+| [web/](web/README.md) | Experimental self-hosted browser application |
+| [website/](website) | Promotional site source |
+| [assets/](assets), [vendor/](vendor), [extern/](extern) | Assets and vendored dependencies |
+| [benchmarks/](benchmarks) | Performance and validity benchmarks |
+
+Some persisted identifiers retain the earlier `aicad` prefix for data compatibility,
+including `.aicadvault`, `.aicm`, `refs/aicad/*` and `aicad.<x>/<n>` schema IDs.
 
 ## Contributing
 

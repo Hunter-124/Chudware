@@ -304,6 +304,12 @@ def test_runtime_rejects_host_invocation_before_starting_children(monkeypatch):
         runtime.guard_container(cells)
 
 
+def test_runtime_reports_missing_complete_payload(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "PAYLOAD", tmp_path)
+    with pytest.raises(RuntimeError, match="required runtime payload missing.*chudware-hostd"):
+        runtime.require_payload(cells)
+
+
 @pytest.mark.parametrize("helper_state", ["missing", "empty", "nonexecutable", "complete"])
 def test_runtime_requires_complete_shape_build_worker(tmp_path, monkeypatch, helper_state):
     monkeypatch.setattr(runtime, "PAYLOAD", tmp_path)

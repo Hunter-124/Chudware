@@ -6,6 +6,8 @@
 !THIRD_PARTY_NOTICES.md
 # Dockerfile copies these compile trees before its native/WASM build layers.
 # Keep host sources and C++ tests: core CMake declares cross-tree targets too.
+!cmake/
+!cmake/ChudwareTestSuites.cmake
 !core/
 !core/**
 !host/
@@ -42,6 +44,13 @@
 !extern/glad/**
 !scripts/
 !scripts/check_web_parity.py
+!scripts/test_suites.json
+!scripts/pin_omp.py
+!vendor/
+!vendor/omp/
+!vendor/omp/OMP_ARTIFACT.lock
+!vendor/omp/OMP-LICENSE
+!vendor/omp/OMP-THIRD-PARTY-NOTICES.txt
 # Runtime-only helpers are copied after compilation, not into its cache key.
 !web/
 !web/gateway/

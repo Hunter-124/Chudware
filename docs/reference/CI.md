@@ -39,6 +39,24 @@ tool required by the updater HTTPS regression fixture; its libraries alone
 are insufficient. The `gate` profile also installs the RPM and Debian inspection
 tools exercised by the packaging suite.
 
+Native builds ask Ninja to finish independent targets after a compiler failure
+(`-k 0`), so one clean-runner log reports the independent failures instead of
+revealing them one at a time. The build still exits unsuccessfully and tests
+are not run against incomplete output.
+
+Linux gate, native-build and release containers use an init process to reap
+orphaned subprocesses after timeout/cancellation checks. The shared
+`.github/scripts/prepare-linux-ci.sh` gives them private `HOME`, `XDG_DATA_HOME`
+and `TMPDIR` directories beneath root-owned `/tmp`, not the runner's shared
+mounts: firmware storage validates ownership and permissions of every ancestor.
+Git trusts only the exact checkout through the disposable container's system
+configuration, established before version metadata is generated. That trust
+survives pytest's deliberate `HOME` isolation; checkout's temporary global
+configuration does not. All Fedora profiles install the OpenSSL command-line
+tool required by the updater HTTPS regression fixture; its libraries alone
+are insufficient. The `gate` profile also installs the RPM and Debian inspection
+tools exercised by the packaging suite.
+
 ## Secrets and variables
 
 Pull-request workflows use no secrets. Pull requests from forks run with a
@@ -77,8 +95,8 @@ native-runtime job is a prerequisite.
 Package visibility and anonymous pulls must be enabled and verified by the owner
 after a real publication. Public MIT source at https://github.com/Hunter-124/Chudware
 or an authenticated push does not establish public image access. See
-[RELEASING.md](RELEASING.md) for publication prerequisites and the separate
-unpinned macOS ARM64 runtime blocker. Native payload/update signing remains unchanged.
+[RELEASING.md](RELEASING.md) for publication prerequisites and native runtime
+requirements. Native payload/update signing remains unchanged.
 
 ## Reproducing a job locally
 

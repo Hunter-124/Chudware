@@ -307,3 +307,8 @@ For source builds, test commands and platform limitations see
 and [browser guide](web/README.md). The full Linux gate is `bash scripts/gate.sh`; its
 stage list and environment requirements are in that script. Build and gate descriptions
 are not evidence that any particular checkout passed them.
+
+Cell-ownership coverage keeps simulation ownership, cancellation and revocation checks
+in the statically linked `test_sim` suite. `test_hostd_cell_ownership` exercises the
+real document registry and native C ABI without linking engine static modules alongside
+`libchudware`; internal C++ exception RTTI is not a cross-library contract.

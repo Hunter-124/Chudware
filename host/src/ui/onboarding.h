@@ -15,6 +15,10 @@ void drawOnboarding(AppState& state, bool appBusy);
 // exercise the exact production persistence path against an isolated config root.
 bool persistOnboardingCompletion(const char* startingWorkspace = nullptr);
 
+// The config-corruption warning drain shares the writer's mutex; do not drain it on the
+// frame thread while an interactive onboarding completion write is in flight.
+bool onboardingCompletionWritePending();
+
 // Screenshot-harness control: explicitly opens the wizard at one of its three steps, bypassing
 // ambient config state without changing or faking provider state.
 void forceOnboardingForScenario(int step);

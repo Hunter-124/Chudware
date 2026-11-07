@@ -470,8 +470,9 @@ def _check_wall_thickness(doc_id: str, call: Any) -> list[Finding]:
 def _check_dfm(doc_id: str, call: Any) -> list[Finding]:
     """Run dfm_check (DFAM mesh_wall_thickness for printed walls) → DFM Finding.
 
-    Returns a ``blocker`` Finding when any DFM check fails (dfm_pass=False), ``info``
-    otherwise.  The ``checks`` list is carried in ``extra`` so the fix provider can
+    Returns a ``blocker`` Finding when any DFM check fails (dfm_pass=False), a ``hint``
+    when the checks could not be evaluated (dfm_pass=None, status ``not_evaluated``), and
+    ``info`` otherwise.  The ``checks`` list is carried in ``extra`` so the fix provider can
     emit per-issue targeted fixes without re-calling the tool.
     """
     dfm = call("dfm_check", doc_id=doc_id) or {}
@@ -479,22 +480,31 @@ def _check_dfm(doc_id: str, call: Any) -> list[Finding]:
     checks = dfm.get("checks") or []
     proc = dfm.get("process", "process")
 
-    failed = [c for c in checks if not c.get("ok", True)]
-    if not dfm_pass and failed:
+    failed = [c for c in checks if c.get("ok") is False]
+    unevaluated = [c for c in checks if c.get("status") == "not_evaluated"]
+    if dfm_pass is False and failed:
         issues = "; ".join(c.get("note", c.get("check", "")) for c in failed)
         finding_text = f"DFM FAIL ({proc}): {issues}"
         severity = "blocker"
+    elif dfm_pass is None:
+        reasons = "; ".join(c.get("note") or c.get("error") or c.get("check", "")
+                            for c in unevaluated) or "no checks evaluated"
+        finding_text = f"DFM NOT EVALUATED ({proc}): {reasons}"
+        severity = "hint"
     else:
         finding_text = f"DFM PASS ({proc}): all {len(checks)} check(s) OK"
         severity = "info"
 
+    numbers = {"n_checks": len(checks), "n_failed": len(failed),
+               "n_not_evaluated": len(unevaluated)}
+    if dfm_pass is not None:
+        numbers["dfm_pass"] = int(bool(dfm_pass))
     return [Finding(
         kind="dfm",
         check=stages.CHECK_DFM,
         severity=severity,
         finding=finding_text,
-        numbers={"dfm_pass": int(dfm_pass), "n_checks": len(checks),
-                 "n_failed": len(failed)},
+        numbers=numbers,
         refs={"doc_id": doc_id},
         source_kind="kernel",
         source_detail="dfm_check+eval_thickness+eval_draft",

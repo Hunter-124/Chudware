@@ -455,6 +455,21 @@ class TestDFMAdvisor(unittest.TestCase):
         findings = self._call_dfm(checks, "injection_mold")
         self.assertEqual(findings[0].severity, "blocker")
 
+    def test_not_evaluated_is_a_hint_not_a_pass(self) -> None:
+        checks = [{"check": "min_wall", "status": "not_evaluated", "ok": None,
+                   "note": "geometry backend unavailable"}]
+
+        def _call(method: str, **kwargs) -> dict:
+            return {"ok": True, "process": "fdm", "status": "not_evaluated",
+                    "dfm_pass": None, "checks": checks}
+
+        findings = adapters._check_dfm("doc-fixture", _call)
+        self.assertEqual(findings[0].severity, "hint")
+        self.assertIn("NOT EVALUATED", findings[0].finding)
+        self.assertIn("geometry backend unavailable", findings[0].finding)
+        self.assertNotIn("dfm_pass", findings[0].numbers)
+        self.assertEqual(findings[0].numbers["n_failed"], 0)
+
     def test_candidate_fixes_per_check(self) -> None:
         checks = [
             {"check": "min_wall", "value_mm": 0.7, "limit_mm": 1.2, "ok": False,

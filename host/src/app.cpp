@@ -180,8 +180,8 @@ inline void wasmBootReady() {
 #include "ui/toast.h" // W1-B: toast notifications
 #ifndef __EMSCRIPTEN__
 #include "update/updater.h"
-#include "ui/web_capabilities.h"
 #endif
+#include "ui/web_capabilities.h"
 #include "ui/viewport_panel.h"
 #include "ui/widgets/ribbon.h"
 #include "ui/widgets/kit.h"

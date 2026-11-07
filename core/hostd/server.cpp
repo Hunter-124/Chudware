@@ -653,6 +653,17 @@ namespace {
 struct StreamCtx { hostd::Server* srv; int clientId; bool renewWatchdog = false; };
 }
 
+// Who receives an actor's agent events in a tenant cell: the actor's gateway connections (the
+// browser's primary and per-turn event sockets) and the connection that streamed the call.
+// The actor's sandboxed workers also hold hello'd connections, but those are plain
+// request/response clients that read only while awaiting a reply. Streaming a chatty turn at
+// one fills its socket, hostd's write times out after CHUDWARE_HOSTD_WRITE_TIMEOUT_S (10 s,
+// stalling every other recipient meanwhile) and the connection is dropped "for re-sync",
+// which the worker's next call then meets as a broken pipe. Caller holds cellMtx_.
+static bool receivesCellAgentEvents(const ClientConn& conn, const std::string& actor, int requester) {
+    return conn.helloDone && conn.actorKey == actor && (conn.gateway || conn.id == requester);
+}
+
 void Server::sendAgentEvent(int clientId, const char* eventJson) {
     if (!eventJson) return;
     std::string line = "{\"event\":\"agent.event\",\"data\":";
@@ -685,7 +696,7 @@ void Server::sendAgentEvent(int clientId, const char* eventJson) {
         bool owns;
         {
             std::lock_guard<std::mutex> lock(cellMtx_);
-            owns = conn->helloDone && conn->actorKey == actor;
+            owns = receivesCellAgentEvents(*conn, actor, clientId);
         }
         if (owns) sendEventTo(conn->id, line);
     }
@@ -2042,7 +2053,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
                         std::lock_guard<std::mutex> lock(clientsMtx_);
                         std::lock_guard<std::mutex> identityLock(cellMtx_);
                         for (const auto& [id, conn] : clients_)
-                            if (conn->helloDone && conn->actorKey == owner) recipients.push_back(id);
+                            if (receivesCellAgentEvents(*conn, owner, requester)) recipients.push_back(id);
                     }
                     const std::string line = json{{"event", "agent.event"}, {"data", data}}.dump();
                     for (int id : recipients) sendEventTo(id, line);

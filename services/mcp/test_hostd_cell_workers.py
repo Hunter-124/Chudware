@@ -281,6 +281,10 @@ int main() {
                           {"info_ctx", infoCtx},
                           {"omp_session_file", "/actor/private.jsonl"},
                           {"nested", {{"sessionFile", "/actor/private.jsonl"}}}}}}.dump() << std::endl;
+            for (int i = 0, n = params.value("flood", 0); i < n; ++i)
+                std::cout << json{{"id", req["id"]}, {"event", "delta"},
+                    {"data", {{"kind", "assistant_delta"}, {"run_id", active}, {"seq", i},
+                              {"text", std::string(1000, 'x')}}}}.dump() << std::endl;
             if (params.value("finish_file", false)) {
                 lock.unlock();
                 while (!std::filesystem::exists(root + "/finish-turn-" + std::to_string(getpid()) +
@@ -615,7 +619,8 @@ def test_missing_actor_launcher_or_compiled_worker_fails_closed(cell):
 class GatewayConnection:
     """Raw adopted-listener client; never discovers or spawns a desktop daemon."""
 
-    def __init__(self, path, actor=None, workspace=None, epoch=0, right="editor", operator=False):
+    def __init__(self, path, actor=None, workspace=None, epoch=0, right="editor", operator=False,
+                 internal=False):
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(20)
         # sun_path holds ~107 bytes; pytest tmp paths can exceed it. Connect through a short
@@ -632,6 +637,9 @@ class GatewayConnection:
             "principal": {"workspace_key": workspace, "actor_key": actor,
                           "right": right, "epoch": epoch,
                           "connection_nonce": uuid.uuid4().hex}}
+        if internal:
+            # What an actor's sandboxed worker sends on its private listener: no principal.
+            params = {"client": "mcp", "proto": 1}
         if operator:
             params = {"client": "control", "operator": True, "proto": 1}
         deadline = time.monotonic() + 60
@@ -993,6 +1001,35 @@ def test_actual_cell_revoke_streams_stop_and_preserves_other_actor(actual_cell_d
     assert result["ctx"]["control_delegate"] == {
         "actor_key": manager_actor, "right": "manager", "action": "cancel"}
     assert fresh.reply(managed_request)["result"]["cancelled"]
+
+
+def test_actual_cell_agent_events_reach_gateway_connections_not_actor_workers(actual_cell_daemon):
+    # A turn streams hundreds of agent events. The actor's own sandboxed workers hold hello'd
+    # connections too, but they are request/response clients that read only while awaiting a
+    # reply; pushing the stream at one fills its socket, hostd's write times out and drops it
+    # "for re-sync", and the worker's next call (the end-of-turn doc_list) meets a broken pipe.
+    cell = actual_cell_daemon
+    alice, workspace = str(uuid.uuid4()), "team:agent-event-fanout"
+    turn = cell["connect"](alice, workspace)
+    monitor = cell["connect"](alice, workspace)
+    handles = turn.call("agent_handles_new")["result"]
+    actor_hex = hashlib.sha256(alice.encode()).hexdigest()[:32]
+    worker = GatewayConnection(cell["state"] / "actors" / actor_hex / "run" / "hostd.sock",
+                               internal=True)
+    try:
+        flood = 1500  # ~1.6 MB of events, far beyond any socket buffer
+        request = turn.send("agent_admin_turn", {**handles, "message": "flood", "flood": flood})
+        turn.run_event("run_started", handles["run_id"])
+        for index in range(flood):  # every browser connection sees every event, in order
+            for browser in (turn, monitor):
+                assert browser.run_event("assistant_delta", handles["run_id"])["seq"] == index
+        assert monitor.call("agent_cancel", {"run_id": handles["run_id"]})["result"]["cancelled"]
+        assert turn.reply(request)["result"]["cancelled"]
+        # The worker's connection was never read during the stream and is still usable.
+        assert worker.call("ping")["result"] == {"ok": True}
+        assert not [e for e in worker.events if e.get("event") == "agent.event"]
+    finally:
+        worker.close()
 
 
 def test_revoke_without_existing_lanes_blocks_delayed_old_epoch_dispatch(cell):

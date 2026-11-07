@@ -3265,9 +3265,12 @@ aggregate interference check incomplete, so the sweep cannot prove clearance.
   `{ok:false, reason:"session_busy"}` while teardown is in progress or its
   outcome is unconfirmed; a control timeout is not permission to transfer.
   Eviction and explicit close observe the same rule.
-- In a tenant cell, actor-scoped agent events remain broadcast to the actor's
-  connections. A GUI turn consumes only events matching its issued `run_id` from
-  its turn connection and does not render the primary socket's duplicate.
+- In a tenant cell, actor-scoped agent events remain broadcast to the actor's gateway
+  connections (the browser's primary and per-turn event sockets) and to the connection that
+  streamed the call; never to the actor's sandboxed worker connections, which are
+  request/response clients that do not drain a stream. A GUI turn consumes only events
+  matching its issued `run_id` from its turn connection and does not render the primary
+  socket's duplicate.
 
 ## Explicit offline transcript compaction (append-only, 2026-11-03)
 

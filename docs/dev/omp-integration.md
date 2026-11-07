@@ -76,7 +76,11 @@ also honored while a turn or maintenance request waits for a worker or a
 session transfer, including the interval before the worker registers the run.
 It prevents that request from starting without cancelling unrelated work.
 
-Cell gateways broadcast an actor's agent events to its connections. Each GUI
+Cell gateways broadcast an actor's agent events to its gateway connections, never to
+its sandboxed workers' connections: those are request/response clients that read only
+while awaiting a reply, so a streamed turn would fill one until hostd's write timeout
+dropped it ("event delivery failed ... disconnecting for re-sync") and the worker's next
+call, typically the end-of-turn `doc_list`, met a broken pipe. Each GUI
 turn socket accepts only its own already-issued run handle; the GUI does not
 also render the duplicate delivered to its primary event socket. Worker-mapped
 nested events carry the owning root turn and session IDs for routing, retaining

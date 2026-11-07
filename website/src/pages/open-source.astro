@@ -4,16 +4,16 @@ import '../styles/company.css';
 
 const REPO = 'https://github.com/Hunter-124/Chudware';
 ---
-<BaseLayout title="Source and licenses" description="Chudware's MIT software rights, current source availability, free self-hosting, optional paid hosting, and the licenses of its third-party components.">
+<BaseLayout title="Source and licenses" description="Chudware's MIT software rights, current source availability, and the licenses of its third-party components.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Open source</p>
-      <h1>MIT-licensed software. Your choice of deployment.</h1>
-      <p class="lede">Use, study, change, and redistribute Chudware under the MIT terms. Desktop use, source builds, and browser self-hosting have no Chudware software fee. Clone the public source repository to build and run it yourself; public desktop installers are not yet available.</p>
+      <h1>MIT-licensed software. Build it yourself.</h1>
+      <p class="lede">Use, study, change, and redistribute Chudware under the MIT terms. Desktop use and source builds have no Chudware software fee. Clone the public source repository to build and run it yourself; public desktop installers are not yet available.</p>
       <dl class="co-sec-facts">
         <div><dt>License</dt><dd>MIT</dd></div>
         <div><dt>Source</dt><dd>Hunter-124/Chudware (public)</dd></div>
-        <div><dt>Hosting</dt><dd>Self-host free; optional paid operation</dd></div>
+        <div><dt>Platforms</dt><dd>Windows, Linux, macOS (build from source)</dd></div>
       </dl>
     </div>
   </header>
@@ -22,8 +22,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
     <div class="wrap co-about-body">
       <div class="co-prose">
         <h2 id="os-project" class="co-anchor">What the repository contains</h2>
-        <p>The C++ desktop and WebAssembly interfaces and native geometry engine, Python gateway, worker, and tool services, packaging scripts for Windows, Linux, and macOS, and release workflows. Browser modeling uses the native C++ engine on the server, with Python providing supporting services.</p>
-        <p>The <a class="text-link" href="/docs/self-hosting/">self-hosting guide</a> builds a single-operator browser deployment from a source checkout. Optional paid, owner-operated hosting supports development; <a class="text-link" href="/contact/">ask about hosting</a> without changing your MIT software rights.</p>
+        <p>The C++ desktop interface and native geometry engine, Python gateway, worker, and tool services, packaging scripts for Windows, Linux, and macOS, and release workflows.</p>
 
         <h2>License</h2>
         <p>The MIT License permits use, copying, modification, merging, publication, distribution, sublicensing, and sale of the software, provided the copyright notice and the permission notice are included in all copies or substantial portions of it. The software is provided without warranty. The repository's <a class="text-link" href={`${REPO}/blob/HEAD/LICENSE`}>LICENSE</a> file is the governing text.</p>
@@ -41,7 +40,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
           <div><dt>Interface</dt><dd>Dear ImGui</dd></div>
           <div><dt>License</dt><dd>MIT</dd></div>
         </dl>
-        <div class="actions"><a class="button" href="/docs/self-hosting/">Self-hosting guide</a><a class="button button-secondary" href={`${REPO}#building-from-source`}>Native build guide</a></div>
+        <div class="actions"><a class="button" href={`${REPO}#building-from-source`}>Native build guide</a></div>
       </aside>
     </div>
   </section>
@@ -76,7 +75,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </li>
       </ol>
       <p class="supporting-copy">Also used: nlohmann/json, Clipper2, miniz, stb, openNURBS, lib3mf, and the Chromium Embedded Framework.</p>
-      <p class="supporting-copy">AI is optional. Desktop Copilot needs its configured agent runtime and your own supported provider account or API key; provider charges and privacy terms apply. The browser container does not require that runtime, and online browser Copilot is unavailable. See <a class="text-link" href="/docs/ai-copilot/">AI setup and limits</a>. Distributed components retain their license notices whether or not AI is enabled.</p>
+      <p class="supporting-copy">AI is optional. Desktop Copilot needs its configured agent runtime and your own supported provider account or API key; provider charges and privacy terms apply. See <a class="text-link" href="/docs/ai-copilot/">AI setup and limits</a>. Distributed components retain their license notices whether or not AI is enabled.</p>
     </div>
   </section>
 
@@ -86,7 +85,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         <h2 id="os-polymesh" class="co-anchor">PolyMesh, the FEA mesher</h2>
         <p><strong>Polyhedral-FEA</strong>, also called PolyMesh, is a BSD-3-Clause CAD meshing and linear-elastostatics project. It imports STEP and B-rep geometry, builds hybrid volume meshes, assembles standard finite elements and polyhedral Virtual Element Method cells into one global system, solves small-strain linear elasticity, recovers stress, estimates error, and writes VTU result fields.</p>
         <p>The adaptive path can alter local size and element order from geometry demand and recovery-based error. A learned advisor can rank measured candidate actions within a degrees-of-freedom budget, but it remains a chooser with refusal gates—not an accuracy guarantee.</p>
-        <p>The repository ships command-line, desktop-study, and self-hosted browser applications in addition to the headless libraries, with build and use instructions maintained alongside the source.</p>
+        <p>The repository ships command-line and desktop-study applications in addition to the headless libraries, with build and use instructions maintained alongside the source.</p>
       </div>
 
       <aside class="co-aside" aria-labelledby="os-polymesh-repository">
@@ -180,9 +179,9 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
   <section class="section cta-band">
     <div class="wrap section-heading">
       <p class="eyebrow">Inspect the source</p>
-      <h2>Read the instructions, choose your setup.</h2>
-      <p class="lede">The public repository is the authority for build instructions. The website guides explain deployment choices and getting started without requiring a Chudware account.</p>
-      <div class="actions"><a class="button" href="/docs/self-hosting/">Self-hosting guide</a><a class="button button-secondary" href="/contact/">Ask about hosting</a></div>
+      <h2>Read the instructions, then build it.</h2>
+      <p class="lede">The public repository is the authority for build instructions. The website guides explain getting started without requiring a Chudware account.</p>
+      <div class="actions"><a class="button" href={`${REPO}#building-from-source`}>Building from source</a><a class="button button-secondary" href="/contact/">Contact the project</a></div>
     </div>
   </section>
 </BaseLayout>

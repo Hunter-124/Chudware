@@ -27,7 +27,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
       <div class="co-faq-list">
         <details class="co-faq" open>
           <summary>What is Chudware?</summary>
-          <div class="co-faq-answer"><p>MIT-licensed, dimension-driven parametric CAD for engineers, with assemblies, drawings, CAM, simulation, PLM, reverse engineering, and an optional desktop copilot. Desktop packaging targets Windows, Linux, and macOS; experimental browser self-hosting uses a native engine on your server. See <a href="/download/">setup choices and current availability</a>.</p></div>
+          <div class="co-faq-answer"><p>MIT-licensed, dimension-driven parametric CAD for engineers, with assemblies, drawings, CAM, simulation, PLM, reverse engineering, and an optional desktop copilot. Desktop packaging targets Windows, Linux, and macOS. See <a href="/download/">setup choices and current availability</a>.</p></div>
         </details>
         <details class="co-faq">
           <summary>Who is it for?</summary>
@@ -55,7 +55,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>Does Chudware cost anything?</summary>
-          <div class="co-faq-answer"><p>There is no Chudware software fee or license key for desktop use, source builds, or self-hosting. Your hardware, hosting, and AI provider costs are separate. Optional paid, owner-operated hosting supports development; <a href="/contact/">ask about hosting</a> directly. It is not required to run Chudware.</p></div>
+          <div class="co-faq-answer"><p>There is no Chudware software fee or license key for desktop use or source builds. Your hardware and AI provider costs are separate.</p></div>
         </details>
         <details class="co-faq">
           <summary>How can I contribute?</summary>
@@ -63,7 +63,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>Can I build it from source?</summary>
-          <div class="co-faq-answer"><p>Yes. Clone the public MIT repository and follow the <a href={`${REPO}#building-from-source`}>repository README</a> for native C++20, CMake, OpenCASCADE, and Python service dependencies. Supported desktop SDK and native runtime dependencies are pinned release assets in the same repository; macOS ARM64's native runtime remains unpinned. The <a href="/docs/self-hosting/">browser self-hosting guide</a> uses Docker Compose from the repository root. Public desktop installers are not yet available.</p></div>
+          <div class="co-faq-answer"><p>Yes. Clone the public MIT repository and follow the <a href={`${REPO}#building-from-source`}>repository README</a> for native C++20, CMake, OpenCASCADE, and Python service dependencies. Supported desktop SDK and native runtime dependencies are pinned release assets in the same repository; macOS ARM64's native runtime remains unpinned. Public desktop installers are not yet available.</p></div>
         </details>
       </div>
     </div>
@@ -75,15 +75,15 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
       <div class="co-faq-list">
         <details class="co-faq" open>
           <summary>Do I need an account?</summary>
-          <div class="co-faq-answer"><p>The software and public source need no Chudware account or license activation. Any remotely exposed browser instance needs authentication supplied by its operator. AI providers have their own accounts and credentials; optional hosted-service access is arranged separately.</p></div>
+          <div class="co-faq-answer"><p>The software and public source need no Chudware account or license activation. AI providers have their own accounts and credentials.</p></div>
         </details>
         <details class="co-faq">
           <summary>Which operating systems have a desktop build?</summary>
-          <div class="co-faq-answer"><p>Packaging targets Windows and Linux x86-64 and macOS ARM64 (Apple silicon). These targets are not a promise of public installers: none is currently available. The <a href="/download/">setup page</a> links platform notes and source-based self-hosting.</p></div>
+          <div class="co-faq-answer"><p>Packaging targets Windows and Linux x86-64 and macOS ARM64 (Apple silicon). These targets are not a promise of public installers: none is currently available. The <a href="/download/">setup page</a> links platform notes and source builds.</p></div>
         </details>
         <details class="co-faq">
           <summary>Where do I get it?</summary>
-          <div class="co-faq-answer"><p>Start at <a href="/download/">setup choices</a>, clone the <a href={REPO}>public source repository</a>, and follow the <a href="/docs/self-hosting/">self-hosting guide</a>. Public desktop installers are not yet available; runtime-only prereleases are not desktop installers. <a href="/contact/">Contact the project</a> about optional paid hosting.</p></div>
+          <div class="co-faq-answer"><p>Start at <a href="/download/">setup choices</a>, clone the <a href={REPO}>public source repository</a>, and follow its <a href={`${REPO}#building-from-source`}>Building from source</a> section. Public desktop installers are not yet available; runtime-only prereleases are not desktop installers.</p></div>
         </details>
       </div>
     </div>
@@ -103,7 +103,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>Where are projects stored?</summary>
-          <div class="co-faq-answer"><p>Desktop documents are local files. In browser mode, the workspace and engine state are on the server, not just in browser storage; the server operator can access that data. A server you operate is self-hosting; optional owner-operated hosting uses the hosting operator's infrastructure. AI provider requests and vendor lookups can send data to external services. Keep your own exports and backups and read <a href="/legal/privacy/">privacy</a>.</p></div>
+          <div class="co-faq-answer"><p>Desktop documents are local files. AI provider requests and vendor lookups can send data to external services. Keep your own exports and backups and read <a href="/legal/privacy/">privacy</a>.</p></div>
         </details>
         <details class="co-faq">
           <summary>Can I migrate existing work?</summary>
@@ -123,7 +123,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>How do I connect an AI provider?</summary>
-          <div class="co-faq-answer"><p>In a desktop build with its compatible copilot runtime configured, open Settings → Providers and connect a supported provider account or your own API key. Enter credentials only there — never in chat or project notes. Online Copilot is not available in the browser deployment; see <a href="/docs/ai-copilot/">AI setup and limits</a>.</p></div>
+          <div class="co-faq-answer"><p>In a desktop build with its compatible copilot runtime configured, open Settings → Providers and connect a supported provider account or your own API key. Enter credentials only there — never in chat or project notes. See <a href="/docs/ai-copilot/">AI setup and limits</a>.</p></div>
         </details>
         <details class="co-faq">
           <summary>Who pays for AI usage?</summary>
@@ -161,7 +161,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
     <div class="wrap section-heading">
       <p class="eyebrow">Still deciding?</p>
       <h2>Try it on a real project.</h2>
-      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/contact/">Ask about hosting</a></div>
+      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/docs/first-part/">Build your first part</a></div>
     </div>
   </section>
 </BaseLayout>

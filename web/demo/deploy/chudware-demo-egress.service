@@ -1,0 +1,21 @@
+# Loads the demo egress firewall (web/demo/deploy/egress.nft) at boot, before the
+# chudware-demo user manager (and so before any session container) can start.
+# deploy/install.sh substitutes __UID__ with the chudware-demo user's id.
+#
+# Stopping this unit does NOT remove the rules (fail closed). To remove them:
+#   sudo systemctl disable --now chudware-demo-egress.service
+#   sudo nft delete table inet chudware_demo
+[Unit]
+Description=Chudware demo: block LAN egress for session containers
+Documentation=file:///etc/chudware-demo/egress.nft
+Wants=network-pre.target
+Before=network-pre.target user@__UID__.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/chudware-demo/egress.nft
+ExecReload=/usr/sbin/nft -f /etc/chudware-demo/egress.nft
+
+[Install]
+WantedBy=multi-user.target

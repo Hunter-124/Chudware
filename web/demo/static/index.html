@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Chudware live demo</title>
+<link rel="stylesheet" href="/demo/static/waiting.css">
+</head>
+<body>
+<main>
+  <h1>Chudware live demo</h1>
+  <p class="lead">A free, public, shared demo of the Chudware CAD workspace running in your
+    browser. Everyone gets a private, short-lived sandbox; only a few can use it at once, so
+    visitors wait in line.</p>
+
+  <section id="panel" aria-live="polite">
+    <div id="intro" hidden>
+      <p id="notice" class="notice" hidden></p>
+      <button id="join" type="button">Start the demo</button>
+      <p id="error" class="error" role="alert" hidden></p>
+    </div>
+    <div id="queue" hidden>
+      <p class="position">You are number <strong id="position">-</strong> in line</p>
+      <p id="eta" class="muted"></p>
+      <p id="capacity" class="muted" hidden>The server is busy right now. Your place is kept.</p>
+      <p class="muted">Keep this page open. It continues automatically when it is your turn and
+        you do not need to refresh. A tab that stops checking in loses its place after a minute.</p>
+      <button id="leave" type="button" class="secondary">Leave the line</button>
+    </div>
+    <div id="starting" hidden>
+      <p class="position">Your turn. Starting a private workspace&hellip;</p>
+      <p class="muted">This usually takes under a minute.</p>
+    </div>
+    <p id="load" class="muted"></p>
+  </section>
+
+  <section>
+    <h2>Before you start</h2>
+    <ul>
+      <li><strong>Nothing persists.</strong> Your workspace is deleted when the session ends. Download
+        your work before then; a banner reminds you five minutes ahead.</li>
+      <li><strong>Session limits.</strong> Up to <span id="max-sessions">3</span> people at a time; a
+        session ends after 45 minutes, or after 15 minutes without activity.</li>
+      <li><strong>Free AI models only.</strong> The AI assistant uses free models on a small shared daily
+        allowance, so it can run out. <span id="ai"></span> Modeling works without it.</li>
+      <li><strong>Privacy.</strong> No account is needed. A cookie identifies your session in this browser
+        only. Your IP address, timestamps and per-session request counts are logged for abuse
+        prevention; your files and prompts are not logged and are deleted with the session.</li>
+      <li>Experimental software: results may be wrong. Do not upload confidential or personal data.</li>
+    </ul>
+  </section>
+</main>
+<script src="/demo/static/waiting.js"></script>
+<noscript><p class="notice">This page needs JavaScript to join the queue.</p></noscript>
+</body>
+</html>

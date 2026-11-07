@@ -83,3 +83,5 @@ web/secrets/
 web/gateway/.venv/
 web/**/*.env
 !web/gateway/config.example.env
+!web/demo/config.example.env
+web/demo/.venv/

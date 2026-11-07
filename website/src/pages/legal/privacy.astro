@@ -1,9 +1,10 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 ---
-<BaseLayout title="Privacy" description="How the static Chudware website and the local desktop app differ in data handling.">
+<BaseLayout title="Privacy" description="How the static Chudware website, the public browser demo, and the local desktop app handle data.">
   <div class="wrap legal-shell"><header><p class="eyebrow">Legal</p><h1>Privacy</h1><p class="effective">Effective November 7, 2026</p></header><div class="prose">
     <h2>This website</h2><p>chudware.com is a static website. It has no accounts, no forms, no analytics, and no advertising or tracking scripts. The hosting provider processes standard request data, such as IP addresses, to deliver pages and protect the site. To detect and block abusive traffic, the site logs each request: your IP address, the network and approximate location reported by the hosting provider, the requested address, request headers, and the first few kilobytes of any submitted data. These logs are kept for three months. Links to GitHub and other sites are governed by those sites' own policies.</p>
+    <h2>The public demo</h2><p>app.chudware.com runs Chudware in your browser against a temporary server session. It has no accounts; a session cookie holds your place in the queue and your session. Each session runs in its own isolated container, and its files are deleted when the session ends: after 15 minutes without activity or 45 minutes in total. Download anything you want to keep before then. Demo AI requests (your prompt, the model context, and tool results) go to OpenRouter's free models under OpenRouter's and the model provider's terms; free models may be used by their providers to improve their services, so do not enter confidential information. The demo logs requests, IP addresses, and per-session usage counts to prevent abuse; these logs are kept for three months.</p>
     <h2>The desktop app</h2><p>The desktop software requires no Chudware account and sends no telemetry. Documents are saved as local files on your machine. Network requests include:</p>
     <ul>
       <li><strong>Update checks.</strong> The app fetches the signed update manifest for your platform from the project's GitHub releases, and downloads an update from GitHub when one is available. GitHub receives the request under its own privacy terms.</li>

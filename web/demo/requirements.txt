@@ -1,0 +1,3 @@
+# The front door needs exactly the gateway's runtime dependencies (starlette arrives
+# with fastapi; uvicorn, httpx and websockets are listed there). No new packages.
+-r ../gateway/requirements.txt

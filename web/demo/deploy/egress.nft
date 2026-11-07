@@ -1,0 +1,51 @@
+#!/usr/sbin/nft -f
+# Chudware public demo: keep session containers off the LAN, tailnet and link-local.
+#
+# Rootless podman's pasta network originates every outbound connection of every session
+# container as an ordinary socket owned by the user that runs podman, `chudware-demo`.
+# An output-hook rule keyed on that uid therefore covers all container egress (and the
+# front door's own traffic, which only needs loopback and the public internet).
+#
+# Its own table: firewalld and other tools do not flush it. Re-running this file is
+# idempotent (the table is deleted and recreated in one transaction).
+#   sudo nft -f /etc/chudware-demo/egress.nft
+table inet chudware_demo
+delete table inet chudware_demo
+
+table inet chudware_demo {
+	# Resolver exceptions. Podman's pasta forwards a container's DNS to the host's
+	# resolvers. With systemd-resolved (127.0.0.53) nothing is needed. If
+	# /etc/resolv.conf names a resolver on the LAN, the rules below would block DNS:
+	# list that resolver here (port 53 only), then reload this file. Example:
+	#   elements = { 192.168.1.1 }
+	set dns_resolvers_v4 {
+		type ipv4_addr
+		flags interval
+	}
+	set dns_resolvers_v6 {
+		type ipv6_addr
+		flags interval
+	}
+
+	chain egress {
+		type filter hook output priority filter; policy accept;
+
+		# Everyone else is untouched.
+		meta skuid != "chudware-demo" return
+
+		# Front door -> session containers' published loopback ports.
+		ip daddr 127.0.0.0/8 accept
+		ip6 daddr ::1 accept
+
+		ip daddr @dns_resolvers_v4 meta l4proto { tcp, udp } th dport 53 accept
+		ip6 daddr @dns_resolvers_v6 meta l4proto { tcp, udp } th dport 53 accept
+
+		# Private/internal IPv4: RFC 1918, CGNAT (Tailscale), link-local, multicast.
+		ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 224.0.0.0/4 } counter reject with icmpx type admin-prohibited
+		# Private/internal IPv6: unique-local (incl. Tailscale fd7a::/48), link-local, multicast.
+		ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx type admin-prohibited
+
+		# Public destinations.
+		accept
+	}
+}

@@ -1,0 +1,33 @@
+# Chudware public demo front door (systemd USER unit of the dedicated chudware-demo
+# user; deploy/install.sh substitutes @APP@ and installs it under that user's
+# ~/.config/systemd/user). Configuration and secrets: /etc/chudware-demo/demo.env
+# (mode 0600, owner chudware-demo); see web/demo/config.example.env.
+[Unit]
+Description=Chudware public demo front door (queue, per-session containers, AI broker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@APP@
+EnvironmentFile=/etc/chudware-demo/demo.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# Loopback only: cloudflared (another user) connects here. The listener must never be
+# exposed, because the client address is taken from CF-Connecting-IP.
+# --no-proxy-headers: X-Forwarded-* is never trusted. 4194304 matches the gateway's
+# WebSocket frame ceiling. Graceful stop ends every session (see README) before exit.
+ExecStart=@APP@/venv/bin/python -m uvicorn demo.app:create_app --factory --app-dir @APP@ \
+    --host 127.0.0.1 --port 8300 --no-access-log --no-server-header --no-proxy-headers \
+    --ws-max-size 4194304 --limit-concurrency 256 --timeout-graceful-shutdown 20
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=90
+UMask=0077
+MemoryMax=1G
+TasksMax=1024
+# Deliberately NOT set: NoNewPrivileges. Rootless podman needs the setuid
+# newuidmap/newgidmap helpers, which NoNewPrivileges would break.
+
+[Install]
+WantedBy=default.target

@@ -1578,7 +1578,7 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
     s_bridgeCatalogLastFetch = now;
     s_bridgeCatalogInFlight = true;
     st.rpc.call("omp_models_list", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
+                [&st](const core::RpcResult& r) {
         s_bridgeCatalogInFlight = false;
         s_bridgeCatalogLastFetch = ImGui::GetTime();
         // A running agent turn holds hostd's agent lane and every other call on it is refused at

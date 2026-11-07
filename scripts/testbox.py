@@ -31,7 +31,8 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = Path.home() / '.cache/chudware-testbox'
 CONFIG = Path.home() / '.config/chudware/testbox.json'
-IMAGE_INPUTS = ('tools/testbox/Containerfile', '.github/scripts/install-fedora-deps.sh', 'requirements.txt')
+IMAGE_INPUTS = ('tools/testbox/Containerfile', '.github/scripts/install-fedora-deps.sh', 'requirements.txt',
+                'web/gateway/requirements.txt')
 GIB = 1024 ** 3
 MIN_FREE_GIB = 30
 IGNORE = b'''**
@@ -39,6 +40,9 @@ IGNORE = b'''**
 !.github/scripts/
 !.github/scripts/install-fedora-deps.sh
 !requirements.txt
+!web/
+!web/gateway/
+!web/gateway/requirements.txt
 !tools/
 !tools/testbox/
 !tools/testbox/Containerfile

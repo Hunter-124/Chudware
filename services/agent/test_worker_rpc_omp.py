@@ -1718,6 +1718,150 @@ def test_cell_turn_has_no_credential_route_and_never_reaches_omp(online_lane, mo
     assert not online_lane.saved
 
 
+_DEMO_ROWS = [
+    {"id": "example/model-a:free", "name": "Model A (free)", "provider": "openrouter",
+     "contextWindow": 65536, "maxTokens": 8192},
+    {"id": "example/model-b:free", "name": "Model B (free)", "provider": "openrouter"},
+]
+
+
+@pytest.fixture
+def demo_cell(online_lane, monkeypatch):
+    """A bound cell actor of a demo container, with its lane mounted and listing two models."""
+    from services.agent import demo_lane, request_context as tenancy
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(online_lane.workspace / "cell-state"))
+    monkeypatch.setattr(demo_lane, "enabled", lambda *args, **kwargs: True)
+    monkeypatch.setattr(demo_lane, "models", lambda **kwargs: [dict(row) for row in _DEMO_ROWS])
+    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    with tenancy.bind_context(ctx):
+        session = tenancy.mint_handle("session")
+        yield SimpleNamespace(session=session, run=lambda: tenancy.mint_handle("run", parent=session))
+
+
+def _demo_turn_params(lane, cell, **extra):
+    params = _params(lane, run_id=cell.run(), session_id=cell.session, **extra)
+    del params["workspace_dir"]  # the cell workspace root is /work, not the test's temporary directory
+    return params
+
+
+def test_demo_cell_models_are_exactly_the_lanes_in_the_lanes_order(demo_cell):
+    listed = worker_rpc._omp_models_list({}, lambda event: None)
+    assert listed["ok"] and listed["refreshing"] is False
+    assert [m["id"] for m in listed["models"]] == ["example/model-a:free", "example/model-b:free"]
+    assert {m["provider"] for m in listed["models"]} == {"openrouter"}
+    assert listed["models"][0]["name"] == "Model A (free)"
+    assert listed["models"][0]["contextWindow"] == 65536 and listed["models"][0]["maxTokens"] == 8192
+    assert worker_rpc._omp_models_list({"providerId": "openrouter"}, lambda e: None)["models"] == listed["models"]
+    assert worker_rpc._omp_models_list({"providerId": "anthropic"}, lambda e: None)["models"] == []
+    assert not worker_rpc._omp_models_list({"providerId": 7}, lambda e: None)["ok"]
+    assert not worker_rpc._omp_models_list({"api_key": "x"}, lambda e: None)["ok"]
+
+
+def test_demo_cell_model_list_reports_a_lane_outage_instead_of_an_empty_picker(demo_cell, monkeypatch):
+    from services.agent import demo_lane
+
+    def down(**kwargs):
+        raise demo_lane.LaneError("demo model lane unavailable: URLError")
+
+    monkeypatch.setattr(demo_lane, "models", down)
+    result = worker_rpc._omp_models_list({}, lambda event: None)
+    assert result["ok"] is False and "unavailable" in result["reason"]
+
+
+def test_demo_providers_panel_is_one_ready_row_answered_without_an_omp_process(online_lane, demo_cell):
+    listed = worker_rpc._omp_provider_list({}, lambda event: None)
+    assert listed["ok"]
+    (row,) = listed["providers"]
+    assert row["id"] == "openrouter" and row["name"] == "Free demo models"
+    assert row["authenticated"] and row["authKinds"] == [] and row["modelsAvailable"] == 2
+    state = worker_rpc._omp_auth_state({"providerId": "openrouter"}, lambda event: None)
+    assert state["ok"] and state["authenticated"] and state["state"] == "configured"
+    assert not worker_rpc._omp_auth_state({"providerId": "anthropic"}, lambda e: None)["authenticated"]
+    assert not online_lane.host.auth_calls and not online_lane.host.transient_calls
+
+
+@pytest.mark.parametrize("method, params", [
+    ("omp_set_key", {"providerId": "openrouter", "apiKey": "sk-visitor"}),
+    ("omp_remove_key", {"providerId": "openrouter"}),
+    ("omp_logout", {"providerId": "openrouter", "credentialId": 1}),
+    ("omp_logout_accounts", {"providerId": "openrouter"}),
+    ("omp_login", {"providerId": "openrouter"}),
+])
+@pytest.mark.parametrize("demo", [True, False])
+def test_cells_never_store_remove_or_sign_in_credentials(online_lane, monkeypatch, method, params, demo):
+    """Refused by the worker itself, whatever the method policy and lane say."""
+    from services.agent import demo_lane, request_context as tenancy
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(online_lane.workspace / "cell-state"))
+    monkeypatch.setattr(demo_lane, "enabled", lambda *args, **kwargs: demo)
+    ctx = {"cell": True, "workspace_key": "team:worker/work", "actor_key": "alice",
+           "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
+    with tenancy.bind_context(ctx):
+        result = worker_rpc.WORKER_METHODS[method](dict(params), lambda event: None)
+    assert result == {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
+    assert not online_lane.host.auth_calls and not online_lane.host.transient_calls
+    assert "sk-visitor" not in repr(online_lane.host.__dict__)
+
+
+def test_demo_turn_runs_a_listed_model_through_the_lane_only(online_lane, demo_cell):
+    params = _demo_turn_params(online_lane, demo_cell, provider="openrouter",
+                               model="example/model-b:free")
+    result = worker_rpc._agent_admin_turn(params, lambda event: None)
+    assert result["ok"] is True, result
+    settings = online_lane.host.turns[0]["settings"]
+    assert (settings["provider"], settings["model"]) == ("openrouter", "example/model-b:free")
+    assert "byok_key" not in online_lane.host.turns[0]
+
+
+def test_demo_turn_naming_no_model_gets_the_lanes_first_model(online_lane, demo_cell):
+    params = _demo_turn_params(online_lane, demo_cell)
+    del params["provider"], params["model"]
+    assert worker_rpc._agent_admin_turn(params, lambda event: None)["ok"]
+    settings = online_lane.host.turns[0]["settings"]
+    assert (settings["provider"], settings["model"]) == ("openrouter", "example/model-a:free")
+
+
+@pytest.mark.parametrize("selection", [
+    {"provider": "openai", "model": "gpt-test"},
+    {"provider": "openrouter", "model": "not/offered:free"},
+    {"provider": "anthropic", "model": "example/model-a:free"},
+    {"provider": "openrouter"},
+])
+def test_demo_turn_refuses_any_model_outside_the_lane(online_lane, demo_cell, selection):
+    params = _demo_turn_params(online_lane, demo_cell)
+    del params["provider"], params["model"]
+    result = worker_rpc._agent_admin_turn({**params, **selection}, lambda event: None)
+    assert result["ok"] is False and result["code"] == "demo_model_not_allowed"
+    assert "Free demo models only" in result["reason"]
+    assert not online_lane.host.turns
+
+
+@pytest.mark.parametrize("extra", [
+    {"api_key": "sk-visitor"}, {"byok_key": "sk-visitor"}, {"base_url": "http://169.254.169.254/v1"},
+])
+def test_demo_turn_never_accepts_a_visitor_key_or_endpoint(online_lane, demo_cell, extra):
+    params = _demo_turn_params(online_lane, demo_cell, provider="openrouter",
+                               model="example/model-a:free", **extra)
+    assert worker_rpc._agent_admin_turn(params, lambda event: None) == {
+        "ok": False, "reason": "credential_isolation_unsupported",
+        "code": "credential_isolation_unsupported"}
+    assert not online_lane.host.turns
+
+
+def test_demo_turn_with_the_lane_down_fails_with_a_readable_reason(online_lane, demo_cell, monkeypatch):
+    from services.agent import demo_lane
+
+    def down(**kwargs):
+        raise demo_lane.LaneError("demo model lane unavailable: URLError")
+
+    monkeypatch.setattr(demo_lane, "models", down)
+    result = worker_rpc._agent_admin_turn(_demo_turn_params(online_lane, demo_cell), lambda e: None)
+    assert result["ok"] is False and "unavailable" in result["reason"]
+    assert not online_lane.host.turns
+
+
 def test_turn_and_resumed_conversation_bind_selected_root_on_host_threads(
     online_lane, monkeypatch, tmp_path
 ):

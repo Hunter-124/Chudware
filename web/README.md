@@ -41,9 +41,11 @@ size; omit `--depth 1` for the repository's complete development history.
   Keep disk space for the image, its unpacked layers, saved models and backups.
   Default runtime limits are four CPUs and 8 GiB RAM; leave room for the host OS
   and size larger workloads separately. These limits are not measured minimums.
-- The container needs neither the optional online-agent SDK nor its executable
-  because online Copilot is unsupported in this deployment; it retains the other
-  root Python requirements and general workers.
+- The image ships the OMP runtime (`CHUDWARE_OMP_BIN`) and the general Python workers, but
+  a single-operator container has **no provider credential route**: online Copilot stays
+  unavailable there because provider keys are never passed into a cell. The one exception is
+  the [public demo mode](#public-demo-mode), whose throwaway containers reach only a fixed,
+  quota-limited free-model lane.
 
 - A current browser with WebAssembly, WebGL2 and cross-origin-isolated shared memory
   (`SharedArrayBuffer`). Localhost HTTP is a secure-context exception; ordinary
@@ -117,8 +119,10 @@ state and caches can fill the host filesystem. Monitor storage and keep backups;
 use the [advanced systemd path](#advanced-systemd-deployment-with-project-quotas) when
 you require enforced filesystem project quotas.
 
-**Browser limitations:** online Copilot is unavailable because remote-model credentials
-are not passed into cells. General Python workers are included, but that does not
+**Browser limitations:** online Copilot is unavailable in a single-operator container because
+remote-model credentials are not passed into cells (the key-management, sign-in and
+model-probe methods are refused outright). Public demo containers are the exception described
+below. General Python workers are included, but that does not
 install every optional solver, firmware toolchain, external desktop application or
 model weight. Features requiring those programs or native OS integrations are not
 promised by this image. The browser build is not full desktop parity. Start with small
@@ -133,6 +137,36 @@ For optional owner-operated paid hosting, [contact the project](https://chudware
 Payment covers operation, convenience and support for the open-source project; it
 never unlocks native or self-hosted software. No checkout, price, automatic provisioning
 or current hosting availability is implied.
+
+## Public demo mode
+
+`CHUDWARE_WEB_DEMO=1` marks a container as one throwaway session of the public demo. It is
+meant to be started only by the host-side front door in [`web/demo/`](demo/README.md), which
+admits visitors from a queue, runs one container per session, proxies to it and destroys the
+container and all of its data at expiry. The flag is exactly `1` or `0`; anything else
+refuses to start so a typo cannot run a demo as a trusted single-operator container.
+
+What the flag changes inside the container, and nothing else:
+
+- `GET /healthz` answers `{"ok": true, "demo": true}` (otherwise exactly `{"ok": true}`). The
+  app shell then polls the front door's `/demo/status` and shows a time-left banner with a
+  *Download your work* action and an expiry overlay.
+- If the front door mounted its per-session socket at `/run/chudware-demo/provider.sock`, each
+  actor sandbox also gets it at the same path plus a fixed loopback forwarder on
+  `127.0.0.1:18081`. OMP's `openrouter` provider is pointed at `http://127.0.0.1:18081/v1`
+  with a placeholder key, and the model picker lists exactly what the lane's `GET /v1/models`
+  returns. The owner's key and the model allowlist live only in the front door; a cell without
+  that socket (every single-operator container) keeps refusing every online credential route.
+- A spent session or daily AI allowance (HTTP 429, `demo_quota_exhausted` /
+  `demo_ai_daily_limit`) ends the turn with the front door's own message. The front door
+  should send `x-should-retry: false` with those answers; OMP then fails at once instead of
+  retrying the request for about fifteen seconds.
+
+Applied in **every** cell, demo or not: the model probe `agent_list_models` (it dials a
+client-chosen `base_url` from the engine's network namespace) and the key-management methods
+`omp_set_key`, `omp_login`, `omp_logout`, `omp_remove_key` and `omp_logout_accounts` are
+refused by `contracts/cell_methods.json`, and the worker refuses the key-management methods
+itself.
 
 ## Ubuntu 24.04+ AppArmor setup
 

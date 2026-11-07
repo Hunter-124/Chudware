@@ -26,6 +26,15 @@ def _env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "").strip()
+    if raw in ("", "0"):
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(f"{name} must be 1 or 0")
+
+
 def _path(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
@@ -73,6 +82,10 @@ class Settings:
     max_engine_bridges: int = field(
         default_factory=lambda: _env_int("CHUDWARE_WEB_MAX_ENGINE_BRIDGES", 4)
     )
+    # Public demo mode (CHUDWARE_WEB_DEMO=1): the container is one throwaway session behind a
+    # trusted front door. It changes only what the container advertises (/healthz) and, inside
+    # the cell, whether the free-model lane may be used; it never relaxes an isolation check.
+    demo: bool = field(default_factory=lambda: _env_flag("CHUDWARE_WEB_DEMO"))
 
     def __post_init__(self) -> None:
         try:

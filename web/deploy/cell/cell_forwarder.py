@@ -1,10 +1,10 @@
-"""Fixed cell/actor loopback egress transport; only the cell's own Unix socket is dialed."""
+"""Fixed cell/actor loopback transports; only the cell's own Unix sockets are dialed."""
 import socket
 import threading
-from cell_runtime import relay
+from cell_runtime import DEMO_PORT, DEMO_SOCKET, demo_requested, demo_socket_present, relay
 
 
-def _start_lane(port, path):
+def _start_lane(port, path, *, provider=False):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -20,7 +20,11 @@ def _start_lane(port, path):
         try:
             upstream.settimeout(10)
             upstream.connect(path)
-            relay(client, upstream, byte_limit=67108864, idle=120)
+            # A demo model stream may legitimately pause between tokens, so it has no byte
+            # cap; the front door owns request bounds, quota and revocation. A silent socket
+            # is still reclaimed so a tenant cannot pin the lane's slots forever.
+            relay(client, upstream, byte_limit=None if provider else 67108864,
+                  idle=600 if provider else 120)
         except (OSError, ValueError):
             pass
         finally:
@@ -42,6 +46,24 @@ def _start_lane(port, path):
     return listener
 
 
-def start():
-    """Bind the fixed egress lane before launching any child; no caller endpoint input."""
-    return [_start_lane(18080, "/run/egress.sock")]
+def demo_lane_enabled(environ=None, socket_path=DEMO_SOCKET):
+    """The AI lane exists only in a demo container whose front door mounted its socket."""
+    return demo_requested(environ) and demo_socket_present(socket_path)
+
+
+def start(*, provider=None):
+    """Bind the fixed lanes before launching any child; no caller endpoint input.
+
+    ``provider`` None decides from the environment (demo container AND mounted socket);
+    a single-operator cell therefore never opens the provider lane.
+    """
+    listeners = []
+    try:
+        listeners.append(_start_lane(18080, "/run/egress.sock"))
+        if demo_lane_enabled() if provider is None else provider:
+            listeners.append(_start_lane(DEMO_PORT, DEMO_SOCKET, provider=True))
+        return listeners
+    except BaseException:
+        for listener in listeners:
+            listener.close()
+        raise

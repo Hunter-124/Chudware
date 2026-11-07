@@ -34,12 +34,16 @@ def pytest_configure(config):
         pytest.exit(guard.MESSAGE, returncode=3)
 
 
-_IMPORT_HOME = tempfile.mkdtemp(prefix="cw-gw-import-")
-os.environ["CHUDWARE_WEB_HOME"] = _IMPORT_HOME
-os.environ["CHUDWARE_WEB_ALLOWED_HOSTS"] = "testserver,localhost,127.0.0.1"
-os.environ.pop("CHUDWARE_WORKSPACE_ROOT", None)
-os.environ.pop("CHUDWARE_WEB_APP", None)
-os.environ.pop("CHUDWARE_WEB_OPERATOR", None)
+# web/conftest.py normally did this first (see there); this covers a run rooted in web/gateway.
+if "CHUDWARE_WEB_TEST_ENV" not in os.environ:
+    os.environ["CHUDWARE_WEB_TEST_ENV"] = "1"
+    _IMPORT_HOME = tempfile.mkdtemp(prefix="cw-gw-import-")
+    os.environ["CHUDWARE_WEB_HOME"] = _IMPORT_HOME
+    os.environ["CHUDWARE_WEB_ALLOWED_HOSTS"] = "testserver,localhost,127.0.0.1"
+    os.environ.pop("CHUDWARE_WORKSPACE_ROOT", None)
+    os.environ.pop("CHUDWARE_WEB_APP", None)
+    os.environ.pop("CHUDWARE_WEB_OPERATOR", None)
+    os.environ.pop("CHUDWARE_WEB_DEMO", None)
 
 
 @pytest.fixture

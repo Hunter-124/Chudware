@@ -359,6 +359,37 @@ def test_clean_environment_never_forwards_ambient_authority():
     assert environment["CHUDWARE_WEB_ALLOWED_HOSTS"] == "cad.example.org"
 
 
+@pytest.mark.parametrize("value", ["", "0", "1"])
+def test_demo_flag_is_forwarded_only_as_a_strict_boolean(value):
+    assert runtime.clean_environment({"CHUDWARE_WEB_DEMO": value})["CHUDWARE_WEB_DEMO"] == value
+    assert "CHUDWARE_WEB_DEMO" in runtime.WEB_OPTIONS
+
+
+def test_demo_flag_is_absent_unless_the_operator_set_it():
+    assert "CHUDWARE_WEB_DEMO" not in runtime.clean_environment({"OPENROUTER_API_KEY": "secret"})
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", "on", "demo"])
+def test_ambiguous_demo_flag_refuses_to_start(value):
+    """A typo must not silently run a public demo as a trusted single-operator container."""
+    with pytest.raises(RuntimeError, match="CHUDWARE_WEB_DEMO must be 1 or 0"):
+        runtime.clean_environment({"CHUDWARE_WEB_DEMO": value})
+
+
+def test_demo_flag_never_carries_a_provider_key_into_the_cell():
+    environment = runtime.clean_environment({
+        "CHUDWARE_WEB_DEMO": "1", "CHUDWARE_DEMO_OPENROUTER_KEY": "owner-key",
+        "OPENROUTER_API_KEY": "owner-key", "OPENAI_BASE_URL": "http://169.254.169.254"})
+    assert environment["CHUDWARE_WEB_DEMO"] == "1"
+    assert not {"CHUDWARE_DEMO_OPENROUTER_KEY", "OPENROUTER_API_KEY", "OPENAI_BASE_URL"} & environment.keys()
+
+
+def test_supervisor_marker_with_the_demo_flag_is_still_admitted(container_layout):
+    layout = container_layout
+    runtime.write_json(layout.run, "runtime.json", {**layout.marker, "demo": True}, cells, replace=True)
+    assert cells.container_runtime(layout.principal)["demo"] is True
+
+
 def start_supervisor(supervisor):
     failures = []
 

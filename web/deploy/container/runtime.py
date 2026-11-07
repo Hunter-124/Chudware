@@ -28,7 +28,7 @@ RUN = Path("/run/chudware")
 IMAGE_MARKER = PAYLOAD / "container-runtime-v1"
 WEB_OPTIONS = frozenset({
     "CHUDWARE_WEB_OPERATOR", "CHUDWARE_WEB_ALLOWED_HOSTS", "CHUDWARE_WEB_MAX_UPLOAD_BYTES",
-    "CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES", "CHUDWARE_WEB_MAX_ENGINE_BRIDGES",
+    "CHUDWARE_WEB_WS_MAX_MESSAGE_BYTES", "CHUDWARE_WEB_MAX_ENGINE_BRIDGES", "CHUDWARE_WEB_DEMO",
 })
 
 
@@ -181,6 +181,8 @@ class PrivateListener:
 def clean_environment(source):
     # Explicit allowlist, not ambient env with a few token names removed.
     options = {key: source[key] for key in WEB_OPTIONS if key in source}
+    if "CHUDWARE_WEB_DEMO" in options and options["CHUDWARE_WEB_DEMO"] not in ("", "0", "1"):
+        raise RuntimeError("CHUDWARE_WEB_DEMO must be 1 or 0")
     return {
         "PATH": "/opt/chudware/bin:/opt/chudware/venv/bin:/usr/bin:/bin",
         "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "LD_LIBRARY_PATH": "/opt/chudware/bin",
@@ -347,7 +349,8 @@ def healthcheck(cells, settings):
     try:
         connection.request("GET", "/healthz", headers={"Host": settings.allowed_hosts[0]})
         response = connection.getresponse()
-        if response.status != 200 or json.loads(response.read(1024)) != {"ok": True}:
+        expected = {"ok": True, "demo": True} if settings.demo else {"ok": True}
+        if response.status != 200 or json.loads(response.read(1024)) != expected:
             raise RuntimeError("gateway is not ready")
     finally:
         connection.close()
@@ -419,7 +422,7 @@ def main():
         broker_thread = threading.Thread(target=broker_module.serve, args=(broker.socket, None), daemon=True)
         broker_thread.start()
         from cell_forwarder import start
-        forwarders = start()
+        forwarders = start(provider=False)  # the AI lane exists only inside actor sandboxes
         environment["CHUDWARE_CELL_ID"] = principal.cell_id
         probe_actor(environment, principal, stop)
         gateway_socket = PrivateListener(directory, "gw.sock", cells)
@@ -427,7 +430,9 @@ def main():
         write_json(RUN, "runtime.json", {"schema": "chudware-container-v1", "supervisor_pid": 1,
                    "uid": os.getuid(), "home": str(HOME), "root": str(WORK), "state": str(STATE),
                    "cell_id": principal.cell_id, "workspace_key": principal.workspace_key,
-                   "socket_device": gateway_socket.identity[0], "socket_inode": gateway_socket.identity[1]},
+                   "socket_device": gateway_socket.identity[0], "socket_inode": gateway_socket.identity[1],
+                   # Read by the fixed actor launcher (hostd clears its environment), never by a tenant.
+                   **({"demo": True} if settings.demo else {})},
                    cells, replace=True)
         hostd = [str(PAYLOAD / "bin/chudware-hostd"), "--cell", "--gateway-listen-fd",
                  str(gateway_socket.socket.fileno()), "--cell-state", str(STATE), "--cell-work", str(WORK)]

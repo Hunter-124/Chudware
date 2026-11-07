@@ -4829,6 +4829,12 @@ static bool drawVisionRoutingSection(AppState& st, float sc) {
         ImGui::TextUnformatted(cm);
         ImGui::PopStyleColor();
     }
+    // Web demo: the only models are the server's free list; the hardcoded vision presets
+    // below would name models the demo lane does not serve.
+    if (ui::webBuild() && ui::webDemo()) {
+        dimText(ui::webGapReason("account_signin"));
+        return changed;
+    }
 
     ImGui::Dummy(ImVec2(0, 6 * sc));
     if (ui::kit::checkbox("vis_route", "Route vision & spatial reasoning through a separate model",

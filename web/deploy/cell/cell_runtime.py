@@ -24,11 +24,92 @@ BASE_ENV = {"PATH": "/opt/chudware/bin:/opt/chudware/venv/bin:/usr/bin:/bin", "L
             "NO_PROXY": "127.0.0.1,localhost,::1", "no_proxy": "127.0.0.1,localhost,::1"}
 ACTOR_ENV = frozenset({"CHUDWARE_ACTOR_KEY", "CHUDWARE_WORKSPACE_KEY", "CHUDWARE_ACTOR_HEX",
     "CHUDWARE_CELL_RIGHT", "CHUDWARE_CELL_EPOCH", "CHUDWARE_HOSTD_WORKER_LANE", "CHUDWARE_WRITER_GROUP"})
+BRIDGE_ENV = ("OMP_CAD_BRIDGE_TRANSPORT", "OMP_CAD_BRIDGE_ENDPOINT", "OMP_CAD_BRIDGE_TOKEN",
+              "OMP_CAD_ASSET_STAGING_DIR", "OMP_CAD_ASSET_JOURNAL")
 
 
 def actor_environment():
     """Only the actor's scoped identity may cross an actor boundary."""
     return {key: os.environ[key] for key in ACTOR_ENV if key in os.environ}
+
+
+# Public-demo AI lane. The trusted front door bind-mounts ONE per-session unix socket here;
+# it speaks OpenAI-compatible HTTP for an allowlist of free models and holds the only key.
+DEMO_SOCKET = "/run/chudware-demo/provider.sock"
+DEMO_PORT = 18081
+RUNTIME_MARKER = "/run/chudware/runtime.json"
+BRIDGE_TOKEN = re.compile(r"[A-Za-z0-9_-]{8,256}\Z")
+
+
+def demo_requested(environ=None, marker=RUNTIME_MARKER):
+    """True when this launcher belongs to a demo container (a flag, never a capability).
+
+    hostd clears its environment before it starts the first actor, so there the container
+    supervisor's private runtime marker is the source of truth; a launcher already inside an
+    actor inherits the flag its parent actor was given. Whether the lane is usable is
+    decided separately by the presence of the mounted socket.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get("CHUDWARE_ACTOR_SANDBOX") == "1":
+        return environ.get("CHUDWARE_WEB_DEMO") == "1"
+    try:
+        return read_json(marker).get("demo") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def demo_socket_present(path=DEMO_SOCKET):
+    try:
+        return stat.S_ISSOCK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def demo_lane_args(pins, demo, path=DEMO_SOCKET):
+    """bwrap arguments that bind the front door's lane socket at the same path in the actor.
+
+    Nothing is bound outside a demo container or while the socket is absent (the lane is then
+    simply unavailable and AI refuses); a non-socket at that path is refused outright. The
+    pinned descriptor, not the path, is what bwrap mounts.
+    """
+    if not demo:
+        return []
+    try:
+        fd = os.open(path, os.O_PATH | os.O_NOFOLLOW)
+    except OSError:
+        return []
+    if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError("demo provider lane must be a socket")
+    os.set_inheritable(fd, False)
+    pins.append(fd)
+    return ["--ro-bind", "/proc/self/fd/" + str(fd), DEMO_SOCKET]
+
+
+def bridge_environment(environ=None):
+    """Extension-bridge coordinates for an OMP process launched from inside an actor.
+
+    The bridge socket lives beneath /actor, which every nested sandbox of the same actor shares,
+    so only paths there (or the workspace, for the session journal) and a well-formed token may
+    cross; anything else is refused rather than dropped.
+    """
+    environ = os.environ if environ is None else environ
+    values = {key: environ[key] for key in BRIDGE_ENV if key in environ}
+    if not values:
+        return {}
+
+    def beneath(value, roots):
+        parts = value.split("/")
+        return (value.startswith("/") and "\x00" not in value and ".." not in parts
+                and any(value == root or value.startswith(root + "/") for root in roots))
+
+    if (values.get("OMP_CAD_BRIDGE_TRANSPORT") != "unix"
+            or not beneath(values.get("OMP_CAD_BRIDGE_ENDPOINT", ""), ("/actor",))
+            or not BRIDGE_TOKEN.fullmatch(values.get("OMP_CAD_BRIDGE_TOKEN", ""))
+            or any(values.get(key) and not beneath(values[key], ("/actor", "/work"))
+                   for key in ("OMP_CAD_ASSET_STAGING_DIR", "OMP_CAD_ASSET_JOURNAL"))):
+        raise ValueError("extension bridge outside the actor namespace")
+    return values
 
 
 def hex_id(value):

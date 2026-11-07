@@ -3577,3 +3577,50 @@ Both methods report `ok`, `complete`, `assumptions`, and `source_failures`; `ok`
 evaluation completeness, not absence of hits. Boolean or sweep failures are not clear
 verdicts. Limits are 256 members/ignored IDs, 32 removal queries with 16 directions each,
 and 64 envelopes.
+
+## Public demo cells: refused credential methods and the free-model lane (append-only, 2026-11-07)
+
+Worker RPC contract revision 2.3. The wire protocol major remains 2. This amendment
+supersedes the sentences above that say a cell has no AI credential route and that provider
+credential management is merely "always refused" in prose: the policy file now enforces it.
+
+**Refused in every cell.** `contracts/cell_methods.json` classifies `agent_list_models`,
+`omp_set_key`, `omp_login`, `omp_logout`, `omp_remove_key` and `omp_logout_accounts` as
+`cell:"refuse"` (rights and scopes unchanged). `agent_list_models` dials a client-chosen
+`base_url` from the engine's own network namespace, so inside a cell it is a request-forgery
+primitive; the engine additionally answers `cell_refused` for it when `CHUDWARE_CELL=1` or a
+cell principal is bound. The five `omp_*` methods refuse with `{ok:false, reason:"cell_refused",
+code:"cell_refused"}` in the worker as well, independent of the method policy.
+`scripts/cell_methods.py` lists all six in `REFUSED_EXACT`, so the validator fails any attempt to
+re-allow them.
+
+**Demo lane.** A container started with `CHUDWARE_WEB_DEMO=1` whose front door mounted the
+per-session socket `/run/chudware-demo/provider.sock` has exactly one online route:
+
+* Each actor sandbox (and each nested sandbox of the same actor) binds that socket at the same
+  path and runs a fixed loopback forwarder `127.0.0.1:18081 -> /run/chudware-demo/provider.sock`.
+  No other environment, path or port selects an endpoint; the container supervisor opens no
+  such lane. The flag reaches the first-level launcher through the supervisor's private
+  `runtime.json` marker (`"demo": true`) and nested launchers through `CHUDWARE_WEB_DEMO=1`.
+* `omp_models_list` returns the lane's `GET /v1/models` rows in the lane's order, provider id
+  `openrouter`, and no other row. A lane outage is `{ok:false, reason}`, never an empty list.
+  No model id is built into the app.
+* `omp_provider_list` returns the single provider `openrouter` ("Free demo models",
+  `authKinds:[]`); `omp_auth_state` answers `configured` for it without starting OMP.
+* `agent_admin_turn` is admitted in a cell only for that provider and a listed model; a turn
+  naming neither gets the lane's first model. Any other selection refuses with
+  `code:"demo_model_not_allowed"`. A turn carrying `api_key`, `byok_key` or `base_url` still
+  refuses with `credential_isolation_unsupported`.
+* OMP runs in the actor sandbox with a private `models.yml` (under the actor state root) that
+  sets the `openrouter` provider's `baseUrl` to `http://127.0.0.1:18081/v1` with the placeholder
+  key `chudware-demo-lane`. The extension bridge socket is created beneath `/actor/run` and its
+  coordinates (`OMP_CAD_BRIDGE_*`, `OMP_CAD_ASSET_*`) cross the nested sandbox boundary only
+  when they name paths beneath `/actor` (or the workspace, for the journal).
+* HTTP 429 `{"error":{"code":"demo_quota_exhausted"|"demo_ai_daily_limit","message":...}}`
+  ends the turn as `stop_reason:"provider_error"` whose `reason` is the lane's message. The
+  host cancels OMP's own retry if it announces one; the front door should also send
+  `x-should-retry: false` so the provider transport does not retry either.
+
+Every other cell, including a demo container without the mounted socket, keeps answering
+`credential_isolation_unsupported` for AI turns and an empty `omp_models_list`.
+`GET /healthz` of a demo container additionally carries `"demo": true`.

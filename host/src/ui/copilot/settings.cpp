@@ -1523,6 +1523,33 @@ void saveProviderListJson(const std::string& providersJson) {
     else s_lastWritten = providersJson;
 }
 
+// Web demo only: the server-filtered omp_models_list is the entire model universe. A saved or
+// default selection (config.json from an earlier page, or "follow model assignments", which
+// resolves server-side outside the allowlist) that is not one of the returned, usable rows is
+// replaced by the first row the picker shows, so no stale or hardcoded model is ever sent.
+static void reconcileDemoModelSelection(AppState& st) {
+    if (!ui::webBuild() || !ui::webDemo()) return;
+    const BridgeModelMeta* first = nullptr;
+    bool selectionListed = false;
+    for (const auto& m : s_bridgeModels) {
+        if (!bridgePickerModelUsable(st, m)) continue;
+        if (!first) first = &m;
+        if (m.provider == st.settings.ompProvider && m.id == st.settings.model) selectionListed = true;
+    }
+    if (!first) return;
+    bool changed = false;
+    if (!selectionListed) {
+        st.settings.provider = ui::PROV_OPENAI;   // legacy classification only, as the picker does
+        st.settings.ompProvider = first->provider;
+        std::strncpy(st.settings.model, first->id.c_str(), sizeof(st.settings.model) - 1);
+        st.settings.model[sizeof(st.settings.model) - 1] = 0;
+        st.settings.vision = first->vision;
+        changed = true;
+    }
+    if (st.settings.composerFollowRoles) { st.settings.composerFollowRoles = false; changed = true; }
+    if (changed) saveSettings(st.settings);
+}
+
 void refreshBridgeModelCatalog(AppState& st, bool force) {
     if (s_scenarioCatalog) return;
     ensureBridgeCatalogSeeded();
@@ -1575,6 +1602,7 @@ void refreshBridgeModelCatalog(AppState& st, bool force) {
         s_bridgeCatalogFromDisk = false;
         s_bridgeModels = parseBridgeCatalogRows(*it);
         if (!s_bridgeModels.empty()) saveBridgeCatalogCache(*it);
+        reconcileDemoModelSelection(st);
     }, 15000);
 }
 
@@ -2064,20 +2092,24 @@ void refreshSignedInProviders(AppState& st, bool force) {
 }
 
 bool bridgePickerModelUsable(const AppState& st, const BridgeModelMeta& m) {
+    // Web demo: the server already filtered omp_models_list to the free-model allowlist and
+    // there is no per-user sign-in state, so the returned catalog is the whole truth (no
+    // provider-list confirmation, no signed-in set, no generation policy over that allowlist).
+    const bool demo = ui::webBuild() && ui::webDemo();
     // Claude < 5.1 / GPT < 6 are never offered, whatever the user's per-model show toggles say.
     // A saved selection of one still displays: pickers render the current value separately.
-    if (ui::isLegacyGenerationModel(m.id)) return false;
+    if (!demo && ui::isLegacyGenerationModel(m.id)) return false;
     // Availability needs a live confirmation of the catalog AND the provider list. The one
     // exception: while a running agent turn holds the service lane nothing can be read live, so
     // the previous session's saved copies — confirmed when they were saved — stand in.
     const bool catalogConfirmed =
         s_bridgeCatalogLive || (s_bridgeCatalogDeferred && s_bridgeCatalogFromDisk);
     const bool providersConfirmed =
-        s_providerListLoaded || (s_providerListDeferred && s_providerListFromDisk);
+        demo || s_providerListLoaded || (s_providerListDeferred && s_providerListFromDisk);
     if (!s_scenarioCatalog && (!catalogConfirmed || !providersConfirmed)) return false;
     const std::string identity = m.provider + "/" + m.id;
-    if (ui::webBuild() || st.signedInBridgeProviders.count(m.provider) == 0 ||
-        st.settings.hiddenModels.count(identity) ||
+    if (!demo && (ui::webBuild() || st.signedInBridgeProviders.count(m.provider) == 0)) return false;
+    if (st.settings.hiddenModels.count(identity) ||
         (st.settings.hiddenModels.count(m.id) &&
          !st.settings.shownLegacyHiddenModels.count(identity))) return false;
     return st.settings.disabledProviders.count(m.provider) == 0;
@@ -2185,8 +2217,9 @@ void drawModelDropdown(AppState& st, bool busy) {
     bool picked = false;
     int uid = 0;       // monotonic per-row id seed — keeps ImGui ids unique across sections
     int shown = 0;     // visible rows after availability + search filtering
+    const bool demoModels = ui::webBuild() && ui::webDemo();  // exactly the server's rows
     ImGui::BeginChild("##modellist", ImVec2(0, 240 * sc), ImGuiChildFlags_None);
-    if (matchq("Follow model assignments", "Settings", "assignments")) {
+    if (!demoModels && matchq("Follow model assignments", "Settings", "assignments")) {
         if (ImGui::Selectable("Follow model assignments", st.settings.composerFollowRoles)) {
             st.settings.composerFollowRoles = true;
             saveSettings(st.settings);
@@ -2222,7 +2255,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     // online selections. Both offline slots share one probe, so deduplicate by id.
     std::set<std::string> seenLocal;
     for (int lp : {ui::PROV_LOCAL, ui::PROV_LLAMACPP}) {
-        if (!st.settings.offlineMode || catOff("local")) break;
+        if (demoModels || !st.settings.offlineMode || catOff("local")) break;
         const ProviderModels& pm = st.providerModels[lp];
         if (!pm.ok) continue;
         for (const auto& id : pm.models) {
@@ -2279,10 +2312,15 @@ void drawModelDropdown(AppState& st, bool busy) {
     ImGui::EndChild();
 
     // No providers signed in yet -> nothing routable; point the user at Settings to add models.
-    if (st.signedInBridgeProviders.empty() && !modelsLoading && !modelsDeferred &&
-        !modelPickerError()) {
+    // The web demo has no sign-in at all: its footer says which models those are instead.
+    const bool webDemoPicker = ui::webBuild() && ui::webDemo();
+    if (webDemoPicker || (st.signedInBridgeProviders.empty() && !modelsLoading && !modelsDeferred &&
+                          !modelPickerError())) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-        ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
+        if (webDemoPicker)
+            ImGui::TextUnformatted(ui::webGapReason("account_signin"));
+        else
+            ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
         ImGui::PopStyleColor();
     }
 

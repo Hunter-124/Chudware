@@ -60,6 +60,10 @@ REFUSED_EXACT = {
     "__hostd_test_stall", "agent_test_stall",
     "principal_update", "principal_revoke",
     "start_capture_session", "stop_capture_session",
+    # Provider credentials never enter or change inside a cell, and the model probe dials a
+    # caller-supplied base_url from the engine's network namespace (SSRF).
+    "agent_list_models", "omp_set_key", "omp_login", "omp_logout", "omp_remove_key",
+    "omp_logout_accounts",
 }
 # DocRegistry's read-only predicate protects document revisions, not workspace or
 # actor state. Its broad agent_/sim_/export/prof_ prefixes are not viewer rights.

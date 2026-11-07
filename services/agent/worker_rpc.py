@@ -46,6 +46,7 @@ from services.agent.online_turn import (
     resolve_model_and_effort,
     turn_budget_notice,
 )
+from services.agent import demo_lane
 from services.agent.omp_host import get_default_omp_host
 from services.agent.request_context import (
     actor_state_root, bind_roots, control_delegate, in_cell, mint_handle, require_handle, scoped_key,
@@ -2134,6 +2135,13 @@ def _auth_providers(result: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _omp_provider_list(params: dict, _emit: Callable) -> dict:
     if params:
         return {"ok": False, "reason": "omp_provider_list takes no params"}
+    if in_cell() and demo_lane.enabled():
+        # One fixed provider, nothing to sign in to: answered without starting an OMP process.
+        try:
+            count = len(demo_lane.models())
+        except demo_lane.LaneError as exc:
+            return {"ok": False, "reason": str(exc)}
+        return {"ok": True, "providers": [demo_lane.provider_descriptor(count)]}
     login = _omp_transient_call("get_login_providers", {})
     models = _omp_transient_call("get_available_models", {})
     setup = _omp_auth_call("setup_providers", {}, _emit)
@@ -2263,6 +2271,8 @@ def _omp_auth_state(params: dict, _emit: Callable) -> dict:
     provider_id = _bounded_identity(params.get("providerId"), 128)
     if provider_id is None:
         return {"ok": False, "reason": "providerId is required"}
+    if in_cell() and demo_lane.enabled():
+        return demo_lane.auth_state(provider_id)
     raw = _omp_auth_call("auth_state", {"provider": provider_id}, _emit)
     if not raw.get("ok"):
         return raw
@@ -2277,7 +2287,14 @@ def _omp_auth_state(params: dict, _emit: Callable) -> dict:
 
 
 
+def _cell_credential_refusal() -> dict:
+    """Provider credentials are never managed from a cell, whatever the method policy says."""
+    return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
+
+
 def _omp_set_key(params: dict, emit: Callable) -> dict:
+    if in_cell():
+        return _cell_credential_refusal()
     provider_id = _bounded_identity(params.get("providerId"), 128)
     api_key = params.get("apiKey")
     if not provider_id or not isinstance(api_key, str) or not api_key:
@@ -2302,6 +2319,8 @@ def _omp_set_key(params: dict, emit: Callable) -> dict:
 
 
 def _omp_remove_key(params: dict, emit: Callable) -> dict:
+    if in_cell():
+        return _cell_credential_refusal()
     provider_id = _bounded_identity(params.get("providerId"), 128)
     if not provider_id:
         return {"ok": False, "reason": "providerId is required"}
@@ -2309,6 +2328,8 @@ def _omp_remove_key(params: dict, emit: Callable) -> dict:
 
 
 def _omp_logout_accounts(params: dict, emit: Callable) -> dict:
+    if in_cell():
+        return _cell_credential_refusal()
     if _has_unknown_params(params, frozenset({"providerId"})):
         return {"ok": False, "reason": "omp_logout_accounts has unknown params"}
     provider_id = _bounded_identity(params.get("providerId"), 128)
@@ -2339,6 +2360,8 @@ def _omp_logout_accounts(params: dict, emit: Callable) -> dict:
 
 
 def _omp_logout(params: dict, emit: Callable) -> dict:
+    if in_cell():
+        return _cell_credential_refusal()
     provider_id = _bounded_identity(params.get("providerId"), 128)
     credential_id = params.get("credentialId")
     if not provider_id or isinstance(credential_id, bool) or not isinstance(credential_id, int):
@@ -2347,6 +2370,8 @@ def _omp_logout(params: dict, emit: Callable) -> dict:
 
 
 def _omp_login(params: dict, emit: Callable) -> dict:
+    if in_cell():
+        return _cell_credential_refusal()
     if _has_unknown_params(params, frozenset({"providerId"})):
         return {"ok": False, "reason": "omp_login has unknown params"}
     provider_id = _bounded_identity(params.get("providerId"), 128)
@@ -2426,8 +2451,21 @@ def _omp_models_list(params: dict, _emit: Callable) -> dict:
     if set(params) - {"providerId"}:
         return {"ok": False, "reason": "omp_models_list has unknown params"}
     if in_cell():
-        # Cells have no provider credential route, so no model is usable there.
-        return {"ok": True, "models": [], "refreshing": False}
+        # Cells have no provider credential route, so no model is usable there. A demo
+        # container's free-model lane is the one exception: exactly what its front door allows.
+        if not demo_lane.enabled():
+            return {"ok": True, "models": [], "refreshing": False}
+        provider_id = _bounded_identity(params.get("providerId"), 128)
+        if "providerId" in params and provider_id is None:
+            return {"ok": False, "reason": "invalid providerId"}
+        try:
+            rows = demo_lane.models()
+        except demo_lane.LaneError as exc:
+            return {"ok": False, "reason": str(exc)}
+        # The lane's own order is kept: its first model is the demo default.
+        listed = [m for m in map(_sanitize_model, rows)
+                  if m is not None and (provider_id is None or m["provider"] == provider_id)]
+        return {"ok": True, "models": listed, "refreshing": False}
     provider_id = _bounded_identity(params.get("providerId"), 128)
     if "providerId" in params and provider_id is None:
         return {"ok": False, "reason": "invalid providerId"}
@@ -3382,10 +3420,18 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             require_handle(run_id, "run", session_id)
         except (KeyError, TypeError):
             return {"ok": False, "reason": "not_found", "code": "not_found"}
-        # Provider key bytes never enter a cell, so a cell has no credential
-        # route for an online turn.
-        return {"ok": False, "reason": "credential_isolation_unsupported",
-                "code": "credential_isolation_unsupported"}
+        # Provider key bytes never enter a cell. The only online route is a demo container's
+        # free-model lane, which takes no caller key or endpoint and no model outside its list.
+        if not demo_lane.enabled() or any(key in raw_params for key in ("api_key", "byok_key", "base_url")):
+            return {"ok": False, "reason": "credential_isolation_unsupported",
+                    "code": "credential_isolation_unsupported"}
+        try:
+            raw_params = demo_lane.pin_model(raw_params)
+        except ValueError:
+            return {"ok": False, "reason": "Free demo models only: choose a model from the list.",
+                    "code": demo_lane.MODEL_REFUSAL}
+        except demo_lane.LaneError as exc:
+            return {"ok": False, "reason": str(exc)}
     try:
         from services.agent.roles import RoleError, load_role
     except ImportError as exc:

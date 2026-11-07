@@ -100,7 +100,9 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 
 @app.get("/healthz")
 async def healthz() -> dict[str, bool]:
-    return {"ok": True}
+    # `demo` is advertised only in demo mode, so the single-operator response stays exactly
+    # {"ok": true}. The app shell polls the front door's /demo/status only when it is present.
+    return {"ok": True, "demo": True} if settings.demo else {"ok": True}
 
 
 @app.get("/")

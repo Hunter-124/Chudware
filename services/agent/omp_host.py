@@ -31,6 +31,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
+from services.agent import demo_lane
 from services.agent.omp_bridge import BridgeError
 from services.agent.omp_questions import TurnQuestions
 from services.agent.online_turn import format_duration
@@ -130,6 +131,9 @@ def publish_host_tools(client: Any, tools: Sequence[Any], advertised: Iterable[s
 
 
 def _keyless_provider_opt_ins() -> list[str]:
+    if demo_lane.enabled():
+        # The lane authenticates on its own side of the socket; there is no key to look for.
+        return [demo_lane.PROVIDER_ID]
     from services.agent.config import load_config
     config = load_config()
     agent = config.get("agent") if isinstance(config, Mapping) else None
@@ -181,8 +185,15 @@ def byok_provider_env(provider: str) -> str | None:
 def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
     """Return the BYOK tenant, provider, key, and OMP's credential env name."""
     if tenancy.in_cell():
-        # Provider key bytes never enter a cell, so a cell has no credential route.
-        raise ValueError("credential_isolation_unsupported")
+        # Provider key bytes never enter a cell. The one exception is a public-demo
+        # container's free-model lane: a placeholder key, one fixed loopback endpoint, and
+        # nothing the caller chooses, so a caller-supplied key is still refused.
+        if not demo_lane.enabled() or any(key in params for key in ("api_key", "byok_key")):
+            raise ValueError("credential_isolation_unsupported")
+        owner = tenancy.owner_key()
+        if owner is None:
+            raise ValueError("cell_refused")
+        return owner[1], demo_lane.PROVIDER_ID, demo_lane.PLACEHOLDER_KEY, ""
     key = _nonempty_string(params.get("byok_key"))
     if key is None:
         if params.get("byok_key") is not None:
@@ -216,6 +227,8 @@ def _credential_client_scope(
         raise ValueError("byok_unsupported_online")
     _, _, secret, env_name = scope
     identity = _credential_identity(params)
+    if tenancy.in_cell():
+        return _demo_client_scope(identity, resume_file)
     root = Path(session_dir) if session_dir else paths.ROOT / "Sessions"
     if resume_file and session_dir is None:
         root = Path(resume_file).expanduser().parent.parent
@@ -246,6 +259,58 @@ def _credential_client_scope(
         env_name: secret,
     })
     return tempdir, str(scoped), clean
+
+
+def _bridge_parent() -> str | None:
+    """Where an OMP extension bridge socket may live.
+
+    A cell worker's OMP child runs in a nested sandbox with its own private /tmp; only the
+    actor directory is shared, so the bridge must be created beneath the actor's runtime
+    root (short enough for a socket path). Desktop keeps the system temporary directory.
+    """
+    if not tenancy.in_cell():
+        return None
+    root = Path(os.environ.get("XDG_RUNTIME_DIR") or "/actor/run")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return str(root)
+
+
+def _demo_client_scope(
+    identity: str | None, resume_file: str | None
+) -> tuple[tempfile.TemporaryDirectory[str], str, dict[str, str]]:
+    """A demo cell's OMP state: private under /actor, with OpenRouter pointed at the lane.
+
+    OMP runs in a nested sandbox that shares only /actor with this worker, so every path it
+    needs is created beneath the actor's own state root. The environment is not rebuilt: a
+    cell worker's environment already carries no ambient credentials, and the launcher
+    copies only an allowlist of it across the sandbox boundary.
+    """
+    state = tenancy.actor_state_root()
+    root = state / "Sessions"
+    scoped = root / f"demo-{identity}"
+    if root.is_symlink() or scoped.is_symlink():
+        raise RuntimeError("credential session directory cannot be a symlink")
+    if resume_file and Path(resume_file).expanduser().resolve().parent != scoped.resolve():
+        raise RuntimeError("session file belongs to another credential scope")
+    scoped.mkdir(mode=0o700, parents=True, exist_ok=True)
+    scoped.chmod(0o700)
+    tempdir = tempfile.TemporaryDirectory(prefix="chudware-demo-", dir=state)
+    try:
+        agent = Path(tempdir.name) / "agent"
+        agent.mkdir(mode=0o700)
+        try:
+            rows = demo_lane.models()
+        except demo_lane.LaneError as exc:
+            # The override still reaches the lane; OMP falls back to its bundled catalog.
+            _LOG.warning("demo model list unavailable (%s)", exc)
+            rows = None
+        config = agent / "models.yml"
+        config.write_text(json.dumps(demo_lane.models_config(rows)), encoding="utf-8")  # JSON is YAML
+        config.chmod(0o600)
+    except BaseException:
+        tempdir.cleanup()
+        raise
+    return tempdir, str(scoped), {"PI_CODING_AGENT_DIR": str(agent)}
 
 
 
@@ -714,6 +779,7 @@ class OmpSessionHost:
         daemon_connections = None
         emit_errors: list[str] = []
         provider_frames: deque[dict[str, Any]] = deque(maxlen=256)
+        quota_failure: list[str] = []  # the lane's own words for a spent demo allowance
         terminal: dict[str, Any] | None = None
         prompt_outcome: dict[str, Any] = {}
         chosen_mode = params.get("mode")
@@ -920,6 +986,12 @@ class OmpSessionHost:
                                 budget_timer = None
                     if kind in _RETRY_FAILED_FRAMES or kind in _ASSISTANT_OUTPUT_FRAMES:
                         provider_frames.append(frame)
+                    quota = demo_lane.frame_quota_message(frame)
+                    if quota is not None:
+                        # A spent demo allowance is not transient: end OMP's retry loop now and
+                        # report the lane's message as the turn's result.
+                        quota_failure[:] = [quota]
+                        _abort_retry(session.client)
                     if not progress_closed:
                         observed = frame
                         if kind in {"host_tool_start", "host_tool_end"} and frame.get("subagentId"):
@@ -1321,6 +1393,8 @@ class OmpSessionHost:
                     except Exception as exc:  # noqa: BLE001 - emit is an injected boundary
                         emit_errors.append(str(exc))
                 provider_failure = _unrecovered_provider_failure(provider_frames)
+                if provider_failure is not None and quota_failure:
+                    provider_failure = quota_failure[0]
                 prompt_failure = None
                 if prompt_outcome.get("status") == "error":
                     error = prompt_outcome.get("error")
@@ -2617,7 +2691,7 @@ class OmpSessionHost:
                     extra += ("--no-mcp",)
                 kwargs["extra_args"] = extra
             from services.agent.omp_bridge import ExtensionBridge
-            helper_bridge_dir = tempfile.TemporaryDirectory(prefix="omp-helper-bridge-")
+            helper_bridge_dir = tempfile.TemporaryDirectory(prefix="omp-helper-bridge-", dir=_bridge_parent())
             def reject_tool(_name, _args, _context):
                 raise RuntimeError("Private helper tools are disabled")
             helper_bridge = ExtensionBridge(helper_bridge_dir.name, reject_tool).start()
@@ -2650,13 +2724,18 @@ class OmpSessionHost:
                     raise HelperCompletionError("agent service host is shut down")
 
             frames: deque[dict[str, Any]] = deque(maxlen=256)
+            quota_failure: list[str] = []
 
             def record(event: Any) -> None:
                 frame = _json_value(event)
-                if isinstance(frame, dict) and (
-                    frame.get("type") in _RETRY_FAILED_FRAMES
-                    or frame.get("type") in _ASSISTANT_OUTPUT_FRAMES
-                ):
+                if not isinstance(frame, dict):
+                    return
+                quota = demo_lane.frame_quota_message(frame)
+                if quota is not None:
+                    quota_failure[:] = [quota]
+                    _abort_retry(client)
+                if (frame.get("type") in _RETRY_FAILED_FRAMES
+                        or frame.get("type") in _ASSISTANT_OUTPUT_FRAMES):
                     frames.append(frame)
 
             unsubscribe = _register_listener(client, _context_callback(record))
@@ -2690,7 +2769,7 @@ class OmpSessionHost:
                     turn = client.prompt_and_wait(message, timeout=remaining)
                     failure = _unrecovered_provider_failure(frames)
                     if failure is not None:
-                        raise HelperCompletionError(failure)
+                        raise HelperCompletionError(quota_failure[0] if quota_failure else failure)
                     text = turn.assistant_text
                     if not isinstance(text, str) or not text.strip():
                         raise HelperCompletionError("helper completion returned no assistant text")
@@ -3126,7 +3205,7 @@ class OmpSessionHost:
             kwargs["extra_args"] = extra
         from services.agent.omp_bridge import ExtensionBridge
 
-        bridge_dir = tempfile.TemporaryDirectory(prefix="omp-cad-")
+        bridge_dir = tempfile.TemporaryDirectory(prefix="omp-cad-", dir=_bridge_parent())
         asset_staging = (Path(bridge_dir.name) / "images"
                          if tempdir is None and not tenancy.in_cell() and not no_session else None)
         if asset_staging is not None:
@@ -4672,6 +4751,22 @@ _MESSAGE_FRAMES = frozenset({"message_end", "message_complete"})
 _ASSISTANT_OUTPUT_FRAMES = _MESSAGE_FRAMES | {"tool_execution_end"}
 
 
+def _abort_retry(client: Any) -> None:
+    """Cancel OMP's automatic retry without blocking its frame reader (replies arrive on it)."""
+    abort = getattr(client, "abort_retry", None)
+    if not callable(abort):
+        return
+
+    def run() -> None:
+        try:
+            abort()
+        except Exception as exc:  # noqa: BLE001 - the turn still ends with OMP's own error
+            _LOG.debug("OMP abort_retry failed (%s)", type(exc).__name__)
+
+    threading.Thread(target=run, name="chudware-abort-retry", daemon=True).start()
+
+
+
 def _unrecovered_provider_failure(frames: Reversible[dict[str, Any]]) -> str | None:
     """Return the provider error when a provider failure was the turn's last real event.
 
@@ -4691,6 +4786,9 @@ def _unrecovered_provider_failure(frames: Reversible[dict[str, Any]]) -> str | N
                 continue  # user/custom/tool-result records are not assistant output
             if message.get("stopReason") != "error":
                 return None
+            quota = demo_lane.quota_message(message.get("errorMessage"))
+            if quota is not None:
+                return quota
             detail = _provider_error_detail(message.get("errorMessage"))
             return f"provider error: {detail or 'no error detail'}"[:1200]
         if kind in _ASSISTANT_OUTPUT_FRAMES:
@@ -4707,6 +4805,9 @@ def _unrecovered_provider_failure(frames: Reversible[dict[str, Any]]) -> str | N
             if isinstance(value, str) and value.strip():
                 message = value.strip()
                 break
+        quota = demo_lane.quota_message(message)
+        if quota is not None:
+            return quota
         return f"provider retry exhausted: {message or 'no error detail'}"[:1200]
     return None
 

@@ -23,6 +23,11 @@ ENV PATH="/opt/chudware-venv/bin:${PATH}" \
 RUN dnf -y install ccache && dnf clean all && \
     /opt/chudware-venv/bin/python -m pip install --disable-pip-version-check \
         pytest-xdist==3.8.0 execnet==2.1.2
+# The web gateway's own pinned dependencies (fastapi, httpx, uvicorn, ...): the `web` unit of the
+# platform suite imports them, as linux-gate.yml installs for CI. Last layer, so it reuses the rest.
+COPY web/gateway/requirements.txt /tmp/gateway-requirements.txt
+RUN /opt/chudware-venv/bin/python -m pip install --disable-pip-version-check \
+        -r /tmp/gateway-requirements.txt && rm /tmp/gateway-requirements.txt
 ENV PATH="/usr/lib64/ccache:${PATH}" \
     CCACHE_DIR=/ccache \
     CCACHE_BASEDIR=/work \

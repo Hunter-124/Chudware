@@ -15,6 +15,34 @@ def test_healthz_is_bare_liveness(client):
     assert r.json() == {"ok": True}
 
 
+def test_healthz_advertises_demo_only_in_demo_mode(client, monkeypatch):
+    from gateway.config import settings
+
+    monkeypatch.setattr(settings, "demo", True)
+    r = client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "demo": True}
+    monkeypatch.setattr(settings, "demo", False)
+    assert client.get("/healthz").json() == {"ok": True}
+
+
+@pytest.mark.parametrize(("raw", "expected"), [(None, False), ("", False), ("0", False), ("1", True)])
+def test_demo_flag_is_exactly_one_or_zero(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("CHUDWARE_WEB_DEMO", raising=False)
+    else:
+        monkeypatch.setenv("CHUDWARE_WEB_DEMO", raw)
+    assert Settings().demo is expected
+
+
+@pytest.mark.parametrize("raw", ["true", "yes", "2", "on"])
+def test_demo_flag_refuses_ambiguous_values(monkeypatch, raw):
+    """A misspelt flag must not silently run a public demo as a single-operator cell."""
+    monkeypatch.setenv("CHUDWARE_WEB_DEMO", raw)
+    with pytest.raises(ValueError, match="CHUDWARE_WEB_DEMO"):
+        Settings()
+
+
 def test_security_headers_on_gateway_responses(client):
     headers = client.get("/healthz").headers
     assert headers["x-content-type-options"] == "nosniff"

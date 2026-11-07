@@ -4967,3 +4967,334 @@ def test_official_omp_restores_enabled_tools_in_fresh_worker(tmp_path, case):
         resumed = phase("resume", **identity)
         assert resumed == {"id": first["id"], "resumed": True}
     assert journal.read_bytes().startswith(before_resume)
+
+
+# --- public demo: quota refusals and the lane-only cell -----------------------------------
+
+_QUOTA_429 = ('429 {"error":{"code":"demo_quota_exhausted",'
+              '"message":"This demo session has used all of its AI requests."}}')
+_QUOTA_TEXT = "This demo session has used all of its AI requests."
+
+
+class QuotaClient(FakeClient):
+    """OMP as it behaves on a front-door 429: announce a retry, then fail it when cancelled."""
+
+    frames: list = []
+
+    def abort_retry(self):
+        self.calls.append(("abort_retry", {}))
+        self.factory.aborted.set()
+
+    def wait_for_idle(self, timeout=None):
+        self.idle_timeouts.append(timeout)
+        for event in self.frames:
+            for listener in tuple(self.listeners):
+                listener(event)
+        return ()
+
+
+def _quota_host(frames):
+    factory = FakeFactory()
+    factory.aborted = threading.Event()
+
+    class Client(QuotaClient):
+        pass
+
+    Client.frames = frames
+    host = OmpSessionHost(
+        client_factory=lambda **kw: factory.clients.append(Client(factory, **kw)) or factory.clients[-1])
+    return host, factory
+
+
+def _turn(host, name):
+    return host.run_turn({"request": "Do the work", "session_id": name, "run_id": f"r-{name}"},
+                         lambda _frame: None)
+
+
+def test_demo_quota_refusal_cancels_omp_retry_and_reports_the_lanes_message():
+    host, factory = _quota_host([
+        {"type": "auto_retry_start", "attempt": 1, "maxAttempts": 10, "delayMs": 500,
+         "errorMessage": _QUOTA_429},
+        {"type": "auto_retry_end", "success": False, "attempt": 1, "finalError": "Retry cancelled"},
+        {"type": "agent_end", "messages": [], "isTerminal": True},
+    ])
+    try:
+        result = _turn(host, "quota")
+        assert factory.aborted.wait(2), "OMP's automatic retry was left running"
+        assert result["ok"] is False
+        assert result["stop_reason"] == "provider_error"
+        assert result["reason"] == _QUOTA_TEXT
+    finally:
+        host.shutdown()
+
+
+def test_demo_quota_refusal_as_a_plain_assistant_error_reads_as_the_lanes_message():
+    host, factory = _quota_host([
+        {"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "error", "errorMessage": _QUOTA_429}},
+        {"type": "agent_end", "messages": [], "isTerminal": True},
+    ])
+    try:
+        result = _turn(host, "plain")
+        assert (result["stop_reason"], result["reason"]) == ("provider_error", _QUOTA_TEXT)
+        assert not factory.aborted.is_set()
+    finally:
+        host.shutdown()
+
+
+@pytest.mark.parametrize("message", [
+    "429 rate limit exceeded", "503 upstream busy",
+    '429 {"error":{"code":"upstream_rate_limited","message":"slow down"}}',
+])
+def test_other_provider_failures_keep_omp_retry_and_their_own_error(message):
+    host, factory = _quota_host([
+        {"type": "auto_retry_start", "attempt": 1, "maxAttempts": 10, "delayMs": 500,
+         "errorMessage": message},
+        {"type": "auto_retry_end", "success": False, "attempt": 10, "finalError": message},
+        {"type": "agent_end", "messages": [], "isTerminal": True},
+    ])
+    try:
+        result = _turn(host, "transient")
+        assert not factory.aborted.wait(0.3)
+        assert result["stop_reason"] == "provider_error"
+        assert result["reason"] == f"provider retry exhausted: {message}"
+    finally:
+        host.shutdown()
+
+
+def test_abort_retry_never_blocks_on_a_client_that_cannot_answer():
+    release = threading.Event()
+    started = threading.Event()
+
+    class Stuck:
+        def abort_retry(self):
+            started.set()
+            release.wait(5)
+
+    began = time.monotonic()
+    omp_host_module._abort_retry(Stuck())
+    assert time.monotonic() - began < 1.0  # the RPC reader thread would otherwise deadlock itself
+    assert started.wait(2)
+    release.set()
+    omp_host_module._abort_retry(object())  # a client without the call is simply skipped
+
+
+def test_helper_completion_reports_a_demo_quota_refusal_and_cancels_retry(helper_runtime):
+    host, factory = helper_runtime
+    original = host._client_factory
+    aborted = threading.Event()
+
+    def make_client(**kwargs):
+        client = original(**kwargs)
+        client.abort_retry = aborted.set
+        client.events.insert(1, {"type": "auto_retry_start", "attempt": 1, "errorMessage": _QUOTA_429})
+        client.events.insert(2, {"type": "auto_retry_end", "success": False, "finalError": "Retry cancelled"})
+        return client
+
+    host._client_factory = make_client
+    with pytest.raises(omp_host_module.HelperCompletionError, match=_QUOTA_TEXT):
+        host.complete_text("", "repair")
+    assert aborted.wait(2)
+
+
+ROWS = [
+    {"id": "example/model-a:free", "name": "Model A (free)", "provider": "openrouter",
+     "contextWindow": 65536, "maxTokens": 8192},
+    {"id": "example/model-b:free", "name": "Model B (free)", "provider": "openrouter"},
+]
+
+
+@pytest.fixture
+def demo_cell(monkeypatch, tmp_path):
+    """A cell of a demo container: the lane is mounted, nothing else about the cell changes."""
+    from services.agent import demo_lane
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "actor-data"))
+    monkeypatch.setattr(demo_lane, "enabled", lambda *args, **kwargs: True)
+    monkeypatch.setattr(demo_lane, "models", lambda **kwargs: [dict(row) for row in ROWS])
+    return tmp_path
+
+
+def test_non_demo_cell_still_has_no_credential_route_even_if_a_socket_exists(cell_runtime, monkeypatch):
+    from services.agent import demo_lane, request_context as tenancy
+
+    monkeypatch.setattr(demo_lane, "enabled", lambda *args, **kwargs: False)
+    with tenancy.bind_context(_cell_context("alice")):
+        with pytest.raises(ValueError, match="credential_isolation_unsupported"):
+            omp_host_module._credential_scope({})
+
+
+def test_demo_cell_credential_scope_is_the_placeholder_lane_key_and_per_actor(demo_cell):
+    from services.agent import request_context as tenancy
+
+    scopes = {}
+    for actor in ("alice", "bob"):
+        with tenancy.bind_context(_cell_context(actor)):
+            scopes[actor] = omp_host_module._credential_scope({})
+            assert omp_host_module._credential_identity({}) == omp_host_module._credential_identity({})
+    assert scopes["alice"] == ("alice", "openrouter", "chudware-demo-lane", "")
+    assert scopes["bob"][0] == "bob"
+    with tenancy.bind_context(_cell_context("alice")):
+        alice = omp_host_module._credential_identity({})
+    with tenancy.bind_context(_cell_context("bob")):
+        assert omp_host_module._credential_identity({}) != alice
+
+
+@pytest.mark.parametrize("extra", [
+    {"api_key": "sk-visitor"}, {"byok_key": "sk-visitor"}, {"byok_key": None},
+    {"byok_key": "sk-visitor", "byok_provider": "openai"},
+])
+def test_demo_cell_refuses_a_visitors_own_key(demo_cell, extra):
+    from services.agent import request_context as tenancy
+
+    with tenancy.bind_context(_cell_context("alice")):
+        with pytest.raises(ValueError, match="credential_isolation_unsupported"):
+            omp_host_module._credential_scope(extra)
+        factory = FakeFactory()
+        host = OmpSessionHost(client_factory=factory)
+        try:
+            result, _ = run(host, "conversation", "run", **extra)
+            assert result["code"] == "credential_isolation_unsupported"
+            assert not factory.clients
+        finally:
+            host.shutdown()
+
+
+def test_demo_keyless_opt_in_is_the_lane_provider_and_reads_no_config(demo_cell, monkeypatch):
+    from services.agent import config
+
+    monkeypatch.setattr(config, "load_config", lambda: pytest.fail("a demo cell reads no user config"))
+    assert omp_host_module._keyless_provider_opt_ins() == ["openrouter"]
+
+
+def test_demo_client_state_is_actor_private_and_points_openrouter_at_the_lane(demo_cell):
+    from services.agent import request_context as tenancy
+
+    with tenancy.bind_context(_cell_context("alice")):
+        state = tenancy.actor_state_root()
+        tempdir, session_dir, env = omp_host_module._demo_client_scope("abc123", None)
+        try:
+            assert set(env) == {"PI_CODING_AGENT_DIR"}  # nothing else is rebuilt or blanked
+            agent = Path(env["PI_CODING_AGENT_DIR"])
+            assert state in agent.parents  # beneath /actor: visible to the nested OMP sandbox
+            assert Path(session_dir) == state / "Sessions" / "demo-abc123"
+            assert (Path(session_dir).stat().st_mode & 0o777) == 0o700
+            config = agent / "models.yml"
+            assert (config.stat().st_mode & 0o777) == 0o600
+            provider = json.loads(config.read_text())["providers"]["openrouter"]
+            assert provider["baseUrl"] == "http://127.0.0.1:18081/v1"
+            assert [m["id"] for m in provider["models"]] == [r["id"] for r in ROWS]
+            assert "sk-" not in config.read_text()
+        finally:
+            tempdir.cleanup()
+        assert not agent.exists()
+
+
+def test_demo_client_state_survives_an_unlistable_lane_with_an_override_only_config(demo_cell, monkeypatch):
+    from services.agent import demo_lane, request_context as tenancy
+
+    def down(**kwargs):
+        raise demo_lane.LaneError("demo model lane unavailable: URLError")
+
+    monkeypatch.setattr(demo_lane, "models", down)
+    with tenancy.bind_context(_cell_context("alice")):
+        tempdir, _, env = omp_host_module._demo_client_scope("abc123", None)
+        try:
+            provider = json.loads((Path(env["PI_CODING_AGENT_DIR"]) / "models.yml").read_text())[
+                "providers"]["openrouter"]
+            assert "models" not in provider and provider["baseUrl"] == "http://127.0.0.1:18081/v1"
+        finally:
+            tempdir.cleanup()
+
+
+def test_demo_client_scope_ignores_client_chosen_session_directories(demo_cell):
+    from services.agent import request_context as tenancy
+
+    with tenancy.bind_context(_cell_context("alice")):
+        tenancy.actor_state_root().mkdir(parents=True)
+        tempdir, session_dir, _ = omp_host_module._credential_client_scope(
+            {}, "/work/attacker-chosen", None)
+        try:
+            assert Path(session_dir).is_relative_to(tenancy.actor_state_root())
+            assert not Path("/work/attacker-chosen").exists()
+        finally:
+            tempdir.cleanup()
+
+
+def test_demo_client_scope_refuses_a_journal_from_another_scope_and_symlinked_roots(demo_cell):
+    from services.agent import request_context as tenancy
+
+    with tenancy.bind_context(_cell_context("alice")):
+        state = tenancy.actor_state_root()
+        state.mkdir(parents=True)
+        stray = demo_cell / "stray.jsonl"
+        stray.write_text("{}")
+        with pytest.raises(RuntimeError, match="another credential scope"):
+            omp_host_module._demo_client_scope("abc123", str(stray))
+        (state / "Sessions").symlink_to(demo_cell)
+        with pytest.raises(RuntimeError, match="symlink"):
+            omp_host_module._demo_client_scope("abc123", None)
+
+
+def test_cell_extension_bridge_lives_beneath_the_actor_runtime_root(monkeypatch, tmp_path):
+    from services.agent import request_context as tenancy
+
+    runtime_root = tmp_path / "actor-run"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_root))
+    assert omp_host_module._bridge_parent() is None  # desktop: the system temporary directory
+    monkeypatch.setattr(tenancy, "in_cell", lambda: True)
+    assert omp_host_module._bridge_parent() == str(runtime_root)
+    assert runtime_root.is_dir() and (runtime_root.stat().st_mode & 0o777) == 0o700
+
+
+def test_demo_cell_launches_omp_with_the_lane_config_and_a_bridge_the_sandbox_shares(
+    demo_cell, monkeypatch
+):
+    from services.agent import request_context as tenancy
+
+    runtime_root = demo_cell / "actor-run"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_root))
+    monkeypatch.setattr(OmpSessionHost, "_resolve_binary", lambda self, required: "/opt/chudware/bin/omp")
+    monkeypatch.setattr(omp_host_module, "_binary_supports_flag", lambda binary, flag: True)
+    monkeypatch.setattr(omp_host_module, "_cad_system_prompt_template", lambda binary: None)
+    launched = []
+
+    def capture(kwargs, params):
+        # Read the config while the client's private state still exists.
+        agent = Path(kwargs["env"]["PI_CODING_AGENT_DIR"])
+        launched.append({**kwargs, "models_yml": json.loads((agent / "models.yml").read_text())})
+        kwargs["command"] = ["/opt/chudware/bin/chudware-actor-sandbox", "hex", "rw", "--", "omp"]
+
+    monkeypatch.setattr(omp_host_module, "_sandbox_client_kwargs", capture)
+    runtime_dirs = []
+
+    class RecordingBridge(FakeBridge):
+        def __init__(self, runtime_dir, dispatch):
+            runtime_dirs.append(runtime_dir)
+            super().__init__(runtime_dir, dispatch)
+
+    monkeypatch.setattr("services.agent.omp_bridge.ExtensionBridge", RecordingBridge)
+    factory = FakeFactory()
+
+    def make_client(**kwargs):
+        client = factory(**kwargs)
+        # A cell only links journals beneath its own actor state root.
+        client.session_file = str(tenancy.actor_state_root() / "Sessions" / "demo-journal.jsonl")
+        return client
+
+    host = OmpSessionHost(client_factory=make_client)
+    try:
+        with tenancy.bind_context(_cell_context("alice")):
+            tenancy.actor_state_root().mkdir(parents=True)
+            session = tenancy.mint_handle("session")
+            result, _ = run(host, session, tenancy.mint_handle("run", parent=session))
+        assert result["ok"], result
+    finally:
+        host.shutdown()
+    kwargs = launched[0]
+    assert Path(runtime_dirs[0]).parent == runtime_root
+    provider = kwargs["models_yml"]["providers"]["openrouter"]
+    assert provider["baseUrl"] == "http://127.0.0.1:18081/v1"
+    assert [m["id"] for m in provider["models"]] == [r["id"] for r in ROWS]
+    assert kwargs["env"]["OMP_CAD_BRIDGE_ENDPOINT"] == "/private/test.sock"
+    assert Path(kwargs["session_dir"]).name.startswith("demo-")

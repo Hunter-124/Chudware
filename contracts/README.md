@@ -24,6 +24,8 @@ lookup and fabrication-output declarations: KiCad files are the document of reco
 KiCad runs out of process. The in-memory `aicad.sch/1` and `aicad.pcb/1` identifiers
 and worker protocol major remain unchanged. Web parity revision 2 and worker RPC
 contract revision 2.2 record the corresponding routing and desktop-launch boundary.
+Worker RPC contract revision 2.3 records the public demo cell: the credential and model-probe
+methods refused in every cell, and the demo-only free-model lane (worker_rpc.md, last section).
 Board physics contract revision 2 documents the KiCad STEP sidecar's unknown
 geometry fields and retained `aicad.boardphys/1` identifier.
 PLM contract revision 3 documents KiCad file tracking and ECAD diff sections;

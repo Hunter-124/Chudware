@@ -1422,6 +1422,17 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             return handle_compile(params, out_json);
         }
         if (m == "agent_list_models") {
+            // The probe connects to a caller-supplied base_url from the engine's own network
+            // namespace, so in a tenant cell it would be an SSRF primitive (cloud metadata,
+            // the loopback gateway, other sessions). hostd's cell policy refuses this method;
+            // this backstop holds even if that classification ever drifts.
+            {
+                const char* cell = std::getenv("CHUDWARE_CELL");
+                if (cellPrincipal || chudware::sim::current_cell_principal() ||
+                    (cell && std::string(cell) == "1"))
+                    return emit(json{{"code", "cell_refused"}, {"message", "cell_refused"}},
+                                out_json, 1);
+            }
             // {provider, base_url?, api_key?} -> {ok, models:[id...], model_rows?[{id,...}], error?}.
             // Probes the backend so the host model picker can hide unreachable / unkeyed providers.
             // model_rows is additive metadata (context/max_output/vision/tools/reasoning_efforts);

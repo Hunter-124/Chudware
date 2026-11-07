@@ -24,6 +24,12 @@ constexpr bool webBuild() {
 #endif
 }
 
+// True only in the web build when the gateway advertised demo mode (GET /healthz ->
+// {"demo": true}; the shell publishes it as window.chudwareDemo once its probe settles,
+// normally before the module reaches its first frame). Always false natively. Call sites
+// gate on webBuild() first so desktop folds away.
+bool webDemo();
+
 // Why `surfaceId` is unavailable in the web build, or nullptr when it is available.
 // Always nullptr in native builds (see webBuild).
 const char* webGapReason(const char* surfaceId);

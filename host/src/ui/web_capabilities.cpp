@@ -80,6 +80,27 @@ bool allowedExternalHttpUrl(const std::string& url) {
 
 }  // namespace
 
+bool webDemo() {
+#ifdef __EMSCRIPTEN__
+    // The shell probes /healthz independently of module start and sets window.chudwareDemo
+    // plus window.chudwareDemoKnown once that settles (failure/timeout => known, not demo).
+    // Until then answer false without caching; afterwards the answer is final for the page
+    // lifetime, and this is asked every frame, so cache it.
+    static int cached = -1;
+    if (cached < 0) {
+        const int v = EM_ASM_INT({
+            if (!window.chudwareDemoKnown) return -1;
+            return window.chudwareDemo === true ? 1 : 0;
+        });
+        if (v < 0) return false;
+        cached = v;
+    }
+    return cached == 1;
+#else
+    return false;
+#endif
+}
+
 const char* webGapReason(const char* surfaceId) {
     if (!webBuild() || !surfaceId) return nullptr;
 #ifdef __EMSCRIPTEN__
@@ -87,6 +108,9 @@ const char* webGapReason(const char* surfaceId) {
     if (!connection || !engine::webCellProtocolReady(connection->serverInfo()))
         return "CAD and AI are unavailable for this workspace connection.";
 #endif
+    // Demo sessions run only the server-side free-model lane: say that, not "use the desktop".
+    if (webDemo() && std::strcmp(surfaceId, "account_signin") == 0)
+        return "Free demo models only";
     for (const WebGap& g : kWebGaps)
         if (std::strcmp(g.id, surfaceId) == 0) return g.reason;
     return nullptr;

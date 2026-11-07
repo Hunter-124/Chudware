@@ -6579,7 +6579,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 "401",         "403",       "unauthorized", "forbidden",
                 "api key",     "api_key",   "apikey",       "authentication",
                 "invalid key", "credential"};
+            // The public demo has no provider key to set: a 401/403 there is the front
+            // door's own refusal, whose message already says what to do.
+            const bool demoSession = ui::webBuild() && ui::webDemo();
             for (const char *mark : kAuthMarks) {
+              if (demoSession) break;
               if (low.find(mark) != std::string::npos) {
                 assistant += "\n(This looks like an authentication problem - "
                              "set your provider/API key in Settings.)";

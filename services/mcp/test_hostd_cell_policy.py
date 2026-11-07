@@ -159,13 +159,28 @@ def test_viewer_file_open_does_not_grant_import_or_document_mutation(policy):
 @pytest.mark.parametrize("method", [
     "agent_admin_turn", "agent_cancel", "agent_steer", "agent_answer",
     "agent_handles_new",
-    "omp_branch_session", "omp_close_session", "omp_set_key", "omp_logout_accounts",
+    "omp_branch_session", "omp_close_session",
     "omp_session_stats", "memory_recall", "memory_remember", "dag_status",
     "subagent_transcript", "reveng_start_session", "sim_cancel",
 ])
 def test_private_methods_are_actor_scoped(policy, method):
     assert policy[method]["scope"] == "actor"
     assert policy[method]["cell"] == "allow"
+
+
+@pytest.mark.parametrize("method", [
+    "agent_list_models", "omp_set_key", "omp_login", "omp_logout", "omp_remove_key",
+    "omp_logout_accounts",
+])
+def test_credential_management_and_url_probing_are_refused_in_cells(policy, method):
+    """Keys are never stored or removed from a cell, and the model probe (a client-chosen
+    base_url dialled from the engine's own network namespace) is not a tenant capability."""
+    assert policy[method]["cell"] == "refuse"
+    assert method in cell_methods.REFUSED_EXACT
+    allowed = copy.deepcopy(policy)
+    allowed[method]["cell"] = "allow"
+    with pytest.raises(cell_methods.PolicyError, match="unsafe method must be refused"):
+        cell_methods.validate_schema(allowed)
 
 
 @pytest.mark.parametrize("method", [

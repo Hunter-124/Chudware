@@ -40,7 +40,7 @@
     "scope": "actor"
   },
   "agent_list_models": {
-    "cell": "allow",
+    "cell": "refuse",
     "right": "read",
     "scope": "actor"
   },
@@ -2065,17 +2065,17 @@
     "scope": "actor"
   },
   "omp_login": {
-    "cell": "allow",
+    "cell": "refuse",
     "right": "write",
     "scope": "actor"
   },
   "omp_logout": {
-    "cell": "allow",
+    "cell": "refuse",
     "right": "write",
     "scope": "actor"
   },
   "omp_logout_accounts": {
-    "cell": "allow",
+    "cell": "refuse",
     "right": "read",
     "scope": "actor"
   },
@@ -2090,7 +2090,7 @@
     "scope": "actor"
   },
   "omp_remove_key": {
-    "cell": "allow",
+    "cell": "refuse",
     "right": "write",
     "scope": "actor"
   },
@@ -2110,7 +2110,7 @@
     "scope": "actor"
   },
   "omp_set_key": {
-    "cell": "allow",
+    "cell": "refuse",
     "right": "write",
     "scope": "actor"
   },

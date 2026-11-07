@@ -4,7 +4,9 @@ from pathlib import Path
 import stat
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cell_runtime import BASE_ENV, actor_environment, close_extra_fds, hex_id, open_path, pinned, rootfs, run_sandbox, set_environment
+from cell_runtime import (BASE_ENV, actor_environment, bridge_environment, close_extra_fds,
+                          demo_lane_args, demo_requested, hex_id, open_path, pinned, rootfs,
+                          run_sandbox, set_environment)
 
 
 def actor_argv(actor, access, command):
@@ -36,6 +38,10 @@ def actor_argv(actor, access, command):
     os.set_inheritable(sockfd, False)
     pins.append(sockfd)
     args += ["--ro-bind", "/proc/self/fd/" + str(sockfd), "/run/egress.sock"]
+    demo = demo_requested()
+    # Public demo only: the front door's per-session AI socket, at the same path in every
+    # nesting level. Absent means the lane is unavailable (AI refuses).
+    args += demo_lane_args(pins, demo)
     env = {**BASE_ENV, **actor_environment(),
            "CHUDWARE_ACTOR_HEX": actor, "CHUDWARE_ACTOR_STATE": "/actor", "CHUDWARE_ACTOR_SANDBOX": "1",
            "CHUDWARE_OMP_BIN": "/opt/chudware/bin/omp",
@@ -43,6 +49,11 @@ def actor_argv(actor, access, command):
            "HOME": "/actor/home", "XDG_DATA_HOME": "/actor/data", "XDG_CONFIG_HOME": "/actor/config",
            "XDG_CACHE_HOME": "/actor/cache", "XDG_RUNTIME_DIR": "/actor/run",
            "CHUDWARE_HOSTD_SOCKET": "/actor/run/hostd.sock"}
+    if demo:
+        env["CHUDWARE_WEB_DEMO"] = "1"
+    if os.environ.get("CHUDWARE_ACTOR_SANDBOX") == "1":
+        # A nested OMP child reaches its parent worker's extension bridge beneath /actor.
+        env.update(bridge_environment())
     # Scoped OMP state may be a private temporary subtree of the actor.
     for key in ("PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
         if key.startswith("XDG_") and os.environ.get("CHUDWARE_ACTOR_SANDBOX") != "1":

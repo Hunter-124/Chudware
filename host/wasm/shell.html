@@ -40,9 +40,9 @@
     #app-surface {
       position: fixed;
       left: calc(var(--viewport-left, 0px) + env(safe-area-inset-left, 0px));
-      top: calc(var(--viewport-top, 0px) + env(safe-area-inset-top, 0px));
+      top: calc(var(--viewport-top, 0px) + env(safe-area-inset-top, 0px) + var(--demo-banner-h, 0px));
       width: max(1px, calc(var(--viewport-width, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)));
-      height: max(1px, calc(var(--viewport-height, 100vh) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));
+      height: max(1px, calc(var(--viewport-height, 100vh) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - var(--demo-banner-h, 0px)));
       overflow: hidden;
     }
     #canvas {
@@ -72,7 +72,7 @@
        pointer-events:none — useless for an explanation a phone user has to read and
        act on, so a real blocking panel replaces it. Text is selectable here on
        purpose: html/body disable selection for the canvas. */
-    #unsupported {
+    #unsupported, #demo-ended {
       display: none;
       position: fixed;
       inset: 0;
@@ -87,10 +87,10 @@
       user-select: text;
       touch-action: auto;
     }
-    #unsupported.visible { display: block; }
-    #unsupported .wrap { max-width: 34em; margin: 0 auto; }
-    #unsupported h1 { font-size: 19px; margin: 0 0 12px; }
-    #unsupported p, #unsupported li { font-size: 15px; line-height: 1.5; margin: 0 0 10px; }
+    #unsupported.visible, #demo-ended.visible { display: block; }
+    #unsupported .wrap, #demo-ended .wrap { max-width: 34em; margin: 0 auto; }
+    #unsupported h1, #demo-ended h1 { font-size: 19px; margin: 0 0 12px; }
+    #unsupported p, #unsupported li, #demo-ended p { font-size: 15px; line-height: 1.5; margin: 0 0 10px; }
     #unsupported ol { padding-left: 1.3em; margin: 0 0 14px; }
     #unsupported code {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -100,7 +100,63 @@
       padding: 1px 5px;
     }
     #unsupported .why { color: #ff8a8a; }
-    #unsupported .dim { color: #9aa7b2; font-size: 13px; }
+    #unsupported .dim, #demo-ended .dim { color: #9aa7b2; font-size: 13px; }
+    #demo-ended a.rejoin {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 9px 18px;
+      border-radius: 8px;
+      background: var(--chudware-accent);
+      color: #12181c;
+      font-size: 15px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+
+    /* Demo-session strip. In flow terms it OWNS the top --demo-banner-h of the visual
+       viewport: #app-surface is pushed down by the same variable, so the canvas (and the
+       app's own title bar / controls) is resized, never covered. Same left/width/safe-area
+       math as #app-surface. Below #demo-ended (30) so expiry always wins. */
+    :root { --demo-banner-h: 0px; }
+    #demo-banner {
+      display: none;
+      position: fixed;
+      left: calc(var(--viewport-left, 0px) + env(safe-area-inset-left, 0px));
+      top: calc(var(--viewport-top, 0px) + env(safe-area-inset-top, 0px));
+      width: max(1px, calc(var(--viewport-width, 100vw) - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)));
+      height: 28px;
+      z-index: 25;
+      box-sizing: border-box;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 0 10px;
+      background: #1a2229;
+      border-bottom: 1px solid rgba(var(--chudware-accent-rgb), 0.45);
+      color: #e6edf3;
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    #demo-banner.visible { display: flex; }
+    #demo-banner.warn { background: #f2a516; border-bottom-color: #b97a00; color: #1b1300; }
+    #demo-banner.critical { background: #c0392b; border-bottom-color: #8e2a20; color: #fff; }
+    #demo-banner .msg { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    #demo-banner .msg:empty { display: none; }
+    #demo-banner button {
+      flex-shrink: 0;
+      height: 20px;
+      padding: 0 10px;
+      border-radius: 5px;
+      border: 1px solid currentColor;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    #demo-banner button:disabled { opacity: 0.6; cursor: default; }
 
     /* On-screen camera HUD — only shown on narrow / touch viewports. */
     #mobile-hud {
@@ -219,6 +275,13 @@
   </div>
   <div id="unsupported" role="alert" aria-live="assertive"><div class="wrap"
        id="unsupported-body"></div></div>
+  <!-- Public demo mode only (see the demo-session block in the script below). Both stay
+       hidden unless GET /healthz answered {"demo": true}. Built/updated via textContent. -->
+  <div id="demo-banner" role="status"><span class="msg" id="demo-banner-msg"></span><span
+       class="msg" id="demo-banner-ai"></span><button
+       type="button" id="demo-download">Download your work</button></div>
+  <div id="demo-ended" role="alert" aria-live="assertive"><div class="wrap"
+       id="demo-ended-body"></div></div>
   <script type="text/javascript">
     window.__chudwareLogs = [];
     function chudwareLog(kind, text) {
@@ -676,6 +739,356 @@
             break;
         }
       });
+    })();
+
+    // ---- Demo session (public demo mode) ---------------------------------------------
+    // The gateway advertises demo mode on GET /healthz ({"ok":true,"demo":true}). The probe
+    // runs here, independently of the wasm download, and publishes window.chudwareDemo (+
+    // chudwareDemoKnown) for the C++ host (ui::webDemo). In demo mode, the host-side front
+    // door's GET /demo/status is polled every 15 s to drive a slim top strip (countdown +
+    // workspace download) and, when the session is gone, a blocking "session ended" panel.
+    window.chudwareDemo = false;
+    window.chudwareDemoKnown = false;
+    (function demoSession() {
+      function setDemo(v) { window.chudwareDemo = v; window.chudwareDemoKnown = true; }
+      var nativeFetch = (window.fetch && !window.__chudwareUnsupported) ? window.fetch.bind(window) : null;
+      if (!nativeFetch) { setDemo(false); return; }
+
+      var BANNER_H = '28px';
+      var POLL_MS = 15000;
+      var banner = document.getElementById('demo-banner');
+      var msgEl = document.getElementById('demo-banner-msg');
+      var aiEl = document.getElementById('demo-banner-ai');
+      var dlBtn = document.getElementById('demo-download');
+      var endedPanel = document.getElementById('demo-ended');
+      var endedBody = document.getElementById('demo-ended-body');
+      var state = null;            // last parsed /demo/status
+      var clockOffset = 0;         // server seconds minus client seconds (from the Date header)
+      var sawSuccess = false;
+      var netFailures = 0;
+      var polling = false;
+      var lastPollAt = 0;
+      var finished = false;
+      var downloading = false;
+      var downloadNote = '';
+      var downloadNoteTimer = 0;
+      var pollTimer = 0, tickTimer = 0;
+
+      // ---- probe: short timeout, any failure => not demo ----
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var abortTimer = ctl ? setTimeout(function() { ctl.abort(); }, 3000) : 0;
+      setTimeout(function() { if (!window.chudwareDemoKnown) setDemo(false); }, 3500);
+      nativeFetch('/healthz', { cache: 'no-store', credentials: 'same-origin',
+                                signal: ctl ? ctl.signal : undefined })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(j) { return !!(j && j.demo === true); })
+        .catch(function() { return false; })
+        .then(function(isDemo) {
+          clearTimeout(abortTimer);
+          if (window.chudwareDemoKnown) return;   // the 3.5 s guard already answered
+          setDemo(isDemo);
+          if (isDemo) start();
+        });
+
+      function start() {
+        // Keep the banner's own controls away from GLFW's window/document listeners (same
+        // reason as the touch HUD) without cancelling native button activation.
+        ['mousedown', 'mouseup', 'mousemove', 'pointerdown', 'pointerup', 'touchstart',
+         'touchmove', 'touchend', 'touchcancel', 'keydown', 'keyup', 'keypress'].forEach(function(type) {
+          window.addEventListener(type, function(ev) {
+            if (banner.contains(ev.target)) ev.stopPropagation();
+          }, { capture: true, passive: false });
+        });
+        // After expiry the app must not receive input at all (it keeps running underneath).
+        ['keydown', 'keyup', 'keypress', 'mousedown', 'mouseup', 'mousemove', 'wheel',
+         'pointerdown', 'pointerup', 'pointermove', 'touchstart', 'touchmove', 'touchend',
+         'paste', 'copy', 'cut'].forEach(function(type) {
+          window.addEventListener(type, function(ev) {
+            if (finished) ev.stopImmediatePropagation();
+          }, { capture: true, passive: false });
+        });
+        dlBtn.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          if (!downloading && !finished) downloadWorkspace();
+        });
+        document.addEventListener('visibilitychange', function() {
+          if (!document.hidden) poll();
+        });
+        watchAppRequests();
+        poll();
+        pollTimer = setInterval(poll, POLL_MS);
+        tickTimer = setInterval(render, 5000);
+      }
+
+      // ---- /demo/status polling ----
+      function poll() {
+        if (finished || polling) return;
+        polling = true;
+        lastPollAt = Date.now();
+        nativeFetch('/demo/status', { cache: 'no-store', credentials: 'same-origin' })
+          .then(function(r) {
+            if (r.status === 401 || r.status === 410) { end('status HTTP ' + r.status); return; }
+            if (!r.ok) throw new Error('status HTTP ' + r.status);
+            var date = Date.parse(r.headers.get('Date') || '');
+            return r.json().then(function(j) {
+              if (!j || typeof j !== 'object' || typeof j.state !== 'string')
+                throw new Error('bad status body');
+              if (isFinite(date)) clockOffset = date / 1000 - Date.now() / 1000;
+              sawSuccess = true;
+              netFailures = 0;
+              if (j.state !== 'active' && j.state !== 'queued' && j.state !== 'starting') {
+                end('state ' + j.state);   // expired, none (no valid cookie) or unknown
+                return;
+              }
+              state = j;      // queued/starting: keep polling quietly, banner stays hidden
+              render();
+            });
+          })
+          .catch(function(e) {
+            // Only a gateway that WAS reachable and then goes away means the session is gone.
+            netFailures += 1;
+            chudwareLog('err', 'demo status: ' + e);
+            if (sawSuccess && netFailures >= 2) end('status unreachable');
+          })
+          .then(function() { polling = false; });
+      }
+
+      // The app's own HTTP requests (main thread only) answered 401/410 mean the front door
+      // dropped the session; /demo/status stays the arbiter so a stray 401 cannot blank a
+      // live session. Throttled so a burst of failing requests is one status read.
+      function watchAppRequests() {
+        function check(url, status) {
+          if (finished || (status !== 401 && status !== 410)) return;
+          try {
+            var u = new URL(url, location.href);
+            if (u.origin !== location.origin || u.pathname === '/demo/status') return;
+          } catch (e) { return; }
+          if (Date.now() - lastPollAt > 2000) poll();
+        }
+        window.fetch = function(input, init) {
+          return nativeFetch(input, init).then(function(r) {
+            check(r.url || (typeof input === 'string' ? input : input && input.url), r.status);
+            return r;
+          });
+        };
+        var xhrOpen = XMLHttpRequest.prototype.open;
+        var xhrSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+          this.__chudwareUrl = url;
+          return xhrOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function() {
+          this.addEventListener('loadend', function() {
+            check(this.responseURL || this.__chudwareUrl, this.status);
+          });
+          return xhrSend.apply(this, arguments);
+        };
+      }
+
+      // ---- banner ----
+      function remainingSeconds() {
+        if (!state) return null;
+        var at = [];
+        if (typeof state.idle_expires_at === 'number') at.push(state.idle_expires_at);
+        if (typeof state.hard_expires_at === 'number') at.push(state.hard_expires_at);
+        if (!at.length) return null;
+        return Math.min.apply(null, at) - (Date.now() / 1000 + clockOffset);
+      }
+      function render() {
+        if (finished) return;
+        var show = !!state && state.state === 'active';
+        document.documentElement.style.setProperty('--demo-banner-h', show ? BANNER_H : '0px');
+        banner.classList.toggle('visible', show);
+        if (!show) return;
+        var secs = remainingSeconds();
+        var left = '';
+        if (secs !== null) {
+          var mins = Math.max(0, Math.ceil(secs / 60));
+          left = mins <= 1 ? 'less than a minute left' : mins + ' min left';
+        }
+        var warn = state.warn === true;
+        banner.classList.toggle('warn', warn);
+        banner.classList.toggle('critical', warn && secs !== null && secs <= 60);
+        var text = warn
+          ? 'Demo session ending soon \u2014 download your work now' + (left ? ' (' + left + ')' : '')
+          : 'Demo session' + (left ? ' \u2014 ' + left : '');
+        if (downloadNote) text = downloadNote;
+        if (msgEl.textContent !== text) msgEl.textContent = text;
+        // Daily AI allowance (null/absent => no segment).
+        var aiLeft = state.ai_remaining_today;
+        var aiText = (typeof aiLeft === 'number' && isFinite(aiLeft) && aiLeft >= 0 && Math.floor(aiLeft) === aiLeft)
+          ? 'AI requests left today: ' + aiLeft : '';
+        if (aiEl.textContent !== aiText) aiEl.textContent = aiText;
+      }
+      function noteDownload(text, ms) {
+        downloadNote = text;
+        clearTimeout(downloadNoteTimer);
+        if (text && ms) downloadNoteTimer = setTimeout(function() { downloadNote = ''; render(); }, ms);
+        render();
+      }
+
+      // ---- session ended: blocking panel ----
+      function end(reason) {
+        if (finished) return;
+        finished = true;
+        clearInterval(pollTimer);
+        clearInterval(tickTimer);
+        chudwareLog('err', 'demo session ended: ' + reason);
+        banner.classList.remove('visible');
+        document.documentElement.style.setProperty('--demo-banner-h', '0px');
+        endedBody.textContent = '';
+        var h = document.createElement('h1');
+        h.textContent = 'Session ended \u2014 your files were deleted';
+        var p = document.createElement('p');
+        p.className = 'dim';
+        p.textContent = 'Demo sessions are temporary. Join the queue to start a fresh one.';
+        var a = document.createElement('a');
+        a.className = 'rejoin';
+        a.href = '/';
+        a.textContent = 'Rejoin the queue';
+        endedBody.appendChild(h);
+        endedBody.appendChild(p);
+        endedBody.appendChild(a);
+        endedPanel.className = 'visible';
+        if (statusEl) statusEl.style.display = 'none';
+        surface.setAttribute('inert', '');
+        if (document.activeElement && document.activeElement !== document.body)
+          document.activeElement.blur();
+        a.focus();
+      }
+
+      // ---- "Download your work" ----
+      // The gateway has no whole-workspace archive route. It does have the two routes the
+      // in-app file dialog uses (GET /workspace/list?dir=, GET /workspace/download?path=,
+      // see fsTriggerDownload in host/src/core/fs_backend.cpp), so the archive is assembled
+      // here from exactly those: walk the tree, fetch each file, write one stored ZIP.
+      function getJson(url) {
+        return nativeFetch(url, { cache: 'no-store', credentials: 'same-origin' }).then(function(r) {
+          if (r.status === 401 || r.status === 410) { end('download HTTP ' + r.status); throw new Error('session ended'); }
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        });
+      }
+      function listTree(dir, out, depth) {
+        if (depth > 32 || out.length > 20000) throw new Error('workspace too large');
+        return getJson('/workspace/list?dir=' + encodeURIComponent(dir)).then(function(j) {
+          (j.files || []).forEach(function(f) {
+            if (f && typeof f.path === 'string') out.push({ path: f.path, mtime: Number(f.mtime) || 0 });
+          });
+          return (j.dirs || []).reduce(function(chain, d) {
+            return chain.then(function() {
+              return (d && typeof d.path === 'string') ? listTree(d.path, out, depth + 1) : null;
+            });
+          }, Promise.resolve());
+        });
+      }
+      var crcTable = null;
+      function crc32(bytes) {
+        if (!crcTable) {
+          crcTable = new Uint32Array(256);
+          for (var n = 0; n < 256; ++n) {
+            var c = n;
+            for (var k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            crcTable[n] = c >>> 0;
+          }
+        }
+        var crc = 0xFFFFFFFF;
+        for (var i = 0; i < bytes.length; ++i) crc = crcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+        return (crc ^ 0xFFFFFFFF) >>> 0;
+      }
+      function zipBlob(entries) {
+        var parts = [], central = [], offset = 0, cdSize = 0;
+        if (entries.length > 0xFFFF) throw new Error('too many files for one archive');
+        entries.forEach(function(e) {
+          var size = e.data.byteLength;
+          if (size >= 0xFFFFFFFF || offset >= 0xFFFFFFFF) throw new Error('workspace too large for one archive');
+          var h = new DataView(new ArrayBuffer(30));
+          h.setUint32(0, 0x04034b50, true);
+          h.setUint16(4, 20, true);
+          h.setUint16(6, 0x0800, true);          // UTF-8 names
+          h.setUint16(10, e.time, true);
+          h.setUint16(12, e.date, true);
+          h.setUint32(14, e.crc, true);
+          h.setUint32(18, size, true);
+          h.setUint32(22, size, true);
+          h.setUint16(26, e.name.length, true);
+          parts.push(h.buffer, e.name, e.data);
+          var c = new DataView(new ArrayBuffer(46));
+          c.setUint32(0, 0x02014b50, true);
+          c.setUint16(4, 20, true);
+          c.setUint16(6, 20, true);
+          c.setUint16(8, 0x0800, true);
+          c.setUint16(12, e.time, true);
+          c.setUint16(14, e.date, true);
+          c.setUint32(16, e.crc, true);
+          c.setUint32(20, size, true);
+          c.setUint32(24, size, true);
+          c.setUint16(28, e.name.length, true);
+          c.setUint32(42, offset, true);
+          central.push(c.buffer, e.name);
+          cdSize += 46 + e.name.length;
+          offset += 30 + e.name.length + size;
+        });
+        if (offset >= 0xFFFFFFFF) throw new Error('workspace too large for one archive');
+        var eocd = new DataView(new ArrayBuffer(22));
+        eocd.setUint32(0, 0x06054b50, true);
+        eocd.setUint16(8, entries.length, true);
+        eocd.setUint16(10, entries.length, true);
+        eocd.setUint32(12, cdSize, true);
+        eocd.setUint32(16, offset, true);
+        return new Blob(parts.concat(central, [eocd.buffer]), { type: 'application/zip' });
+      }
+      function dosStamp(mtime) {
+        var d = new Date((mtime || 0) * 1000);
+        var y = d.getFullYear();
+        if (y < 1980) return { date: (1 << 5) | 1, time: 0 };
+        return { date: ((y - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+                 time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1) };
+      }
+      function downloadWorkspace() {
+        downloading = true;
+        dlBtn.disabled = true;
+        var encoder = new TextEncoder();
+        var files = [];
+        var entries = [];
+        noteDownload('Preparing your files\u2026', 0);
+        listTree('', files, 0).then(function() {
+          if (!files.length) throw new Error('nothing to download yet');
+          return files.reduce(function(chain, f, i) {
+            return chain.then(function() {
+              noteDownload('Preparing your files\u2026 ' + (i + 1) + '/' + files.length, 0);
+              return nativeFetch('/workspace/download?path=' + encodeURIComponent(f.path),
+                                 { cache: 'no-store', credentials: 'same-origin' }).then(function(r) {
+                if (r.status === 401 || r.status === 410) { end('download HTTP ' + r.status); throw new Error('session ended'); }
+                if (!r.ok) throw new Error(f.path + ': HTTP ' + r.status);
+                return r.arrayBuffer();
+              }).then(function(buf) {
+                var stamp = dosStamp(f.mtime);
+                entries.push({ name: encoder.encode(f.path), data: buf, crc: crc32(new Uint8Array(buf)),
+                               date: stamp.date, time: stamp.time });
+              });
+            });
+          }, Promise.resolve());
+        }).then(function() {
+          var url = URL.createObjectURL(zipBlob(entries));
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = 'chudware-workspace.zip';
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
+          noteDownload('', 0);
+        }).catch(function(e) {
+          if (finished) return;
+          chudwareLog('err', 'demo download: ' + e);
+          noteDownload('Download failed: ' + (e && e.message ? e.message : e), 8000);
+        }).then(function() {
+          downloading = false;
+          dlBtn.disabled = false;
+        });
+      }
     })();
 
     var Module = {

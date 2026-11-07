@@ -1,0 +1,11 @@
+# Cloudflare Pages project config for chudware.com. While this file exists it is the
+# source of truth for the project's Functions settings and bindings; the dashboard
+# cannot edit them. Deployed by .github/workflows/site-build.yml.
+name = "chudware-site"
+pages_build_output_dir = "./dist"
+compatibility_date = "2026-09-01"
+
+# Request log written by functions/_middleware.js; see docs/dev/website-request-logging.md.
+[[analytics_engine_datasets]]
+binding = "REQUEST_LOG"
+dataset = "chudware_requests"

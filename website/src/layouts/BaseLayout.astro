@@ -94,14 +94,12 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
           {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
         </nav>
         <div class="header-actions">
-          <a class="header-link tap" href="/docs/self-hosting/">Self-host</a>
           <a class="button button-small" href="/download/">Get started</a>
         </div>
         <details class="mobile-nav">
           <summary class="tap"><Icon name="menu" /><span>Menu</span></summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
-            <a class="tap" href="/docs/self-hosting/">Self-host</a>
             <a class="tap mobile-download" href="/download/">Get started</a>
           </nav>
         </details>

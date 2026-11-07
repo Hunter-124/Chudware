@@ -14,4 +14,5 @@ repository layout; reference material lives in [`docs/reference/`](../reference/
 | [gui-workspaces.md](gui-workspaces.md) | Workspace tabs (AI, CAM/Manufacture, Reverse Engineering, Simulation, Firmware, ...) and auxiliary panels |
 | [evaluate-tools.md](evaluate-tools.md) | Measurement, mass properties and interference tools shared by agents and the Evaluate tab |
 | [engineering-checks.md](engineering-checks.md) | Agent DFM, stress, assemblability and harness checks, evidence and registration |
+| [website-request-logging.md](website-request-logging.md) | chudware.com request logging: live tail, Analytics Engine dataset columns and queries |
 | [SCAD file formats](../reference/cad-file-formats.md#openscad-source-and-native-documents) | SCAD import/rendering and native documents; [document operations contract](../../contracts/doc_ops.md#36-openscad-source-and-managed-conversion-append-only); agent guidance: `cad_guide('scad')` |

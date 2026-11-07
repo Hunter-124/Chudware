@@ -114,8 +114,8 @@
   .brand { display: inline-flex; align-items: center; gap: var(--s3); color: var(--text); text-decoration: none; font: 700 .79rem/1 var(--mono); letter-spacing: .15em; }
   .brand img { flex: 0 0 auto; }
   .desktop-nav { display: flex; align-items: stretch; gap: var(--s2); margin-left: auto; }
-  .desktop-nav a, .header-link { display: inline-flex; min-height: var(--touch); align-items: center; padding-inline: var(--s3); border-radius: var(--radius-sm); color: var(--muted); text-decoration: none; font: 560 var(--step--1)/1 var(--sans); }
-  .desktop-nav a:hover, .desktop-nav a:focus-visible, .desktop-nav a[aria-current="page"], .header-link:hover, .header-link:focus-visible { background: var(--surface); color: var(--text); }
+  .desktop-nav a { display: inline-flex; min-height: var(--touch); align-items: center; padding-inline: var(--s3); border-radius: var(--radius-sm); color: var(--muted); text-decoration: none; font: 560 var(--step--1)/1 var(--sans); }
+  .desktop-nav a:hover, .desktop-nav a:focus-visible, .desktop-nav a[aria-current="page"] { background: var(--surface); color: var(--text); }
   .desktop-nav a[aria-current="page"] { box-shadow: inset 0 calc(var(--border-strong) * -1) var(--accent); }
   .header-actions { display: flex; align-items: center; gap: var(--s2); }
   .mobile-nav { display: none; position: relative; }

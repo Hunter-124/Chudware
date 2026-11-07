@@ -5298,3 +5298,54 @@ def test_demo_cell_launches_omp_with_the_lane_config_and_a_bridge_the_sandbox_sh
     assert [m["id"] for m in provider["models"]] == [r["id"] for r in ROWS]
     assert kwargs["env"]["OMP_CAD_BRIDGE_ENDPOINT"] == "/private/test.sock"
     assert Path(kwargs["session_dir"]).name.startswith("demo-")
+
+
+_DIE_WITH_PARENT_CHILD = (
+    "import ctypes, signal, sys, time\n"
+    "ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG, what bwrap --die-with-parent does\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+def test_client_launch_thread_outlives_a_die_with_parent_sandbox_until_stopped():
+    # bubblewrap's --die-with-parent is PR_SET_PDEATHSIG, which the kernel acts on when the *thread*
+    # that forked the child exits. client.start() forks the sandboxed OMP, so a launch thread that
+    # returned as soon as start() did killed the sandbox right after its extension loaded.
+    class Client:
+        def start(self):
+            self.launcher = threading.current_thread()
+            self.child = subprocess.Popen(
+                [sys.executable, "-c", _DIE_WITH_PARENT_CHILD], stdout=subprocess.PIPE, text=True)
+            assert self.child.stdout.readline().strip() == "ready"  # PDEATHSIG armed before start returns
+
+        def stop(self):
+            self.child.kill()
+            self.child.wait(5)
+            return True
+
+    client = Client()
+    omp_host_module._start_client(client)
+    try:
+        time.sleep(0.5)
+        assert client.launcher.is_alive()
+        assert client.child.poll() is None, "the sandbox died with its launching thread"
+    finally:
+        omp_host_module._stop_client(client)
+        client.child.stdout.close()
+    client.launcher.join(5)
+    assert not client.launcher.is_alive()
+
+
+def test_failed_client_launch_does_not_park_its_thread():
+    class Client:
+        def start(self):
+            self.launcher = threading.current_thread()
+            raise RuntimeError("no such binary")
+
+    client = Client()
+    with pytest.raises(RuntimeError, match="no such binary"):
+        omp_host_module._start_client(client)
+    client.launcher.join(5)
+    assert not client.launcher.is_alive()

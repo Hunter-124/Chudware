@@ -308,3 +308,47 @@ def test_transport_authentication_and_private_socket(tmp_path):
         assert exchange(info["token"])["result"] == {"tools": [], "generation": 0}
     finally:
         bridge.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix transport")
+def test_extension_round_trips_over_its_socket_inside_a_cell(tmp_path, monkeypatch):
+    # The extension speaks to the bridge over its socket with no hostd identity. In a cell the
+    # registry bootstrap and a tool call must still reach the bridge, not a cell refusal.
+    monkeypatch.setenv("CHUDWARE_CELL", "1")
+    bridge = ExtensionBridge(tmp_path, lambda name, args, ctx: {"echo": args}).start()
+    bridge.publish_tools([definition()])
+    info = bridge.info()
+
+    def exchange(action, params=None):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(2)
+        try:
+            client.connect(info["endpoint"])
+            client.sendall((json.dumps({"token": info["token"], "action": action, "params": params or {}}) + "\n").encode())
+            data = bytearray()
+            while b"\n" not in data:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+            return json.loads(data)
+        finally:
+            client.close()
+
+    try:
+        snapshot = exchange("bootstrap")
+        assert snapshot["ok"] is True
+        assert [tool["name"] for tool in snapshot["result"]["tools"]] == ["cad_tool"]
+        assert isinstance(snapshot["result"]["generation"], int)
+        started = exchange("tool_start", {"name": "cad_tool", "arguments": {"v": 1}, "context": {
+            "agent_id": "root", "session_id": "session", "tool_call_id": "call"}})["result"]
+        deadline = time.monotonic() + 2
+        while True:
+            state = exchange("tool_poll", {"id": started["id"]})["result"]
+            if state.get("done"):
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert state["error"] is None and state["result"] == {"echo": {"v": 1}}
+    finally:
+        bridge.stop()

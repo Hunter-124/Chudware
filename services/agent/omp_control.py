@@ -14,6 +14,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Self
 from services.agent.request_context import bind_context, control_delegate
@@ -441,7 +442,13 @@ class ControlServer:
         if not isinstance(params, dict):
             raise RequestError("malformed", "control params must be an object")
         try:
-            with bind_context(request.get("ctx")):
+            # Worker controls carry hostd's authenticated request identity. The extension
+            # bridge (the only server with an explicit action list) is authenticated by its
+            # per-runtime token on an actor-private socket and never has one: its CAD tool
+            # bindings restore the owner they captured, and a cell refuses an unbound
+            # identity, so binding `ctx=None` here would refuse every bridge call.
+            scope = bind_context(request.get("ctx")) if self._delegated_controls else nullcontext()
+            with scope:
                 if self._delegated_controls:
                     control_delegate(action)
                 with self._state_lock:

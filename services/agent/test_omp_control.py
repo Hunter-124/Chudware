@@ -1111,3 +1111,40 @@ def test_blocked_handler_does_not_consume_stop_capacity(runtime_dir):
         release.set()
         thread.join(1)
         server.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Unix socket permissions")
+def test_extension_bridge_server_needs_no_hostd_identity_inside_a_cell(runtime_dir, monkeypatch):
+    # The bridge socket is authenticated by its per-runtime token and is private to the actor; it
+    # never carries hostd's request context. A cell refuses an unbound identity, which once made
+    # every bridge call answer {"ok": false, "reason": "cell_refused"} inside a 200 envelope and the
+    # extension reject its own registry ("invalid CAD registry").
+    monkeypatch.setenv("CHUDWARE_CELL", "1")
+    server = ControlServer(
+        lambda action, params: {"tools": [], "action": action}, runtime_dir,
+        accepted_actions={"bootstrap"},
+    ).start()
+    try:
+        info = server.info()
+        reply, _ = _request(info, {"token": info["token"], "action": "bootstrap", "params": {}})
+        assert reply == {"ok": True, "result": {"tools": [], "action": "bootstrap"}}
+        denied, _ = _request(info, {"token": "wrong", "action": "bootstrap", "params": {}})
+        assert denied["ok"] is False and denied["error"]["code"] == "unauthorized"
+        other, _ = _request(info, {"token": info["token"], "action": "status", "params": {}})
+        assert other["ok"] is False and other["error"]["code"] == "invalid_action"
+    finally:
+        server.stop()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Unix socket permissions")
+def test_worker_control_server_still_refuses_an_unbound_request_inside_a_cell(runtime_dir, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_CELL", "1")
+    calls: list[str] = []
+    server = ControlServer(lambda action, params: calls.append(action) or {"state": "idle"}, runtime_dir).start()
+    try:
+        info = server.info()
+        reply, _ = _request(info, {"token": info["token"], "action": "status", "params": {}})
+        assert reply == {"ok": True, "result": {"ok": False, "reason": "cell_refused", "code": "cell_refused"}}
+        assert calls == []
+    finally:
+        server.stop()

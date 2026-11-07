@@ -71,9 +71,12 @@ class _BoundedCallTimeout(TimeoutError):
     pass
 
 
-def _start_call(call: Callable[[], Any]) -> tuple[threading.Event, dict[str, Any]]:
+def _start_call(
+    call: Callable[[], Any], *, hold: threading.Event | None = None
+) -> tuple[threading.Event, dict[str, Any]]:
     """Run a transport call on its own thread; ``done`` is set once ``result`` holds
-    its ``value`` or ``error``."""
+    its ``value`` or ``error``. With ``hold``, a call that succeeded keeps its thread
+    parked until ``hold`` is set."""
     done = threading.Event()
     result: dict[str, Any] = {}
     def invoke() -> None:
@@ -83,13 +86,17 @@ def _start_call(call: Callable[[], Any]) -> tuple[threading.Event, dict[str, Any
             result["error"] = exc
         finally:
             done.set()
+        if hold is not None and "error" not in result:
+            hold.wait()
     threading.Thread(target=_context_callback(invoke), name="omp-bounded-call", daemon=True).start()
     return done, result
 
 
-def _bounded_call(call: Callable[[], Any], timeout: float) -> Any:
+def _bounded_call(
+    call: Callable[[], Any], timeout: float, *, hold: threading.Event | None = None
+) -> Any:
     """Bound a transport call including writer-lock acquisition and pipe writes."""
-    done, result = _start_call(call)
+    done, result = _start_call(call, hold=hold)
     if not done.wait(timeout):
         raise _BoundedCallTimeout("OMP control request timed out")
     if "error" in result:
@@ -4401,6 +4408,15 @@ def _register_listener(
 
 
 def _stop_client(client: Any) -> None:
+    try:
+        _teardown_client(client)
+    finally:
+        hold = getattr(client, "_omp_launch_hold", None)
+        if hold is not None:
+            hold.set()
+
+
+def _teardown_client(client: Any) -> None:
     def kill_owned_process() -> None:
         process = getattr(client, "_process", None)
         if process is None or process.poll() is not None:
@@ -4473,6 +4489,11 @@ def _start_client(client: Any, *, timeout: float = 35.0) -> None:
 
         note_sdk_launch(sandboxed=bool(getattr(client, "_chudware_activity_sandboxed", False)))
     abandoned = threading.Event()
+    # bubblewrap's --die-with-parent is prctl(PR_SET_PDEATHSIG), which the kernel delivers when
+    # the *thread* that forked the child exits, not when its process does. client.start() forks
+    # the (sandboxed) RPC process, so the thread running it must outlive that process or the
+    # kernel kills the sandbox as soon as start() returns. `_stop_client` releases the thread.
+    client._omp_launch_hold = hold = threading.Event()
     def start() -> None:
         try:
             client.start()
@@ -4481,7 +4502,7 @@ def _start_client(client: Any, *, timeout: float = 35.0) -> None:
                 client._omp_force_stop = True
                 _stop_client(client)
     try:
-        _bounded_call(start, timeout)
+        _bounded_call(start, timeout, hold=hold)
     except _BoundedCallTimeout:
         abandoned.set()
         client._omp_force_stop = True

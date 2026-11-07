@@ -82,6 +82,21 @@ also render the duplicate delivered to its primary event socket. Worker-mapped
 nested events carry the owning root turn and session IDs for routing, retaining
 their subagent and span IDs for trace lineage. Native offline streams retain
 their child-run activity.
+
+In a cell the OMP process runs in a nested actor sandbox (`chudware-actor-sandbox`,
+bubblewrap `--die-with-parent`) and two properties are load-bearing:
+
+- `--die-with-parent` is `PR_SET_PDEATHSIG`, which the kernel delivers when the *thread*
+  that forked the child exits, not when its process does. `omp_host._start_client` therefore
+  runs `client.start()` on a thread that stays parked until `_stop_client` releases it; a
+  launch thread that returns with `start()` gets the sandbox killed right after its extension
+  loads, and the turn then waits out a bridge timeout (`extension operation timed out`).
+- The extension bridge socket lives beneath `/actor/run` (shared by every nested sandbox of
+  the actor) and is authenticated only by its per-runtime token. It carries no hostd request
+  context, so `ControlServer` binds one only for worker controls; its CAD tool bindings
+  restore the owner they captured. Binding an absent context in a cell is a refusal, which
+  would answer every bridge call with `cell_refused` in a success envelope.
+
 Each conversation also owns its context usage, reported window and window
 provenance; switching or background telemetry never borrows another chat's
 denominator. Token peaks from the native lane update that same owner.

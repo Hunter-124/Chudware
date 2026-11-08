@@ -70,8 +70,9 @@ Windows portability notes baked into the build:
 - The JSON-heavy `doc/session.cpp` compiles with `/bigobj` on MSVC so native
   document persistence does not exceed the normal COFF section count.
 - The core and host targets link `nlohmann_json` explicitly (no ambient system include on Windows).
-- MSVC builds use `/bigobj` for `core/doc/session.cpp` and `host/src/ui/scenarios.cpp`,
-  whose generated object sections can exceed the default compiler limit.
+- MSVC builds use `/bigobj` for `core/doc/session.cpp`, `core/tests/test_document.cpp`
+  and `host/src/ui/scenarios.cpp`, whose generated object sections can exceed the
+  default compiler limit.
 - `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
 
 ## 3b. Build the core WITH the OCCT geometry kernel

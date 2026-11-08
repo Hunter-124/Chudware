@@ -35,6 +35,7 @@ concurrency:
 jobs:
   linux:
     name: Linux x86_64
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -112,26 +113,52 @@ jobs:
 
       - name: Configure and build core (windows-occt)
         run: |
-          cmake --preset windows-occt
+          cmake --preset windows-occt -DCHUDWARE_LTO=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build --preset windows-occt -- -k 0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: ctest core
-        run: ctest --test-dir build/windows-occt/core --output-on-failure --no-tests=error
-
       - name: Configure and build host GUI
         run: |
-          cmake -S host -B host/build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
+          cmake -S host -B host/build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF -DCHUDWARE_LTO=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build host/build-windows -- -k 0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Collect developer binaries
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'chudware-win-dev'
+          New-Item -ItemType Directory -Force -Path (Join-Path $out 'core'), (Join-Path $out 'host') | Out-Null
+          Get-ChildItem -LiteralPath build/windows-occt/bin -File |
+            Where-Object { $_.Extension -eq '.dll' -or $_.Name -in @('chudware-hostd.exe', 'polymesh.exe') } |
+            Copy-Item -Destination (Join-Path $out 'core')
+          Get-ChildItem -LiteralPath host/build-windows/bin -File |
+            Where-Object { -not $_.Name.StartsWith('test_') -and $_.Extension -ne '.pdb' } |
+            Copy-Item -Destination (Join-Path $out 'host')
+          foreach ($p in @('core/libchudware.dll', 'core/chudware-hostd.exe', 'host/chudware.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $out $p))) { throw "missing $p" }
+          }
+          Get-ChildItem -Recurse $out | Format-Table FullName, Length
+
+      - name: Upload developer binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chudware-win-dev
+          path: ${{ runner.temp }}/chudware-win-dev
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: ctest core
+        if: ${{ !cancelled() }}
+        run: ctest --test-dir build/windows-occt/core --output-on-failure --no-tests=error
+
       - name: ctest host GUI
+        if: ${{ !cancelled() }}
         run: ctest --test-dir host/build-windows --output-on-failure --no-tests=error
 
   macos:
     name: macOS arm64
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 240
     steps:

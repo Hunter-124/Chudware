@@ -952,9 +952,9 @@ FlatPattern sm_flat_pattern(const TopoDS_Shape& body, const TopoDS_Shape& base,
             transform.SetValues(wall_rotation(0, 0), wall_rotation(0, 1), wall_rotation(0, 2), wall_translation.x(),
                                 wall_rotation(1, 0), wall_rotation(1, 1), wall_rotation(1, 2), wall_translation.y(),
                                 wall_rotation(2, 0), wall_rotation(2, 1), wall_rotation(2, 2), wall_translation.z());
-            const Eigen::Vector3d far = folded_wall_start + wall_dir * wall;
+            const Eigen::Vector3d wall_end = folded_wall_start + wall_dir * wall;
             TopoDS_Shape window = make_face_from_pts(
-                {folded_wall_start, folded_wall_start + edge * width, far + edge * width, far});
+                {folded_wall_start, folded_wall_start + edge * width, wall_end + edge * width, wall_end});
             if (window.IsNull()) return fail(step + "wall window construction failed");
             const Eigen::Vector3d wall_into = along * std::sin(theta) - fold * std::cos(theta);
             if (has_partial_depth_face(body, window, folded_wall_start, wall_into, T))

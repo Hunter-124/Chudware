@@ -4774,16 +4774,16 @@ static nlohmann::json fea_run_static_impl(
             int best = -1;
             for (int i = 0; i < n_nodes; ++i) {
                 if (!std::isfinite(r.von_mises[i]) || r.von_mises[i] < 0.0) continue;
-                bool near = false;
+                bool clustered = false;
                 for (int j : selected) {
                     double d2 = 0.0;
                     for (int c = 0; c < 3; ++c) {
                         const double d = points[3 * i + c] - points[3 * j + c];
                         d2 += d * d;
                     }
-                    if (d2 <= radius * radius) { near = true; break; }
+                    if (d2 <= radius * radius) { clustered = true; break; }
                 }
-                if (!near && (best < 0 || r.von_mises[i] > r.von_mises[best])) best = i;
+                if (!clustered && (best < 0 || r.von_mises[i] > r.von_mises[best])) best = i;
             }
             if (best < 0) break;
             selected.push_back(best);
@@ -4810,16 +4810,16 @@ static nlohmann::json fea_run_static_impl(
                     if (!std::isfinite(r.factor_of_safety[i]) || r.factor_of_safety[i] < 0.0 ||
                         !std::isfinite(r.von_mises[i]))
                         continue;
-                    bool near = false;
+                    bool clustered = false;
                     for (int j : selected) {
                         double d2 = 0.0;
                         for (int c = 0; c < 3; ++c) {
                             const double d = points[3 * i + c] - points[3 * j + c];
                             d2 += d * d;
                         }
-                        if (d2 <= radius * radius) { near = true; break; }
+                        if (d2 <= radius * radius) { clustered = true; break; }
                     }
-                    if (!near && (best < 0 || r.factor_of_safety[i] < r.factor_of_safety[best]))
+                    if (!clustered && (best < 0 || r.factor_of_safety[i] < r.factor_of_safety[best]))
                         best = i;
                 }
                 if (best < 0) break;

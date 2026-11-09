@@ -252,14 +252,15 @@ def pin_model(params: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def provider_descriptors(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Settings → Providers in a demo cell: the OpenRouter row, plus the NVIDIA and Anthropic rows
-    when the lane serves models through them. Ready, nothing to configure."""
+    """Settings → Providers in a demo cell: one row per provider the lane serves models through
+    (the OpenRouter row alone when it lists none). Ready, nothing to configure."""
     counts = {provider_id: sum(1 for row in rows if row.get("provider") == provider_id)
               for provider_id in PROVIDER_IDS}
     return [{"id": provider_id, "name": _PROVIDER_NAMES[provider_id], "available": count > 0,
              "authenticated": True, "authKinds": [], "modelsAvailable": count,
              "state": "configured", "origin": "demo"}
-            for provider_id, count in counts.items() if count or provider_id == PROVIDER_ID]
+            # The OpenRouter row stands alone when the lane lists nothing at all.
+            for provider_id, count in counts.items() if count or (provider_id == PROVIDER_ID and not rows)]
 
 
 def auth_state(provider_id: str) -> dict[str, Any]:

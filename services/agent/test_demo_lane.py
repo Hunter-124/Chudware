@@ -234,6 +234,8 @@ def test_an_nvidia_served_row_gets_the_nvidia_provider_on_chat_completions():
     providers = demo_lane.provider_descriptors([nvidia, free])
     assert [(p["id"], p["modelsAvailable"]) for p in providers] == [("openrouter", 1), ("nvidia", 1)]
     assert providers[1]["name"] == "NVIDIA API (demo)"
+    # No empty OpenRouter row beside providers that do serve models.
+    assert [p["id"] for p in demo_lane.provider_descriptors([nvidia])] == ["nvidia"]
 
 
 def test_omp_config_without_anthropic_rows_still_points_the_anthropic_provider_at_the_lane():

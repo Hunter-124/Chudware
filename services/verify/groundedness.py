@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Protocol, runtime_checkable
 
-from tools.translator.gsl_ser import Slot, enumerate_slots, extract_numerals
+from services.verify.gsl_ser import Slot, enumerate_slots, extract_numerals
 
 
 @dataclass(frozen=True)

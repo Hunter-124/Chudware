@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from tools.translator.groundedness import (
+from services.verify.groundedness import (
     H4GroundednessAdapter,
     _MembershipStub,
     Verdict,
@@ -173,7 +173,7 @@ def test_adapter_vacuous_empty_text():
 
 def test_adapter_set_checker_roundtrip():
     """Verify set_checker installs the adapter and is_stub() reflects the change."""
-    import tools.translator.groundedness as gm
+    import services.verify.groundedness as gm
     original = gm.get_checker()
     adapter = H4GroundednessAdapter()
     try:

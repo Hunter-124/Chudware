@@ -18,7 +18,7 @@ value AS SERIALIZED, at the narration.md precision for its unit — never the ra
 
 Design boundary: model-produced text never invents a numeral; every numeral in a
 caption must trace to a Slot enumerated here. The groundedness checker
-(`tools/translator/groundedness.py`) scores text against these slots and flags
+(`services/verify/groundedness.py`) scores text against these slots and flags
 extrinsic (invented) numerals. This file is engine-free: it operates on state DICTS
 (the `_digest`-shaped payload the deterministic describers already produce), so it runs
 in CI with no libchudware.

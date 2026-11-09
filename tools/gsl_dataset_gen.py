@@ -343,8 +343,8 @@ def paraphrase_default(caption: str, rng: random.Random) -> str:
 def verify_pair(state: dict, caption: str) -> tuple[bool, list[str]]:
     """A pair is admissible iff (1) the state round-trips exactly through gsl-ser/v1 and
     (2) the caption has NO ungrounded numeral (groundedness seam). Returns (ok, reasons)."""
-    from tools.translator import gsl_ser as _g  # noqa: PLC0415
-    from tools.translator import groundedness as _gnd  # noqa: PLC0415
+    from services.verify import gsl_ser as _g  # noqa: PLC0415
+    from services.verify import groundedness as _gnd  # noqa: PLC0415
     reasons: list[str] = []
     rt = _g.roundtrip_diff(state)
     if rt:
@@ -368,7 +368,7 @@ def _sample_domain(rng: random.Random) -> str:
 def make_pair(domain: str, rng: random.Random, paraphraser) -> Optional[dict]:
     """One (serialization, caption) training pair for `domain`, paraphrased + re-verified.
     Returns None (dropped) if the re-check fails — never emit an unverified pair."""
-    from tools.translator import gsl_ser as _g  # noqa: PLC0415
+    from services.verify import gsl_ser as _g  # noqa: PLC0415
 
     if domain in _STATE_GENS:
         state = _STATE_GENS[domain](rng)
@@ -397,7 +397,7 @@ def make_pair(domain: str, rng: random.Random, paraphraser) -> Optional[dict]:
                    f"{tgt.token()} to {_g.fmt_value(new_val, tgt.unit)}.")
         # A delta caption legitimately names BOTH the before- and after-value, so it must
         # ground against before ∪ after (not `after` alone); the state must round-trip.
-        from tools.translator import groundedness as _gnd  # noqa: PLC0415
+        from services.verify import groundedness as _gnd  # noqa: PLC0415
         allslots = [s for s in _g.enumerate_slots(base) + _g.enumerate_slots(after)
                     if s.numeric]
         ungrounded = [(v, u) for v, u in _g.extract_numerals(caption)

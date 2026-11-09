@@ -8,7 +8,7 @@ import pytest
 # ── groundedness checker tests (no engine needed) ──────────────────────────
 
 def test_groundedness_exact_match():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     result = check_groundedness("The part weighs 150 g and is 50 mm tall.",
                                 {"mass": 150.0, "height": 50.0})
     assert result["score"] == pytest.approx(1.0, abs=0.01)
@@ -16,21 +16,21 @@ def test_groundedness_exact_match():
 
 
 def test_groundedness_unit_conversion():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     # 0.05 m == 50 mm  — cross-unit match
     result = check_groundedness("The height is 0.05 m.", {"height": 50.0})
     assert result["score"] == pytest.approx(1.0, abs=0.01)
 
 
 def test_groundedness_ksi_mpa():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     # 250 MPa == 36.26 ksi — cross-unit match
     result = check_groundedness("Yield stress 36.26 ksi.", {"yield_mpa": 250.0})
     assert result["score"] == pytest.approx(1.0, abs=0.05)
 
 
 def test_groundedness_spurious():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     # A numeral in the text with NO state match = hallucination risk -> spurious
     result = check_groundedness("The part is 999 mm tall.", {"height": 50.0})
     assert result["score"] < 0.5
@@ -41,13 +41,13 @@ def test_groundedness_spurious():
 
 
 def test_groundedness_vacuous():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     result = check_groundedness("The design looks great.", {})
     assert result["score"] == pytest.approx(1.0)
 
 
 def test_groundedness_attached_unit():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     # No space between number and unit ("50mm") must still parse
     result = check_groundedness("Plate is 50mm x 3in.", {"width": 50.0, "thickness": 76.2})
     assert result["score"] == pytest.approx(1.0, abs=0.01)
@@ -55,7 +55,7 @@ def test_groundedness_attached_unit():
 
 
 def test_groundedness_no_false_unit_from_word():
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     # "3 more" must NOT read as "3 m" (3000 mm); bare 3 still matches slot 3.0
     result = check_groundedness("Add 3 more ribs.", {"rib_count": 3.0})
     assert result["score"] == pytest.approx(1.0)

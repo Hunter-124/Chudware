@@ -156,3 +156,12 @@ slots using existing units; (2) confirm `roundtrip_diff` is `[]` for representat
 states. A NEW unit is a v1
 extension only if it is dimensionless-or-additive; anything that changes an existing
 slot's unit/precision is a `gsl-ser/v2` change.
+
+---
+
+## Amendment 2026-11-09 — executable reference relocated
+
+The executable reference and the groundedness seam moved from `tools/translator/` to
+`services/verify/gsl_ser.py` and `services/verify/groundedness.py`, so runtime code ships
+with `services/` (the browser image and desktop packages do not include `tools/`).
+Behaviour is unchanged; earlier text naming `tools/translator/...` refers to the old location.

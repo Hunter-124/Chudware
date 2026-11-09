@@ -888,7 +888,7 @@ def _gap_groundedness(model_text: str = "", doc_id: str = None, **_) -> str:
         state["mass"] = cb.call("eval_mass", {"doc_id": d})  # the model's applied materials
     except Exception:  # noqa: BLE001
         pass
-    from tools.translator.groundedness import check_groundedness
+    from services.verify.groundedness import check_groundedness
     result = check_groundedness(model_text, state)
     ok = not result.get("spurious")  # any ungrounded numeral fails the gate (IP-7)
     summary = (f"{len(result.get('matched', []))} grounded, "

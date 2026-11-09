@@ -3,3 +3,8 @@
 # core/tests/data/firmware/*.golden.h) to CRLF, breaking byte-exact generator/oracle
 # comparisons that assume LF (see docs/reference/BUILD_WINDOWS.md).
 * text=auto eol=lf
+
+# cmd.exe misparses batch files with LF line endings (labels, multi-line blocks), so
+# they keep CRLF in the working tree; the index still stores LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

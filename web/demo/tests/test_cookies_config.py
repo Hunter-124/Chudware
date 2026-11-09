@@ -68,6 +68,26 @@ def test_only_free_models_are_accepted(tmp_path, model):
         make_cfg(tmp_path, ai_models=(model,))
 
 
+@pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5", "claude-opus-5", "claude-sonnet-4-6",
+                                   "claude-haiku-4-5-20251001", "anthropic/claude-opus-5-5", "CLAUDE-OPUS-5-5"])
+def test_only_claude_5_5_opus_sonnet_and_haiku_are_accepted(tmp_path, model):
+    with pytest.raises(ConfigError, match="CLAUDE_MODELS"):
+        make_cfg(tmp_path, claude_models=(model,))
+    assert make_cfg(tmp_path).claude_models == ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5")
+
+
+def test_claude_caps_come_from_the_environment_and_must_be_positive(tmp_path):
+    cfg = DemoConfig.from_env({"CHUDWARE_DEMO_CLAUDE_SESSION_USD": "2.5", "CHUDWARE_DEMO_CLAUDE_MONTHLY_USD": "50",
+                               "CHUDWARE_DEMO_CLAUDE_MODELS": "claude-haiku-5-5"})
+    assert (cfg.claude_session_usd, cfg.claude_client_daily_usd, cfg.claude_daily_usd,
+            cfg.claude_monthly_usd) == (2.5, 10.0, 30.0, 50.0)
+    assert cfg.claude_models == ("claude-haiku-5-5",) and not cfg.claude_enabled
+    with pytest.raises(ConfigError):
+        make_cfg(tmp_path, claude_daily_usd=0)
+    with pytest.raises(ConfigError):
+        DemoConfig.from_env({"CHUDWARE_DEMO_CLAUDE_SESSION_USD": "ten"})
+
+
 @pytest.mark.parametrize("override", [
     {"warn_seconds": 3000},
     {"memory": "3500m,exec"},

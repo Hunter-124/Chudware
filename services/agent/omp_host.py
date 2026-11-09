@@ -193,7 +193,7 @@ def _credential_scope(params: Mapping[str, Any]) -> tuple[str, str, str, str] | 
     """Return the BYOK tenant, provider, key, and OMP's credential env name."""
     if tenancy.in_cell():
         # Provider key bytes never enter a cell. The one exception is a public-demo
-        # container's free-model lane: a placeholder key, one fixed loopback endpoint, and
+        # container's AI lane: a placeholder key, one fixed loopback endpoint, and
         # nothing the caller chooses, so a caller-supplied key is still refused.
         if not demo_lane.enabled() or any(key in params for key in ("api_key", "byok_key")):
             raise ValueError("credential_isolation_unsupported")

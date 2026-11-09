@@ -1847,7 +1847,7 @@ def test_demo_providers_panel_is_one_ready_row_answered_without_an_omp_process(o
     listed = worker_rpc._omp_provider_list({}, lambda event: None)
     assert listed["ok"]
     (row,) = listed["providers"]
-    assert row["id"] == "openrouter" and row["name"] == "Free demo models"
+    assert row["id"] == "openrouter" and row["name"] == "Demo models"
     assert row["authenticated"] and row["authKinds"] == [] and row["modelsAvailable"] == 2
     state = worker_rpc._omp_auth_state({"providerId": "openrouter"}, lambda event: None)
     assert state["ok"] and state["authenticated"] and state["state"] == "configured"
@@ -1907,7 +1907,7 @@ def test_demo_turn_refuses_any_model_outside_the_lane(online_lane, demo_cell, se
     del params["provider"], params["model"]
     result = worker_rpc._agent_admin_turn({**params, **selection}, lambda event: None)
     assert result["ok"] is False and result["code"] == "demo_model_not_allowed"
-    assert "Free demo models only" in result["reason"]
+    assert "Demo models only" in result["reason"]
     assert not online_lane.host.turns
 
 

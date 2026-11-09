@@ -250,6 +250,7 @@ class DemoManager:
             "active_sessions": sum(1 for e in self.entries.values() if e.state in (STARTING, ACTIVE)),
             "max_sessions": self.cfg.max_active,
             "ai_remaining_today": self.broker.ai_remaining_today(),
+            "claude_available": self.broker.claude_available(),
         }
         if sid is None:
             return out
@@ -398,7 +399,8 @@ class DemoManager:
             session_dir.mkdir(parents=True, exist_ok=True)
             session_dir.chmod(0o700)
             entry.run_dir = session_dir / "run"
-            await self.broker.open_session(entry.sid, entry.run_dir, entry.usage, session_dir / "usage.json")
+            await self.broker.open_session(entry.sid, entry.run_dir, entry.usage, session_dir / "usage.json",
+                                           entry.ip_tag)
             spec = self._spec(entry, int(self.clock()))
             await self.runtime.start(spec)
             if not await self.runtime.wait_ready(spec, self.cfg.start_timeout):
@@ -514,7 +516,8 @@ class DemoManager:
             self.entries[info.sid] = entry
             self.ip_index[info.ip_tag] = info.sid
             try:
-                await self.broker.open_session(info.sid, spec.run_dir, entry.usage, session_dir / "usage.json")
+                await self.broker.open_session(info.sid, spec.run_dir, entry.usage, session_dir / "usage.json",
+                                               entry.ip_tag)
             except Exception as exc:  # noqa: BLE001
                 log.error("adopted %s but its provider socket failed: %s", info.name, exc)
                 await self._destroy(entry, "adopt_failed")

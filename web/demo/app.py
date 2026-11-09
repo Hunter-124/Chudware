@@ -213,7 +213,8 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
     if broker is None:
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
         cfg.state_dir.chmod(0o700)
-        broker = ProviderBroker(cfg, budget_path=cfg.state_dir / "ai-budget.json", clock=clock)
+        broker = ProviderBroker(cfg, budget_path=cfg.state_dir / "ai-budget.json",
+                                claude_path=cfg.state_dir / "claude-spend.json", clock=clock)
     runtime = runtime or PodmanRuntime(cfg)
     kwargs: dict[str, Any] = {"clock": clock, "capacity_probe": capacity_probe}
     if port_free is not None:

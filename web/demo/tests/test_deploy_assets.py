@@ -18,13 +18,15 @@ def test_example_env_has_no_secret_values_and_only_known_names():
         stripped = line.lstrip("# ").strip()
         match = re.fullmatch(r"(CHUDWARE_DEMO_[A-Z_]+)=(.*)", stripped)
         if not line.startswith("#") and match:
-            if match.group(1) in ("CHUDWARE_DEMO_OPENROUTER_KEY", "CHUDWARE_DEMO_COOKIE_KEY"):
+            if match.group(1) in ("CHUDWARE_DEMO_OPENROUTER_KEY", "CHUDWARE_DEMO_ANTHROPIC_KEY",
+                                  "CHUDWARE_DEMO_COOKIE_KEY"):
                 assert match.group(2) == "", line                  # secrets are never in the repository
-    assert not re.search(r"sk-or-|ghp_|BEGIN [A-Z ]*PRIVATE", text)
-    # Every documented name is one the config actually reads.
+    assert not re.search(r"sk-or-|sk-ant-|ghp_|BEGIN [A-Z ]*PRIVATE", text)
+    # Every documented name is one the config actually reads (the keys are read verbatim).
     source = (DEMO / "config.py").read_text()
     for name in set(re.findall(r"CHUDWARE_DEMO_([A-Z_]+)=", text)):
-        assert re.search(rf"""["']{name}["']""", source) or name == "OPENROUTER_KEY", name
+        assert (re.search(rf"""["']{name}["']""", source)
+                or f'"CHUDWARE_DEMO_{name}"' in source), name
     # The shipped defaults are what the code documents.
     cfg = DemoConfig.from_env({})
     assert cfg.ai_max_requests == 15 and cfg.ai_daily_requests == 45
@@ -37,7 +39,7 @@ def test_user_unit_binds_loopback_only_and_reads_the_root_owned_env_file():
     assert "EnvironmentFile=/etc/chudware-demo/demo.env" in unit
     # newuidmap is setuid: NoNewPrivileges would break rootless podman.
     assert not re.search(r"^NoNewPrivileges=yes", unit, re.MULTILINE)
-    assert "OPENROUTER" not in unit and not re.search(r"sk-or-", unit)
+    assert "OPENROUTER" not in unit and "ANTHROPIC" not in unit and not re.search(r"sk-or-|sk-ant-", unit)
 
 
 def test_egress_ruleset_blocks_lan_tailnet_and_link_local_for_the_demo_user_only():

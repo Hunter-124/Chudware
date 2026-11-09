@@ -45,7 +45,7 @@ size; omit `--depth 1` for the repository's complete development history.
   a single-operator container has **no provider credential route**: online Copilot stays
   unavailable there because provider keys are never passed into a cell. The one exception is
   the [public demo mode](#public-demo-mode), whose throwaway containers reach only a fixed,
-  quota-limited free-model lane.
+  quota-limited lane of free OpenRouter models and capped Claude models.
 
 - A current browser with WebAssembly, WebGL2 and cross-origin-isolated shared memory
   (`SharedArrayBuffer`). Localhost HTTP is a secure-context exception; ordinary

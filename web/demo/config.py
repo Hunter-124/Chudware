@@ -32,6 +32,44 @@ DEFAULT_PUBLIC_HOSTS = ("app.chudware.com", "localhost", "127.0.0.1")
 # from the container; LAN egress is blocked by deploy/egress.nft, not by pasta.
 DEFAULT_PASTA_OPTIONS: tuple[str, ...] = ()
 DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
+
+
+@dataclass(frozen=True)
+class ClaudePrice:
+    """USD per million tokens (platform.claude.com pricing, 2026-11)."""
+
+    input: float
+    cache_write_5m: float
+    cache_write_1h: float
+    cache_read: float
+    output: float
+
+
+@dataclass(frozen=True)
+class ClaudeModel:
+    name: str
+    # Advertised to OMP as the context window, so compaction keeps every request inside it.
+    context: int
+    price: ClaudePrice
+    # A cheaper card up to ``tier_tokens`` prompt tokens (input + cache read + cache write).
+    tier_tokens: int | None = None
+    tier_price: ClaudePrice | None = None
+
+
+# The only Claude models the demo may serve: the 5.5 generation of Opus, Sonnet and Haiku.
+# Fable and Mythos are deliberately absent; config refuses any id not listed here.
+CLAUDE_MODELS: dict[str, ClaudeModel] = {
+    "claude-sonnet-5-5": ClaudeModel("Claude Sonnet 5.5", 200_000,
+                                     ClaudePrice(2.0, 2.5, 4.0, 0.10, 10.0)),
+    "claude-opus-5-5": ClaudeModel("Claude Opus 5.5", 200_000,
+                                   ClaudePrice(4.0, 5.0, 8.0, 0.20, 20.0)),
+    "claude-haiku-5-5": ClaudeModel("Claude Haiku 5.5", 200_000,
+                                    ClaudePrice(0.50, 0.625, 1.0, 0.05, 2.50),
+                                    tier_tokens=100_000,
+                                    tier_price=ClaudePrice(0.10, 0.125, 0.20, 0.01, 0.50)),
+}
+DEFAULT_CLAUDE_MODELS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5")
 
 _MODEL_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)*:free\Z")
 _SIZE_RE = re.compile(r"[1-9][0-9]*[kmg]\Z")
@@ -109,6 +147,17 @@ class DemoConfig:
     ai_models_cache_seconds: int = 600
     ai_max_output_tokens: int = 16_384
     ai_max_body_bytes: int = 4 * MIB
+    # Claude (owner's Claude API key, paid from its monthly credits). Spend caps in USD,
+    # enforced before forwarding: per session, per client network per UTC day, all
+    # sessions per UTC day, all sessions per UTC calendar month.
+    anthropic_key: str = field(default="", repr=False)
+    anthropic_base: str = DEFAULT_ANTHROPIC_BASE
+    claude_models: tuple[str, ...] = DEFAULT_CLAUDE_MODELS
+    claude_session_usd: float = 10.0
+    claude_client_daily_usd: float = 10.0
+    claude_daily_usd: float = 30.0
+    claude_monthly_usd: float = 99.0
+    claude_max_output_tokens: int = 32_000
 
     # -- containers --------------------------------------------------------
     image: str = f"{DEFAULT_IMAGE_REPO}:edge"
@@ -141,9 +190,19 @@ class DemoConfig:
                 raise ConfigError(
                     f"CHUDWARE_DEMO_AI_MODELS entry {model!r} is not a free OpenRouter model "
                     "(it must be <vendor>/<name>:free)")
+        for model in self.claude_models:
+            if model not in CLAUDE_MODELS:
+                raise ConfigError(
+                    f"CHUDWARE_DEMO_CLAUDE_MODELS entry {model!r} is not allowed "
+                    f"(only {', '.join(CLAUDE_MODELS)})")
+        for name in ("claude_session_usd", "claude_client_daily_usd", "claude_daily_usd",
+                     "claude_monthly_usd"):
+            if not getattr(self, name) > 0:
+                raise ConfigError(f"{name} must be a positive amount")
         for name in ("max_active", "max_queue", "idle_seconds", "hard_seconds", "warn_seconds",
                      "queue_poll_timeout", "start_timeout", "join_limit", "join_window",
                      "ai_max_requests", "ai_max_tokens", "ai_max_output_tokens", "ai_daily_requests",
+                     "claude_max_output_tokens",
                      "ai_models_cache_seconds",
                      "ai_max_body_bytes", "pids_limit", "port_count", "max_request_bytes",
                      "ws_max_message_bytes", "cookie_max_age"):
@@ -183,6 +242,10 @@ class DemoConfig:
     def ai_enabled(self) -> bool:
         return bool(self.openrouter_key)
 
+    @property
+    def claude_enabled(self) -> bool:
+        return bool(self.anthropic_key and self.claude_models)
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "DemoConfig":
         env = os.environ if environ is None else environ
@@ -196,6 +259,13 @@ class DemoConfig:
                 return int(raw) if raw else default
             except ValueError:
                 raise ConfigError(f"CHUDWARE_DEMO_{name} must be an integer") from None
+
+        def usd(name: str, default: float) -> float:
+            raw = get(name)
+            try:
+                return float(raw) if raw else default
+            except ValueError:
+                raise ConfigError(f"CHUDWARE_DEMO_{name} must be a number") from None
 
         tag = get("IMAGE_TAG", "edge")
         if not _TAG_RE.fullmatch(tag):
@@ -223,6 +293,14 @@ class DemoConfig:
             ai_max_tokens=num("AI_MAX_TOKENS", 200_000),
             ai_daily_requests=num("AI_DAILY_REQUESTS", 45),
             ai_max_output_tokens=num("AI_MAX_OUTPUT_TOKENS", 16_384),
+            anthropic_key=env.get("CHUDWARE_DEMO_ANTHROPIC_KEY", "").strip(),
+            anthropic_base=get("ANTHROPIC_BASE", DEFAULT_ANTHROPIC_BASE).rstrip("/"),
+            claude_models=_csv(get("CLAUDE_MODELS")) if get("CLAUDE_MODELS") else DEFAULT_CLAUDE_MODELS,
+            claude_session_usd=usd("CLAUDE_SESSION_USD", 10.0),
+            claude_client_daily_usd=usd("CLAUDE_CLIENT_DAILY_USD", 10.0),
+            claude_daily_usd=usd("CLAUDE_DAILY_USD", 30.0),
+            claude_monthly_usd=usd("CLAUDE_MONTHLY_USD", 99.0),
+            claude_max_output_tokens=num("CLAUDE_MAX_OUTPUT_TOKENS", 32_000),
             image=f"{get('IMAGE_REPO', DEFAULT_IMAGE_REPO)}:{tag}",
             podman_bin=get("PODMAN_BIN", "podman"),
             session_root=Path(get("SESSION_ROOT")) if get("SESSION_ROOT") else default_session_root(env),

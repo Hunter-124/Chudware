@@ -94,20 +94,27 @@ class FakeRuntime:
 
 
 class FakeBroker:
-    def __init__(self, remaining: int | None = 45) -> None:
+    def __init__(self, remaining: int | None = 45, claude: bool = False) -> None:
         self.remaining = remaining
+        self.claude = claude
         self.opened: dict[str, tuple[Path, Any]] = {}
+        self.clients: dict[str, str] = {}
         self.closed: list[str] = []
 
-    async def open_session(self, sid: str, run_dir: Path, usage: Any, usage_path: Path | None = None) -> None:
+    async def open_session(self, sid: str, run_dir: Path, usage: Any, usage_path: Path | None = None,
+                           client: str = "") -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
         self.opened[sid] = (run_dir, usage)
+        self.clients[sid] = client
 
     async def close_session(self, sid: str) -> None:
         self.closed.append(sid)
 
     def ai_remaining_today(self) -> int | None:
         return self.remaining
+
+    def claude_available(self) -> bool:
+        return self.claude
 
     async def aclose(self) -> None:
         pass

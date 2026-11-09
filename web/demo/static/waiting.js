@@ -55,10 +55,14 @@
     $('load').textContent = s.state === 'queued' || s.state === 'starting'
       ? s.active_sessions + ' of ' + s.max_sessions + ' sessions running, ' + s.queue_length + ' waiting'
       : '';
-    if (s.ai_remaining_today === null || s.ai_remaining_today === undefined) {
-      $('ai').textContent = 'AI is not enabled on this server right now.';
+    const free = s.ai_remaining_today === null || s.ai_remaining_today === undefined
+      ? '' : s.ai_remaining_today + ' free AI requests are left today.';
+    if (s.claude_available) {
+      $('ai').textContent = 'Claude Opus, Sonnet and Haiku 5.5 are available, with a per-visitor limit. ' + free;
+    } else if (free) {
+      $('ai').textContent = free;
     } else {
-      $('ai').textContent = s.ai_remaining_today + ' free AI requests are left today.';
+      $('ai').textContent = 'AI is not enabled on this server right now.';
     }
     if (s.state === 'queued') {
       show('queue');

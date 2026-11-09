@@ -180,7 +180,7 @@ def test_session_token_quota_uses_reported_usage_and_persists(tmp_path):
         assert (await post(lane, chat())).status_code == 200      # 15 < 20 before it ran: allowed
         refused = await post(lane, chat())                        # 30 >= 20
         assert refused.status_code == 429 and error_code(refused) == "demo_quota_exhausted"
-        assert json.loads(usage_path.read_text()) == {"requests": 2, "tokens": 30}
+        assert json.loads(usage_path.read_text()) == {"requests": 2, "tokens": 30, "claude_micros": 0}
         assert Usage.load(usage_path) == Usage(2, 30)
         assert (usage_path.stat().st_mode & 0o777) == 0o600
         await client.aclose()

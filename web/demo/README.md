@@ -15,7 +15,7 @@ stranger.
               podman container        podman container        podman container     (max 3 at once)
               (gateway + engine)      │  /run/chudware-demo/provider.sock  ◄── one unix socket per session
                                       ▼                                        served by the front door
-                                  OpenRouter (free models only), owner key held only by the front door
+                                  OpenRouter (free models) · Anthropic (Claude), owner keys held only by the front door
 ```
 
 * **Queue.** At most 3 sessions run at once; everyone else waits in a FIFO queue with a
@@ -25,8 +25,9 @@ stranger.
   and **all** of its data are destroyed (tmpfs only; nothing is ever written to disk).
 * **Isolation.** Every session is its own rootless podman container running as a dedicated
   host user whose network egress is firewalled away from the LAN/tailnet (below).
-* **AI.** Only free OpenRouter models, through a per-session unix socket. The owner's key is
-  read by the front door alone and never enters a container.
+* **AI.** Free OpenRouter models plus Claude Opus/Sonnet/Haiku 5.5 on the owner's Claude API
+  key, through a per-session unix socket. Both keys are read by the front door alone and
+  never enter a container.
 * **No accounts.** An anonymous signed cookie names the queue entry / session.
 
 ## Behaviour
@@ -57,13 +58,15 @@ Proxied to an **admitted** visitor's container only: `/app`, `/app/*`, `/engine`
 {"state":"queued|starting|active|expired|none","position":int|null,"queue_length":int,
  "eta_seconds":int|null,"idle_expires_at":epoch|null,"hard_expires_at":epoch|null,"warn":bool,
  "note":null|"capacity"|"idle"|"hard_limit"|"ended"|"queue_timeout"|"start_failed"|"container_exited"|"shutdown",
- "active_sessions":int,"max_sessions":int,"ai_remaining_today":int|null}
+ "active_sessions":int,"max_sessions":int,"ai_remaining_today":int|null,"claude_available":bool}
 ```
 
 The first seven keys are the cross-slice contract. Additions: `note` (why a session ended,
 or `capacity` while the host is full), the session counts, `ai_remaining_today` (`null` when
-no key is configured) and the state `none`, returned only to a caller without a valid cookie
-(an in-app caller whose session no longer exists gets `expired`). `?wait=N` (clamped to 25)
+no OpenRouter key is configured), `claude_available` (true when a Claude key is configured
+and neither the daily nor the monthly USD budget is spent) and the state `none`, returned
+only to a caller without a valid cookie (an in-app caller whose session no longer exists
+gets `expired`). `?wait=N` (clamped to 25)
 holds the request until the state or position changes. `warn` is true when either the hard
 or the idle deadline is ≤ 5 minutes away. `eta_seconds` is a rough estimate: current
 occupants free their slot at min(hard, idle) expiry; visitors ahead are assumed to hold one
@@ -74,8 +77,9 @@ Mutating routes require POST and refuse a cross-origin `Origin`. The session coo
 
 ## AI lane
 
-Per session the front door serves an OpenAI-compatible endpoint on
-`<session dir>/run/provider.sock`, mounted at `/run/chudware-demo/provider.sock` (socket mode
+Per session the front door serves an OpenAI-compatible endpoint (free models) and a native
+Claude Messages endpoint on `<session dir>/run/provider.sock`, mounted at
+`/run/chudware-demo/provider.sock` (socket mode
 0666 in a 0711 directory: the container user can connect, never write). The socket **is** the
 identity.
 
@@ -90,6 +94,12 @@ identity.
 | Forwarding | `models`, `route`, `provider`, `plugins`, `transforms`, `preset`, `web_search_options` are stripped (they could route to a paid model or add paid plugins); output is capped at 16 384 tokens per request; streams get `include_usage`. |
 | Logging | Per request: session id prefix, model, and counters. Never prompts, completions or the key. |
 | Retries | Deterministic refusals (`model_not_allowed`, `demo_quota_exhausted`, `demo_ai_daily_limit`, `ai_unavailable`, `invalid_request`, `request_too_large`) carry `x-should-retry: false`, which OMP's transport honours; without it a 429 is re-POSTed five times. The transient `demo_ai_rate_limited` does not. |
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Native Claude Messages API, Claude models only; streaming allowed. The front door adds the owner's key (`CHUDWARE_DEMO_ANTHROPIC_KEY`, base `CHUDWARE_DEMO_ANTHROPIC_BASE`). `/v1/models` lists the Claude rows first, then the free rows. |
+| Claude allowlist | `CHUDWARE_DEMO_CLAUDE_MODELS`, default and maximum exactly `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-5-5`; any other id (Fable, Mythos, …) is refused at config and with `403 model_not_allowed`. |
+| Claude USD caps | Per session $10 (`CHUDWARE_DEMO_CLAUDE_SESSION_USD`), per client network per UTC day $10 (`…_CLIENT_DAILY_USD`), all sessions per UTC day $30 (`…_DAILY_USD`), per UTC calendar month $99 (`…_MONTHLY_USD`). A request is admitted only if each total plus its advance charge stays within its cap. Session and client caps → `429 demo_quota_exhausted`; daily and monthly → `429 demo_ai_daily_limit`. Errors use `{"type":"error","error":{"type":<code>,"message":…}}`. |
+| Claude charging | Every turn is first counted with the (free) upstream `count_tokens`; the advance charge is that count at the dearest input rate (1 h cache write) plus the full `max_tokens` at the output rate. It is settled from the reported usage, including cache read/write pricing and the `iterations` of server-side work; Haiku 5.5 is billed $0.10 in / $0.50 out per MTok for prompts up to 100k tokens and $0.50 / $2.50 above. A stream cut before its final usage, or a read timeout after the request was sent, keeps the advance charge; only a connection that never opened is refunded. A correction settled after midnight (or month end) never lowers the newer period. The ledger persists at `state_dir/claude-spend.json`. |
+| Claude forwarding | Only the fields of a plain turn are forwarded (`model`, `messages`, `system`, `max_tokens`, `stop_sequences`, `stream`, `temperature`, `top_p`, `top_k`, `tools`, `tool_choice`, `thinking`, `metadata`, `output_config`, `cache_control`, and `context_management` with `clear_*` edits only), so server compaction, fallbacks, MCP servers, containers, priority tier, fast mode and inference geo never reach the API. Server tools (tool `type` other than `custom`) are dropped. Image and document blocks must be inline (`base64`, `text` or `content` sources, at any nesting): a URL or file-id source could be small when counted and large when billed, so it is refused with `400 invalid_request`. `anthropic-beta` keeps only allowlisted families (interleaved thinking, fine-grained tool streaming, effort, context management, structured outputs, extended cache TTL, mid-conversation system/output-config/tool changes, prompt-caching scope, thinking controls and token count, task budgets). `max_tokens` is capped at 32 000 (`CHUDWARE_DEMO_CLAUDE_MAX_OUTPUT_TOKENS`) and a thinking budget is clamped below it. |
+| Claude errors | An upstream 429 → `429 demo_ai_rate_limited` with the upstream `Retry-After`. 401/403, or a 400 mentioning a credit balance → `503 ai_unavailable` (logged, not shown). No Claude key: `503 ai_unavailable`. |
 
 ## Session container flags
 
@@ -173,7 +183,9 @@ own venv from `web/gateway/requirements.txt`: no new dependencies); creates
 `chudware-demo`, fresh cookie key); installs and enables the user unit; pulls the session
 image as that user; starts the service. Then:
 
-1. Put the key in `/etc/chudware-demo/demo.env` (`CHUDWARE_DEMO_OPENROUTER_KEY=…`) and
+1. Put the keys in `/etc/chudware-demo/demo.env` (`CHUDWARE_DEMO_OPENROUTER_KEY=…`,
+   `CHUDWARE_DEMO_ANTHROPIC_KEY=…`; for Claude use a key from a dedicated Claude Console
+   workspace with a monthly spend limit set, as a hard backstop behind the USD caps) and
    `sudo systemctl --machine=chudware-demo@.host --user restart chudware-demo.service`.
 2. Point the existing tunnel (`app.chudware.com`) at `http://127.0.0.1:8300`.
 

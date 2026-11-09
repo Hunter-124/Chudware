@@ -1,4 +1,4 @@
-"""The public-demo free-model lane: when it exists, what it lists, what it never accepts."""
+"""The public-demo model lane (free models and Claude): when it exists, what it lists, what it never accepts."""
 from __future__ import annotations
 
 import json
@@ -20,6 +20,18 @@ LISTING = {"object": "list", "data": [
      "architecture": {"input_modalities": ["text", "image"]}},
     {"id": "example/model-b:free"},
 ]}
+
+# The front door's Claude row, exactly as ProviderBroker._claude_entry shapes it.
+CLAUDE_ROW = {
+    "id": "claude-sonnet-5-5", "object": "model", "created": 0, "owned_by": "anthropic",
+    "name": "Claude Sonnet 5.5", "context_length": 200000,
+    "top_provider": {"context_length": 200000, "max_completion_tokens": 32000},
+    "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
+    "supported_parameters": ["tools", "tool_choice", "max_tokens", "reasoning"],
+    "pricing": {"prompt": "0.000002", "completion": "0.00001",
+                "input_cache_read": "0.0000001", "input_cache_write": "0.0000025"},
+}
+MIXED_LISTING = {"object": "list", "data": [CLAUDE_ROW, *LISTING["data"]]}
 
 
 @pytest.fixture
@@ -108,7 +120,7 @@ def test_models_are_exactly_what_the_lane_lists_in_its_order(lane):
 
 def test_no_model_id_is_built_into_the_lane_module():
     source = Path(demo_lane.__file__).read_text(encoding="utf-8")
-    assert ":free" not in source
+    assert ":free" not in source and "claude" not in source.lower()
 
 
 def test_model_list_is_cached_briefly_and_refresh_bypasses_it(lane):
@@ -186,6 +198,8 @@ def test_omp_config_points_openrouter_at_the_loopback_lane_with_a_placeholder_ke
     assert provider["baseUrl"] == "http://127.0.0.1:18081/v1"
     assert provider["apiKey"] == demo_lane.PLACEHOLDER_KEY == "chudware-demo-lane"
     assert provider["api"] == "openai-completions"
+    assert provider["auth"] == "apiKey"
+    assert all("api" not in m and "baseUrl" not in m for m in provider["models"])
     first, second = provider["models"]
     assert first["id"] == "example/model-a:free"
     assert (first["contextWindow"], first["maxTokens"]) == (65536, 8192)
@@ -203,9 +217,52 @@ def test_omp_config_without_a_model_list_still_reaches_only_the_lane():
     assert demo_lane.models_config([])["providers"]["openrouter"].get("models") is None
 
 
+def test_a_claude_row_carries_its_api_family_and_per_million_token_cost():
+    claude, free, _ = demo_lane.parse_models(MIXED_LISTING)
+    assert claude["id"] == "claude-sonnet-5-5" and claude["api"] == "anthropic-messages"
+    assert claude["provider"] == "openrouter" and claude["name"] == "Claude Sonnet 5.5"
+    assert (claude["contextWindow"], claude["maxTokens"]) == (200000, 32000)
+    assert claude["input"] == ["text", "image"]
+    assert claude["cost"] == {"input": 2.0, "output": 10.0, "cacheRead": 0.1, "cacheWrite": 2.5}
+    assert "api" not in free and free["cost"] == {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+
+
+def test_omp_config_routes_a_claude_row_through_the_lane_root_and_keeps_free_rows_on_chat_completions():
+    config = demo_lane.models_config(demo_lane.parse_models(MIXED_LISTING))
+    provider = config["providers"]["openrouter"]
+    assert provider["api"] == "openai-completions" and provider["baseUrl"] == "http://127.0.0.1:18081/v1"
+    assert provider["auth"] == "apiKey" and provider["apiKey"] == demo_lane.PLACEHOLDER_KEY
+    claude, free, _ = provider["models"]
+    assert claude["api"] == "anthropic-messages" and claude["baseUrl"] == "http://127.0.0.1:18081"
+    assert claude["baseUrl"] == demo_lane.LANE_ROOT
+    assert claude["cost"] == {"input": 2.0, "output": 10.0, "cacheRead": 0.1, "cacheWrite": 2.5}
+    assert (claude["contextWindow"], claude["maxTokens"]) == (200000, 32000)
+    assert claude["input"] == ["text", "image"]
+    assert "api" not in free and "baseUrl" not in free
+    assert free["cost"] == {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    assert json.loads(json.dumps(config)) == config
+
+
+@pytest.mark.parametrize("pricing", [
+    None, [], "free", {"prompt": "abc", "completion": None, "input_cache_read": [], "input_cache_write": {}},
+    {"prompt": "-0.000002", "completion": "-1", "input_cache_read": "NaN", "input_cache_write": "Infinity"},
+    {"prompt": "1e999999999", "completion": "1e400", "input_cache_read": True, "input_cache_write": ""},
+])
+def test_garbage_pricing_falls_back_to_zero_per_field(pricing):
+    row = demo_lane.parse_models({"data": [{**CLAUDE_ROW, "pricing": pricing}]})[0]
+    assert row["cost"] == {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+
+
+def test_one_bad_price_does_not_discard_the_good_ones():
+    pricing = {"prompt": 0.000003, "completion": "oops", "input_cache_read": "0.0000003"}
+    row = demo_lane.parse_models({"data": [{**CLAUDE_ROW, "pricing": pricing}]})[0]
+    assert row["cost"] == {"input": 3.0, "output": 0, "cacheRead": 0.3, "cacheWrite": 0}
+
+
 def test_the_only_endpoint_in_the_module_is_the_fixed_loopback_lane():
     source = Path(demo_lane.__file__).read_text(encoding="utf-8")
     assert "openrouter.ai" not in source and "https://" not in source
+    assert demo_lane.LANE_ROOT == "http://127.0.0.1:18081"
     assert demo_lane.LANE_BASE_URL == "http://127.0.0.1:18081/v1"
     assert demo_lane.LANE_SOCKET == "/run/chudware-demo/provider.sock"
 
@@ -246,7 +303,7 @@ def test_pinning_needs_a_live_nonempty_lane(lane):
 
 def test_providers_panel_has_one_ready_row_with_nothing_to_sign_in_to():
     row = demo_lane.provider_descriptor(4)
-    assert row["id"] == "openrouter" and row["name"] == "Free demo models"
+    assert row["id"] == "openrouter" and row["name"] == "Demo models"
     assert row["authenticated"] is True and row["available"] is True and row["authKinds"] == []
     assert row["modelsAvailable"] == 4
     assert demo_lane.provider_descriptor(0)["available"] is False
@@ -310,3 +367,26 @@ def test_only_a_retry_start_frame_is_inspected():
     snake = {"type": "auto_retry_start", "error_message": _error("demo_quota_exhausted", "Done.")}
     assert demo_lane.frame_quota_message(snake) == "Done."
     assert demo_lane.frame_quota_message({"type": "auto_retry_start", "errorMessage": "503 busy"}) is None
+
+
+def _claude_error(code, message="Message from the front door."):
+    return "429 " + json.dumps({"type": "error", "error": {"type": code, "message": message}})
+
+
+@pytest.mark.parametrize("code", ["demo_ai_daily_limit", "demo_quota_exhausted"])
+def test_a_claude_shaped_refusal_surfaces_the_lanes_own_message(code):
+    assert demo_lane.quota_message(_claude_error(code, "Today's AI budget is spent.")) == (
+        "Today's AI budget is spent.")
+    frame = {"type": "auto_retry_start", "errorMessage": _claude_error(code, "Used up.")}
+    assert demo_lane.frame_quota_message(frame) == "Used up."
+
+
+@pytest.mark.parametrize("code", ["demo_ai_daily_limit", "demo_quota_exhausted"])
+def test_a_claude_shaped_refusal_without_a_message_still_reads_as_a_sentence(code):
+    message = demo_lane.quota_message('429 {"type":"error","error":{"type":"%s"}}' % code)
+    assert message and code not in message and message.endswith(".")
+
+
+@pytest.mark.parametrize("code", ["demo_ai_rate_limited", "ai_unavailable", "model_not_allowed"])
+def test_other_claude_refusals_are_not_quota_refusals(code):
+    assert demo_lane.quota_message(_claude_error(code)) is None

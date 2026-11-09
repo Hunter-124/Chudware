@@ -2510,7 +2510,7 @@ def _omp_models_list(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": "omp_models_list has unknown params"}
     if in_cell():
         # Cells have no provider credential route, so no model is usable there. A demo
-        # container's free-model lane is the one exception: exactly what its front door allows.
+        # container's demo model lane is the one exception: exactly what its front door allows.
         if not demo_lane.enabled():
             return {"ok": True, "models": [], "refreshing": False}
         provider_id = _bounded_identity(params.get("providerId"), 128)
@@ -3484,14 +3484,14 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         except (KeyError, TypeError):
             return {"ok": False, "reason": "not_found", "code": "not_found"}
         # Provider key bytes never enter a cell. The only online route is a demo container's
-        # free-model lane, which takes no caller key or endpoint and no model outside its list.
+        # demo model lane, which takes no caller key or endpoint and no model outside its list.
         if not demo_lane.enabled() or any(key in raw_params for key in ("api_key", "byok_key", "base_url")):
             return {"ok": False, "reason": "credential_isolation_unsupported",
                     "code": "credential_isolation_unsupported"}
         try:
             raw_params = demo_lane.pin_model(raw_params)
         except ValueError:
-            return {"ok": False, "reason": "Free demo models only: choose a model from the list.",
+            return {"ok": False, "reason": "Demo models only: choose a model from the list.",
                     "code": demo_lane.MODEL_REFUSAL}
         except demo_lane.LaneError as exc:
             return {"ok": False, "reason": str(exc)}

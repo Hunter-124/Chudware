@@ -132,8 +132,8 @@ inline bool buildControlFrame(const std::string& token,
                               const std::string& action,
                               const nlohmann::json& params,
                               std::string& frame, std::string& err) {
-    if (action != "cancel" && action != "steer" && action != "answer" &&
-        action != "status" && action != "apply_compaction_policy") {
+    if (action != "cancel" && action != "steer" && action != "withdraw_steer" &&
+        action != "answer" && action != "status" && action != "apply_compaction_policy") {
         err = "unsupported worker control action";
         return false;
     }

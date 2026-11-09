@@ -193,7 +193,8 @@ bool is_degenerate_patch(const TopoDS_Face& face) {
 }
 
 void keep_degenerate_patches(ShapeUpgrade_UnifySameDomain& unify, const TopoDS_Shape& input) {
-    // OCCT 7.9 (through 7.9.3 as packaged by Fedora) evaluates every boundary pcurve of a
+    // Upstream added a null-pcurve check in 7.9.3, but Fedora's 7.9.3-2 package does not carry
+    // it: keep this guard. OCCT 7.9 (through 7.9.3 as packaged by Fedora) evaluates every boundary pcurve of a
     // merge on the reference face (ComputeMinEdgeSize) without a null check. A degenerated
     // edge of another face in the merge has no pcurve there: a non-planar reference skips
     // degenerated edges when transforming pcurves, and a planar reference derives pcurves

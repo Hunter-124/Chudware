@@ -7,6 +7,8 @@ NATIVE FORMAT — Chudware's native, editable file is .step+. It stores the WHOL
 tree plus its simulation studies (and any 2D drawings) in one container the app reopens fully
 editable. Save deliverables as .step+ so the user keeps an editable part; a plain STEP/STL is a
 flattened export (geometry only — no feature history, no studies).
+Do not read inside a .step+ with path syntax (file.step+:inner); use doc_open / doc_tree /
+doc_query, or copy it to *.zip first.
 
 PICK THE RIGHT FEATURE — model like a person would, with standard editable features. Do NOT
 approximate a curved or organic body with a stack of boxes.

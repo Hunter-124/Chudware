@@ -20265,7 +20265,8 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
             if (!unknown.empty()) {
                 json available = json::array();
                 for (const auto& member : members) available.push_back(member.first);
-                throw OpError("unknown_member", "Interference scope contains unknown member names",
+                throw OpError("unknown_member", "Interference scope contains unknown member names " +
+                                                unknown.dump() + "; valid members: " + available.dump(),
                               {{"unknown", unknown}, {"available", available}});
             }
             scope["kind"] = "members";

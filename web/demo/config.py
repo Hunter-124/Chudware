@@ -32,6 +32,13 @@ DEFAULT_PUBLIC_HOSTS = ("app.chudware.com", "localhost", "127.0.0.1")
 # from the container; LAN egress is blocked by deploy/egress.nft, not by pasta.
 DEFAULT_PASTA_OPTIONS: tuple[str, ...] = ()
 DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+# Free OpenRouter models that NVIDIA's own API also serves, under NVIDIA's id. With an NVIDIA
+# key the lane serves these from NVIDIA instead (no daily cap there, only a per-minute rate).
+NVIDIA_MODELS: dict[str, str] = {
+    "nvidia/nemotron-3-ultra-550b-a55b:free": "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/nemotron-3.5-super-vl:free": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+}
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
 
 
@@ -139,11 +146,10 @@ class DemoConfig:
     openrouter_key: str = field(default="", repr=False)
     openrouter_base: str = DEFAULT_OPENROUTER_BASE
     ai_models: tuple[str, ...] = DEFAULT_MODELS
-    ai_max_requests: int = 15
-    ai_max_tokens: int = 200_000
-    # The owner's key is on OpenRouter's free tier (~50 free-model requests/day for the
-    # whole account), so one budget is shared by every session, reset 00:00 UTC.
-    ai_daily_requests: int = 45
+    # Free models carry no demo quota. OpenRouter's own account allowance (50 free-model
+    # requests per UTC day without purchased credits) still applies to the models it serves.
+    nvidia_key: str = field(default="", repr=False)
+    nvidia_base: str = DEFAULT_NVIDIA_BASE
     ai_models_cache_seconds: int = 600
     ai_max_output_tokens: int = 16_384
     ai_max_body_bytes: int = 4 * MIB
@@ -201,7 +207,7 @@ class DemoConfig:
                 raise ConfigError(f"{name} must be a positive amount")
         for name in ("max_active", "max_queue", "idle_seconds", "hard_seconds", "warn_seconds",
                      "queue_poll_timeout", "start_timeout", "join_limit", "join_window",
-                     "ai_max_requests", "ai_max_tokens", "ai_max_output_tokens", "ai_daily_requests",
+                     "ai_max_output_tokens",
                      "claude_max_output_tokens",
                      "ai_models_cache_seconds",
                      "ai_max_body_bytes", "pids_limit", "port_count", "max_request_bytes",
@@ -240,7 +246,12 @@ class DemoConfig:
 
     @property
     def ai_enabled(self) -> bool:
-        return bool(self.openrouter_key)
+        """Some free model is routable: through OpenRouter, or NVIDIA for the models it serves."""
+        return bool(self.openrouter_key or (self.nvidia_key and set(self.ai_models) & set(NVIDIA_MODELS)))
+
+    @property
+    def nvidia_enabled(self) -> bool:
+        return bool(self.nvidia_key)
 
     @property
     def claude_enabled(self) -> bool:
@@ -289,9 +300,8 @@ class DemoConfig:
             openrouter_key=env.get("CHUDWARE_DEMO_OPENROUTER_KEY", "").strip(),
             openrouter_base=get("OPENROUTER_BASE", DEFAULT_OPENROUTER_BASE).rstrip("/"),
             ai_models=_csv(get("AI_MODELS")) or DEFAULT_MODELS,
-            ai_max_requests=num("AI_MAX_REQUESTS", 15),
-            ai_max_tokens=num("AI_MAX_TOKENS", 200_000),
-            ai_daily_requests=num("AI_DAILY_REQUESTS", 45),
+            nvidia_key=env.get("CHUDWARE_DEMO_NVIDIA_KEY", "").strip(),
+            nvidia_base=get("NVIDIA_BASE", DEFAULT_NVIDIA_BASE).rstrip("/"),
             ai_max_output_tokens=num("AI_MAX_OUTPUT_TOKENS", 16_384),
             anthropic_key=env.get("CHUDWARE_DEMO_ANTHROPIC_KEY", "").strip(),
             anthropic_base=get("ANTHROPIC_BASE", DEFAULT_ANTHROPIC_BASE).rstrip("/"),

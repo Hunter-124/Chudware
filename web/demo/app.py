@@ -201,13 +201,14 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if config is None:
         config = DemoConfig.from_env()
-        # The key stays in this process only: scrub it from the environment that child
+        # The keys stay in this process only: scrub them from the environment that child
         # processes (podman, conmon) would otherwise inherit.
-        os.environ.pop("CHUDWARE_DEMO_OPENROUTER_KEY", None)
-        os.environ.pop("CHUDWARE_DEMO_COOKIE_KEY", None)
+        for name in ("OPENROUTER_KEY", "NVIDIA_KEY", "ANTHROPIC_KEY", "COOKIE_KEY"):
+            os.environ.pop("CHUDWARE_DEMO_" + name, None)
     cfg = config
     if not cfg.ai_enabled:
-        log.warning("CHUDWARE_DEMO_OPENROUTER_KEY is not set: the AI lane answers 503, the rest works")
+        log.warning("neither CHUDWARE_DEMO_OPENROUTER_KEY nor CHUDWARE_DEMO_NVIDIA_KEY is set: "
+                    "the free-model lane answers 503, the rest works")
     if not cfg.cookie_key_persistent:
         log.warning("CHUDWARE_DEMO_COOKIE_KEY is not set: sessions cannot survive a front-door restart")
     if broker is None:

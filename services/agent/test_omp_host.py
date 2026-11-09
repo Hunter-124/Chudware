@@ -5306,7 +5306,7 @@ def test_demo_keyless_opt_in_is_the_lane_provider_and_reads_no_config(demo_cell,
     from services.agent import config
 
     monkeypatch.setattr(config, "load_config", lambda: pytest.fail("a demo cell reads no user config"))
-    assert omp_host_module._keyless_provider_opt_ins() == ["openrouter", "anthropic"]
+    assert omp_host_module._keyless_provider_opt_ins() == ["openrouter", "nvidia", "anthropic"]
 
 
 def test_demo_client_state_is_actor_private_and_points_openrouter_at_the_lane(demo_cell):

@@ -62,7 +62,7 @@ def test_join_sets_a_hardened_cookie_reaches_active_and_root_redirects_to_the_ap
 def test_status_document_matches_the_contract(tmp_path):
     with front_door(tmp_path, capacity=LOW) as fd:
         stranger = fd.visitor("198.51.100.9").get("/demo/status").json()
-        assert stranger["state"] == "none" and stranger["ai_remaining_today"] == 45
+        assert stranger["state"] == "none" and stranger["free_ai_available"] is True
         visitor = fd.visitor()
         visitor.join()
         status = visitor.get("/demo/status").json()

@@ -58,12 +58,13 @@ Proxied to an **admitted** visitor's container only: `/app`, `/app/*`, `/engine`
 {"state":"queued|starting|active|expired|none","position":int|null,"queue_length":int,
  "eta_seconds":int|null,"idle_expires_at":epoch|null,"hard_expires_at":epoch|null,"warn":bool,
  "note":null|"capacity"|"idle"|"hard_limit"|"ended"|"queue_timeout"|"start_failed"|"container_exited"|"shutdown",
- "active_sessions":int,"max_sessions":int,"ai_remaining_today":int|null,"claude_available":bool}
+ "active_sessions":int,"max_sessions":int,"free_ai_available":bool,"claude_available":bool}
 ```
 
 The first seven keys are the cross-slice contract. Additions: `note` (why a session ended,
-or `capacity` while the host is full), the session counts, `ai_remaining_today` (`null` when
-no OpenRouter key is configured), `claude_available` (true when a Claude key is configured
+or `capacity` while the host is full), the session counts, `free_ai_available` (true when
+some free model is routable: through NVIDIA, or through OpenRouter while its daily allowance
+is not spent), `claude_available` (true when a Claude key is configured
 and neither the daily nor the monthly USD budget is spent) and the state `none`, returned
 only to a caller without a valid cookie (an in-app caller whose session no longer exists
 gets `expired`). `?wait=N` (clamped to 25)
@@ -85,15 +86,16 @@ identity.
 
 | | |
 |---|---|
-| `GET /v1/models` | The allowlist ∩ OpenRouter's live `/models` (cached 10 min), so a retired model disappears instead of erroring. Entries carry OpenRouter's `name`, `context_length`, `top_provider`, `architecture` and `supported_parameters` when known. `?output_modalities=…` (OMP's rerank/decision discovery) answers an empty list; `/v1/images|embeddings|videos/models` are an instant local 404. Probes are never counted or forwarded. |
-| `POST /v1/chat/completions` | Streaming allowed. `model` must be allowlisted, else `403 model_not_allowed`. |
+| `GET /v1/models` | The free routes: a model NVIDIA serves (with an NVIDIA key) under NVIDIA's id, the rest ∩ OpenRouter's live `/models` (cached 10 min), so a retired OpenRouter model disappears instead of erroring. Entries carry `served_by` (`nvidia` or `openrouter`, which the app shows as the provider) and OpenRouter's `name`, `context_length`, `top_provider`, `architecture` and `supported_parameters` when known. `?output_modalities=…` (OMP's rerank/decision discovery) answers an empty list; `/v1/images|embeddings|videos/models` are an instant local 404. Probes are never counted or forwarded. |
+| `POST /v1/chat/completions` | Streaming allowed. `model` must be a listed free route, else `403 model_not_allowed`. |
+| NVIDIA | With `CHUDWARE_DEMO_NVIDIA_KEY` (free at build.nvidia.com), `nvidia/nemotron-3-ultra-550b-a55b:free` is served as `nvidia/nemotron-3-ultra-550b-a55b` and `nvidia/nemotron-3.5-super-vl:free` as `nvidia/nemotron-3.5-super-vl-120b-a12b` from `CHUDWARE_DEMO_NVIDIA_BASE` (default `https://integrate.api.nvidia.com/v1`); their OpenRouter ids are then not routes. NVIDIA's free API has no daily cap, only a per-minute rate: its 429 is `429 demo_ai_rate_limited` with `Retry-After`. |
 | Allowlist | `CHUDWARE_DEMO_AI_MODELS`; every entry must end in `:free` or the front door refuses to start. Default: `nvidia/nemotron-3-ultra-550b-a55b:free`, `nvidia/nemotron-3.5-super-vl:free`, `google/gemma-4-31b-it:free`, `cohere/north-mini-code:free`. |
-| Per-session cap | 15 requests and 200 000 total tokens (reported `usage`; a byte-length estimate when a stream ends without one) → `429 demo_quota_exhausted`. Counters survive a front-door crash. |
-| Daily cap | 45 requests across all sessions per UTC day (the owner's key is on OpenRouter's free tier, ≈ 50 free-model requests/day) → `429 demo_ai_daily_limit` ("The demo's free AI allowance for today is used up; modeling still works"). An upstream 429 that names a per-day limit exhausts the budget too; a per-minute 429 is `429 demo_ai_rate_limited` with `Retry-After`. Shown on the waiting page via `ai_remaining_today`. |
-| Key | Added by the front door; any client `Authorization`/`X-Api-Key`/cookie is dropped. A key OpenRouter refuses (401/402/403) is reported to the visitor only as `503 ai_unavailable` and logged. No key configured: `503 ai_unavailable`, the rest of the demo works. |
+| No free-model quota | Free models carry no per-session or daily demo cap. Requests and tokens are still counted per session (reported `usage`; a byte-length estimate when a stream ends without one), for the logs only. |
+| OpenRouter's daily allowance | OpenRouter allows an account without purchased credits 50 free-model requests per UTC day. Its 429 that names a per-day limit → `429 demo_ai_daily_limit` ("OpenRouter's free allowance for today is used up; …"), and the rest of that UTC day is refused locally for the OpenRouter-served models (persisted at `state_dir/ai-budget.json`); NVIDIA-served models are unaffected. A per-minute 429 is `429 demo_ai_rate_limited` with `Retry-After`. |
+| Key | Added by the front door; any client `Authorization`/`X-Api-Key`/cookie is dropped. A key OpenRouter or NVIDIA refuses (401/402/403) is reported to the visitor only as `503 ai_unavailable` and logged. No key configured: `503 ai_unavailable`, the rest of the demo works. |
 | Forwarding | `models`, `route`, `provider`, `plugins`, `transforms`, `preset`, `web_search_options` are stripped (they could route to a paid model or add paid plugins); output is capped at 16 384 tokens per request; streams get `include_usage`. |
 | Logging | Per request: session id prefix, model, and counters. Never prompts, completions or the key. |
-| Retries | Deterministic refusals (`model_not_allowed`, `demo_quota_exhausted`, `demo_ai_daily_limit`, `ai_unavailable`, `invalid_request`, `request_too_large`) carry `x-should-retry: false`, which OMP's transport honours; without it a 429 is re-POSTed five times. The transient `demo_ai_rate_limited` does not. |
+| Retries | Deterministic refusals (`model_not_allowed`, `demo_quota_exhausted` (Claude), `demo_ai_daily_limit`, `ai_unavailable`, `invalid_request`, `request_too_large`) carry `x-should-retry: false`, which OMP's transport honours; without it a 429 is re-POSTed five times. The transient `demo_ai_rate_limited` does not. |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Native Claude Messages API, Claude models only; streaming allowed. The front door adds the owner's key (`CHUDWARE_DEMO_ANTHROPIC_KEY`, base `CHUDWARE_DEMO_ANTHROPIC_BASE`). `/v1/models` lists the Claude rows first, then the free rows. |
 | Claude allowlist | `CHUDWARE_DEMO_CLAUDE_MODELS`, default and maximum exactly `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-5-5`; any other id (Fable, Mythos, …) is refused at config and with `403 model_not_allowed`. |
 | Claude USD caps | Per session $10 (`CHUDWARE_DEMO_CLAUDE_SESSION_USD`), per client network per UTC day $10 (`…_CLIENT_DAILY_USD`), all sessions per UTC day $30 (`…_DAILY_USD`), per UTC calendar month $99 (`…_MONTHLY_USD`). A request is admitted only if each total plus its advance charge stays within its cap. Session and client caps → `429 demo_quota_exhausted`; daily and monthly → `429 demo_ai_daily_limit`. Errors use `{"type":"error","error":{"type":<code>,"message":…}}`. |
@@ -223,7 +225,7 @@ B=http://127.0.0.1:8300
 sudo nft list table inet chudware_demo | head -30           # firewall loaded
 sudo systemctl --machine=chudware-demo@.host --user status chudware-demo.service
 curl -s $B/demo/health; echo                                  # {"ok":true,"active":0,"queued":0,"max":3}
-curl -s $B/demo/status; echo                                  # "state":"none", ai_remaining_today
+curl -s $B/demo/status; echo                                  # "state":"none", free_ai_available
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' $B/healthz       # 401 (not admitted)
 
 # Join, wait for admission (container start, < 60 s), use the app through the proxy.

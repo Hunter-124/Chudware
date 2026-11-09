@@ -914,10 +914,8 @@
           : 'Demo session' + (left ? ' \u2014 ' + left : '');
         if (downloadNote) text = downloadNote;
         if (msgEl.textContent !== text) msgEl.textContent = text;
-        // Free-model daily allowance (null/absent => no segment); Claude has its own caps.
-        var aiLeft = state.ai_remaining_today;
-        var aiText = (typeof aiLeft === 'number' && isFinite(aiLeft) && aiLeft >= 0 && Math.floor(aiLeft) === aiLeft)
-          ? 'Free AI requests left today: ' + aiLeft : '';
+        // Free models carry no limit; Claude has its own caps.
+        var aiText = state.free_ai_available === true ? 'Free models available' : '';
         if (state.claude_available === true) aiText = 'Claude 5.5 available' + (aiText ? ' \u00b7 ' + aiText : '');
         if (aiEl.textContent !== aiText) aiEl.textContent = aiText;
       }

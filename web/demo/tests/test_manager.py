@@ -392,7 +392,7 @@ def test_status_for_unknown_and_missing_cookie(tmp_path):
         mgr, _, _, _, _ = build(tmp_path)
         none = mgr.status(None)
         assert none["state"] == "none" and none["position"] is None and none["warn"] is False
-        assert none["ai_remaining_today"] == 45 and none["max_sessions"] == 3
+        assert none["free_ai_available"] is True and none["max_sessions"] == 3
         # A genuine cookie whose session is gone (restart without adoption, long expiry).
         assert mgr.status(sid_for(7))["state"] == "expired"
         for key in ("state", "position", "queue_length", "eta_seconds", "idle_expires_at",

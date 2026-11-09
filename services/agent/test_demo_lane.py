@@ -32,6 +32,9 @@ CLAUDE_ROW = {
                 "input_cache_read": "0.0000001", "input_cache_write": "0.0000025"},
 }
 MIXED_LISTING = {"object": "list", "data": [CLAUDE_ROW, *LISTING["data"]]}
+# A free row the front door serves from NVIDIA's API rather than OpenRouter.
+NVIDIA_ROW = {"id": "example/model-n", "object": "model", "owned_by": "example", "served_by": "nvidia",
+              "name": "Model N", "context_length": 131072}
 
 
 @pytest.fixture
@@ -213,10 +216,24 @@ def test_omp_config_points_openrouter_at_the_loopback_lane_with_a_placeholder_ke
 
 def test_omp_config_without_a_model_list_still_reaches_only_the_lane():
     providers = demo_lane.models_config(None)["providers"]
-    assert set(providers) == {"openrouter", "anthropic"}
+    assert set(providers) == {"openrouter", "nvidia", "anthropic"}
+    assert providers["nvidia"]["baseUrl"] == demo_lane.LANE_BASE_URL and "models" not in providers["nvidia"]
     assert "models" not in providers["openrouter"] and providers["openrouter"]["baseUrl"] == demo_lane.LANE_BASE_URL
     assert "models" not in providers["anthropic"] and providers["anthropic"]["baseUrl"] == demo_lane.LANE_ROOT
     assert all(p.get("models") is None for p in demo_lane.models_config([])["providers"].values())
+
+
+def test_an_nvidia_served_row_gets_the_nvidia_provider_on_chat_completions():
+    nvidia, free = demo_lane.parse_models({"data": [NVIDIA_ROW, LISTING["data"][1]]})
+    assert nvidia["provider"] == "nvidia" and free["provider"] == "openrouter"
+    config = demo_lane.models_config([nvidia, free])["providers"]
+    assert config["nvidia"]["api"] == "openai-completions" and config["nvidia"]["baseUrl"] == demo_lane.LANE_BASE_URL
+    assert config["nvidia"]["apiKey"] == demo_lane.PLACEHOLDER_KEY and config["nvidia"]["auth"] == "apiKey"
+    assert [m["id"] for m in config["nvidia"]["models"]] == ["example/model-n"]
+    assert [m["id"] for m in config["openrouter"]["models"]] == ["example/model-b:free"]
+    providers = demo_lane.provider_descriptors([nvidia, free])
+    assert [(p["id"], p["modelsAvailable"]) for p in providers] == [("openrouter", 1), ("nvidia", 1)]
+    assert providers[1]["name"] == "NVIDIA API (demo)"
 
 
 def test_omp_config_without_anthropic_rows_still_points_the_anthropic_provider_at_the_lane():
@@ -341,7 +358,7 @@ def test_providers_panel_adds_a_ready_anthropic_row_when_the_lane_serves_claude(
 
 
 def test_auth_state_is_ready_for_the_lane_and_signed_out_for_anything_else():
-    for provider_id in ("openrouter", "anthropic"):
+    for provider_id in ("openrouter", "nvidia", "anthropic"):
         ready = demo_lane.auth_state(provider_id)
         assert ready["state"] == "configured" and ready["authenticated"] is True
         assert ready["hasApiKey"] is False and ready["accounts"] == []

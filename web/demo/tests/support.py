@@ -94,8 +94,8 @@ class FakeRuntime:
 
 
 class FakeBroker:
-    def __init__(self, remaining: int | None = 45, claude: bool = False) -> None:
-        self.remaining = remaining
+    def __init__(self, free: bool = True, claude: bool = False) -> None:
+        self.free = free
         self.claude = claude
         self.opened: dict[str, tuple[Path, Any]] = {}
         self.clients: dict[str, str] = {}
@@ -110,8 +110,8 @@ class FakeBroker:
     async def close_session(self, sid: str) -> None:
         self.closed.append(sid)
 
-    def ai_remaining_today(self) -> int | None:
-        return self.remaining
+    def free_ai_available(self) -> bool:
+        return self.free
 
     def claude_available(self) -> bool:
         return self.claude

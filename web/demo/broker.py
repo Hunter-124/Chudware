@@ -1,19 +1,24 @@
-"""AI broker (free OpenRouter models and capped Claude), one unix socket per session.
+"""AI broker (free models and capped Claude), one unix socket per session.
 
 The owner's keys live only in this (host) process. A session container sees nothing but
 ``/run/chudware-demo/provider.sock``; the socket identity *is* the session, so there is
 no credential to steal inside the container. Wire contract:
 
-    POST /v1/chat/completions        OpenAI-compatible; free OpenRouter models, streaming allowed
+    POST /v1/chat/completions        OpenAI-compatible; free models, streaming allowed. With an
+                                     NVIDIA key the models NVIDIA serves go there under NVIDIA's
+                                     id; the rest go to OpenRouter.
     POST /v1/messages                Claude Messages API; allowlisted Claude 5.5 models only
     POST /v1/messages/count_tokens   Claude token counting (free upstream, not charged)
-    GET  /v1/models                  Claude models first, then free models OpenRouter still lists
+    GET  /v1/models                  Claude models first, then the free models (``served_by``
+                                     names their upstream)
 
-Refusals are JSON ``{"error":{"code":...,"message":...}}`` on the OpenAI routes and
+Free models carry no demo quota; Claude carries USD caps. Refusals are JSON
+``{"error":{"code":...,"message":...}}`` on the OpenAI routes and
 ``{"type":"error","error":{"type":...,"message":...}}`` on the Claude routes:
     403 model_not_allowed        model outside the allowlist of that route
-    429 demo_quota_exhausted     this session (or, for Claude, this client today) used its allowance
-    429 demo_ai_daily_limit      the shared daily allowance (Claude: daily or monthly USD cap) is spent
+    429 demo_quota_exhausted     Claude: this session or this client today used its allowance
+    429 demo_ai_daily_limit      Claude's daily or monthly USD cap is spent, or OpenRouter's own
+                                 daily free-model allowance for the owner's account is
     429 demo_ai_rate_limited     the provider is rate limiting right now (retry shortly)
     503 ai_unavailable           no key configured, or the provider refused the key
 Prompts, completions and the keys are never logged; only per-session counters are.
@@ -42,7 +47,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .config import CLAUDE_MODELS, DemoConfig
+from .config import CLAUDE_MODELS, NVIDIA_MODELS, DemoConfig
 
 log = logging.getLogger("chudware-demo.broker")
 
@@ -56,8 +61,8 @@ MAX_ERROR_BODY = 64 * 1024
 _DAILY_RE = re.compile(r"per[- _]?day|daily", re.IGNORECASE)
 MESSAGES = {
     "model_not_allowed": "This demo only serves its listed AI models.",
-    "demo_quota_exhausted": "This demo session's AI allowance is used up; modeling still works.",
-    "demo_ai_daily_limit": "The demo's free AI allowance for today is used up; modeling still works",
+    "demo_ai_daily_limit": ("OpenRouter's free allowance for today is used up; pick another model "
+                            "or try again tomorrow. Modeling still works."),
     "demo_ai_rate_limited": "The free AI model is busy right now; try again in a minute.",
     "ai_unavailable": "AI is not available in this demo right now; modeling still works.",
     "upstream_unavailable": "The AI provider could not be reached; try again shortly.",
@@ -150,47 +155,58 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         log.warning("could not persist %s", path.name, exc_info=True)
 
 
-class DailyBudget:
-    """Requests per UTC day across every session; 429 from upstream also zeroes it."""
+class UpstreamAllowance:
+    """OpenRouter's own daily free-model allowance for the owner's account: no count is kept
+    here, only whether OpenRouter answered that it is spent (until the next UTC day), so the
+    rest of the day is refused locally instead of being re-sent upstream."""
 
-    def __init__(self, limit: int, path: Path | None = None, clock: Callable[[], float] = time.time):
-        self.limit, self.path, self.clock = limit, path, clock
-        self.day, self.used, self.exhausted = self._today(), 0, False
+    def __init__(self, path: Path | None = None, clock: Callable[[], float] = time.time):
+        self.path, self.clock = path, clock
+        self.day, self.exhausted = self._today(), False
         if path is not None:
             try:
                 raw = json.loads(path.read_text("utf-8"))
                 if int(raw["day"]) == self.day:
-                    self.used, self.exhausted = max(0, int(raw["used"])), bool(raw["exhausted"])
+                    self.exhausted = bool(raw["exhausted"])
             except (OSError, ValueError, KeyError, TypeError):
                 pass
 
     def _today(self) -> int:
         return int(self.clock() // 86400)
 
-    def _roll(self) -> None:
+    def available(self) -> bool:
         today = self._today()
         if today != self.day:
-            self.day, self.used, self.exhausted = today, 0, False
-
-    def _save(self) -> None:
-        if self.path is not None:
-            _atomic_json(self.path, {"day": self.day, "used": self.used, "exhausted": self.exhausted})
-
-    def remaining(self) -> int:
-        self._roll()
-        return 0 if self.exhausted else max(0, self.limit - self.used)
-
-    def try_consume(self) -> bool:
-        if self.remaining() <= 0:
-            return False
-        self.used += 1
-        self._save()
-        return True
+            self.day, self.exhausted = today, False
+        return not self.exhausted
 
     def mark_exhausted(self) -> None:
-        self._roll()
+        self.available()
         self.exhausted = True
-        self._save()
+        if self.path is not None:
+            _atomic_json(self.path, {"day": self.day, "exhausted": True})
+
+
+@dataclass(frozen=True)
+class FreeRoute:
+    """Where one listed free model id is sent, and under which upstream id."""
+
+    upstream: str        # "openrouter" | "nvidia"
+    model: str           # the id the upstream knows
+    source: str          # the configured (OpenRouter) id, for its catalogue metadata
+
+
+def free_routes(cfg: DemoConfig) -> dict[str, FreeRoute]:
+    """Listed id -> route. A model NVIDIA serves goes there (under NVIDIA's id) when an NVIDIA
+    key is set; the rest go to OpenRouter when its key is set; anything else is not served."""
+    routes: dict[str, FreeRoute] = {}
+    for model in cfg.ai_models:
+        nvidia = NVIDIA_MODELS.get(model)
+        if cfg.nvidia_key and nvidia:
+            routes[nvidia] = FreeRoute("nvidia", nvidia, model)
+        elif cfg.openrouter_key:
+            routes[model] = FreeRoute("openrouter", model, model)
+    return routes
 
 
 MICROS = 1_000_000  # micro-USD per USD; tokens x (USD per million tokens) is micro-USD exactly
@@ -406,21 +422,23 @@ def claude_betas(raw: str | None) -> str | None:
 
 
 class ModelCatalog:
-    """The allowlist restricted to models OpenRouter still lists (cached)."""
+    """The free routes, with OpenRouter's catalogue metadata (cached). An OpenRouter-served
+    model OpenRouter no longer lists is dropped; an NVIDIA-served one is kept."""
 
     def __init__(self, cfg: DemoConfig, client: httpx.AsyncClient, clock: Callable[[], float] = time.time):
         self.cfg, self.client, self.clock = cfg, client, clock
+        self.routes = free_routes(cfg)
         self._items: list[dict[str, Any]] | None = None
         self._expires = 0.0
         self._lock = asyncio.Lock()
 
     @staticmethod
-    def _entry(model: str, live: dict[str, Any] | None) -> dict[str, Any]:
+    def _entry(model: str, route: FreeRoute, live: dict[str, Any] | None) -> dict[str, Any]:
         """An OpenAI-style model entry, carrying OpenRouter's own metadata when known."""
         live = live or {}
         item: dict[str, Any] = {"id": model, "object": "model",
                                 "created": int(live.get("created") or 0),
-                                "owned_by": model.split("/", 1)[0]}
+                                "owned_by": model.split("/", 1)[0], "served_by": route.upstream}
 
         def number(value: Any) -> bool:
             return isinstance(value, int) and not isinstance(value, bool)
@@ -429,7 +447,8 @@ class ModelCatalog:
             return isinstance(value, list) and all(isinstance(v, str) for v in value)
 
         if isinstance(live.get("name"), str):
-            item["name"] = live["name"]
+            # NVIDIA serves the full model, not OpenRouter's ":free" listing of it.
+            item["name"] = live["name"].removesuffix(" (free)") if route.upstream == "nvidia" else live["name"]
         if number(live.get("context_length")):
             item["context_length"] = live["context_length"]
         top = live.get("top_provider")
@@ -464,11 +483,13 @@ class ModelCatalog:
                 log.warning("OpenRouter model catalogue unavailable; keeping the last known list")
                 self._expires = now + 60
                 if self._items is None:
-                    self._items = [self._entry(m, None) for m in self.cfg.ai_models]
+                    self._items = [self._entry(m, r, None) for m, r in self.routes.items()]
                 return self._items
-            self._items = [self._entry(m, live[m]) for m in self.cfg.ai_models if m in live]
+            self._items = [self._entry(m, r, live.get(r.source)) for m, r in self.routes.items()
+                           if r.upstream == "nvidia" or r.source in live]
             self._expires = now + self.cfg.ai_models_cache_seconds
-            retired = [m for m in self.cfg.ai_models if m not in live]
+            retired = [r.source for r in self.routes.values()
+                       if r.upstream == "openrouter" and r.source not in live]
             if retired:
                 log.warning("allowlisted models no longer on OpenRouter: %s", ", ".join(retired))
             return self._items
@@ -545,14 +566,17 @@ class ProviderBroker:
             follow_redirects=False, trust_env=False,
             limits=httpx.Limits(max_connections=32, max_keepalive_connections=8))
         self._own_client = client is None
-        self.budget = DailyBudget(cfg.ai_daily_requests, budget_path, clock)
+        self.allowance = UpstreamAllowance(budget_path, clock)
         self.catalog = ModelCatalog(cfg, self.client, clock)
         self.claude = ClaudeLedger(cfg, claude_path, clock)
         self.lanes: dict[str, Lane] = {}
 
     # -- public --------------------------------------------------------------
-    def ai_remaining_today(self) -> int | None:
-        return self.budget.remaining() if self.cfg.ai_enabled else None
+    def free_ai_available(self) -> bool:
+        """Some free model is routable right now (OpenRouter's daily allowance aside, NVIDIA)."""
+        routes = self.catalog.routes.values()
+        return any(r.upstream == "nvidia" for r in routes) or (
+            any(r.upstream == "openrouter" for r in routes) and self.allowance.available())
 
     def claude_available(self) -> bool:
         """A Claude key is configured and neither the daily nor the monthly budget is spent."""
@@ -677,8 +701,7 @@ class ProviderBroker:
         return bytes(body)
 
     def _tag(self, lane: Lane) -> str:
-        return (f"sid={lane.sid[:8]} req={lane.usage.requests}/{self.cfg.ai_max_requests} "
-                f"tokens={lane.usage.tokens}/{self.cfg.ai_max_tokens}")
+        return f"sid={lane.sid[:8]} req={lane.usage.requests} tokens={lane.usage.tokens}"
 
     def _charge(self, lane: Lane, reported: int | None, sent: int, received: int) -> None:
         # No usage block (stream cut off, odd upstream): charge a byte-length estimate
@@ -700,17 +723,17 @@ class ProviderBroker:
         if not isinstance(payload, dict):
             return error_response(400, "invalid_request")
         model = payload.get("model")
-        if not isinstance(model, str) or model not in self.cfg.ai_models:
+        route = self.catalog.routes.get(model) if isinstance(model, str) else None
+        if route is None:
             return error_response(403, "model_not_allowed")
         clean = sanitize_chat_payload(payload, self.cfg.ai_max_output_tokens)
         if clean is None:
             return error_response(400, "invalid_request")
-        if lane.usage.requests >= self.cfg.ai_max_requests or lane.usage.tokens >= self.cfg.ai_max_tokens:
-            log.info("ai quota refused %s", self._tag(lane))
-            return error_response(429, "demo_quota_exhausted")
-        if not self.budget.try_consume():
-            log.info("ai daily budget spent, refused sid=%s", lane.sid[:8])
+        nvidia = route.upstream == "nvidia"
+        if not nvidia and not self.allowance.available():
+            log.info("openrouter daily allowance spent, refused sid=%s", lane.sid[:8])
             return error_response(429, "demo_ai_daily_limit")
+        clean["model"] = route.model
         lane.usage.requests += 1
         lane.usage.save(lane.usage_path)
 
@@ -719,20 +742,22 @@ class ProviderBroker:
         # The client's own headers (Authorization included) are never forwarded: the
         # upstream request is built from scratch around the owner's key.
         headers = {
-            "Authorization": f"Bearer {self.cfg.openrouter_key}",
+            "Authorization": f"Bearer {self.cfg.nvidia_key if nvidia else self.cfg.openrouter_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if streaming else "application/json",
             "Accept-Encoding": "identity",
-            "HTTP-Referer": f"https://{self.cfg.public_hosts[0]}",
-            "X-Title": "Chudware demo",
             "User-Agent": "chudware-demo-broker/1",
         }
+        if not nvidia:
+            headers["HTTP-Referer"] = f"https://{self.cfg.public_hosts[0]}"
+            headers["X-Title"] = "Chudware demo"
+        base = self.cfg.nvidia_base if nvidia else self.cfg.openrouter_base
         try:
             upstream = await self.client.send(self.client.build_request(
-                "POST", f"{self.cfg.openrouter_base}/chat/completions", content=body,
+                "POST", f"{base}/chat/completions", content=body,
                 headers=headers), stream=True)
         except httpx.HTTPError as exc:
-            log.warning("openrouter unreachable (%s) %s", type(exc).__name__, self._tag(lane))
+            log.warning("%s unreachable (%s) %s", route.upstream, type(exc).__name__, self._tag(lane))
             return error_response(502, "upstream_unavailable")
 
         status = upstream.status_code
@@ -742,7 +767,7 @@ class ProviderBroker:
             finally:
                 with anyio.CancelScope(shield=True):
                     await upstream.aclose()
-            return self._upstream_error(lane, status, detail or b"", upstream.headers)
+            return self._upstream_error(lane, route, status, detail or b"", upstream.headers)
         if streaming:
             return self._stream_response(lane, upstream, len(body))
         try:
@@ -758,21 +783,24 @@ class ProviderBroker:
         except ValueError:
             reported = None
         self._charge(lane, reported, len(body), len(data))
-        log.info("ai ok model=%s %s", model, self._tag(lane))
+        log.info("ai ok %s model=%s %s", route.upstream, route.model, self._tag(lane))
         return Response(data, status_code=status,
                         media_type=upstream.headers.get("content-type", "application/json"))
 
-    def _upstream_error(self, lane: Lane, status: int, detail: bytes, headers: httpx.Headers) -> Response:
+    def _upstream_error(self, lane: Lane, route: FreeRoute, status: int, detail: bytes,
+                        headers: httpx.Headers) -> Response:
         if status == 429:
-            if _DAILY_RE.search(detail.decode("utf-8", "replace")):
-                self.budget.mark_exhausted()
+            # Only OpenRouter has a daily allowance; NVIDIA's free API limits per minute.
+            if route.upstream == "openrouter" and _DAILY_RE.search(detail.decode("utf-8", "replace")):
+                self.allowance.mark_exhausted()
                 log.warning("openrouter daily free allowance exhausted")
                 return error_response(429, "demo_ai_daily_limit")
+            log.info("%s rate limited %s", route.upstream, self._tag(lane))
             return error_response(429, "demo_ai_rate_limited", {"Retry-After": "30"})
         if status in (401, 402, 403):
-            log.error("openrouter refused the demo key (HTTP %s); check the key and credits", status)
+            log.error("%s refused the demo key (HTTP %s); check the key", route.upstream, status)
             return error_response(503, "ai_unavailable")
-        log.info("openrouter HTTP %s %s", status, self._tag(lane))
+        log.info("%s HTTP %s model=%s %s", route.upstream, status, route.model, self._tag(lane))
         return Response(detail, status_code=status,
                         media_type=headers.get("content-type", "application/json"))
 

@@ -249,7 +249,7 @@ class DemoManager:
             "warn": False, "note": None,
             "active_sessions": sum(1 for e in self.entries.values() if e.state in (STARTING, ACTIVE)),
             "max_sessions": self.cfg.max_active,
-            "ai_remaining_today": self.broker.ai_remaining_today(),
+            "free_ai_available": self.broker.free_ai_available(),
             "claude_available": self.broker.claude_available(),
         }
         if sid is None:

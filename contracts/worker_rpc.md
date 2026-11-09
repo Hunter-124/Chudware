@@ -3772,3 +3772,13 @@ OpenRouter, so they are now listed under their own provider:
   `http://127.0.0.1:18081/v1` (`openai-completions`) and the `anthropic` provider's to
   `http://127.0.0.1:18081` (`anthropic-messages`), both with the placeholder key and
   `auth: apiKey`, with or without a model list.
+
+## Public demo lane: an `nvidia` provider for NVIDIA-served free rows (append-only, 2026-11-09)
+
+Worker RPC contract revision 2.5. The wire protocol major remains 2. A front-door `/v1/models`
+entry with `served_by:"nvidia"` (a free model the front door sends to NVIDIA's API) is listed
+by `omp_models_list` under provider id `nvidia`; `omp_provider_list` adds an `nvidia` row
+("NVIDIA API (demo)", `authKinds:[]`) when the lane lists one, and `omp_auth_state` answers
+`configured` for it. The private `models.yml` points the `nvidia` provider at
+`http://127.0.0.1:18081/v1` (`openai-completions`) with the placeholder key, like `openrouter`.
+Turns are admitted under the provider of the chosen row, as in revision 2.4.

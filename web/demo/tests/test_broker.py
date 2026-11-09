@@ -1,4 +1,5 @@
-"""Provider broker: allowlist, quotas, daily budget, key isolation, streaming, catalogue."""
+"""Provider broker: allowlist, no free-model quota, OpenRouter's daily allowance, NVIDIA routing,
+key isolation, streaming, catalogue."""
 
 from __future__ import annotations
 
@@ -13,12 +14,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from demo.broker import DailyBudget, ProviderBroker, Usage, sanitize_chat_payload, usage_total
+from demo.broker import ProviderBroker, UpstreamAllowance, Usage, sanitize_chat_payload, usage_total
 
 from .support import FakeClock, make_cfg
 
 OWNER_KEY = "sk-or-owner-key"
+NVIDIA_KEY = "nvapi-owner-key"
 ULTRA = "nvidia/nemotron-3-ultra-550b-a55b:free"
+ULTRA_NVIDIA = "nvidia/nemotron-3-ultra-550b-a55b"
 GEMMA = "google/gemma-4-31b-it:free"
 USAGE_15 = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
 
@@ -152,86 +155,49 @@ def test_usage_total_reads_total_or_the_sum_of_parts():
     assert usage_total({"usage": None}) is None and usage_total([]) is None
 
 
-def test_session_request_quota_returns_429_without_forwarding(tmp_path):
+def test_free_models_carry_no_session_or_daily_quota(tmp_path):
     async def main():
-        broker, upstream, _, client = make(tmp_path, ai_max_requests=2)
-        lane = broker.make_lane("a" * 24, Usage())
-        assert (await post(lane, chat())).status_code == 200
-        assert (await post(lane, chat())).status_code == 200
-        refused = await post(lane, chat())
-        assert refused.status_code == 429 and error_code(refused) == "demo_quota_exhausted"
-        assert refused.headers["x-should-retry"] == "false"            # OMP must not re-POST it
-        assert refused.json()["error"]["message"] == (
-            "This demo session's AI allowance is used up; modeling still works.")
-        assert len(upstream.chat) == 2 and lane.usage.requests == 2
-        # Another session's allowance is its own.
-        other = broker.make_lane("b" * 24, Usage())
-        assert (await post(other, chat())).status_code == 200
-        await client.aclose()
-    run(main())
-
-
-def test_session_token_quota_uses_reported_usage_and_persists(tmp_path):
-    async def main():
-        broker, upstream, _, client = make(tmp_path, ai_max_tokens=20)
+        broker, upstream, _, client = make(tmp_path)
         usage_path = tmp_path / "usage.json"
         lane = broker.make_lane("a" * 24, Usage(), usage_path)
-        assert (await post(lane, chat())).status_code == 200      # 15 < 20: allowed
-        assert (await post(lane, chat())).status_code == 200      # 15 < 20 before it ran: allowed
-        refused = await post(lane, chat())                        # 30 >= 20
-        assert refused.status_code == 429 and error_code(refused) == "demo_quota_exhausted"
-        assert json.loads(usage_path.read_text()) == {"requests": 2, "tokens": 30, "claude_micros": 0}
-        assert Usage.load(usage_path) == Usage(2, 30)
+        for _ in range(120):
+            assert (await post(lane, chat())).status_code == 200
+        assert len(upstream.chat) == 120
+        # Still counted, for the logs only.
+        assert json.loads(usage_path.read_text()) == {"requests": 120, "tokens": 1800, "claude_micros": 0}
+        assert Usage.load(usage_path) == Usage(120, 1800)
         assert (usage_path.stat().st_mode & 0o777) == 0o600
+        assert broker.free_ai_available() is True
         await client.aclose()
     run(main())
 
 
-def test_daily_budget_is_shared_resets_at_utc_midnight_and_persists(tmp_path):
+def test_openrouter_daily_exhaustion_is_shared_persisted_and_ends_at_utc_midnight(tmp_path):
     async def main():
         path = tmp_path / "budget.json"
         clock = FakeClock((19_675 + 1) * 86400 - 10)               # ten seconds before UTC midnight
         upstream = Upstream()
-        cfg = make_cfg(tmp_path, ai_daily_requests=2)
         client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
-        broker = ProviderBroker(cfg, client=client, budget_path=path, clock=clock)
+        broker = ProviderBroker(make_cfg(tmp_path), client=client, budget_path=path, clock=clock)
+        upstream.respond = lambda r: httpx.Response(429, json={"error": {
+            "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock.", "code": 429}})
         a, b = broker.make_lane("a" * 24, Usage()), broker.make_lane("b" * 24, Usage())
-        assert broker.ai_remaining_today() == 2
-        assert (await post(a, chat())).status_code == 200
-        assert (await post(b, chat())).status_code == 200
-        assert broker.ai_remaining_today() == 0
         refused = await post(a, chat())
         assert refused.status_code == 429 and error_code(refused) == "demo_ai_daily_limit"
         assert refused.headers["x-should-retry"] == "false"
-        assert refused.json()["error"]["message"] == (
-            "The demo's free AI allowance for today is used up; modeling still works")
-        assert len(upstream.chat) == 2 and a.usage.requests == 1     # the refusal was not charged to the session
-
-        # A restart on the same day keeps the spent budget; after midnight it is fresh.
-        assert DailyBudget(2, path, clock).remaining() == 0
-        clock.advance(11)
-        assert DailyBudget(2, path, clock).remaining() == 2
-        assert broker.ai_remaining_today() == 2
-        assert (await post(a, chat())).status_code == 200
-        await client.aclose()
-    run(main())
-
-
-def test_upstream_daily_exhaustion_maps_to_demo_ai_daily_limit(tmp_path):
-    async def main():
-        broker, upstream, clock, client = make(tmp_path)
-        upstream.respond = lambda r: httpx.Response(429, json={"error": {
-            "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock.", "code": 429}})
-        lane = broker.make_lane("a" * 24, Usage())
-        refused = await post(lane, chat())
-        assert refused.status_code == 429 and error_code(refused) == "demo_ai_daily_limit"
-        assert broker.ai_remaining_today() == 0
+        assert refused.json()["error"]["message"].startswith("OpenRouter's free allowance for today is used up")
+        assert broker.free_ai_available() is False
         upstream.respond = lambda r: httpx.Response(200, json={"usage": USAGE_15})
-        again = await post(lane, chat())                       # no more upstream calls today
+        again = await post(b, chat())                          # no more upstream calls today
         assert again.status_code == 429 and error_code(again) == "demo_ai_daily_limit"
         assert len(upstream.chat) == 1
-        clock.advance(86400)
-        assert broker.ai_remaining_today() == 45
+
+        # A restart on the same day keeps it; after midnight it is gone.
+        assert UpstreamAllowance(path, clock).available() is False
+        clock.advance(11)
+        assert UpstreamAllowance(path, clock).available() is True
+        assert broker.free_ai_available() is True
+        assert (await post(a, chat())).status_code == 200
         await client.aclose()
     run(main())
 
@@ -246,7 +212,67 @@ def test_upstream_per_minute_limit_is_not_reported_as_the_daily_limit(tmp_path):
         assert busy.status_code == 429 and error_code(busy) == "demo_ai_rate_limited"
         assert busy.headers["retry-after"] == "30"
         assert "x-should-retry" not in busy.headers                    # transient: retrying is right
-        assert broker.ai_remaining_today() == 44
+        assert broker.free_ai_available() is True
+        await client.aclose()
+    run(main())
+
+
+# --- NVIDIA ---------------------------------------------------------------------------
+
+
+def test_with_an_nvidia_key_nemotron_is_listed_and_served_under_nvidias_id(tmp_path):
+    async def main():
+        broker, upstream, _, client = make(tmp_path, nvidia_key=NVIDIA_KEY)
+        lane = broker.make_lane("a" * 24, Usage())
+        upstream.models_data[0]["name"] = "NVIDIA: Nemotron 3 Ultra (free)"
+        async with lane_client(lane) as c:
+            data = (await c.get("/v1/models")).json()["data"]
+        listed = {m["id"]: m for m in data}
+        assert ULTRA not in listed and listed[ULTRA_NVIDIA]["served_by"] == "nvidia"
+        assert listed[ULTRA_NVIDIA]["name"] == "NVIDIA: Nemotron 3 Ultra"
+        assert listed[ULTRA_NVIDIA]["context_length"] == 262144     # OpenRouter's metadata
+        assert listed[GEMMA]["served_by"] == "openrouter"
+
+        response = await post(lane, chat(ULTRA_NVIDIA), headers={"Authorization": "Bearer visitor"})
+        assert response.status_code == 200
+        sent = upstream.chat[-1]
+        assert sent.url == "https://integrate.api.nvidia.com/v1/chat/completions"
+        assert sent.headers["authorization"] == f"Bearer {NVIDIA_KEY}"
+        assert "http-referer" not in sent.headers and "x-title" not in sent.headers
+        assert json.loads(sent.content)["model"] == ULTRA_NVIDIA
+        # The OpenRouter id of a model NVIDIA serves is not a second route to it.
+        assert (await post(lane, chat(ULTRA))).status_code == 403
+        assert (await post(lane, chat(GEMMA))).status_code == 200
+        assert upstream.chat[-1].url == "https://openrouter.ai/api/v1/chat/completions"
+        await client.aclose()
+    run(main())
+
+
+def test_nvidia_is_untouched_by_openrouters_daily_allowance_and_its_429_is_transient(tmp_path):
+    async def main():
+        broker, upstream, _, client = make(tmp_path, nvidia_key=NVIDIA_KEY)
+        lane = broker.make_lane("a" * 24, Usage())
+        broker.allowance.mark_exhausted()
+        assert broker.free_ai_available() is True
+        assert (await post(lane, chat(ULTRA_NVIDIA))).status_code == 200
+        assert error_code(await post(lane, chat(GEMMA))) == "demo_ai_daily_limit"
+        upstream.respond = lambda r: httpx.Response(429, json={"error": "Too many requests per day"})
+        busy = await post(lane, chat(ULTRA_NVIDIA))
+        assert busy.status_code == 429 and error_code(busy) == "demo_ai_rate_limited"
+        assert busy.headers["retry-after"] == "30" and "x-should-retry" not in busy.headers
+        await client.aclose()
+    run(main())
+
+
+def test_an_nvidia_key_alone_serves_only_the_models_nvidia_has(tmp_path):
+    async def main():
+        broker, upstream, _, client = make(tmp_path, openrouter_key="", nvidia_key=NVIDIA_KEY)
+        lane = broker.make_lane("a" * 24, Usage())
+        async with lane_client(lane) as c:
+            ids = [m["id"] for m in (await c.get("/v1/models")).json()["data"]]
+        assert ids == [ULTRA_NVIDIA, "nvidia/nemotron-3.5-super-vl-120b-a12b"]
+        assert (await post(lane, chat(GEMMA))).status_code == 403
+        assert (await post(lane, chat(ULTRA_NVIDIA))).status_code == 200
         await client.aclose()
     run(main())
 
@@ -291,7 +317,7 @@ def test_missing_key_answers_503_and_touches_nothing(tmp_path):
             models = await c.get("/v1/models")
         assert models.status_code == 503 and error_code(models) == "ai_unavailable"
         assert upstream.chat == [] and upstream.models_hits == 0 and lane.usage == Usage()
-        assert broker.ai_remaining_today() is None
+        assert broker.free_ai_available() is False
         await client.aclose()
     run(main())
 
@@ -362,7 +388,7 @@ def test_models_carry_openrouter_metadata_but_nothing_else(tmp_path):
         async with lane_client(broker.make_lane("a" * 24, Usage())) as c:
             (entry,) = (await c.get("/v1/models")).json()["data"]
         assert entry == {
-            "id": ULTRA, "object": "model", "created": 7, "owned_by": "nvidia",
+            "id": ULTRA, "object": "model", "created": 7, "owned_by": "nvidia", "served_by": "openrouter",
             "name": "NVIDIA: Nemotron Ultra (free)", "context_length": 262144,
             "top_provider": {"context_length": 262144, "max_completion_tokens": 65536},
             "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"],
@@ -384,7 +410,7 @@ def test_omp_model_discovery_probes_are_answered_locally_and_uncounted(tmp_path)
                 response = await c.get("/v1/models?" + query)
                 assert response.status_code == 200 and response.json() == {"object": "list", "data": []}
         assert upstream.models_hits == 0 and upstream.chat == []       # nothing forwarded upstream
-        assert lane.usage == Usage() and broker.ai_remaining_today() == 45   # nothing counted
+        assert lane.usage == Usage()                                   # nothing counted
         await client.aclose()
     run(main())
 
@@ -438,7 +464,7 @@ def test_prompts_and_keys_are_never_logged_but_counts_are(tmp_path, caplog):
     run(main())
     text = caplog.text
     assert "UNIQUE-PROMPT-TEXT-123" not in text and OWNER_KEY not in text and "user-token-xyz" not in text
-    assert "sid=abcdef01" in text and "req=1/15" in text
+    assert "sid=abcdef01" in text and "req=1 " in text
 
 
 def test_a_real_unix_socket_lane_round_trips_and_is_cleaned_up(tmp_path):

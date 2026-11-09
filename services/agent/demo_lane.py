@@ -2,10 +2,10 @@
 
 A demo container's trusted front door mounts ONE per-session unix socket into every actor
 sandbox; the fixed loopback forwarder in ``web/deploy/cell/cell_forwarder.py`` exposes it as
-``http://127.0.0.1:18081``: OpenAI-style ``/v1/chat/completions`` for the free OpenRouter models
-and the native Messages API (``/v1/messages``) for the Anthropic ones, which the front door sends
-to the Anthropic API itself; each family is its own provider, so the picker names the real
-one. The owner's keys and the model allowlist live only in the front door: it rejects any
+``http://127.0.0.1:18081``: OpenAI-style ``/v1/chat/completions`` for the free models (which the
+front door sends to OpenRouter or to NVIDIA's API) and the native Messages API
+(``/v1/messages``) for the Anthropic ones, which it sends to the Anthropic API itself; each
+upstream is its own provider, so the picker names the real one. The owner's keys and the model allowlist live only in the front door: it rejects any
 other model, enforces the per-session quota and USD caps and strips client credentials. Nothing here accepts a caller-supplied
 endpoint, key or provider, and a cell that is not a demo container (or whose front door
 mounted no socket) keeps refusing every online credential route exactly as before.
@@ -32,10 +32,13 @@ LANE_BASE_URL = f"{LANE_ROOT}/v1"
 LANE_SOCKET = "/run/chudware-demo/provider.sock"
 PROVIDER_ID = "openrouter"
 PROVIDER_NAME = "Demo models"
+NVIDIA_PROVIDER_ID = "nvidia"
+NVIDIA_PROVIDER_NAME = "NVIDIA API (demo)"
 ANTHROPIC_PROVIDER_ID = "anthropic"
 ANTHROPIC_PROVIDER_NAME = "Anthropic API (demo)"
-PROVIDER_IDS = (PROVIDER_ID, ANTHROPIC_PROVIDER_ID)
-_PROVIDER_NAMES = {PROVIDER_ID: PROVIDER_NAME, ANTHROPIC_PROVIDER_ID: ANTHROPIC_PROVIDER_NAME}
+PROVIDER_IDS = (PROVIDER_ID, NVIDIA_PROVIDER_ID, ANTHROPIC_PROVIDER_ID)
+_PROVIDER_NAMES = {PROVIDER_ID: PROVIDER_NAME, NVIDIA_PROVIDER_ID: NVIDIA_PROVIDER_NAME,
+                   ANTHROPIC_PROVIDER_ID: ANTHROPIC_PROVIDER_NAME}
 # Not a secret. OMP wants some key for a custom provider (an unmatched value is used literally);
 # the front door ignores client credentials and adds the real one on its side of the socket.
 PLACEHOLDER_KEY = "chudware-demo-lane"
@@ -107,10 +110,16 @@ def _row(item: Any) -> dict[str, Any] | None:
     pricing = item.get("pricing")
     pricing = pricing if isinstance(pricing, Mapping) else {}
     anthropic = item.get("owned_by") == "anthropic"
+    if anthropic:
+        provider = ANTHROPIC_PROVIDER_ID
+    elif item.get("served_by") == NVIDIA_PROVIDER_ID:
+        provider = NVIDIA_PROVIDER_ID
+    else:
+        provider = PROVIDER_ID
     row: dict[str, Any] = {
         "id": model_id,
         "name": name.strip()[:256] if isinstance(name, str) and name.strip() else model_id,
-        "provider": ANTHROPIC_PROVIDER_ID if anthropic else PROVIDER_ID,
+        "provider": provider,
         "cost": {key: _per_million(pricing.get(source)) for key, source in _COST_FIELDS},
     }
     if anthropic:
@@ -178,9 +187,10 @@ _DEFAULT_OUTPUT = 16_384
 
 
 def models_config(rows: list[Mapping[str, Any]] | None) -> dict[str, Any]:
-    """OMP ``models.yml`` that points its OpenRouter and Anthropic providers at the lane.
+    """OMP ``models.yml`` that points its OpenRouter, NVIDIA and Anthropic providers at the lane.
 
-    Free rows use the OpenRouter provider's ``openai-completions`` transport and ``/v1`` base URL.
+    Free rows use the OpenRouter or NVIDIA provider's ``openai-completions`` transport and the
+    lane's ``/v1`` base URL.
     Anthropic rows use the Anthropic provider's ``anthropic-messages`` transport and the lane ROOT
     itself: OMP's Anthropic transport appends ``/v1/messages`` (and strips a trailing ``/v1``), so
     the front door's native route is reached either way. ``auth: apiKey`` keeps OMP from shaping
@@ -192,6 +202,8 @@ def models_config(rows: list[Mapping[str, Any]] | None) -> dict[str, Any]:
     providers: dict[str, dict[str, Any]] = {
         PROVIDER_ID: {"baseUrl": LANE_BASE_URL, "apiKey": PLACEHOLDER_KEY,
                       "api": "openai-completions", "auth": "apiKey"},
+        NVIDIA_PROVIDER_ID: {"baseUrl": LANE_BASE_URL, "apiKey": PLACEHOLDER_KEY,
+                             "api": "openai-completions", "auth": "apiKey"},
         ANTHROPIC_PROVIDER_ID: {"baseUrl": LANE_ROOT, "apiKey": PLACEHOLDER_KEY,
                                 "api": _ANTHROPIC_API, "auth": "apiKey"},
     }
@@ -210,7 +222,11 @@ def models_config(rows: list[Mapping[str, Any]] | None) -> dict[str, Any]:
                 entry["reasoning"] = True
             if "image" in (row.get("input") or ()):
                 entry["input"] = ["text", "image"]
-            providers[ANTHROPIC_PROVIDER_ID if anthropic else PROVIDER_ID].setdefault("models", []).append(entry)
+            if anthropic:
+                provider = ANTHROPIC_PROVIDER_ID
+            else:
+                provider = NVIDIA_PROVIDER_ID if row.get("provider") == NVIDIA_PROVIDER_ID else PROVIDER_ID
+            providers[provider].setdefault("models", []).append(entry)
     return {"providers": providers}
 
 
@@ -236,8 +252,8 @@ def pin_model(params: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def provider_descriptors(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Settings → Providers in a demo cell: the free-model row, plus the Anthropic row when the
-    lane serves Anthropic models. Ready, nothing to configure."""
+    """Settings → Providers in a demo cell: the OpenRouter row, plus the NVIDIA and Anthropic rows
+    when the lane serves models through them. Ready, nothing to configure."""
     counts = {provider_id: sum(1 for row in rows if row.get("provider") == provider_id)
               for provider_id in PROVIDER_IDS}
     return [{"id": provider_id, "name": _PROVIDER_NAMES[provider_id], "available": count > 0,

@@ -55,8 +55,7 @@
     $('load').textContent = s.state === 'queued' || s.state === 'starting'
       ? s.active_sessions + ' of ' + s.max_sessions + ' sessions running, ' + s.queue_length + ' waiting'
       : '';
-    const free = s.ai_remaining_today === null || s.ai_remaining_today === undefined
-      ? '' : s.ai_remaining_today + ' free AI requests are left today.';
+    const free = s.free_ai_available ? 'Free models are available without a limit.' : '';
     if (s.claude_available) {
       $('ai').textContent = 'Claude Opus, Sonnet and Haiku 5.5 are available, with a per-visitor limit. ' + free;
     } else if (free) {

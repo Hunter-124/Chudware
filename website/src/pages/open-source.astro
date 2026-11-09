@@ -1,5 +1,6 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
 import '../styles/company.css';
 
 const REPO = 'https://github.com/Hunter-124/Chudware';
@@ -10,6 +11,14 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
       <p class="eyebrow">Open source</p>
       <h1>MIT-licensed software. Build it yourself.</h1>
       <p class="lede">Use, study, change, and redistribute Chudware under the MIT terms. Desktop use and source builds have no Chudware software fee. Clone the public source repository to build and run it yourself; public desktop installers are not yet available.</p>
+      <a class="co-repo" href={REPO}>
+        <span class="co-repo-mark"><Icon name="github" /></span>
+        <span class="co-repo-text">
+          <span class="co-repo-url"><span class="co-repo-host">github.com/</span><span class="co-repo-name">Hunter-124/Chudware</span></span>
+          <span class="co-repo-sub">Source, issues, releases, and build instructions</span>
+        </span>
+        <Icon name="arrow-right" class="co-repo-arrow" />
+      </a>
       <dl class="co-sec-facts">
         <div><dt>License</dt><dd>MIT</dd></div>
         <div><dt>Source</dt><dd>Hunter-124/Chudware (public)</dd></div>

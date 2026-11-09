@@ -270,9 +270,38 @@ def test_an_nvidia_key_alone_serves_only_the_models_nvidia_has(tmp_path):
         lane = broker.make_lane("a" * 24, Usage())
         async with lane_client(lane) as c:
             ids = [m["id"] for m in (await c.get("/v1/models")).json()["data"]]
-        assert ids == [ULTRA_NVIDIA, "nvidia/nemotron-3.5-super-vl-120b-a12b"]
+        assert ids == [ULTRA_NVIDIA, "nvidia/nemotron-3.5-super-vl-120b-a12b",
+                       "mistralai/mistral-large-4-1t-a52b", "minimaxai/minimax-m3.1-flash"]
         assert (await post(lane, chat(GEMMA))).status_code == 403
         assert (await post(lane, chat(ULTRA_NVIDIA))).status_code == 200
+        await client.aclose()
+    run(main())
+
+
+def test_nvidia_only_models_follow_the_mapped_ones_with_their_names(tmp_path):
+    async def main():
+        broker, upstream, _, client = make(tmp_path, nvidia_key=NVIDIA_KEY,
+                                           nvidia_models=("mistralai/mistral-large-4-1t-a52b",))
+        lane = broker.make_lane("a" * 24, Usage())
+        async with lane_client(lane) as c:
+            data = (await c.get("/v1/models")).json()["data"]
+        assert data[-1] == {"id": "mistralai/mistral-large-4-1t-a52b", "object": "model", "created": 0,
+                            "owned_by": "mistralai", "served_by": "nvidia", "name": "Mistral Large 4"}
+        assert (await post(lane, chat("mistralai/mistral-large-4-1t-a52b"))).status_code == 200
+        sent = upstream.chat[-1]
+        assert sent.url == "https://integrate.api.nvidia.com/v1/chat/completions"
+        assert json.loads(sent.content)["model"] == "mistralai/mistral-large-4-1t-a52b"
+        assert (await post(lane, chat("minimaxai/minimax-m3.1-flash"))).status_code == 403   # not configured
+        await client.aclose()
+    run(main())
+
+
+def test_nvidia_only_models_need_the_nvidia_key(tmp_path):
+    async def main():
+        broker, upstream, _, client = make(tmp_path)
+        lane = broker.make_lane("a" * 24, Usage())
+        assert (await post(lane, chat("mistralai/mistral-large-4-1t-a52b"))).status_code == 403
+        assert upstream.chat == []
         await client.aclose()
     run(main())
 

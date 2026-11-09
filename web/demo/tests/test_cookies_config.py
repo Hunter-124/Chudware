@@ -57,6 +57,7 @@ def test_default_config_values(tmp_path):
     assert (cfg.max_active, cfg.max_queue) == (3, 30)
     assert (cfg.idle_seconds, cfg.hard_seconds, cfg.warn_seconds) == (900, 2700, 300)
     assert cfg.nvidia_key == "" and cfg.nvidia_base == "https://integrate.api.nvidia.com/v1"
+    assert cfg.nvidia_models == ("mistralai/mistral-large-4-1t-a52b", "minimaxai/minimax-m3.1-flash")
     assert cfg.ai_models == DEFAULT_MODELS and all(m.endswith(":free") for m in cfg.ai_models)
     assert cfg.pasta_options == ()
 
@@ -115,7 +116,22 @@ def test_from_env_reads_prefixed_names(tmp_path):
     assert cfg.image == "ghcr.io/hunter-124/chudware-web:sha-abc123"
     assert cfg.ai_models == ("a/b:free", "c/d:free")
     assert (cfg.nvidia_key, cfg.max_active) == ("nvapi-x", 2)
+    assert cfg.nvidia_models == DemoConfig.nvidia_models    # unset: the defaults
     assert cfg.session_root == tmp_path / "chudware-demo"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("none", ()), ("a/b, c/d", ("a/b", "c/d"))])
+def test_nvidia_models_from_env(tmp_path, raw, expected):
+    cfg = DemoConfig.from_env({"CHUDWARE_DEMO_NVIDIA_MODELS": raw, "HOME": str(tmp_path),
+                               "XDG_RUNTIME_DIR": str(tmp_path)})
+    assert cfg.nvidia_models == expected
+
+
+@pytest.mark.parametrize("model", ["mistral-large", "a/b:free", "a/b/c", "a/b c"])
+def test_nvidia_models_must_be_plain_vendor_name_ids(tmp_path, model):
+    with pytest.raises(ConfigError):
+        make_cfg(tmp_path, nvidia_models=(model,))
 
 
 def test_missing_secrets_degrade_instead_of_failing(tmp_path):

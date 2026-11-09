@@ -47,7 +47,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from .config import CLAUDE_MODELS, NVIDIA_MODELS, DemoConfig
+from .config import CLAUDE_MODELS, NVIDIA_MODEL_NAMES, NVIDIA_MODELS, DemoConfig
 
 log = logging.getLogger("chudware-demo.broker")
 
@@ -197,8 +197,9 @@ class FreeRoute:
 
 
 def free_routes(cfg: DemoConfig) -> dict[str, FreeRoute]:
-    """Listed id -> route. A model NVIDIA serves goes there (under NVIDIA's id) when an NVIDIA
-    key is set; the rest go to OpenRouter when its key is set; anything else is not served."""
+    """Listed id -> route, in listing order. A model NVIDIA serves goes there (under NVIDIA's id)
+    when an NVIDIA key is set; the rest go to OpenRouter when its key is set; then come the
+    NVIDIA-only models. Anything else is not served."""
     routes: dict[str, FreeRoute] = {}
     for model in cfg.ai_models:
         nvidia = NVIDIA_MODELS.get(model)
@@ -206,6 +207,9 @@ def free_routes(cfg: DemoConfig) -> dict[str, FreeRoute]:
             routes[nvidia] = FreeRoute("nvidia", nvidia, model)
         elif cfg.openrouter_key:
             routes[model] = FreeRoute("openrouter", model, model)
+    if cfg.nvidia_key:
+        for model in cfg.nvidia_models:
+            routes.setdefault(model, FreeRoute("nvidia", model, model))
     return routes
 
 
@@ -449,6 +453,8 @@ class ModelCatalog:
         if isinstance(live.get("name"), str):
             # NVIDIA serves the full model, not OpenRouter's ":free" listing of it.
             item["name"] = live["name"].removesuffix(" (free)") if route.upstream == "nvidia" else live["name"]
+        elif model in NVIDIA_MODEL_NAMES:
+            item["name"] = NVIDIA_MODEL_NAMES[model]
         if number(live.get("context_length")):
             item["context_length"] = live["context_length"]
         top = live.get("top_provider")

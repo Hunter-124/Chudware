@@ -39,6 +39,16 @@ NVIDIA_MODELS: dict[str, str] = {
     "nvidia/nemotron-3-ultra-550b-a55b:free": "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3.5-super-vl:free": "nvidia/nemotron-3.5-super-vl-120b-a12b",
 }
+# Further models served from NVIDIA's free API only (listed after the free OpenRouter-mapped
+# ones), with their display names. Each answered tool calls quickly and correctly when chosen
+# (2026-11-09); DeepSeek V4.1 Flash (minutes or no answer), GLM-5.3 Flash (minutes), Gemma 4
+# (its content screen refused a plain CAD prompt) and Kimi K2.6 (not served to free accounts)
+# were not reliable enough.
+NVIDIA_MODEL_NAMES: dict[str, str] = {
+    "mistralai/mistral-large-4-1t-a52b": "Mistral Large 4",
+    "minimaxai/minimax-m3.1-flash": "MiniMax M3.1 Flash",
+}
+DEFAULT_NVIDIA_MODELS = tuple(NVIDIA_MODEL_NAMES)
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
 
 
@@ -79,6 +89,7 @@ CLAUDE_MODELS: dict[str, ClaudeModel] = {
 DEFAULT_CLAUDE_MODELS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5")
 
 _MODEL_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)*:free\Z")
+_NVIDIA_MODEL_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 _SIZE_RE = re.compile(r"[1-9][0-9]*[kmg]\Z")
 _IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]{1,128})?(@sha256:[0-9a-f]{64})?\Z")
 _TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}\Z")
@@ -150,6 +161,7 @@ class DemoConfig:
     # requests per UTC day without purchased credits) still applies to the models it serves.
     nvidia_key: str = field(default="", repr=False)
     nvidia_base: str = DEFAULT_NVIDIA_BASE
+    nvidia_models: tuple[str, ...] = DEFAULT_NVIDIA_MODELS
     ai_models_cache_seconds: int = 600
     ai_max_output_tokens: int = 16_384
     ai_max_body_bytes: int = 4 * MIB
@@ -196,6 +208,10 @@ class DemoConfig:
                 raise ConfigError(
                     f"CHUDWARE_DEMO_AI_MODELS entry {model!r} is not a free OpenRouter model "
                     "(it must be <vendor>/<name>:free)")
+        for model in self.nvidia_models:
+            if not _NVIDIA_MODEL_RE.fullmatch(model):
+                raise ConfigError(f"CHUDWARE_DEMO_NVIDIA_MODELS entry {model!r} is not an NVIDIA API "
+                                  "model id (<vendor>/<name>)")
         for model in self.claude_models:
             if model not in CLAUDE_MODELS:
                 raise ConfigError(
@@ -247,7 +263,8 @@ class DemoConfig:
     @property
     def ai_enabled(self) -> bool:
         """Some free model is routable: through OpenRouter, or NVIDIA for the models it serves."""
-        return bool(self.openrouter_key or (self.nvidia_key and set(self.ai_models) & set(NVIDIA_MODELS)))
+        return bool(self.openrouter_key or (self.nvidia_key and (
+            self.nvidia_models or set(self.ai_models) & set(NVIDIA_MODELS))))
 
     @property
     def nvidia_enabled(self) -> bool:
@@ -282,6 +299,8 @@ class DemoConfig:
         if not _TAG_RE.fullmatch(tag):
             raise ConfigError("CHUDWARE_DEMO_IMAGE_TAG is not a valid image tag")
         cookie_key = get("COOKIE_KEY")
+        raw_nvidia = get("NVIDIA_MODELS")
+        nvidia_models = () if raw_nvidia == "none" else _csv(raw_nvidia) or DEFAULT_NVIDIA_MODELS
         return cls(
             public_hosts=_csv(get("PUBLIC_HOSTS")) or DEFAULT_PUBLIC_HOSTS,
             cookie_key=cookie_key.encode("utf-8"),
@@ -302,6 +321,8 @@ class DemoConfig:
             ai_models=_csv(get("AI_MODELS")) or DEFAULT_MODELS,
             nvidia_key=env.get("CHUDWARE_DEMO_NVIDIA_KEY", "").strip(),
             nvidia_base=get("NVIDIA_BASE", DEFAULT_NVIDIA_BASE).rstrip("/"),
+            # Unset: the defaults; "none": no NVIDIA-only models.
+            nvidia_models=nvidia_models,
             ai_max_output_tokens=num("AI_MAX_OUTPUT_TOKENS", 16_384),
             anthropic_key=env.get("CHUDWARE_DEMO_ANTHROPIC_KEY", "").strip(),
             anthropic_base=get("ANTHROPIC_BASE", DEFAULT_ANTHROPIC_BASE).rstrip("/"),

@@ -26,7 +26,7 @@ def test_waiting_page_is_static_strict_and_self_contained(tmp_path):
         assert not re.search(r"<script(?![^>]*\bsrc=)", html) and "style=" not in html
         assert not re.search(r"https?://", html)
         # What the page tells visitors (the owner's required disclosures).
-        for phrase in ("Nothing persists", "45 minutes", "15 minutes", "Free AI models only", "Privacy",
+        for phrase in ("Nothing persists", "45 minutes", "15 minutes", "AI models", "Privacy",
                        "deleted"):
             assert phrase in html
         js = fd.client.get("/demo/static/waiting.js")

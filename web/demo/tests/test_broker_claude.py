@@ -136,7 +136,7 @@ def test_owner_key_replaces_client_credentials_and_only_plain_turn_fields_are_fo
             assert gone not in body
         assert body["context_management"] == {"edits": [{"type": "clear_tool_uses_20250919"}]}
         assert body["cache_control"] == {"type": "ephemeral"}
-        assert body["max_tokens"] == 32_000 and body["thinking"]["budget_tokens"] == 30_976
+        assert body["max_tokens"] == 32_000 and body["thinking"] == {"type": "adaptive"}
         # The pre-flight count carries only the prompt-shaping fields.
         assert set(json.loads(upstream.counts[0].content)) == {"model", "messages", "tools", "thinking"}
         await client.aclose()

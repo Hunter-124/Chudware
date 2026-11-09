@@ -386,11 +386,10 @@ def sanitize_messages_payload(payload: dict[str, Any], max_output: int) -> dict[
     else:
         clean["max_tokens"] = min(value, max_output) if value >= 1 else max_output
     thinking = clean.get("thinking")
-    if isinstance(thinking, dict):
-        budget = thinking.get("budget_tokens")
-        if isinstance(budget, int) and not isinstance(budget, bool) and budget >= clean["max_tokens"]:
-            # The upstream requires budget < max_tokens; keep the clamp from turning into a 400.
-            clean["thinking"] = {**thinking, "budget_tokens": max(1024, clean["max_tokens"] - 1024)}
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        # The 5.5 models accept only adaptive thinking (effort rides in output_config); a
+        # client that knows them only as generic reasoning models still sends a token budget.
+        clean["thinking"] = {"type": "adaptive"}
     return clean
 
 

@@ -140,7 +140,7 @@ def publish_host_tools(client: Any, tools: Sequence[Any], advertised: Iterable[s
 def _keyless_provider_opt_ins() -> list[str]:
     if demo_lane.enabled():
         # The lane authenticates on its own side of the socket; there is no key to look for.
-        return [demo_lane.PROVIDER_ID]
+        return list(demo_lane.PROVIDER_IDS)
     from services.agent.config import load_config
     config = load_config()
     agent = config.get("agent") if isinstance(config, Mapping) else None

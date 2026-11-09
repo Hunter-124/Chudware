@@ -2194,12 +2194,12 @@ def _omp_provider_list(params: dict, _emit: Callable) -> dict:
     if params:
         return {"ok": False, "reason": "omp_provider_list takes no params"}
     if in_cell() and demo_lane.enabled():
-        # One fixed provider, nothing to sign in to: answered without starting an OMP process.
+        # The lane's fixed providers, nothing to sign in to: answered without starting an OMP process.
         try:
-            count = len(demo_lane.models())
+            rows = demo_lane.models()
         except demo_lane.LaneError as exc:
             return {"ok": False, "reason": str(exc)}
-        return {"ok": True, "providers": [demo_lane.provider_descriptor(count)]}
+        return {"ok": True, "providers": demo_lane.provider_descriptors(rows)}
     login = _omp_transient_call("get_login_providers", {})
     models = _omp_transient_call("get_available_models", {})
     setup = _omp_auth_call("setup_providers", {}, _emit)

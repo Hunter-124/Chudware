@@ -3752,3 +3752,23 @@ per-session socket `/run/chudware-demo/provider.sock` has exactly one online rou
 Every other cell, including a demo container without the mounted socket, keeps answering
 `credential_isolation_unsupported` for AI turns and an empty `omp_models_list`.
 `GET /healthz` of a demo container additionally carries `"demo": true`.
+
+## Public demo lane: an `anthropic` provider for the Claude rows (append-only, 2026-11-09)
+
+Worker RPC contract revision 2.4. The wire protocol major remains 2. This amendment
+supersedes the demo-lane rows of revision 2.3 that name `openrouter` as the lane's only
+provider. The front door sends the lane's Claude rows to the Claude API itself, not to
+OpenRouter, so they are now listed under their own provider:
+
+* `omp_models_list` returns a lane row whose front-door entry is `owned_by:"anthropic"` with
+  provider id `anthropic`; every other row keeps provider id `openrouter`. The lane's order is
+  unchanged.
+* `omp_provider_list` returns the `openrouter` row ("Demo models") and, when the lane lists at
+  least one Anthropic row, an `anthropic` row ("Anthropic API (demo)"), both `authKinds:[]`;
+  `omp_auth_state` answers `configured` for either without starting OMP.
+* `agent_admin_turn` is admitted for a listed model only under the provider of its own row; a
+  turn naming neither gets the lane's first row with that row's provider.
+* The private `models.yml` sets the `openrouter` provider's `baseUrl` to
+  `http://127.0.0.1:18081/v1` (`openai-completions`) and the `anthropic` provider's to
+  `http://127.0.0.1:18081` (`anthropic-messages`), both with the placeholder key and
+  `auth: apiKey`, with or without a model list.

@@ -2,10 +2,11 @@
 
 A demo container's trusted front door mounts ONE per-session unix socket into every actor
 sandbox; the fixed loopback forwarder in ``web/deploy/cell/cell_forwarder.py`` exposes it as
-``http://127.0.0.1:18081``: OpenAI-style ``/v1/chat/completions`` for the free models and the
-native Messages API (``/v1/messages``) for the Anthropic ones. The owner's keys and the model
-allowlist live only in the front door: it rejects any other model, enforces the per-session
-quota and USD caps and strips client credentials. Nothing here accepts a caller-supplied
+``http://127.0.0.1:18081``: OpenAI-style ``/v1/chat/completions`` for the free OpenRouter models
+and the native Messages API (``/v1/messages``) for the Anthropic ones, which the front door sends
+to the Anthropic API itself; each family is its own provider, so the picker names the real
+one. The owner's keys and the model allowlist live only in the front door: it rejects any
+other model, enforces the per-session quota and USD caps and strips client credentials. Nothing here accepts a caller-supplied
 endpoint, key or provider, and a cell that is not a demo container (or whose front door
 mounted no socket) keeps refusing every online credential route exactly as before.
 """
@@ -31,6 +32,10 @@ LANE_BASE_URL = f"{LANE_ROOT}/v1"
 LANE_SOCKET = "/run/chudware-demo/provider.sock"
 PROVIDER_ID = "openrouter"
 PROVIDER_NAME = "Demo models"
+ANTHROPIC_PROVIDER_ID = "anthropic"
+ANTHROPIC_PROVIDER_NAME = "Anthropic API (demo)"
+PROVIDER_IDS = (PROVIDER_ID, ANTHROPIC_PROVIDER_ID)
+_PROVIDER_NAMES = {PROVIDER_ID: PROVIDER_NAME, ANTHROPIC_PROVIDER_ID: ANTHROPIC_PROVIDER_NAME}
 # Not a secret. OMP wants some key for a custom provider (an unmatched value is used literally);
 # the front door ignores client credentials and adds the real one on its side of the socket.
 PLACEHOLDER_KEY = "chudware-demo-lane"
@@ -101,13 +106,14 @@ def _row(item: Any) -> dict[str, Any] | None:
     name = item.get("name")
     pricing = item.get("pricing")
     pricing = pricing if isinstance(pricing, Mapping) else {}
+    anthropic = item.get("owned_by") == "anthropic"
     row: dict[str, Any] = {
         "id": model_id,
         "name": name.strip()[:256] if isinstance(name, str) and name.strip() else model_id,
-        "provider": PROVIDER_ID,
+        "provider": ANTHROPIC_PROVIDER_ID if anthropic else PROVIDER_ID,
         "cost": {key: _per_million(pricing.get(source)) for key, source in _COST_FIELDS},
     }
-    if item.get("owned_by") == "anthropic":
+    if anthropic:
         row["api"] = _ANTHROPIC_API
     context = _positive_int(item.get("context_length"))
     if context:
@@ -172,22 +178,24 @@ _DEFAULT_OUTPUT = 16_384
 
 
 def models_config(rows: list[Mapping[str, Any]] | None) -> dict[str, Any]:
-    """OMP ``models.yml`` that points its OpenRouter provider at the lane.
+    """OMP ``models.yml`` that points its OpenRouter and Anthropic providers at the lane.
 
-    Free rows inherit the provider's ``openai-completions`` transport and ``/v1`` base URL.
-    An Anthropic row names ``anthropic-messages`` and the lane ROOT itself: OMP's Anthropic transport
-    appends ``/v1/messages`` (and strips a trailing ``/v1``), so the front door's native route is
-    reached either way. ``auth: apiKey`` keeps OMP from shaping those requests as OAuth ones.
+    Free rows use the OpenRouter provider's ``openai-completions`` transport and ``/v1`` base URL.
+    Anthropic rows use the Anthropic provider's ``anthropic-messages`` transport and the lane ROOT
+    itself: OMP's Anthropic transport appends ``/v1/messages`` (and strips a trailing ``/v1``), so
+    the front door's native route is reached either way. ``auth: apiKey`` keeps OMP from shaping
+    those requests as OAuth ones.
 
-    Rows are optional: without them the override still reaches the lane and relies on OMP's
-    bundled OpenRouter catalog; the front door rejects anything outside its allowlist anyway.
+    Rows are optional: without them both overrides still reach the lane and rely on OMP's
+    bundled catalogs; the front door rejects anything outside its allowlist anyway.
     """
-    provider: dict[str, Any] = {
-        "baseUrl": LANE_BASE_URL, "apiKey": PLACEHOLDER_KEY, "api": "openai-completions",
-        "auth": "apiKey",
+    providers: dict[str, dict[str, Any]] = {
+        PROVIDER_ID: {"baseUrl": LANE_BASE_URL, "apiKey": PLACEHOLDER_KEY,
+                      "api": "openai-completions", "auth": "apiKey"},
+        ANTHROPIC_PROVIDER_ID: {"baseUrl": LANE_ROOT, "apiKey": PLACEHOLDER_KEY,
+                                "api": _ANTHROPIC_API, "auth": "apiKey"},
     }
     if rows:
-        entries = []
         for row in rows:
             context = row.get("contextWindow") or _DEFAULT_CONTEXT
             output = min(row.get("maxTokens") or _DEFAULT_OUTPUT, context)
@@ -196,16 +204,14 @@ def models_config(rows: list[Mapping[str, Any]] | None) -> dict[str, Any]:
                 "id": row["id"], "name": row["name"], "contextWindow": context, "maxTokens": output,
                 "cost": {key: cost.get(key, 0) for key, _ in _COST_FIELDS},
             }
-            if row.get("api") == _ANTHROPIC_API:
-                entry["api"] = _ANTHROPIC_API
-                entry["baseUrl"] = LANE_ROOT
+            anthropic = row.get("api") == _ANTHROPIC_API
+            if anthropic:
                 # These models think; let OMP drive their effort instead of treating them as non-reasoning.
                 entry["reasoning"] = True
             if "image" in (row.get("input") or ()):
                 entry["input"] = ["text", "image"]
-            entries.append(entry)
-        provider["models"] = entries
-    return {"providers": {PROVIDER_ID: provider}}
+            providers[ANTHROPIC_PROVIDER_ID if anthropic else PROVIDER_ID].setdefault("models", []).append(entry)
+    return {"providers": providers}
 
 
 def pin_model(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -222,22 +228,28 @@ def pin_model(params: Mapping[str, Any]) -> dict[str, Any]:
     provider = provider.strip() if isinstance(provider, str) else ""
     model = model.strip() if isinstance(model, str) else ""
     if not provider and not model:
-        provider, model = PROVIDER_ID, next(iter(allowed))
-    if provider != PROVIDER_ID or model not in allowed:
+        model = next(iter(allowed))
+        provider = allowed[model]["provider"]
+    if model not in allowed or provider != allowed[model]["provider"]:
         raise ValueError(MODEL_REFUSAL)
     return {**params, "provider": provider, "model": model}
 
 
-def provider_descriptor(count: int) -> dict[str, Any]:
-    """The single provider row of Settings → Providers in a demo cell: ready, nothing to configure."""
-    return {"id": PROVIDER_ID, "name": PROVIDER_NAME, "available": count > 0, "authenticated": True,
-            "authKinds": [], "modelsAvailable": count, "state": "configured", "origin": "demo"}
+def provider_descriptors(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Settings → Providers in a demo cell: the free-model row, plus the Anthropic row when the
+    lane serves Anthropic models. Ready, nothing to configure."""
+    counts = {provider_id: sum(1 for row in rows if row.get("provider") == provider_id)
+              for provider_id in PROVIDER_IDS}
+    return [{"id": provider_id, "name": _PROVIDER_NAMES[provider_id], "available": count > 0,
+             "authenticated": True, "authKinds": [], "modelsAvailable": count,
+             "state": "configured", "origin": "demo"}
+            for provider_id, count in counts.items() if count or provider_id == PROVIDER_ID]
 
 
 def auth_state(provider_id: str) -> dict[str, Any]:
     """``omp_auth_state`` for a demo cell, answered without starting an OMP process."""
-    ready = provider_id == PROVIDER_ID
-    return {"ok": True, "id": provider_id, "name": PROVIDER_NAME if ready else provider_id,
+    ready = provider_id in PROVIDER_IDS
+    return {"ok": True, "id": provider_id, "name": _PROVIDER_NAMES.get(provider_id, provider_id),
             "state": "configured" if ready else "signed_out", "authenticated": ready,
             "hasApiKey": False, "hasOAuth": False, "accounts": [], "disabled": [],
             "usage": {"notes": [], "windows": []}, **({"origin": "demo"} if ready else {})}

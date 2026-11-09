@@ -153,9 +153,10 @@ What the flag changes inside the container, and nothing else:
   *Download your work* action and an expiry overlay.
 - If the front door mounted its per-session socket at `/run/chudware-demo/provider.sock`, each
   actor sandbox also gets it at the same path plus a fixed loopback forwarder on
-  `127.0.0.1:18081`. OMP's `openrouter` provider is pointed at `http://127.0.0.1:18081/v1`
-  with a placeholder key, and the model picker lists exactly what the lane's `GET /v1/models`
-  returns. The owner's key and the model allowlist live only in the front door; a cell without
+  `127.0.0.1:18081`. OMP's `openrouter` provider (the free models) is pointed at
+  `http://127.0.0.1:18081/v1` and its `anthropic` provider (the Claude models, which the front
+  door sends to the Claude API on the owner's key) at `http://127.0.0.1:18081`, both with a
+  placeholder key, and the model picker lists exactly what the lane's `GET /v1/models` returns. The owner's key and the model allowlist live only in the front door; a cell without
   that socket (every single-operator container) keeps refusing every online credential route.
 - A spent session or daily AI allowance (HTTP 429, `demo_quota_exhausted` /
   `demo_ai_daily_limit`) ends the turn with the front door's own message. The front door

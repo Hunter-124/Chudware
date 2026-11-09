@@ -1851,7 +1851,8 @@ def test_demo_providers_panel_is_one_ready_row_answered_without_an_omp_process(o
     assert row["authenticated"] and row["authKinds"] == [] and row["modelsAvailable"] == 2
     state = worker_rpc._omp_auth_state({"providerId": "openrouter"}, lambda event: None)
     assert state["ok"] and state["authenticated"] and state["state"] == "configured"
-    assert not worker_rpc._omp_auth_state({"providerId": "anthropic"}, lambda e: None)["authenticated"]
+    assert worker_rpc._omp_auth_state({"providerId": "anthropic"}, lambda e: None)["authenticated"]
+    assert not worker_rpc._omp_auth_state({"providerId": "openai"}, lambda e: None)["authenticated"]
     assert not online_lane.host.auth_calls and not online_lane.host.transient_calls
 
 

@@ -212,29 +212,42 @@ def test_omp_config_points_openrouter_at_the_loopback_lane_with_a_placeholder_ke
 
 
 def test_omp_config_without_a_model_list_still_reaches_only_the_lane():
-    provider = demo_lane.models_config(None)["providers"]["openrouter"]
-    assert "models" not in provider and provider["baseUrl"] == demo_lane.LANE_BASE_URL
-    assert demo_lane.models_config([])["providers"]["openrouter"].get("models") is None
+    providers = demo_lane.models_config(None)["providers"]
+    assert set(providers) == {"openrouter", "anthropic"}
+    assert "models" not in providers["openrouter"] and providers["openrouter"]["baseUrl"] == demo_lane.LANE_BASE_URL
+    assert "models" not in providers["anthropic"] and providers["anthropic"]["baseUrl"] == demo_lane.LANE_ROOT
+    assert all(p.get("models") is None for p in demo_lane.models_config([])["providers"].values())
+
+
+def test_omp_config_without_anthropic_rows_still_points_the_anthropic_provider_at_the_lane():
+    providers = demo_lane.models_config(demo_lane.parse_models(LISTING))["providers"]
+    assert "models" not in providers["anthropic"] and providers["anthropic"]["baseUrl"] == demo_lane.LANE_ROOT
 
 
 def test_a_claude_row_carries_its_api_family_and_per_million_token_cost():
     claude, free, _ = demo_lane.parse_models(MIXED_LISTING)
     assert claude["id"] == "claude-sonnet-5-5" and claude["api"] == "anthropic-messages"
-    assert claude["provider"] == "openrouter" and claude["name"] == "Claude Sonnet 5.5"
+    assert claude["provider"] == "anthropic" and claude["name"] == "Claude Sonnet 5.5"
+    assert free["provider"] == "openrouter"
     assert (claude["contextWindow"], claude["maxTokens"]) == (200000, 32000)
     assert claude["input"] == ["text", "image"]
     assert claude["cost"] == {"input": 2.0, "output": 10.0, "cacheRead": 0.1, "cacheWrite": 2.5}
     assert "api" not in free and free["cost"] == {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
 
 
-def test_omp_config_routes_a_claude_row_through_the_lane_root_and_keeps_free_rows_on_chat_completions():
+def test_omp_config_routes_claude_rows_through_the_anthropic_provider_and_free_rows_through_openrouter():
     config = demo_lane.models_config(demo_lane.parse_models(MIXED_LISTING))
     provider = config["providers"]["openrouter"]
     assert provider["api"] == "openai-completions" and provider["baseUrl"] == "http://127.0.0.1:18081/v1"
     assert provider["auth"] == "apiKey" and provider["apiKey"] == demo_lane.PLACEHOLDER_KEY
-    claude, free, _ = provider["models"]
-    assert claude["api"] == "anthropic-messages" and claude["baseUrl"] == "http://127.0.0.1:18081"
-    assert claude["baseUrl"] == demo_lane.LANE_ROOT
+    anthropic = config["providers"]["anthropic"]
+    assert anthropic["api"] == "anthropic-messages" and anthropic["baseUrl"] == "http://127.0.0.1:18081"
+    assert anthropic["baseUrl"] == demo_lane.LANE_ROOT
+    assert anthropic["auth"] == "apiKey" and anthropic["apiKey"] == demo_lane.PLACEHOLDER_KEY
+    (claude,) = anthropic["models"]
+    free, _ = provider["models"]
+    assert claude["id"] == "claude-sonnet-5-5" and claude["reasoning"] is True
+    assert "api" not in claude and "baseUrl" not in claude
     assert claude["cost"] == {"input": 2.0, "output": 10.0, "cacheRead": 0.1, "cacheWrite": 2.5}
     assert (claude["contextWindow"], claude["maxTokens"]) == (200000, 32000)
     assert claude["input"] == ["text", "image"]
@@ -280,6 +293,15 @@ def test_a_listed_model_is_accepted_as_is(lane):
     assert demo_lane.pin_model(params) == {**params, "provider": "openrouter"}
 
 
+def test_a_claude_model_is_pinned_under_the_anthropic_provider(lane):
+    lane["body"] = json.dumps(MIXED_LISTING).encode()
+    assert demo_lane.pin_model({})["provider"] == "anthropic"  # the lane's first row is Claude
+    params = {"provider": "anthropic", "model": "claude-sonnet-5-5"}
+    assert demo_lane.pin_model(params) == params
+    with pytest.raises(ValueError, match=demo_lane.MODEL_REFUSAL):
+        demo_lane.pin_model({"provider": "openrouter", "model": "claude-sonnet-5-5"})
+
+
 @pytest.mark.parametrize("params", [
     {"provider": "openai", "model": "gpt-test"},
     {"provider": "openrouter", "model": "not/listed:free"},
@@ -302,18 +324,28 @@ def test_pinning_needs_a_live_nonempty_lane(lane):
 
 
 def test_providers_panel_has_one_ready_row_with_nothing_to_sign_in_to():
-    row = demo_lane.provider_descriptor(4)
+    (row,) = demo_lane.provider_descriptors(demo_lane.parse_models(LISTING))
     assert row["id"] == "openrouter" and row["name"] == "Demo models"
     assert row["authenticated"] is True and row["available"] is True and row["authKinds"] == []
-    assert row["modelsAvailable"] == 4
-    assert demo_lane.provider_descriptor(0)["available"] is False
+    assert row["modelsAvailable"] == 2
+    (empty,) = demo_lane.provider_descriptors([])
+    assert empty["id"] == "openrouter" and empty["available"] is False
+
+
+def test_providers_panel_adds_a_ready_anthropic_row_when_the_lane_serves_claude():
+    free, anthropic = demo_lane.provider_descriptors(demo_lane.parse_models(MIXED_LISTING))
+    assert (free["id"], free["modelsAvailable"]) == ("openrouter", 2)
+    assert (anthropic["id"], anthropic["modelsAvailable"]) == ("anthropic", 1)
+    assert anthropic["name"] == "Anthropic API (demo)"
+    assert anthropic["authenticated"] is True and anthropic["available"] is True and anthropic["authKinds"] == []
 
 
 def test_auth_state_is_ready_for_the_lane_and_signed_out_for_anything_else():
-    ready = demo_lane.auth_state("openrouter")
-    assert ready["state"] == "configured" and ready["authenticated"] is True
-    assert ready["hasApiKey"] is False and ready["accounts"] == []
-    other = demo_lane.auth_state("anthropic")
+    for provider_id in ("openrouter", "anthropic"):
+        ready = demo_lane.auth_state(provider_id)
+        assert ready["state"] == "configured" and ready["authenticated"] is True
+        assert ready["hasApiKey"] is False and ready["accounts"] == []
+    other = demo_lane.auth_state("openai")
     assert other["state"] == "signed_out" and other["authenticated"] is False
 
 

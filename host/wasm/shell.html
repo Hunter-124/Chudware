@@ -914,10 +914,11 @@
           : 'Demo session' + (left ? ' \u2014 ' + left : '');
         if (downloadNote) text = downloadNote;
         if (msgEl.textContent !== text) msgEl.textContent = text;
-        // Daily AI allowance (null/absent => no segment).
+        // Free-model daily allowance (null/absent => no segment); Claude has its own caps.
         var aiLeft = state.ai_remaining_today;
         var aiText = (typeof aiLeft === 'number' && isFinite(aiLeft) && aiLeft >= 0 && Math.floor(aiLeft) === aiLeft)
-          ? 'AI requests left today: ' + aiLeft : '';
+          ? 'Free AI requests left today: ' + aiLeft : '';
+        if (state.claude_available === true) aiText = 'Claude 5.5 available' + (aiText ? ' \u00b7 ' + aiText : '');
         if (aiEl.textContent !== aiText) aiEl.textContent = aiText;
       }
       function noteDownload(text, ms) {

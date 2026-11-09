@@ -108,9 +108,9 @@ const char* webGapReason(const char* surfaceId) {
     if (!connection || !engine::webCellProtocolReady(connection->serverInfo()))
         return "CAD and AI are unavailable for this workspace connection.";
 #endif
-    // Demo sessions run only the server-side free-model lane: say that, not "use the desktop".
+    // Demo sessions run only the server-side demo model lane: say that, not "use the desktop".
     if (webDemo() && std::strcmp(surfaceId, "account_signin") == 0)
-        return "Free demo models only";
+        return "Demo models only";
     for (const WebGap& g : kWebGaps)
         if (std::strcmp(g.id, surfaceId) == 0) return g.reason;
     return nullptr;

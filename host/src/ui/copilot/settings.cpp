@@ -1438,6 +1438,8 @@ std::vector<ui::BridgeModelMeta> parseBridgeCatalogRows(const nlohmann::json& mo
         b.deprecated = isDeprecatedModelId(b.id);
         rows.push_back(std::move(b));
     }
+    // The web demo keeps the front door's order: its first row is the demo default.
+    if (ui::webBuild() && ui::webDemo()) return rows;
     // Newest-first per provider: provider ASC, deprecated last, then newest release first,
     // then name ASC as a stable tiebreak for same-day/unknown-date rows.
     std::stable_sort(rows.begin(), rows.end(),

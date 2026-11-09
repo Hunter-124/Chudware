@@ -240,19 +240,18 @@ def test_license_debt_has_vggt_entry():
 
 
 # ---------------------------------------------------------------------------
-# OpenMVS banner explicitly mentions AGPL + subprocess
+# OpenMVS banner names the tool and how to install it
 # ---------------------------------------------------------------------------
 
-def test_openmvs_banner_mentions_agpl():
-    """Banner for missing OpenMVS must remind user of the AGPL constraint."""
+def test_openmvs_banner_says_how_to_install():
+    """Banner for missing OpenMVS must name OpenMVS and how to get it."""
     status = _fresh_status(
         gpu=True, webcam=True,
         binaries={k: (k != "openmvs") for k in rp._PROVISIONING_KEYS},
     )
-    agpl_banners = [b for b in status["banners"] if "AGPL" in b]
-    assert agpl_banners, (
-        "Expected at least one banner mentioning AGPL when OpenMVS is absent"
-    )
+    banners = [b for b in status["banners"] if "OpenMVS" in b]
+    assert banners, "Expected a banner naming OpenMVS when it is absent"
+    assert "reveng_install_tools" in banners[0] and "OPENMVS_BIN" in banners[0]
 
 
 def test_openmvs_discovery_matches_backend_for_path_and_override(tmp_path, monkeypatch):

@@ -9408,9 +9408,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 _unpublish(d)
                 if _CUR["doc_id"] == d:
                     _CUR["doc_id"] = None
-                return _dumps({"ok": True, "detached": True, "doc_id": d,
+                return _dumps({"ok": True, "detached": True, "closed": False, "doc_id": d,
                                **({"discarded": r.get("discarded", False)} if discard else {}),
-                               "note": r.get("note")})
+                               "note": (r.get("note") or "") + (
+                                   " NOT closed: the app or an active run still holds this "
+                                   "document, so its name and path stay bound. new_part(<same "
+                                   "name>) will RESUME it with its old features, and save_part "
+                                   "to its path from another doc is refused. Use a new name or "
+                                   "fresh=True.")})
             _unpublish(d)  # drop its mirror tab in the app
             if _CUR["doc_id"] == d:
                 _CUR["doc_id"] = None
@@ -9784,6 +9789,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         a long wait interrupts the cell before the job finishes. The finished result stays
         retrievable (get_job(job_id)), so read it in a short eval afterwards.
         """
+        try:
+            timeout_s = float(timeout_s)
+            poll_s = float(poll_s)
+        except (TypeError, ValueError):
+            raise ValueError("wait_job: timeout_s and poll_s must be numbers of seconds") from None
         timeout_s = max(0.0, min(900.0, timeout_s))
         poll_s = max(0.5, min(30.0, poll_s))
         start = time.monotonic()

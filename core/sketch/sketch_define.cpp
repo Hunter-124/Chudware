@@ -35,7 +35,12 @@ bool line_curve(const json& e) { return e.value("type", std::string()) == "line"
 
 Point handle_point(const std::string& ref, const json& coords) {
     if (ref == "origin") return {};
-    const auto& e = coords.at(entity_of(ref));
+    const auto found = coords.find(entity_of(ref));
+    if (found == coords.end())
+        throw std::runtime_error("constraint ref '" + ref + "': no entity " + entity_of(ref) +
+                                 " in this sketch (entity ids are document-wide; read the "
+                                 "sketch's own ids back from the sketch readback)");
+    const auto& e = *found;
     const auto sub = ref.find('.') == std::string::npos ? "" : ref.substr(ref.find('.') + 1);
     const auto type = e.value("type", std::string());
     if (type == "spline" || type == "style_spline") {

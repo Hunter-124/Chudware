@@ -17,6 +17,7 @@ from services.agent.request_context import root_value
 from . import cad_viewpoint as _vp
 from . import shot_planner as _sp
 from .cad_common import (
+    coerce_json_or_repr,
     COMPONENT_KEY_RE,
     component_key_refusal,
     _CLOSEUP_H,
@@ -850,7 +851,7 @@ def _split_view(view) -> tuple:
         proj = str(opts["projection"]).strip().lower()
         if proj in ("orthographic", "ortho"):
             opts["projection"] = "ortho"
-        elif proj == "perspective":
+        elif proj in ("perspective", "persp"):
             opts["projection"] = "perspective"
         else:
             raise ValueError(f"view.projection must be 'perspective' or 'ortho', got {proj!r}")
@@ -1391,6 +1392,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             # Let a bad tier name surface: the engine refuses instead of guessing.
             cb.call("doc_set_display_quality",
                     {"doc_id": d, "quality": str(display_quality).strip().lower()})
+        view = coerce_json_or_repr(view)  # a JSON-string view is a dict view, not a named view
         view_spec, cam_opts = _split_view(view)
         view_name = view if isinstance(view, str) else "custom"
         emp_spec = emphasize if emphasize is not None else target

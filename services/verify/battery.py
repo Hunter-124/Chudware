@@ -1658,6 +1658,15 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         else:
             scores[name] = score
 
+    # Uniform finding shape: every finding carries code/severity/message, whatever
+    # check produced it (setdefault never overwrites a check's own fields).
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        f.setdefault("code", f.get("kind") or f.get("check") or "finding")
+        f.setdefault("severity", "fail" if f.get("ok") is False else "warn")
+        f.setdefault("message", f.get("detail") or f.get("text") or f.get("error") or "")
+
     elapsed = (time.monotonic() - t0) * 1000
     return {
         "scores": dict(sorted(scores.items())),

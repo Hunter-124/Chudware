@@ -8770,7 +8770,16 @@ json assembly_transform_op(const json& doc, const json& op, const json& id_map) 
         return {value.at(0).get<double>(), value.at(1).get<double>(), value.at(2).get<double>()};
     };
     const json rotation = p.value("rotate", json());
-    const double angle = rotation.is_object() ? rotation.value("angle", 0.0) : p.value("angle", 0.0);
+    // Accept a bare number or the {"value": n, "expr": null} dimension object.
+    const auto degrees = [](const json& v) {
+        const json& n = v.is_object() && v.contains("value") ? v.at("value") : v;
+        if (n.is_null()) return 0.0;
+        if (!n.is_number())
+            throw OpError("invalid_op", "transform: angle must be a number in degrees");
+        return n.get<double>();
+    };
+    const double angle = rotation.is_object() ? degrees(rotation.value("angle", json()))
+                                              : degrees(p.value("angle", json()));
     Eigen::Vector3d axis = vector(rotation.is_object() ? rotation.value("axis", json())
         : rotation.is_null() ? p.value("axis", json()) : rotation, Eigen::Vector3d::UnitZ());
     if (std::abs(angle) > 1e-9 && axis.norm() < 1e-12)

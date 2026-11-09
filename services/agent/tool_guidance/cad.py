@@ -352,6 +352,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Hyphens and underscores are interchangeable. 'overview' and 'ops' contain "
             "the full cheatsheet; 'add_features' is the complete mutation reference. "
             "The reply is plain text; Eval's details.xdev.inner is already decoded. "
+            "A refused call returns {ok:false, error, ...}: check ok first; oversized results are at "
+            "details._truncated.full_result. If tool.X fails with 'registered but not available', "
+            "call enable_tools(tools=[...]) first. "
             "A truncated text reply includes its complete-result path; the JSON file "
             "decodes to the original string."
         ),

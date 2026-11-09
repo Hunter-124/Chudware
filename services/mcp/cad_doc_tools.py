@@ -7564,6 +7564,34 @@ def _non_body_edit_context(ops: list, tree: dict, id_map: dict) -> Optional[dict
     return context
 
 
+def _invalid_body_warning(exact: Any) -> Optional[str]:
+    """Warning text when the engine's post-op validity pass flagged a body, else None."""
+    bad = (exact or {}).get("invalid_bodies") if isinstance(exact, dict) else None
+    if not isinstance(bad, list) or not bad:
+        return None
+    return ("result body invalid (brep_check): BRepCheck reports invalid topology on "
+            f"{len(bad)} body(ies); it may not render or tessellate and downstream ops can "
+            "fail. Run check_geometry_health, then undo/edit the last feature (smaller "
+            "radius, different edges or tolerance).")
+
+
+def _adjusted_dress(features: list) -> list:
+    """Structured fillet auto-adjustments from the engine's feature `data.fillet` records."""
+    rows = []
+    for f in features:
+        fil = (f.get("data") or {}).get("fillet") if isinstance(f.get("data"), dict) else None
+        if not isinstance(fil, dict) or fil.get("adjustment") in (None, "none"):
+            continue
+        req = (fil.get("requested") or {}).get("radius")
+        eff = (fil.get("effective") or {}).get("radius")
+        if not (isinstance(req, (int, float)) and isinstance(eff, (int, float)) and req > 0):
+            continue
+        rows.append({"id": f.get("id"), "adjusted": True, "requested_radius": req,
+                     "applied_radius": eff,
+                     "change_fraction": round(abs(eff - req) / req, 4)})
+    return rows
+
+
 def _warning_changes(before: Optional[dict], features: list) -> dict:
     current = [{"id": f.get("id"), "warning": f["warning"]}
                for f in features if f.get("warning")]
@@ -8715,6 +8743,26 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if r.get("auto_rollback"):
                     out["auto_rollback"] = r["auto_rollback"]
                     out["warning"] = r.get("warning")
+                invalid_text = _invalid_body_warning(exact_after)
+                if invalid_text:
+                    out["body_valid"] = False
+                    out["warning"] = (f"{out['warning']} | {invalid_text}"
+                                      if out.get("warning") else invalid_text)
+                adjusted = _adjusted_dress(feats)
+                if adjusted:
+                    out["adjusted"] = True
+                    out["adjustments"] = adjusted
+                    big = [a for a in adjusted if a["change_fraction"] > 0.5]
+                    if big:
+                        adj_text = "; ".join(
+                            f"{a['id']}: requested radius {a['requested_radius']:g} mm was "
+                            f"auto-adjusted to {a['applied_radius']:g} mm "
+                            f"({a['change_fraction'] * 100:.0f}% change)" for a in big)
+                        adj_text = ("RADIUS CHANGED, NOT AS REQUESTED - " + adj_text +
+                                    ". The geometry does not have the size you asked for; "
+                                    "pick edges/geometry that allow it or revise the design.")
+                        out["warning"] = (f"{out['warning']} | {adj_text}"
+                                          if out.get("warning") else adj_text)
                 history_feedback = _model_history_feedback(r)
                 if history_feedback is not None:
                     out["model_history"] = history_feedback

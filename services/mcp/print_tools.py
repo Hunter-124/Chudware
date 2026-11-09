@@ -1256,7 +1256,8 @@ def register_print_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def print_media_inventory(root: str, offset: int = 0, limit: int = 200) -> str:
+    def print_media_inventory(root: str = "", offset: int = 0, limit: int = 200,
+                              path: str = "") -> str:
         """Read-only inventory of printer media (USB stick / SD card): every file, which G-code is selectable.
 
         Changes nothing. Call it FIRST, before any delivery, and again to read back what a
@@ -1273,10 +1274,15 @@ def register_print_tools(mcp: FastMCP) -> None:
         Possible root-level firmware images raise firmware_files_present warnings and block
         publishing; some printers auto-flash them at boot. Inventory never removes them.
         Never decide which file is current from mtime. Pass inventory_token unchanged to
-        publish_print_media."""
+        publish_print_media. `path` is accepted as an alias for `root`."""
         try:
             from services.manufacturing.print_media import inventory_print_media  # noqa: PLC0415
 
+            if not root and path:
+                root = path
+            if not (isinstance(root, str) and root.strip()):
+                raise ValueError("print_media_inventory needs root=<mounted media root> "
+                                 "(path= is accepted as an alias).")
             if isinstance(root, str) and root.strip():
                 root = resolve_agent_path(root, "root")
             return _dumps(inventory_print_media(root, offset=offset, limit=limit))

@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -210,6 +213,97 @@ bool build_edge(const nlohmann::json& ent, const SketchPlane& plane,
         return false;  // malformed param dict / OCCT throw — skip this entity
     }
     return false;  // unsupported entity type (point/style_spline/ellipse/...) — skip
+}
+
+// Entity types that never contribute profile edges by design (reference geometry).
+bool is_non_profile_type(const std::string& t) { return t == "point" || t == "text"; }
+
+// Append the profile edges for one solved entity. Slots and arc slots expand into
+// their outline (2 lines + 2 semicircular caps) so a slot-only sketch is a closed
+// profile; everything else maps 1:1 through build_edge. Entity types that yield no
+// edge and are not construction/reference are recorded in `ignored`.
+void append_entity_edges(const nlohmann::json& ent, const SketchPlane& plane,
+                         std::vector<SketchEdge>& out,
+                         std::set<std::string>* ignored = nullptr) {
+    if (!ent.is_object() || !ent.contains("type") || !ent["type"].is_string()) return;
+    if (ent.value("construction", false)) return;
+    const std::string t = ent["type"];
+    using nlohmann::json;
+    std::vector<json> parts;
+    try {
+        const double DEG = 180.0 / kPi;
+        auto line = [](Eigen::Vector2d a, Eigen::Vector2d b) {
+            return json{{"type", "line"}, {"p1", json::array({a.x(), a.y()})},
+                        {"p2", json::array({b.x(), b.y()})}};
+        };
+        auto arc = [](Eigen::Vector2d c, double r, double sa, double ea) {
+            return json{{"type", "arc"}, {"center", json::array({c.x(), c.y()})},
+                        {"radius", r}, {"start", sa}, {"end", ea}, {"ccw", true}};
+        };
+        if (t == "slot") {
+            // Solver convention (sketch.cpp): p1/p2 are the cap-centre ends, width the
+            // full slot width, so caps are semicircles of radius width/2.
+            Eigen::Vector2d p1(ent["p1"][0], ent["p1"][1]), p2(ent["p2"][0], ent["p2"][1]);
+            const double r = std::abs(ent["width"].get<double>()) / 2.0;
+            if (r <= kEps || near2(p1, p2)) {
+                if (ignored) ignored->insert(t);
+                return;
+            }
+            const Eigen::Vector2d d = (p2 - p1).normalized();
+            const Eigen::Vector2d n(-d.y(), d.x());
+            const double th = std::atan2(d.y(), d.x()) * DEG;
+            parts.push_back(line(p1 + r * n, p2 + r * n));
+            parts.push_back(arc(p2, r, th - 90.0, th + 90.0));
+            parts.push_back(line(p2 - r * n, p1 - r * n));
+            parts.push_back(arc(p1, r, th + 90.0, th + 270.0));
+        } else if (t == "arc_slot") {
+            // Spine arc (centre, radius, a0..a1 degrees, CCW) swept by `width`; ends are
+            // semicircular caps of radius width/2 centred on the spine endpoints.
+            Eigen::Vector2d c(ent["center"][0], ent["center"][1]);
+            const double R = ent["radius"].get<double>();
+            const double a0 = ent["a0"].get<double>();
+            double a1 = ent["a1"].get<double>();
+            const double r = std::abs(ent["width"].get<double>()) / 2.0;
+            while (a1 <= a0) a1 += 360.0;
+            if (r <= kEps || R - r <= kEps) {
+                if (ignored) ignored->insert(t);
+                return;
+            }
+            auto at = [&](double rad, double deg) {
+                return Eigen::Vector2d(c.x() + rad * std::cos(deg / DEG),
+                                       c.y() + rad * std::sin(deg / DEG));
+            };
+            parts.push_back(arc(c, R + r, a0, a1));
+            parts.push_back(arc(at(R, a1), r, a1, a1 + 180.0));
+            parts.push_back(arc(c, R - r, a0, a1));
+            parts.push_back(arc(at(R, a0), r, a0 + 180.0, a0 + 360.0));
+        }
+    } catch (...) {
+        if (ignored) ignored->insert(t);
+        return;
+    }
+    if (parts.empty()) {
+        SketchEdge se;
+        if (build_edge(ent, plane, se)) out.push_back(std::move(se));
+        else if (ignored && !is_non_profile_type(t) &&
+                 t != "line" && t != "circle" && t != "arc" && t != "spline")
+            ignored->insert(t);
+        return;
+    }
+    for (const json& p : parts) {
+        SketchEdge se;
+        if (build_edge(p, plane, se)) out.push_back(std::move(se));
+    }
+}
+
+// A sketch whose only geometry is of types the profile builder cannot turn into
+// edges would otherwise surface as a misleading "no closed face"; name the types.
+void throw_if_ignored(const std::set<std::string>& ignored) {
+    if (ignored.empty()) return;
+    std::string names;
+    for (const auto& n : ignored) names += (names.empty() ? "" : ", ") + n;
+    throw std::runtime_error("profile sketch contains only unsupported entity types (" +
+                             names + "); these are ignored when building a profile");
 }
 
 // One detected closed loop: the edges in head-to-tail order (reversed where the
@@ -501,10 +595,11 @@ std::vector<TopoDS_Face> faces_from_solved_sketch(
 
     // 1) Build one lifted OCCT edge per non-construction line/circle/arc.
     std::vector<SketchEdge> edges;
+    std::set<std::string> ignored;
     for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
-        SketchEdge se;
-        if (build_edge(it.value(), plane, se)) edges.push_back(std::move(se));
+        append_entity_edges(it.value(), plane, edges, &ignored);
     }
+    if (edges.empty()) throw_if_ignored(ignored);
     if (edges.empty()) return faces;
 
     // 2) Detect closed loops (circles + chained open edges).
@@ -563,9 +658,9 @@ std::vector<TopoDS_Face> all_region_faces_from_solved_sketch(
     if (!solved_entities.is_object()) return faces;
 
     std::vector<SketchEdge> edges;
+    std::set<std::string> ignored;
     for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
-        SketchEdge se;
-        if (build_edge(it.value(), plane, se)) edges.push_back(std::move(se));
+        append_entity_edges(it.value(), plane, edges, &ignored);
     }
     if (edges.empty()) return faces;
 
@@ -612,9 +707,9 @@ std::vector<std::vector<TopoDS_Face>> connected_material_regions(
     if (!solved_entities.is_object()) return groups;
 
     std::vector<SketchEdge> edges;
+    std::set<std::string> ignored;
     for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
-        SketchEdge se;
-        if (build_edge(it.value(), plane, se)) edges.push_back(std::move(se));
+        append_entity_edges(it.value(), plane, edges, &ignored);
     }
     if (edges.empty()) return groups;
 
@@ -688,10 +783,13 @@ TopoDS_Wire wire_from_solved_sketch(
     const nlohmann::json& solved_entities, const SketchPlane& plane) {
     if (!solved_entities.is_object()) return TopoDS_Wire();
     std::vector<TopoDS_Edge> edges;
+    std::set<std::string> ignored;
     for (auto it = solved_entities.begin(); it != solved_entities.end(); ++it) {
-        SketchEdge se;
-        if (build_edge(it.value(), plane, se)) edges.push_back(se.edge);
+        std::vector<SketchEdge> ses;
+        append_entity_edges(it.value(), plane, ses, &ignored);
+        for (auto& se : ses) edges.push_back(se.edge);
     }
+    if (edges.empty()) throw_if_ignored(ignored);
     if (edges.empty()) return TopoDS_Wire();
     return make_wire(edges);  // connects head-to-tail in entity order (open or closed)
 }

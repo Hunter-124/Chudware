@@ -828,6 +828,9 @@ EMBEDDED PYTHON EVAL
   The edit-part skill includes the complete checked transport helper. Its
   details.xdev.inner is already decoded: structured results are objects or arrays,
   while cad_guide and cad_skill results are plain text. Do not JSON-decode strings.
+  A refused call returns {ok:false, error, ...}, so check ok first. Oversized
+  results are at details._truncated.full_result.
+  tool.X failing with "registered but not available" means call enable_tools(tools=["X"]) first.
   The helper joins auto_backgrounded jobs and loads structured _truncated.full_result
   and spilled text JSON before checking ok or using fields. Recover the saved reply,
   not a second execution.
@@ -934,6 +937,7 @@ GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, as
   Token phrases can express simple side/surface/orientation/pick predicates, but are
   not arbitrary natural-language queries. For "the outer cylindrical wall near x=200",
   state near:[200,y,z] explicitly in the query; prose coordinates do not narrow it.
+  Edges of one face: query_geometry({"of_face":"<face sid>"}) (adjacency: query_adjacency).
   EXPLORE first with describe_part() / query_geometry({"of":"face"}) / hover(sid),
   then SELECT with a structured query built from the keys above.
 
@@ -1530,7 +1534,12 @@ _ADD_FEATURES_GUIDE = """Apply a list of document ops to build/edit the part (th
         and search. Corrected literal dimensions are saved in the accepted tree;
         expressions stay authored and may have derived `feature.data.fillet_effective`.
         A rejected part batch is atomic; its candidate statuses do not describe the live
-        geometry. Do not infer effective radii from warning text.
+        geometry. Do not infer effective radii from warning text; a corrected fillet also
+        sets top-level `adjusted:true` and `adjustments[]` (requested_radius,
+        applied_radius, change_fraction), and a change over 50% puts a prominent
+        "RADIUS CHANGED" entry in `warning`. `body_valid:false` plus a "result body invalid
+        (brep_check)" `warning` means the op left invalid topology (BRepCheck): run
+        check_geometry_health and fix or undo before render_part, which cannot tessellate it.
         VERIFY LOOP: inspect each mutation's result and measure affected geometry with
         measure_part()/query_geometry()/inspect_feature(target). Render when visual judgment
         or a warning warrants it, and review the finished artifact as needed. Before

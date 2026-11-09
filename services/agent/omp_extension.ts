@@ -731,7 +731,11 @@ export default async function cadExtension(pi: ExtensionAPI) {
           }
           return row[b.length];
         };
-        const suggestions = [...registered.keys()].map(candidate => ({ candidate, score: distance(name, candidate) }))
+        const opKinds = ["add_feature", "edit_feature", "delete_feature", "set_suppressed", "reorder_feature", "rename",
+          "set_folder", "copy_feature", "asm_delete_component"];
+        if (opKinds.includes(name))
+          return fail(`\`${name}\` is an op inside add_features(ops=[{op:"${name}"}]), not a tool.`);
+        const suggestions = [...registered.keys()].map(candidate => ({ candidate, score: candidate.includes(name) || name.includes(candidate) ? -1 : distance(name, candidate) }))
           .sort((a, b) => a.score - b.score || a.candidate.localeCompare(b.candidate))
           .slice(0, 3).map(item => item.candidate);
         return fail(`Unknown CAD tool xd://${name}.${suggestions.length ? ` Closest: ${suggestions.join(", ")}.` : ""} Use list_tool_categories to discover tools.`);
@@ -783,7 +787,9 @@ export default async function cadExtension(pi: ExtensionAPI) {
       const item = tool as Record<string, unknown>;
       if ((item.name !== "eval" && item.name !== "_eval") || typeof item.description !== "string") return tool;
       const description = item.description.replace(/^Session tool names: [^\n]*$/m,
-        "Enabled session tools are available via `tool.<name>`; read their xd:// documentation for schemas.");
+        "Enabled session tools are available via `tool.<name>`; read their xd:// documentation for schemas. " +
+        "tool.X failing with 'registered but not available' means call enable_tools(tools=[...]) first. " +
+        "A refused call returns {ok:false, error, ...}: check ok first; oversized results are at details._truncated.full_result.");
       if (description === item.description) return tool;
       changed = true;
       return { ...item, description };

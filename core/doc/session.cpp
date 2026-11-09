@@ -7611,10 +7611,19 @@ const json& exact_geometry_stats(const CompileResult& r,
             return r.exact_stats = previous->exact_stats;
     double volume = 0.0;
     int faces = 0, solids = 0;
+    json invalid_bodies = json::array();
     Bnd_Box box;
     for (std::size_t i = 0; i < r.shapes.size(); ++i) {
         const TopoDS_Shape& shape = r.shapes[i];
         if (shape.IsNull()) continue;
+        // Topology validity rides the same memoized pass (parallel, no geometry controls
+        // beyond the default) so an op that yields a corrupt body is reported in its reply.
+        try {
+            if (!BRepCheck_Analyzer(shape, Standard_True, Standard_True).IsValid())
+                invalid_bodies.push_back(static_cast<int>(i));
+        } catch (const Standard_Failure&) {
+            invalid_bodies.push_back(static_cast<int>(i));
+        }
         BRepBndLib::AddOptimal(shape, box, /*useTriangulation=*/Standard_False,
                                /*useShapeTolerance=*/Standard_False);
         TopTools_IndexedMapOfShape face_map, solid_map;
@@ -7642,7 +7651,8 @@ const json& exact_geometry_stats(const CompileResult& r,
         bounds = {{"min", {x0, y0, z0}}, {"max", {x1, y1, z1}}, {"size", {x1 - x0, y1 - y0, z1 - z0}}};
     }
     r.exact_stats = {{"basis", "brep_exact"}, {"volume_mm3", volume}, {"bbox", std::move(bounds)},
-                     {"face_count", faces}, {"solid_count", solids}};
+                     {"face_count", faces}, {"solid_count", solids},
+                     {"invalid_bodies", std::move(invalid_bodies)}};
     return r.exact_stats;
 }
 

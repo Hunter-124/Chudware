@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections import defaultdict
 from typing import Annotated, Any, Optional, Union
 
@@ -309,7 +310,20 @@ def _kept_import_bodies(names: list, keep, exclude) -> list:
     return [(i + 1, names[i]) for i in range(len(names)) if live[i]]
 
 
+# describe_part runs inside an Eval cell with a 120-300 s deadline. The face/edge queries are
+# single RPCs, but everything after them (clustering, attribution, adjacency bridging, the
+# per-feature placement narrative) is Python work that grows with face count. Past this budget
+# the digest degrades to the cheap facts and says so (truncated:true) instead of blocking.
+_DIGEST_BUDGET_S = 45.0
+
+
 def _digest(doc_id: str) -> dict:
+    t0 = time.monotonic()
+    truncated: list = []
+
+    def over() -> bool:
+        return time.monotonic() - t0 > _DIGEST_BUDGET_S
+
     bodies = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False}).get("bodies", [])
     if not bodies:
         raise ValueError("document has no bodies")
@@ -328,7 +342,7 @@ def _digest(doc_id: str) -> dict:
 
     # Instance/symmetry clustering: faces with the same shape+size are likely pattern copies.
     groups: dict = defaultdict(list)
-    for f in faces:
+    for f in ([] if over() else faces):
         key = (f.get("surf"), round(f.get("area_or_len") or 0.0, 1),
                round(f.get("radius") or 0.0, 2), f.get("concavity"))
         groups[key].append(f)
@@ -348,6 +362,8 @@ def _digest(doc_id: str) -> dict:
     caps = [{"sid": f.get("sid"), "side": f.get("side"), "area": f.get("area_or_len")}
             for f in faces if f.get("surf") == "plane" and f.get("side")]
 
+    if over():
+        truncated.append("instances")
     att = _face_attribution(doc_id, feats, owner_map, faces)
     ord_owner = att["owner"]              # per doc_query face index: the de-smeared owner
     faces_by_owner = att["owned"]
@@ -363,6 +379,9 @@ def _digest(doc_id: str) -> dict:
     # in `faces` is face `ord` i.
     touches: dict = defaultdict(set)
     try:
+        if over():
+            truncated.append("touches")
+            raise TimeoutError("describe_part budget")
         adj = cb.call("doc_adjacency", {"doc_id": doc_id})
         for e in adj.get("edges", []):
             between = e.get("between") or []
@@ -415,7 +434,10 @@ def _digest(doc_id: str) -> dict:
                      "ref": fid if j == 0 else f"{fid}#{j}",
                      **({"source_ordinal": src} if src != j + 1 else {})}
                     for j, (src, nm) in enumerate(kept)]
-        if owned:
+        if owned and over():
+            if "placement" not in truncated:
+                truncated.append("placement")
+        elif owned:
             anchor = _pick_anchor(fid, touches.get(fid, ()), rank, area_by_owner)
             placement = _feature_placement(owned, bbox, ft, anchor)
             if placement is not None:
@@ -431,7 +453,15 @@ def _digest(doc_id: str) -> dict:
             entry["consumed"] = True
         feat_summary.append(entry)
 
+    extra: dict = {}
+    if truncated:
+        extra = {"truncated": True, "truncated_sections": truncated,
+                 "truncated_note": (f"describe_part exceeded its {_DIGEST_BUDGET_S:.0f}s budget on "
+                                    f"{len(faces)} faces; the sections listed were skipped. Use "
+                                    f"get_part(feature_ids=[...]) for feature detail, hover(sid) "
+                                    f"or query_geometry for specific entities.")}
     return {
+        **extra,
         "part": (tree.get("tree") or {}).get("name"),
         # Assembly rows are components; a multibody component carries one source
         # ordinal per solid. Surface-only rows still represent one body.
@@ -2353,7 +2383,8 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         features and attributed_faces (raw kernel attribution). Use hover(sid)
         for an entity. doc_id may be an open part's id or name; omit for current.
         Aliases and ignored filters are reported in interpreted. A part without
-        a solid returns ok with empty=true.
+        a solid returns ok with empty=true. On very large parts it stops after a time
+        budget and returns a partial digest with truncated:true (use get_part for detail).
         """
         _unwrap_var_kw(kwargs)
         try:
@@ -2371,6 +2402,10 @@ def register_gsl_tools(mcp: FastMCP) -> None:
                     out["interpreted"] = notes
                 return _dumps(out)
             out = {"ok": True, "outline": _outline_text(d), "digest": d}
+            if d.get("truncated"):
+                out["truncated"] = True
+                out["outline"] += "\n[truncated] " + d["truncated_note"]
+                out["next"] = "get_part"
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)

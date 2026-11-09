@@ -13,14 +13,17 @@
 #include <GProp_GProps.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Shape.hxx>
 #include <TopoDS_Wire.hxx>
 #include <nlohmann/json.hpp>
 
+#include "geom/features.h"
 #include "geom/plane.h"
 #include "geom/profile.h"
 
 using nlohmann::json;
 using chudware::geom::SketchPlane;
+using chudware::geom::faces_from_solved_sketch;
 using chudware::geom::wire_from_solved_sketch;
 
 namespace {
@@ -98,4 +101,39 @@ TEST_CASE("disconnected path returns no wire") {
                   {"p2", json::array({60.0, 50.0})}};  // far away, no shared endpoint
     TopoDS_Wire w = wire_from_solved_sketch(ents, xy());
     CHECK(w.IsNull());
+}
+
+// --- slot / arc_slot expand into outline edges: a slot-only sketch is a closed profile.
+TEST_CASE("slot-only sketch extrudes to a solid with the slot area") {
+    json ents;
+    ents["s1"] = {{"type", "slot"}, {"p1", json::array({0.0, 0.0})},
+                  {"p2", json::array({20.0, 0.0})}, {"width", 6.0}};
+    auto faces = chudware::geom::faces_from_solved_sketch(ents, xy());
+    REQUIRE(faces.size() == 1);
+    TopoDS_Shape solid =
+        geom::extrude_face(faces[0], Eigen::Vector3d(0, 0, 1), 5.0);
+    REQUIRE_FALSE(solid.IsNull());
+    GProp_GProps g;
+    BRepGProp::VolumeProperties(solid, g);
+    const double area = 20.0 * 6.0 + kPi * 3.0 * 3.0;
+    CHECK(g.Mass() == doctest::Approx(area * 5.0).epsilon(1e-4));
+}
+
+TEST_CASE("arc_slot-only sketch yields a face with the swept-band area") {
+    json ents;  // 90 deg spine arc, R=10, width 4 => cap radius 2
+    ents["a1"] = {{"type", "arc_slot"}, {"center", json::array({0.0, 0.0})},
+                  {"radius", 10.0}, {"a0", 0.0}, {"a1", 90.0}, {"width", 4.0}};
+    auto faces = chudware::geom::faces_from_solved_sketch(ents, xy());
+    REQUIRE(faces.size() == 1);
+    GProp_GProps g;
+    BRepGProp::SurfaceProperties(faces[0], g);
+    const double band = 0.25 * kPi * (12.0 * 12.0 - 8.0 * 8.0);
+    CHECK(g.Mass() == doctest::Approx(band + kPi * 4.0).epsilon(1e-4));
+}
+
+TEST_CASE("unsupported-only sketch names the ignored entity types") {
+    json ents;
+    ents["w"] = {{"type", "wobble"}, {"p1", json::array({0.0, 0.0})}};
+    CHECK_THROWS_WITH(chudware::geom::faces_from_solved_sketch(ents, xy()),
+                      doctest::Contains("wobble"));
 }

@@ -386,6 +386,8 @@ def test_print_media_workspace_paths_preserve_manifest_and_media_safety(
     with bind_roots(str(project)):
         inventory = json.loads(print_tools["print_media_inventory"](root="media"))
         assert inventory["ok"], inventory
+        aliased = json.loads(print_tools["print_media_inventory"](path="media"))
+        assert aliased["ok"], aliased
         rejected = json.loads(print_tools["publish_print_media"](
             root="media", project="test",
             jobs=[{"part_id": "unsafe", "manifest_path": "print/unsafe.print.json",

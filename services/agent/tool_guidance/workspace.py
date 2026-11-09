@@ -30,7 +30,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "enable_tools": {
         "prompt_note": (
             "Enable only the packs the current step needs — every enabled "
-            "tool costs prompt tokens for the rest of the turn."
+            "tool costs prompt tokens for the rest of the turn. Eval's tool.X "
+            "failing with 'registered but not available' means call "
+            "enable_tools(tools=['X']) first."
         ),
     },
     "list_tool_categories": {

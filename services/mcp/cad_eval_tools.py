@@ -952,6 +952,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           near           [x,y,z] a point ON (or the centroid of) the face/edge you mean —
                          ranked by distance to its actual geometry, ties to the nearer centroid
           count/index    cap the set / keep specific ordinals
+          of_face        a FACE sid: list the EDGES bordering that face, e.g.
+                         {"of_face":"Fae1b6c"} (the adjacency graph is query_adjacency)
 
         Examples:
           {"of":"face","side":"top"}                                     the top face
@@ -1014,6 +1016,33 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # the docs tell the model to address the element by one, so asking about a sid
             # here has exactly one meaning. Live claude-opus-5 2026-08-04:
             # query_geometry(doc_id=…, sid="F1b1b80") answered "needs a geometry query".
+            of_face = extra.pop("of_face", None)
+            if isinstance(query, dict) and "of_face" in query:
+                query = dict(query)
+                of_face = query.pop("of_face")
+            if of_face is not None:
+                # The edges bordering one face: of_face=<face sid> (+ any other edge predicates).
+                if not isinstance(of_face, str) or not _SID_RE.fullmatch(of_face.strip()) \
+                        or of_face.strip()[0].lower() != "f":
+                    raise ValueError("query_geometry: of_face must be a FACE sid (e.g. 'Fae1b6c').")
+                if isinstance(query, dict) and str(query.get("of", "edge")).lower() != "edge":
+                    raise ValueError("query_geometry: of_face lists EDGES; use of='edge' (or omit it).")
+                d = _doc(doc_id)
+                faces = (cb.call("doc_query", {"doc_id": d, "query": {"of": "face"}}) or {}).get("matches", [])
+                hit = [m for m in faces if str(m.get("sid", "")).casefold() == of_face.strip().casefold()]
+                if len(hit) != 1 or hit[0].get("body") is None or hit[0].get("topo") is None:
+                    raise ValueError(f"query_geometry: no unique face with sid {of_face!r}; requery current geometry.")
+                topo = (cb.call("doc_face_edges", {"doc_id": d, "body_id": int(hit[0]["body"]),
+                                                   "topo_id": int(hit[0]["topo"])}) or {}).get("edges") or []
+                wanted = {(int(hit[0]["body"]), int(t)) for t in topo}
+                emap = (cb.call("doc_query", {"doc_id": d, "query": {"of": "edge"}}) or {}).get("matches", [])
+                rows = [m for m in emap if m.get("body") is not None and m.get("topo") is not None
+                        and (int(m["body"]), int(m["topo"])) in wanted]
+                return _dumps({"ok": True, "doc_id": d, "query": {"of": "edge", "of_face": of_face.strip()},
+                               "count": len(rows[offset:offset + page_size]), "total_count": len(rows),
+                               "offset": offset, "page_size": page_size,
+                               "next_offset": offset + page_size if offset + page_size < len(rows) else None,
+                               "matches": rows[offset:offset + page_size]})
             sid = extra.pop("sid", None)
             kind = extra.pop("of", None) if sid is not None else None
             if isinstance(query, dict) and "sid" in query:

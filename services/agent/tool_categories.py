@@ -27,6 +27,8 @@ META_TOOLS: frozenset[str] = frozenset({
     "enable_tools",
     "list_tool_categories",
     "design_recipe",
+    # Schema failures happen in every pack; the guide that explains the shapes must too.
+    "cad_guide",
 })
 
 # Logical packs → concrete names and/or family:X tokens. Pure data; family tokens

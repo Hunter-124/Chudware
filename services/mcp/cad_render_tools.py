@@ -17,6 +17,7 @@ from services.agent.request_context import root_value
 from . import cad_viewpoint as _vp
 from . import shot_planner as _sp
 from .cad_common import (
+    render_failure_reason,
     coerce_json_or_repr,
     COMPONENT_KEY_RE,
     component_key_refusal,
@@ -1568,7 +1569,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 if rd.get("ok") and os.path.exists(png):
                     return _with_save_note(_captioned_render(png, d, [view_name]),
                                            _render_save_note(png, save_to))
-                raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
+                raise ValueError(f"Render failed: {render_failure_reason(d, r)}")
         # Mesh-accurate overlay: B-rep edges (hidden-line removed), explicit `highlight`
         # targets, feature callouts and a scale bar, reprojected through the SAME camera the
         # engine just rendered — its own echoed frame when it gave us one. Degrades to a
@@ -1670,8 +1671,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             r = cb.call("doc_render_contact_sheet", params)
             if not r.get("ok") or not os.path.exists(png):
                 raise ValueError(
-                    f"Contact sheet failed: "
-                    f"{r.get('reason', r.get('error', 'no bodies to render'))}")
+                    f"Contact sheet failed: {render_failure_reason(d, r)}")
             return _with_save_note(_captioned_render(png, d, view_list),
                                    _render_save_note(png, save_to))
 

@@ -555,6 +555,34 @@ def _write_diff(before: dict, after: dict, vol_before, vol_after, *,
                           + "x".join(f"{v:g}" for v in out["bbox_mm"]) + " mm")
     return out
 
+def render_failure_reason(doc_id: str, r: Optional[dict]) -> str:
+    """Why a render produced no image: the engine's own reason, else an honest fallback.
+
+    "no bodies" is reserved for a document whose bbox really is empty; a document that has
+    bodies but no mesh is invalid or non-tessellatable, which check_geometry_health names.
+    """
+    r = r if isinstance(r, dict) else {}
+    reason = r.get("reason") or r.get("error")
+    if reason:
+        return str(reason)
+    try:
+        bb = cb.call("doc_bbox", {"doc_id": doc_id}) or {}
+        empty = not bb.get("size")
+        count = None
+        if not empty:
+            rows = (cb.call("asm_world_bodies", {"doc_id": doc_id}) or {}).get("bodies")
+            count = len(rows) if isinstance(rows, list) else None
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == "engine_connection_lost":
+            raise
+        return "the engine returned no mesh; run check_geometry_health (the body may be invalid or non-tessellatable)"
+    if empty or count == 0:
+        return "no bodies to render"
+    has = f"the document has {count} bodies" if count is not None else "the document has bodies"
+    return (f"the engine returned no mesh; {has}; run check_geometry_health "
+            "(it may be invalid or non-tessellatable)")
+
+
 def _resolve_alias(doc_id: str) -> str:
     """Follow the recovery alias chain so a stale (pre-restart) doc_id resolves to the live one."""
     seen: set = set()
@@ -5824,8 +5852,7 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
         params["background"] = bg
     r = cb.call("doc_render_view", params)
     if not r.get("ok") or not os.path.exists(out_png):
-        raise ValueError(
-            f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
+        raise ValueError(f"Render failed: {render_failure_reason(doc_id, r)}")
     frame = _frame_from_rpc(r)
     if frame is not None and plane is not None:
         frame["section"] = plane

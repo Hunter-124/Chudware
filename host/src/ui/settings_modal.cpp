@@ -7366,7 +7366,7 @@ static void drawGeneralPage(AppState& st) {
         if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir(st);
         ImGui::SameLine();
         if (ui::kit::secondaryButton("Browse\xe2\x80\xa6", true, nullptr, ImVec2(90.0f * sc, 0))) {
-            std::string chosen = openFolderDialog();
+            std::string chosen = ui::openFolderDialog();
             if (!chosen.empty() && chosen != "/workspace") {
                 std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
                 std::strncpy(s_wsBuf.data(), chosen.c_str(), s_wsBuf.size() - 1);

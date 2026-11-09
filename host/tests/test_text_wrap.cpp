@@ -22,6 +22,7 @@
 //   ✓ offsets stay sorted and unique
 //   ✓ a first sighting seeds instead of shifting garbage
 //   ✓ copied composer selections flatten synthetic wraps while preserving hard breaks and UTF-8
+//   ✓ Home's logical line start skips soft wraps and stops just past the user's break
 
 #include "ui/copilot/text_wrap.h"
 
@@ -33,6 +34,7 @@ using ui::copilot::WrapState;
 using ui::copilot::isHardBreak;
 using ui::copilot::normalizeComposerSelection;
 using ui::copilot::noteEdit;
+using ui::copilot::logicalLineStart;
 using ui::copilot::seedHardBreaks;
 
 static int g_failures = 0;
@@ -223,6 +225,20 @@ int main() {
         CHECK(normalizeComposerSelection(wrapped, {}, 0, end) ==
               expected.substr(0, (size_t)end));
         CHECK(normalizeComposerSelection(wrapped, {}, 0, (int)wrapped.size()) == expected);
+    }
+
+    // ---- Home: logical line start ignores soft wraps, honors hard breaks ----
+    {
+        // "first\nline\nsecond\npart" with only offset 10 typed by the user.
+        const std::vector<int> hard{10};
+        CHECK(logicalLineStart(hard, 0) == 0);
+        CHECK(logicalLineStart(hard, 6) == 0);    // visual row 2, still logical line 1
+        CHECK(logicalLineStart(hard, 10) == 0);   // caret before the break belongs above it
+        CHECK(logicalLineStart(hard, 11) == 11);  // just past the break
+        CHECK(logicalLineStart(hard, 18) == 11);  // soft-wrapped row of line 2
+        CHECK(logicalLineStart({}, 18) == 0);
+        CHECK(logicalLineStart({3, 4}, 5) == 5);  // blank line between two breaks
+        CHECK(logicalLineStart({3, 4}, 4) == 4);
     }
 
     if (g_failures == 0) std::printf("test_text_wrap: all checks passed\n");

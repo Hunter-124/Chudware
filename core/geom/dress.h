@@ -37,8 +37,27 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 
 namespace geom {
+
+// How often the oriented skin of a shape bounds an edge. A seam has two uses on one face; a
+// boolean imprint (e.g. the contact line of a tangent boss) is INTERNAL to its face, has
+// no use, and does not open the skin. Counting ancestor faces instead reads such an
+// imprint as a free edge, so a closed solid is called open and every blend on it fails.
+struct EdgeBoundaryUses {
+    int boundary = 0;       // FORWARD/REVERSED uses in face wires
+    bool embedded = false;  // INTERNAL/EXTERNAL in some face
+    bool is_free() const { return boundary == 1 || (boundary == 0 && !embedded); }
+};
+
+// Index-aligned with `edges` (TopExp::MapShapes(shape, TopAbs_EDGE, edges)); slot 0 is unused.
+std::vector<EdgeBoundaryUses> edge_boundary_uses(const TopoDS_Shape& shape,
+                                                 const TopTools_IndexedMapOfShape& edges);
+
+// True when `shape` has at least one edge and none that is free. Degenerate edges (cone apex,
+// sphere pole) are ignored. An OCCT failure reads as not watertight.
+bool is_watertight(const TopoDS_Shape& shape);
 
 enum class FilletFailure {
     none,
@@ -95,11 +114,17 @@ struct FilletResult {
 // when the other changes. Equal requested endpoints remain equal. This preserves a
 // requested endpoint when possible; it does not claim a globally nearest pair.
 // All radii and tolerance are millimetres.
-// Search makes at most 72 probes under a 30 s aggregate budget, with at most
-// 5 s per isolated probe; on platforms or configurations using in-process
-// builds an individual native call has no hard wall-clock deadline. On timeout
-// or budget exhaustion after a verified candidate, the best candidate is
-// returned with a conservative resolution instead of discarding it.
+// Search makes at most 72 probes under a 30 s aggregate budget; one probe may use
+// all of the remaining budget, so a slow but sound build is not failed by a
+// per-probe cap. On platforms or configurations using in-process builds an
+// individual native call has no hard wall-clock deadline. On timeout or budget
+// exhaustion after a verified candidate, the best candidate is returned with a
+// conservative resolution instead of discarding it.
+// A downward correction of a constant radius never goes below min(0.05 mm, 0.1% of the
+// body's thinnest extent, a tenth of the request) (or edge tolerance, if larger): a request whose only valid
+// candidates are smaller fails, naming the failure at the requested radius,
+// rather than returning a blend no part could carry. Build failures name the
+// failing contour by selected-edge order and a model-space point.
 // Finite nonpositive radii are searched from model/kernel tolerances, not a fixed floor.
 // Variable endpoints must also exceed the relevant source and generated B-rep
 // tolerances; the check certifies resolvability, not a measured section radius.
@@ -121,6 +146,14 @@ struct FilletResult {
 // endpoints within OCCT's radius resolution are unsupported when both are
 // individually resolvable; an unresolvable endpoint instead enters correction.
 // OCCT interpolates along the contour spine; linear interpolation is not promised.
+// RUN-OFF. When the unchanged request fails, a constant-radius fillet of inside (concave)
+// edges is retried at the SAME radius before any correction (fillet_runoff.h): an end that
+// the blend is too wide for (a boss shorter than the radius, a rib standing nearer a plate
+// edge than the radius, an inside corner beside a wall that is too short) is extended past
+// its open edge, blended, and cut back flush with that edge; blends that only collide with
+// each other (two bosses closer than a radius) are built one contour at a time and united.
+// The result reports effective radius == requested radius. Outside-edge fillets, slanted or
+// rounded ends, and radii larger than the body keep the correction search described above.
 FilletResult fillet_edges(const TopoDS_Shape& shape, double radius,
                           std::optional<Eigen::Vector3d> dir = std::nullopt,
                           std::optional<double> radius2 = std::nullopt,

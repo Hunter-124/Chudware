@@ -393,35 +393,50 @@ bool panelHeader(const char* id, const PanelHeaderSpec& spec) {
 // form tabs
 // ==================================================================================================
 bool formTabs(const char* id, const char* const* fullLabels, const char* const* shortLabels,
-              int count, int* selected, const char* const* tooltips) {
+              int count, int* selected, const char* const* tooltips, bool fitLabels) {
     if (!fullLabels || count <= 0 || !selected) return false;
     ImGui::PushID(id && id[0] ? id : "kit_form_tabs");
 
     const float avail = ImMax(ImGui::GetContentRegionAvail().x, ui::metrics::stroke(1.0f));
     const float pX    = padX();
+    auto labelW = [&](const char* label) { return ImGui::CalcTextSize(label ? label : "").x + pX * 2.0f; };
+    // The widest label of a set: the width every equal cell needs.
     auto widest = [&](const char* const* labels) {
         float w = 0.0f;
-        for (int i = 0; i < count; ++i)
-            w = ImMax(w, ImGui::CalcTextSize(labels[i] ? labels[i] : "").x);
-        return w + pX * 2.0f;
+        for (int i = 0; i < count; ++i) w = ImMax(w, labelW(labels[i]));
+        return w;
     };
     const char* const* shortSet = shortLabels ? shortLabels : fullLabels;
     const float        wFull    = widest(fullLabels);
     const float        wShort   = widest(shortSet);
+    // Width a row of `n` segments from `first` needs: equal cells are all as wide as the widest
+    // label, fitted cells each as wide as their own label.
+    auto rowNeeds = [&](const char* const* labels, float widestW, int first, int n) {
+        if (!fitLabels) return widestW * (float)n;
+        float w = 0.0f;
+        for (int i = first; i < first + n; ++i) w += labelW(labels[i]);
+        return w;
+    };
+    // Whether every row of `per` segments fits.
+    auto fits = [&](const char* const* labels, float widestW, int per) {
+        for (int first = 0; first < count; first += per)
+            if (rowNeeds(labels, widestW, first, ImMin(per, count - first)) > avail) return false;
+        return true;
+    };
 
     // Full on one row, else short on one row, else the fewest equal rows that fit (full labels
     // preferred at each row count). Labels only elide in the degenerate one-per-row case.
     const char* const* shown  = shortSet;
     int                perRow = 1;
-    if (wFull * (float)count <= avail) {
+    if (fits(fullLabels, wFull, count)) {
         shown = fullLabels; perRow = count;
-    } else if (wShort * (float)count <= avail) {
+    } else if (fits(shortSet, wShort, count)) {
         shown = shortSet; perRow = count;
     } else {
         for (int rows = 2; rows <= count; ++rows) {
             const int per = (count + rows - 1) / rows;
-            if (wFull * (float)per <= avail)  { shown = fullLabels; perRow = per; break; }
-            if (wShort * (float)per <= avail) { shown = shortSet;   perRow = per; break; }
+            if (fits(fullLabels, wFull, per)) { shown = fullLabels; perRow = per; break; }
+            if (fits(shortSet, wShort, per))  { shown = shortSet;   perRow = per; break; }
         }
     }
     const int   rows  = (count + perRow - 1) / perRow;
@@ -440,8 +455,11 @@ bool formTabs(const char* id, const char* const* fullLabels, const char* const* 
         const int    first = r * perRow;
         const int    n     = ImMin(perRow, count - first);
         // Every row spans the full width: a shorter last row ("BOM | To Piping") gets wider
-        // cells instead of stopping two-thirds across.
-        const float  cellW = avail / (float)n;
+        // cells instead of stopping two-thirds across. Fitted cells share the width in
+        // proportion to their labels.
+        float rowNeed = 0.0f;
+        for (int k = 0; k < n; ++k) rowNeed += labelW(shown[first + k]);
+        float cellX = 0.0f;
         const ImVec2 t0(p0.x, p0.y + (h + vgap) * (float)r);
         const ImVec2 t1(t0.x + avail, t0.y + h);
         dl->AddRectFilled(t0, t1, role(palette.frameBg, kTrackA), rnd);
@@ -449,8 +467,10 @@ bool formTabs(const char* id, const char* const* fullLabels, const char* const* 
 
         for (int k = 0; k < n; ++k) {
             const int    i = first + k;
-            const ImVec2 sMin(t0.x + cellW * (float)k, t0.y);
+            const float  cellW = fitLabels ? avail * labelW(shown[i]) / rowNeed : avail / (float)n;
+            const ImVec2 sMin(t0.x + cellX, t0.y);
             const ImVec2 sMax(sMin.x + cellW, t1.y);
+            cellX += cellW;
 
             ImGui::PushID(i);
             ImGui::SetCursorScreenPos(sMin);

@@ -1,6 +1,13 @@
-# PLM live-session protocol — `aicad.plm-live/1`
+# PLM live-session protocol — `aicad.plm-live/2`
 
-Status: **FROZEN v1** (2026-08-27).
+Status: **FROZEN v2** (2026-11-07). v1 was frozen 2026-08-27.
+
+Revision v2 removes the nullable, reserved `account_id` from participant identity
+(join request, `joined` roster, `commit` author, checkpoint attribution, and the
+remote profile `identity`) and bumps the schema discriminator to
+`aicad.plm-live/2`. A peer speaking `aicad.plm-live/1` is refused with
+`invalid_schema`; a participant identity carrying any field other than `id` and
+`display` is refused with `invalid_identity`. No other v1 semantics change.
 
 This is an additive live-editing extension to `contracts/plm.md`. It applies
 only when a project remote profile has `kind:"plm-server"` and capability
@@ -39,7 +46,7 @@ order of committed operation batches.
 The transport is WebSocket (`ws://` for explicitly local development,
 `wss://` otherwise). Each WebSocket message contains one UTF-8 JSON object.
 
-- Schema discriminator: `"schema":"aicad.plm-live/1"` on every message.
+- Schema discriminator: `"schema":"aicad.plm-live/2"` on every message.
 - Maximum message: 4 MiB. Maximum `ops` batch: 1 MiB canonical JSON and 1,000
   operations. A larger proposal is rejected before allocation/copy.
 - The server SHALL accept no WebSocket extensions in v1; this avoids ambiguous
@@ -60,12 +67,9 @@ A live server is deny-by-default.
   (environment override is allowed for headless tests/administration).
 - The server compares token bytes in constant time and closes unauthorized
   handshakes with code 4401.
-- The participant identity is `{id,display,account_id}`. `id` and `display` are
-  required non-empty strings; `account_id` is nullable/reserved. The server
-  records identity from the authenticated join, never from later messages.
-- One token MAY authorize several participants on a small self-hosted server;
-  account-level authorization is an additive future capability, not implied by
-  v1.
+- The participant identity is `{id,display}`, both required non-empty strings. The
+  server records identity from the authenticated join, never from later messages.
+- One token MAY authorize several participants on a small self-hosted server.
 
 ## 4. Session key and lifecycle
 
@@ -78,9 +82,9 @@ Client request:
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"join",
+  "schema":"aicad.plm-live/2", "type":"join",
   "project_id":"p…", "item_id":"i…",
-  "participant":{"id":"u…","display":"Sarah","account_id":null},
+  "participant":{"id":"u…","display":"Sarah"},
   "last_seq":12,
   "token":"<redacted-on-receipt>"
 }
@@ -90,11 +94,11 @@ Successful response:
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"joined",
+  "schema":"aicad.plm-live/2", "type":"joined",
   "session_id":"s…", "project_id":"p…", "item_id":"i…",
   "head_seq":14, "engine_revision":27,
   "snapshot":{"encoding":"canonical-json","document":{}},
-  "participants":[{"id":"u…","display":"Sarah","account_id":null}],
+  "participants":[{"id":"u…","display":"Sarah"}],
   "checkpoint_base":"<vault commit>"
 }
 ```
@@ -119,7 +123,7 @@ When the last participant leaves:
 2. it writes exactly one vault checkpoint for the live session, even if several
    sockets disconnect concurrently;
 3. checkpoint attribution contains the de-duplicated participants who committed
-   at least one batch: `participants:[{id,display,account_id}]`;
+   at least one batch: `participants:[{id,display}]`;
 4. the checkpoint message is `Live session: <N> committed batch(es)` unless the
    clients supplied a non-empty session note;
 5. the session remains resumable from that checkpoint and sequence summary.
@@ -132,7 +136,7 @@ Proposal:
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"propose",
+  "schema":"aicad.plm-live/2", "type":"propose",
   "session_id":"s…", "client_op_id":"01J…",
   "base_seq":14,
   "ops":[{"op":"add_feature","feature":{}}]
@@ -148,9 +152,9 @@ Accepted broadcast (including to the proposer):
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"commit",
+  "schema":"aicad.plm-live/2", "type":"commit",
   "session_id":"s…", "seq":15, "client_op_id":"01J…",
-  "author":{"id":"u…","display":"Sarah","account_id":null},
+  "author":{"id":"u…","display":"Sarah"},
   "engine_revision":28,
   "ops":[{"op":"add_feature","feature":{}}],
   "snapshot":{"encoding":"canonical-json","document":{}},
@@ -166,7 +170,7 @@ Rejected response (only to proposer):
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"rejected",
+  "schema":"aicad.plm-live/2", "type":"rejected",
   "session_id":"s…", "client_op_id":"01J…",
   "head_seq":15, "reason":"stale_reference",
   "hint":"A referenced feature no longer exists; refresh and choose it again."
@@ -181,7 +185,7 @@ stack traces, engine internals, and transport stderr MUST NOT appear in `hint`.
 Client request:
 
 ```json
-{"schema":"aicad.plm-live/1","type":"catchup","session_id":"s…","from_seq":9}
+{"schema":"aicad.plm-live/2","type":"catchup","session_id":"s…","from_seq":9}
 ```
 
 The server replies with contiguous `commit` messages through `head_seq`. If the
@@ -189,7 +193,7 @@ range is unavailable or the client's state hash disagrees, it sends:
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"snapshot",
+  "schema":"aicad.plm-live/2", "type":"snapshot",
   "session_id":"s…", "head_seq":15, "engine_revision":28,
   "snapshot":{"encoding":"canonical-json","document":{}},
   "state_hash":"sha256:<hex>"
@@ -205,7 +209,7 @@ Client presence update:
 
 ```json
 {
-  "schema":"aicad.plm-live/1", "type":"presence",
+  "schema":"aicad.plm-live/2", "type":"presence",
   "session_id":"s…",
   "cursor":{"space":"viewport","x":0.0,"y":0.0,"z":0.0},
   "selection":{"kind":"face","selector":"feature:Pad/face:top"},
@@ -227,7 +231,7 @@ A leave/timeout broadcasts `presence_left`.
   "id":"r…", "name":"Workshop server", "kind":"plm-server",
   "url":"wss://plm.example.test/live",
   "capabilities":["snapshot_sync","live_coedit","presence"],
-  "identity":{"user_id":"u…","display":"Sarah","account_id":null}
+  "identity":{"user_id":"u…","display":"Sarah"}
 }
 ```
 
@@ -236,7 +240,6 @@ A leave/timeout broadcasts `presence_left`.
   joined live. Snapshot sync/checkpoints still use the vault.
 - Missing `live_coedit` means the client MUST use `aicad.plm/1` advisory locks even if the URL
   happens to point at a live-capable service.
-- `chudware-cloud` remains reserved/unavailable and does not imply this kind.
 
 ## 9. Server process
 

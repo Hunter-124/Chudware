@@ -1438,18 +1438,16 @@ namespace {
 // Kind → user-facing label. SSH/HTTPS name the protocol the user picked in the
 // share dialog — that is a deliberate choice, not leaked tool vocabulary.
 const char* teamKindLabel(const std::string& kind) {
-    if (kind == "folder")         return "Shared folder";
-    if (kind == "ssh")            return "Server (SSH)";
-    if (kind == "https")          return "Server (HTTPS)";
-    if (kind == "plm-server")     return "Live server";
-    if (kind == "chudware-cloud") return "Chudware Cloud";
+    if (kind == "folder")     return "Shared folder";
+    if (kind == "ssh")        return "Server (SSH)";
+    if (kind == "https")      return "Server (HTTPS)";
+    if (kind == "plm-server") return "Live server";
     return "Shared location";
 }
 
 const char* teamKindIcon(const std::string& kind) {
-    if (kind == "folder")         return "body_folder";
-    if (kind == "plm-server")     return "team";
-    if (kind == "chudware-cloud") return "app";
+    if (kind == "folder")     return "body_folder";
+    if (kind == "plm-server") return "team";
     return "vendor_globe";
 }
 
@@ -1609,8 +1607,6 @@ void drawShareProjectDialog(AppState& st) {
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kOpts[i].hint);
     }
-    ImGui::SameLine();
-    (void)ui::kit::secondaryButton("Chudware Cloud", false, "Not yet available");
 
     ImGui::Dummy(ImVec2(0, 4 * S));
     if (H.shareKind == 0) {
@@ -1669,12 +1665,7 @@ void drawRemoteCard(AppState& st, const PlmRemoteRow& rm) {
     auto& H = g_plmHub;
     ImGui::PushID(rm.id.c_str());
     (void)ui::kit::cardBegin("##remote", rm.name.c_str(), teamKindIcon(rm.kind));
-    ui::kit::chip(teamKindLabel(rm.kind),
-                  rm.reserved ? ui::kit::Tone::Warn : ui::kit::Tone::Accent);
-    if (rm.reserved) {
-        ImGui::SameLine();
-        ui::kit::chip("Not yet available", ui::kit::Tone::Warn, /*dot=*/true);
-    }
+    ui::kit::chip(teamKindLabel(rm.kind), ui::kit::Tone::Accent);
     if (rm.canLive) {
         ImGui::SameLine();
         ui::kit::chip("Live editing", ui::kit::Tone::Ok, /*dot=*/true,
@@ -1735,9 +1726,6 @@ void drawRemoteCard(AppState& st, const PlmRemoteRow& rm) {
             ui::kit::inlineStatus(L.err.c_str(), ui::kit::Tone::Err);
     } else if (syncing) {
         ui::kit::spinner("Syncing");
-    } else if (rm.reserved) {
-        (void)ui::kit::primaryButton("Sync now", false,
-                                     "Chudware Cloud is not yet available");
     } else {
         const bool idle = H.syncingRemote.empty();
         if (ui::kit::primaryButton("Sync now", rm.canSync && idle,

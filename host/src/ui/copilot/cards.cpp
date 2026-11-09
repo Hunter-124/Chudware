@@ -7,6 +7,7 @@
 // activity_timeline.cpp.
 
 #include "copilot_internal.h"
+#include "subrun_usage.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -2402,7 +2403,8 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts) {
     });
 }
 
-void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live) {
+void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live,
+                    const std::function<void()>& body) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -2442,9 +2444,49 @@ void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live) {
         ImGui::PopStyleColor();
     }
 
+    // The sub-agent's own totals (OMP's AgentProgress, carried in the detail trailer): requests,
+    // context against its window, spend and model. Main's context meter says nothing about these.
+    const ui::copilot::SubRunUsage use = ui::copilot::subRunUsageFromDetail(a.detail);
+    const std::string usageLine = ui::copilot::subRunUsageLine(
+        use, use.model.empty() ? std::string() : ui::shortModelName(use.model));
+    if (!usageLine.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(chatEllipsize(usageLine, ImGui::GetContentRegionAvail().x).c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            std::string tip = usageLine;
+            if (use.tokens > 0)
+                tip += "\nBilled volume: " + ui::copilot::subRunCount(use.tokens) +
+                       " tokens (input + output + cache writes)";
+            if (use.contextTokens > 0 && use.contextWindow > 0)
+                tip += "\nContext: " + std::to_string(use.contextTokens) + " of " +
+                       std::to_string(use.contextWindow) + " tokens";
+            if (use.durationMs > 0) tip += "\nRun time: " + ui::kit::fmtDuration(use.durationMs / 1000.0);
+            if (!use.model.empty()) tip += "\nModel: " + use.model;
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
+    if (use.retrying && a.status == "running") {
+        std::string tip = "The provider failed or rate-limited the sub-agent; it is waiting to retry.";
+        if (use.retryMax > 0)
+            tip += "\nAttempt " + std::to_string(use.retryAttempt) + " of " + std::to_string(use.retryMax);
+        if (use.retryDelayMs > 0) tip += "\nRetrying in " + ui::kit::fmtDuration(use.retryDelayMs / 1000.0);
+        if (!use.retryError.empty()) tip += "\n" + use.retryError;
+        ui::kit::chip("waiting on provider retry", ui::kit::Tone::Warn, true, tip.c_str());
+    }
+
+    // What the card owns (a sub-agent's calls) hangs under the title. Its own right-click copy
+    // stops above it: a nested row has a copy menu of its own.
+    float bodyTopY = -1.0f;
+    if (body) {
+        bodyTopY = ImGui::GetCursorScreenPos().y;
+        body();
+    }
+
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##subrun WindowPadding
     ImRect cardRect = endGlassBubble(gb);
+    if (bodyTopY >= 0.0f) cardRect.Max.y = ImMin(cardRect.Max.y, bodyTopY);
     chatCopyContext(cardRect, "##sub_run_copy", [&] { return chatActivityCopyText(a); });
 }
 

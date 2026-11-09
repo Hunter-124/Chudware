@@ -36,6 +36,7 @@
 #include "tesseract.h"         // ui::drawTesseract (vector brand mark in the title bar)
 #include "anim.h"
 #include "widgets/kit.h"       // ui::kit::elide (active-project label capping)
+#include "settings_modal.h"    // SettingsRoute deep links (ConfigurationManager -> Settings General)
 
 #include <filesystem>      // Recent-files menu labels
 #include <cstdio>          // snprintf
@@ -633,9 +634,9 @@ struct FilMenuDrawer {
             leftPaneEntry("PropertyManager",    AppState::LP_PropertyManager,
                           st.propertyManager && st.propertyManager->active());
             if (ImGui::MenuItem("ConfigurationManager", nullptr,
-                                st.openSettings && st.openSettingsTab == 1)) {
+                                st.openSettings && st.openSettingsTab == SettingsGeneral)) {
                 st.openSettings = true;
-                st.openSettingsTab = 1;  // Settings → General → Configurations
+                st.openSettingsTab = SettingsGeneral;  // Settings → General → Configurations
             }
             leftPaneEntry("Explorer",           AppState::LP_Explorer);
             ImGui::MenuItem("Design Table",     nullptr, &st.showDesignTablePanel);

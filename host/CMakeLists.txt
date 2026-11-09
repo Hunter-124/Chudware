@@ -176,7 +176,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/pending_stack.cpp      # pinned stack under the live turn: pending steers + queued messages
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
   src/ui/settings_modal.cpp
-  src/ui/onboarding.cpp       # first-run account/provider/test/workspace wizard
+  src/ui/onboarding.cpp       # first-run provider/test/workspace wizard
   src/ui/provider_logos.cpp             # provider brand color + badge (Settings -> Providers)
   src/ui/provider_usage.cpp             # shared subscription usage poll (Settings + composer rings)
   src/ui/omp_descriptors.cpp           # OMP worker payload parsing (GL-free; unit-tested)
@@ -236,6 +236,7 @@ set(CHUDWARE_CORE_SOURCES
   # --- end C17 ---
   # --- C18: sketch mode UI ---
   src/ui/sketch_mode.cpp
+  src/ui/sketch_model_snap.cpp   # model-geometry inference (vertex / midpoint / center / on-edge) + external-ref binding
   src/ui/sketch_relations_panel.cpp   # Display/Delete Relations panel (sketch_relations_panel.h)
   src/ui/airfoil.cpp   # NACA 4-/5-digit + .dat airfoil profile generator (SketchTool::Airfoil)
   src/ui/sketch3d_mode.cpp   # 3D free-space sketcher (sketch3d features)
@@ -1085,6 +1086,23 @@ add_test(NAME test_sketch_consumers
   COMMAND test_sketch_consumers
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end sketch consumption ---
+
+# --- Sketch model-geometry inference: ui/sketch_model_snap.{h,cpp} (no GL / imgui / AppState).
+# Guards the 2026-11-07 "the cursor never snaps to the model's vertices / edges / hole centers
+# while sketching": candidate table, priority, occlusion probe, and the associative external-ref
+# binding of a snap into one ops batch.
+add_executable(test_sketch_model_snap
+  tests/test_sketch_model_snap.cpp
+  src/ui/sketch_model_snap.cpp)
+target_include_directories(test_sketch_model_snap PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_sketch_model_snap PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_sketch_model_snap PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_sketch_model_snap
+  COMMAND test_sketch_model_snap
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end sketch model-geometry inference ---
 
 # --- CEF metrics spool bound: links the REAL GL/CEF-free filesystem cleanup.
 # Exercises both exact Chromium spool directories without loading libcef or a GL context.

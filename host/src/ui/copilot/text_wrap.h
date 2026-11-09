@@ -36,6 +36,11 @@ void noteEdit(WrapState& ws, const char* buf, int len, int cursor);
 // Is the '\n' at `off` one of the user's?
 bool isHardBreak(const std::vector<int>& hard, int off);
 
+// Offset of the first byte of the LOGICAL line holding `pos`: just past the nearest hard break
+// before it, or 0. Wrapper newlines are skipped, so Home lands where the user broke the line,
+// not at the start of the visual row.
+int logicalLineStart(const std::vector<int>& hard, int pos);
+
 // Return the selected byte range from the live composer buffer, restoring only wrapper-created
 // '\n' bytes to spaces. Offsets listed in `hardBreaks` are user-authored and remain newlines.
 // Bounds are clamped and may be reversed.

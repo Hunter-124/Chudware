@@ -56,11 +56,21 @@ out-of-range finite endpoints; `radius2` is required.
 CORRECTION AND READBACK: resolvable positive requests that pass input/topology checks are
 tried unchanged first. A bounded search can correct construction or completed validation
 failures and finite nonpositive or unresolvable inputs, accepting only a valid solid
-covering EVERY selected edge. Incomplete validation stops the search, not evidence
+covering EVERY selected edge. A downward correction of a constant radius stops at min(0.05 mm,
+0.1% of the body's thinnest extent, a tenth of the request): if only a smaller radius builds, the fillet fails instead
+of producing a micro-blend. Incomplete validation stops the search, not evidence
 for reducing a radius; a previously fully validated all-edge candidate is retained
-on timeout or budget exhaustion. Variable endpoints are refined in deterministic
-order with the other endpoint held fixed; this is not a global optimum or a guarantee
-of success.
+when the 30 s search budget runs out. One probe may use the whole budget, so a slow
+but sound build of a large spline body is not cut short. Variable endpoints are refined
+in deterministic order with the other endpoint held fixed; this is not a global
+optimum or a guarantee of success.
+RUN-OFF: an inside-corner constant fillet wider than the planar face it rolls on (a boss or
+rib standing closer to a plate's edge than the radius) is built at the REQUESTED radius and
+ends flush with that face's open edge, like a SolidWorks overflow. This is tried after the
+unchanged request fails and before any radius reduction, so such a fillet reports
+`adjustment:"none"`. It applies only to inside corners whose support face ends at a
+perpendicular convex edge and to a radius no larger than the body; outside-edge fillets
+and slanted or rounded rims keep the correction search.
 No selected edge is silently dropped and no unchanged no-op counts as a fillet.
 Inspect the completed result, not just `ok` or a warning:
 - MCP `add_features`: `features[i].data.fillet`.
@@ -82,10 +92,22 @@ Inspect the completed result, not just `ok` or a warning:
 
 Invalid or dangling selectors, zero matches, nonfinite radii, unsupported topology,
 kernel crashes and a search that cannot produce a valid all-edge result are explicit
-failures. A timeout before finding a valid candidate is also a failure, not proof that
-a radius is too large. The search has finite tolerance and probes and may not find
-every feasible solution. If a part batch is rejected, its feature rows describe the
-rejected candidate, not the unchanged live geometry.
+failures. A budget stop before finding a valid candidate is also a failure, not proof
+that a radius is too large; its message gives the failure at the requested radius. The
+search has finite tolerance and probes and may not find every feasible solution. If a
+part batch is rejected, its feature rows describe the rejected candidate, not the
+unchanged live geometry.
+
+READING A FAILURE: build failures name the failing contour by selected-edge order and a
+point ("the blend along selected edge 2 near (x, y, z) failed"),
+or a corner that could not be closed; invalid results and self-intersections name where.
+When the search reports the same location at the requested and the smallest radius, the
+cause does not depend on size: a smaller radius will not fix it. Inspect what meets the
+selected edge there (query_geometry near that point): typically an earlier fillet or round
+the new blend must run into, or a sliver face/step narrower than the radius. Fix the
+construction instead: put the fillet before the round it collides with (the add_feature
+op's "before":"fN"), round the meeting edges together in one feature, or remove the
+sliver at its source.
 
 Common mistakes:
 1. Put the query under `refs.edges` (an OBJECT with "of"), not at the feature top level.

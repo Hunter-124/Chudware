@@ -51,7 +51,7 @@ These files are shared by many features; change them deliberately and keep edits
 
 Desktop onboarding offers **Start without an account** as the immediate path to Model:
 local CAD needs no account, API key or internet connection. Copilot provider sign-in and
-testing are optional during setup and remain available through Settings → Providers.
+testing are optional during setup and remain available through Settings → AI → Providers.
 Completing the wizard marks the current session complete immediately; its durable config
 merge runs on a background worker. Completion writes are serialized, with the latest queued
 workspace choice winning, and are polled every frame even after the modal closes. A failed
@@ -109,7 +109,7 @@ theme/DPI matrix. `CHUDWARE_TEXT_CONTRAST_OUT` selects the report/capture direct
 presented and user-opened live documents; use an isolated daemon instance and private
 paths. `settings_routes` uses private HOME/XDG paths and `CHUDWARE_ENGINE_DAEMON=0`;
 it exercises Quick Settings → Prompts and keyboard/click search navigation across the
-eight AI sections, reporting to `scratch/settings_routes_shots/report.json`.
+AI tabs and sections, reporting to `scratch/settings_routes_shots/report.json`.
 
 `asm_refresh` exercises unsaved component edits through the actual active/background
 assembly meshes, selection preservation and editor deferral. Run both
@@ -121,7 +121,7 @@ authenticated provider state. Catalog presence alone does not enable a provider;
 models, disabled providers and unloaded local models are excluded. Claude older than 5.1 and
 OpenAI models older than GPT-6 (including codex variants and the o-series) are never offered
 on any provider route (`ui::isLegacyGenerationModel`, `host/src/ui/model_registry.h`, applied
-in `bridgePickerModelUsable`, `providerPickerModels` and Settings -> Providers -> Models); a
+in `bridgePickerModelUsable`, `providerPickerModels` and Settings -> AI -> Providers -> Models); a
 saved selection of one still displays as the current value. An existing fixed
 assignment remains visible by provider/model ID if it becomes unavailable, and is not silently
 replaced. Online role assignments preserve the runtime provider ID even when multiple
@@ -140,7 +140,7 @@ stays, and the 5 s poll asks again until the lane is free. A complete live read 
 (`model_catalog_cache.json`) and of the provider list (`provider_list_cache.json`, beside
 `config.json`) is kept on disk; only while a run defers the live read does the next launch
 show those saved copies (labelled "last session", `modelPickerDeferred()`), so the picker and
-Settings -> Providers are not blank. Otherwise availability still needs a live confirmation.
+Settings -> AI -> Providers are not blank. Otherwise availability still needs a live confirmation.
 Provider detail (`omp_auth_state`) retries every 3 s until it loads, then every 60 s; a busy
 lane keeps the loaded detail instead of replacing it with an empty one. Model assignments
 (`ai_roles_get` / `ai_roles_set`) are agent-lane calls too: a busy lane keeps the loaded
@@ -184,8 +184,42 @@ env -u CHUDWARE_THEME xvfb-run -a ./host/build-linux/bin/chudware --ui-screensho
 ```
 
 
-Settings deep-link routes 8–15 are Harness, Roles, Prompts, Skills, Rules, Benchmarks,
-Tools and Dev Preview, respectively (`host/src/ui/settings_modal.h`).
+### Settings window
+
+`host/src/ui/settings_modal.cpp` draws the window from a table of categories
+(`kSettingsCategories`: Appearance, General, AI). The rail — or, below ~520 px, a segmented
+row — and the page dispatch come from that table, so a new category (Drawings, Units,
+Simulation, Modeling…) is one row plus its draw function. Keep the row order: `SettingsRoute`
+page numbers 0–2 index it.
+
+AI is a strip of tabs in OMP's order — Models, Behavior, Context, Memory, Tools, Coding,
+Agents, Providers, Developer (`kAiTabs`; `ui::kit::formTabs`, which wraps onto more rows when
+narrow). A tab body is its Chudware-owned sections, then — in Advanced mode only — its OMP
+rows, then its full-height editors (role prompts on Models, Rules on Context, Skills on
+Agents). Basic mode lists only the tabs with an everyday control (Models, Behavior, Context,
+Memory, Providers); Tools, Coding, Agents and Developer need Advanced. Runtime repair is on
+Developer, and on Behavior in Basic mode so a broken runtime stays fixable. Load-bearing
+window ids: `##tab_<tab id>` (scroll body), `##ai_basic_models`, `##ai_compaction`,
+`##ai_memory`, `##ai_harness_session`, `##ai_tools_global`, `##ai_dev_preview`,
+`##bench_artifact`, `##roleeditor`, `##set_skill_list`, `##set_trig_list`, `##settings_nav`
+(one Advanced checkbox).
+
+OMP rows come from `omp_config_get`, read once per Settings open and again after every
+`omp_config_set`. A boolean is a checkbox, anything else an options combo; the help marker
+carries OMP's description and `OMP setting: <key>`. Each row shows its scope: **OMP** (the
+user's OMP config, shared with their other OMP sessions) or **Chudware** (Chudware's own OMP
+config layer); each tab says once where those files are. A project / overlay / env source is
+named under the row; `runtime` (OMP's soft protocol-default pin) never is. Chudware-owned
+controls that drive OMP settings name the key in their help: compaction method →
+`compaction.enabled` / `compaction.methodOrder`, project memory → `memory.backend`, task list
+preference → `todo.enabled` / `todo.eager`.
+
+Deep links are `SettingsRoute` values (`host/src/ui/settings_modal.h`): 0–2 are pages, 3 is
+the AI Providers tab, 4–7 are retired pages that fold onto the tab that absorbed them, and
+8 onward are AI tabs and sections inside a tab (the tab scrolls the section into view).
+A route to something Basic mode hides turns Advanced on. `CHUDWARE_SHOT=appearance` takes the
+route in `CHUDWARE_SHOT_SETTINGS_TAB`; the value `ai` captures every AI tab (Basic and
+Advanced, then narrow and phone widths) to `scratch/appearance_shots/appearance_ai_*.png`.
 
 Run build commands one at a time; parallel `./build.sh`/`ninja` runs race on the Ninja lock.
 

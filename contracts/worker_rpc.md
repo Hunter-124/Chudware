@@ -35,12 +35,14 @@ for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params
 | `doc_list` (appended 2026-09-24) | each row also carries `reproducible_from: [abs source_path…]` — non-empty only for a never-saved part (no `path`) whose every feature is an `import` with an absolute `source_path` and whose `revision <= feature_count` (nothing authored after the imports: any edit/material/undo op empties it). Consumers treat the doc as reproducible scratch only while every listed file still exists: hostd autosave skips it and `retireDoc` closes it without an orphan; `cad_common.save_touched_docs` reports it `skipped` `reproducible_import` instead of writing it to the project |
 | `doc_list` (appended 2026-09-30) | each row also carries `native_source_path` (abs `.step+` or `null`) — the native file a `doc_open(detach_path=true)` session was loaded from (agent `import_part` of a `.step+`). While that session is unedited (`revision == 0`, not dirty) and the file exists, `reproducible_from` lists it, so the same skip/close rules apply. After edits, automatic and bare saves write back to `native_source_path` instead of minting `<project>/<name>.step+`; an explicit save path still wins, and hostd recovery-snapshot sources are never used as that destination |
 | `doc_open` (appended 2026-11-01) | `{path, detach_path: true, recovered: true}` opens a hostd recovery-tier artifact as unsaved work: the session starts `dirty` and carries no `native_source_path` (the artifact is deleted right after), so autosave, the GUI quit prompt and doc-GC retirement keep protecting it until it is saved or discarded |
+| `doc_open` (appended 2026-11-07) | optional `display_quality: "draft"\|"standard"\|"fine"` opens a native session at that display tier (absent = engine default; unknown → `invalid_op`), so a build cache saved at the caller's tier is served warm instead of re-tiered by a follow-up `doc_set_display_quality`. The response carries the session's `display_quality`. `doc_set_display_quality` at the session's current tier keeps its compile and caches |
 | `doc_apply_ops` | doc_ops §1 envelope → ops-response (incl. `owner_map`) |
 | `doc_undo` / `doc_redo` | `{doc_id}` → ops-response |
 | `doc_tree` | `{doc_id}` → `{revision, tree, owner_map}` (no rebuild; uses the last build) |
 | `doc_rebuild` | `{doc_id, from?: feature_id}` → ops-response (forced) |
 | `doc_activate` | `{doc_id}` → ops-response — cheap activation for viewers/tab-switch: serves the engine's warm read-cache compile (same response shape as `doc_rebuild`, incl. a freshly published `tess.aicm_path`) **without** recompiling or re-tessellating when the doc is unchanged since its last build; falls back to the forced-rebuild path internally when that cache is cold. Read-only (never bumps the revision); allowed for ro attaches. Appended 2026-07-15 (viewport tab-switch perf) |
 | `doc_resolve_pick` | `{doc_id, revision, body_id, kind: "face"\|"edge"\|"vertex"\|"body", topo_id}` → `{selector}` (errors `stale_revision` if revision moved) |
+| `doc_feature_edges` | `{doc_id, feature_id, revision?}` → `{feature, revision, body, refs:[{index, error, edges:[{selector, points:[[x,y,z]…], closed, mid?, grow?}]}]}` — appended 2026-11-07; `mid`/`grow` appended 2026-11-07. The edges a **fillet/chamfer**'s `refs.edges` select, resolved against the body the feature received (the state just before it ran), because the feature has already consumed them from the displayed result. One `refs` row per element of the slot (a single object is one element); each row lists the unique edges that element names — a geometry query such as `{"of":"edge","parallel":"z"}` can name many — as canonical pick selectors (contracts/selectors.md) plus a world-space polyline (`points`; `closed` drops the repeated last point). `mid` is the point ON the edge curve at half its ARC length (where a size handle belongs); `grow` is the unit vector the blend face moves along as its size increases, evaluated at `mid` from the edge's two faces' outward normals nA, nB on that input body — a CONVEX edge: the inward bisector `-(nA+nB)/\|nA+nB\|` (the round removes material, so a +X/+Z box edge gives `(-1,0,-1)/√2`); a CONCAVE edge: `+(nA+nB)/\|nA+nB\|` (the round adds material, the face rises into the open corner). `mid` is omitted for an edge with no measurable curve; `grow` is omitted unless the edge borders exactly two distinct faces whose normals do not cancel (a knife edge) and whose traversals give a sign. An element that names nothing carries `error` and no edges. Read-only: the input comes from the session's build checkpoint when it holds one, otherwise from a rollback-bar compile on a private copy of the cache. Part documents only; `invalid_op` for any other feature type; `stale_revision` if `revision` moved |
 | `doc_checkpoint` | `{doc_id}` → `{checkpoint: "<id>"}` — deep-snapshot the current doc (PropertyManager-cancel). Multiple live checkpoints allowed; all cleared on doc close/new/open |
 | `doc_revert` | `{doc_id, checkpoint}` → ops-response — restore the snapshot, rebuild, bump revision, and push ONE undo entry (a single `doc_undo` after a revert returns to the pre-revert state). Reverting when the doc already equals the snapshot is a cheap no-op but still returns the full response. `invalid_op` on an unknown checkpoint id |
 | `doc_push_pull` | `{doc_id, body_id, topo_id, distance, commit?}` → push-pull response (Instant3D, §2.1) — drag a planar/cylindrical FACE by a signed `distance` (mm along the face outward normal); resolves the face's owning feature + the single drivable param, edits it, rebuilds. `commit:false` (default) = transient preview (no undo entry); `commit:true` = ONE undo entry. A face mapping to no single param returns `{ok:true, draggable:false, reason}` with NO doc mutation |
@@ -398,6 +400,80 @@ violations with segment locations and body IDs. Lengths and clearances are in mm
 and angles in degrees. Clearance is measured against the document's world-space
 display tessellation, not exact B-rep surfaces; no obstacles means no clearance
 measurement, not a passed clearance check. Both RPCs are read-only.
+
+Amended (append-only, 2026-11-06). Existing fields are unchanged; additions:
+
+- `harness_route` success adds `exit_stub_mm`: the straight stub applied at each endpoint
+  that has a `dir`, now `2 × min_bend_radius_mm` (previously `max(2R, 2 × grid)`), so an
+  endpoint's feasibility no longer depends on the other endpoint or the automatic grid.
+- `harness_route` failures keep `{ok:false, code, error}` and add, per code:
+  `start_blocked`/`end_blocked`: `endpoint` (`"start"|"end"`), `pos`, `obstacle`
+  (`"name (#id)"` or `"keepout:name"`), `distance_mm` (centreline to surface; 0 when
+  inside), `required_mm` (`clearance + od/2`), `inside_solid`. New code `exit_blocked`
+  (replaces `no_path` for a blocked endpoint stub): `endpoint`, `dir`, `stub_mm`
+  (required straight length), `free_mm` (clear straight length along `dir`, resolved to
+  about 0.01 mm), `obstacle`. `budget`: `expanded_nodes`, `grid_mm`, `max_nodes`.
+- `harness_path_check` accepts a measured bend when `radius >= min_bend_radius_mm ×
+  (1 − bend_tolerance_rel)`; the result reports `bend_tolerance_rel` (`1e-6`). Interior
+  vertices collinear with their neighbours are ignored when estimating bends, so a point
+  inserted on a chord never changes a verdict; finding `index` values still refer to the
+  caller's original `path`. Arcs tangent to their legs and sampled by n ≥ 2 turning
+  vertices (n − 1 ≥ 1 equal chords, including the router's shallow one- and two-chord arcs)
+  are recognised from their chord/turn pattern; a single polyline corner remains an
+  `isolated_kink`.
+- Scene bodies with zero-area display triangles no longer fail the call: the triangles
+  are skipped and one warning per body (`"cover_L (#3): skipped N degenerate (zero-area)
+  display triangles"`) is returned; a body with no usable triangles is ignored with that
+  warning. Scene-body error messages name the body as `name (#id)`.
+- `harness_path_check` accepts optional `junctions: [int]`, indices into `path` where the
+  wire leaves a bundle (strictly interior: `1 .. len(path)-2`; duplicates ignored; a
+  non-array, non-integer or out-of-range entry is `bad_args`). A turning vertex at a
+  junction index (after collinear filtering; a collinear junction vertex yields no
+  finding) is never an arc sample or isolated kink and neither forms nor extends an arc
+  pattern. Its radius is the available tangent fillet `min(L_in, L_out) / tan(θ/2)` over
+  the adjacent straight runs; a run shared with a neighbouring junction vertex counts
+  half. It passes when `radius >= min_bend_radius_mm × (1 − bend_tolerance_rel)`.
+  Findings use `kind:"junction_fillet"` with `radius_mm` = `available_fillet_radius_mm`
+  = that radius, and the radius also enters `min_bend_radius_found_mm`. Junction
+  fillets are not clearance-checked (the fillet lies inside the corner).
+- `harness_route` bend feasibility (append-only, 2026-11-06). Control points are chosen
+  among lattice points whose bends the tangent legs can hold (trim `R·tan(θ/2)` within the
+  incoming leg minus the previous corner's trim, the next leg and, at the final point, the
+  end stub). When every candidate polyline fails only on turn geometry — for example an
+  end behind the start's exit direction, inside its minimum turning circle — the offending
+  corner is replaced by a detour (overshoot along the incoming leg, quarter turn, run,
+  turn onto the next leg) before the route is declared infeasible. A `no_path` whose
+  candidates were rejected only for turn geometry (no obstacle blocked any of them) adds
+  `reason:"turn_infeasible"`, `min_bend_radius_mm`, `exit_stub_mm` and a `hint`.
+  Control points of the reconstructed lattice path are now selected by a shortest-path
+  search over (previous control, current control) states: edges are lattice steps or
+  obstacle-clear chords, every corner's trim must fit both adjacent legs (the end stub at
+  the final point) and its fillet arc must clear the obstacles. When no lattice subsequence
+  is feasible and `grid_mm` was not supplied, the search is retried once at half the grid
+  within the remaining `max_nodes`; the reply's `grid_mm` is the grid that produced the
+  route. The detour repair is also applied to the straight `sp→ep` polyline when an
+  obstacle (not the turn) rejects it, so a route can leave the exit stub, clear the
+  obstacle and come back. A detour keeps the leg that arrives at its corner, so the corner
+  at the end of an endpoint's exit stub is detoured travelling away from that endpoint (the
+  polyline reversed): a route always leaves each endpoint that has a `dir` along it and
+  never reaches one across its stub.
+- `harness_path_check` accepts optional `report_range: [first, last]` (integer vertex
+  indices, `0 <= first <= last <= len(path)-1`; anything else is `bad_args`). The bend
+  estimate (collinear filtering, arc detection, junction fillets) runs on the whole path, so
+  an arc cut by a split point keeps its context; bend findings, `bend_violation_count`,
+  `min_bend_radius_found_mm`, clearance findings, `clearance_violation_count` and
+  `min_clearance_mm` cover only vertices inside the range (inclusive) and legs `i→i+1` with
+  `first <= i` and `i+1 <= last`. `length_mm` stays the full path length; the result adds
+  `report_length_mm`, the length of the range (equal to `length_mm` when the range is
+  omitted). Finding `index` values still refer to the full `path`.
+- `harness_route` `bad_args` for a numeric parameter names the parameter, the supplied value and
+  the accepted range, e.g. `"max_nodes = 400000 is invalid: expected an integer in [1, 200000]"`
+  (previously one message covering every parameter); missing `od_mm`/`min_bend_radius_mm` is
+  `"od_mm and min_bend_radius_mm are required"`. A keepout with an unknown field or with
+  neither/both of `body` and `aabb` appends the accepted forms to the error.
+- `harness_route` treats a control-polyline turn below `1e-5` rad as straight (no fillet arc);
+  previously such a corner produced a micro-arc whose two vertices, nanometres apart, read as
+  two `isolated_kink` findings in `harness_path_check`, failing the route's own final check.
 
 ### Formats (M8; minimal `doc_save`/`doc_open` for `.step+` exist from M1)
 `import_file {path, into?: doc_id}` → ops-response (adds `import` feature(s); dxf/dwg/sat record
@@ -3580,6 +3656,55 @@ Both methods report `ok`, `complete`, `assumptions`, and `source_failures`; `ok`
 evaluation completeness, not absence of hits. Boolean or sweep failures are not clear
 verdicts. Limits are 256 members/ignored IDs, 32 removal queries with 16 directions each,
 and 64 envelopes.
+
+## Withdrawing an unread steer (append-only, 2026-11-06)
+
+`agent_withdraw_steer {run_id, steer_id}` (control action `withdraw_steer`, same private
+control socket and actor-scoped `run` right as `agent_steer`) takes one user steer back before
+the model reads it, without stopping the run. Response `{ok, run_id, steer_id, withdrawn,
+active, reason?}`. `withdrawn:true`: OMP dropped it from its steering queue
+(`remove_queued_message`), or it had not been handed to OMP yet; it never emits
+`agent.steer`, Stop never carries it, and the same text may be steered again.
+`withdrawn:false`: the run no longer holds it unread (its `agent.steer {status:"delivered"}`
+follows), the run ended (`active:false`; hostd answers `{ok:true, withdrawn:false,
+reason:"no active agent run"}` when no worker run matches), or `reason:"ambiguous"` when
+another unread steer of that run has the same text (OMP removes by text). Transport failures
+return `ok:false` with `reason`.
+
+## OMP settings in Settings → AI (append-only, 2026-11-06)
+
+Chudware does not keep its own copies of OMP settings. `omp_config_get {}` returns
+`{ok, agentDir, chudwareLayer, settings:[entry]}`, `entry = {key, tab, group, label,
+description, type, options:[{value, label, description?}], current, default, source, scope}`,
+for the rows of OMP's own settings panel that Settings → AI exposes (policy and tab mapping:
+`services/agent/omp_settings.py`). `tab` is the Chudware AI tab (`models`, `context`, `memory`,
+`tools`, `coding`, `agents`, `providers`; `behavior` and `developer` have no OMP rows); `group`
+is OMP's own section heading. Entries come ordered by tab, then OMP's group order, then OMP's
+row order. Label, description, choices, order and validation are OMP's; only rows that render
+as a checkbox or a choice list are returned (`type` is `boolean`, or `enum`, `number` or
+`string` with a non-empty `options`), credentials never, and neither does a row OMP itself
+hides (a reserve margin while usage-aware fallback is off). Memory shows only the group of the
+selected project-memory backend. Keys Chudware owns or pins per session (compaction method,
+`todo.eager`, `task.maxRuntimeMs`, the memory backend, the composer's thinking level, tool
+availability) are not returned. `current` and `default` are option values (`"true"` / `"false"`
+for a boolean; `"default"` when a sentinel such as `-1` is in effect); `source` is OMP's
+provenance (`default`, `global`, `project`, `overlay`, `runtime`, `env`).
+
+`scope` says where a change is stored. `"omp"`: the user's own OMP config, shared with their
+other OMP sessions. `"chudware"`: one OMP config file under the actor's state root
+(`<root>/omp/cad-settings.yml`, path in `chudwareLayer`), passed as `--config` to every
+Chudware OMP process before the per-session overlay. It holds Chudware's CAD defaults and the
+user's choice for those keys: `lsp.enabled` and `lsp.diagnosticsOnWrite` (both off) and
+`task.maxEffort` (`high`); its `default` is Chudware's. `omp_config_set {key, value}` takes a
+policy key and a string and replies `{ok, ...entry}` with the value now in effect, or
+`{ok:false, reason}` for a key outside the policy, a credential or an invalid value. `value` is
+an option value, `"true"` / `"false"`, or `"default"`: an OMP key is then removed from the user's
+OMP config, a Chudware key returns to Chudware's default (a row whose real choices include
+`"default"`, such as the service tiers, takes it as that choice; select `default` to reset).
+OMP RPC runtimes watch their config files, so running sessions apply either scope without a
+restart; `lsp.enabled` also adds or removes the `lsp` tool, which only new conversation
+processes pick up. Both calls run on the service lane (`WorkerBridge::isServiceMethod`);
+`omp_config_get` is also a non-blocking query. Cell policy: actor scope, `read` / `write`.
 
 ## Public demo cells: refused credential methods and the free-model lane (append-only, 2026-11-07)
 

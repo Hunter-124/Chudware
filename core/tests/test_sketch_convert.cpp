@@ -872,6 +872,98 @@ TEST_CASE("convert: model vertex becomes an associative projected point") {
     chudware::doc::doc_close(doc);
 }
 
+TEST_CASE("convert: a drawing batch with prepended model refs commits associative relations in one step") {
+    // The op shape the GUI emits when a sketch tool snaps to model geometry (host/src/ui/
+    // sketch_model_snap.cpp, modelref::bind): the model references become sketch_convert ops
+    // PREPENDED to the drawing batch, so the drawn line and its relations to the model commit as
+    // ONE batch and every placeholder of the original batch shifts behind them.
+    const std::string doc = make_box("ModelSnapBatch", 40, 30, 20);
+    const std::string sketch = add_projection_sketch(doc, 20);   // on the top face: u,v = world x,y
+    json vertex;
+    for (int i = 1; i <= 8; ++i) {
+        const json candidate = chudware::doc::doc_resolve_pick(doc, 1, "vertex", i).at("selector");
+        if (candidate.at("centroid") == json::array({40.0, 30.0, 20.0})) vertex = candidate;
+    }
+    REQUIRE(vertex.is_object());
+    const json edge = doc_query(doc, {{"of", "edge"}, {"near", {20, 0, 20}}, {"count", 1}});
+    REQUIRE(edge.at("count").get<int>() == 1);
+    const json vref{{"kind", "vertex"}, {"selector", vertex}};
+    const json eref{{"kind", "edge"}, {"selector", edge.at("matches").front()}};
+    auto convert = [&](const json& ref) {
+        return json{{"op", "sketch_convert"}, {"sketch", sketch}, {"refs", json::array({ref})},
+                    {"construction", true}, {"fix", true}, {"associative", true}};
+    };
+    const json result = doc_apply_ops(doc, -1, json::array({
+        convert(vref), convert(eref),
+        json{{"op", "sketch_add_entity"}, {"sketch", sketch},
+             {"entity", {{"type", "line"}, {"p1", {39.5, 29.5}}, {"p2", {20.0, 0.8}}}},
+             {"constraints", json::array({
+                 json{{"type", "coincident"}, {"refs", {"$0.p", "$self.p1"}}},
+                 json{{"type", "point_on"}, {"refs", {"$self.p2", "$1"}}}})}}}), false);
+    for (const auto& status : result.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const std::string pointId = result.at("id_map").at("$0"), edgeId = result.at("id_map").at("$1"),
+                      lineId = result.at("id_map").at("$2");
+
+    json feature = feature_of(result.at("tree"), sketch);
+    const json& refs = feature.at("params").at("external_refs");
+    REQUIRE(refs.size() == 2);
+    CHECK(refs[0].at("source") == vref);
+    CHECK(refs[1].at("source") == eref);
+    CHECK_FALSE(refs[0].at("stale").get<bool>());
+    CHECK_FALSE(refs[1].at("stale").get<bool>());
+    bool coincident = false, on_edge = false;
+    for (const auto& c : feature.at("params").at("constraints")) {
+        if (c.at("type") == "coincident" && c.at("refs") == json::array({pointId + ".p", lineId + ".p1"}))
+            coincident = true;
+        if (c.at("type") == "point_on" && c.at("refs") == json::array({lineId + ".p2", edgeId}))
+            on_edge = true;
+    }
+    CHECK(coincident);
+    CHECK(on_edge);
+
+    // One batch is one undo step: the references, the line and its relations go and return together.
+    const json undone = chudware::doc::doc_undo(doc);
+    CHECK(feature_of(undone.at("tree"), sketch).at("params").at("entities").empty());
+    const json redone = chudware::doc::doc_redo(doc);
+    CHECK(feature_of(redone.at("tree"), sketch).at("params").at("entities").size() == 3);
+
+    // Solved: the line starts at the model corner and ends ON the model edge (y = 0).
+    auto solved_line = [&]() {
+        const json enter = doc_sketch_enter(doc, sketch);
+        json line_entity;
+        for (const auto& e : enter.at("entities"))
+            if (e.value("id", std::string()) == lineId) line_entity = e;
+        chudware::doc::doc_sketch_exit(doc, sketch);
+        return line_entity;
+    };
+    json drawn = solved_line();
+    REQUIRE(drawn.is_object());
+    CHECK(drawn.at("p1").at(0).get<double>() == doctest::Approx(40.0).epsilon(1e-6));
+    CHECK(drawn.at("p1").at(1).get<double>() == doctest::Approx(30.0).epsilon(1e-6));
+    CHECK(std::abs(drawn.at("p2").at(1).get<double>()) < 1e-6);
+
+    // Associative: widen the box 40 -> 45; the converted corner moves and the line start follows.
+    const json edited = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"},
+             {"params", {{"p2", {45, 0}}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"params", {{"p1", {45, 0}}, {"p2", {45, 30}}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"params", {{"p1", {45, 30}}}}}}), false);
+    for (const auto& status : edited.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(status.value("ok", false), status.dump());
+    feature = feature_of(edited.at("tree"), sketch);
+    for (const auto& xr : feature.at("params").at("external_refs"))
+        CHECK_FALSE(xr.at("stale").get<bool>());
+    drawn = solved_line();
+    REQUIRE(drawn.is_object());
+    CHECK(drawn.at("p1").at(0).get<double>() == doctest::Approx(45.0).epsilon(1e-6));
+    CHECK(drawn.at("p1").at(1).get<double>() == doctest::Approx(30.0).epsilon(1e-6));
+    CHECK(std::abs(drawn.at("p2").at(1).get<double>()) < 1e-6);
+    chudware::doc::doc_close(doc);
+}
+
 TEST_CASE("convert: pierce finds the plane crossing of a slanted edge and follows edits") {
     const std::string doc = doc_new("part", "PierceReference").at("doc_id");
     json entities = json::array({line("e1", 0, -10, 20, 10), line("e2", 20, 10, 40, 10),

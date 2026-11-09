@@ -322,17 +322,26 @@ class HostToolDefinitionTests(unittest.TestCase):
             "required": ["extra"],
         }
         entries = OrderedDict(
-            (("task_list", _entry(planner, "Publish the plan", pydantic_shaped)),)
+            (("publish_plan", _entry(planner, "Publish the plan", pydantic_shaped)),)
         )
-        binding = build_host_tools(_context(entries, allowed_tools=None))[0]
+        binding = next(b for b in build_host_tools(_context(entries, allowed_tools=None))
+                       if b.name == "publish_plan")
 
-        self.assertEqual(binding.name, "task_list")
         self.assertNotIn("extra", binding.input_schema["properties"])
         self.assertNotIn("required", binding.input_schema)
         # The real arguments survive untouched.
         self.assertEqual(
             sorted(binding.input_schema["properties"]), ["items", "run_id", "title"]
         )
+
+    def test_omp_lane_never_advertises_the_task_list_omp_todo_replaces(self):
+        entries = OrderedDict((
+            ("task_list", _entry(_alpha, "Publish the plan")),
+            ("get_part", _entry(_alpha, "Read part")),
+        ))
+        names = {b.name for b in build_host_tools(_context(entries, allowed_tools=None))}
+        self.assertIn("get_part", names)
+        self.assertNotIn("task_list", names)
 
     def test_a_genuinely_required_argument_still_survives_the_catch_all_strip(self):
         def sized(width, depth=1, **extra):

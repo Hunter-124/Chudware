@@ -1231,7 +1231,9 @@ if(CHUDWARE_WITH_OCCT)
     geom/booleans.cpp
     geom/op_history.cpp
     util/process_isolation.cpp
+    geom/blend_sweep.cpp
     geom/dress.cpp
+    geom/fillet_runoff.cpp
     geom/shell_sections.cpp
     geom/transform.cpp
     geom/fit.cpp

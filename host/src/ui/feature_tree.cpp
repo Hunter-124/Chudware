@@ -3767,6 +3767,10 @@ static void applyOpenedDoc(AppState& st, const std::string& path, uint64_t ticke
         st.addDocTab(isAsm);
         if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
             st.docTabs[st.activeTab].path = sourceImport ? std::string() : path;
+            // The engine opened the session at this tier: syncDisplayQuality must not re-tier
+            // it (a re-tier drops the warm compile restored from the saved build cache).
+            if (!st.docMirror.lastOpenedDisplayQuality().empty())
+                st.docTabs[st.activeTab].displayQualityApplied = st.docMirror.lastOpenedDisplayQuality();
             st.applyHumanDirty(st.docMirror.docId(), liveDirty);
             if (sourceImport)
                 st.markHumanEdit(st.docMirror.docId(), st.docMirror.revision());
@@ -3929,7 +3933,7 @@ static const std::string& handoffTabId(const AppState::DocTab& tab) {
 // an elapsed-time readout in the tree + status line until the mesh is on screen. Non-modal: tabs
 // already open keep switching from their local snapshots while the engine builds.
 static void startAsyncOpen(AppState& st, const std::string& path, bool asSolid) {
-    nlohmann::json params = {{"path", path}};
+    nlohmann::json params = {{"path", path}, {"display_quality", st.settings.displayQuality}};
     if (asSolid) params["as_solid"] = true;
     std::string ext = std::filesystem::u8path(path).extension().string();
     for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
@@ -3986,6 +3990,8 @@ static void startAsyncOpen(AppState& st, const std::string& path, bool asSolid) 
                                       : AppState::DocTab::TabKind::Part;
             tab.title = jfld(mirror.tree(), "name");
             tab.path = ext == ".scad" ? std::string() : path;
+            if (!mirror.lastOpenedDisplayQuality().empty())
+                tab.displayQualityApplied = mirror.lastOpenedDisplayQuality();
             st.docTabs.push_back(std::move(tab));
             auto& added = st.docTabs.back();
             st.ensureTabSession(added);
@@ -6546,7 +6552,10 @@ void drawFeatureTreeBody(AppState& st,
         const bool treeFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         const bool treeHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
                                                         ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-        if (treeFocused && !ImGui::GetIO().WantTextInput &&
+        // While a sketch is open, Esc belongs to the sketcher's one-step-per-press ladder.
+        const bool sketchOwnsEsc = (st.sketchMode && st.sketchMode->active()) ||
+                                   (st.sketch3dMode && st.sketch3dMode->active());
+        if (treeFocused && !sketchOwnsEsc && !ImGui::GetIO().WantTextInput &&
             ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             clearTreeFeatureSelection(st);
         } else if (treeHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
@@ -6718,7 +6727,7 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
     // all user-facing opens go through async rpc so STEP import never freezes the GL thread.
     if (st.handoffQuietOpen) {
         std::string err;
-        if (st.docMirror.open(st.worker, path, err, asSolid)) {
+        if (st.docMirror.open(st.worker, path, err, asSolid, st.settings.displayQuality)) {
             applyOpenedDoc(st, path);
             return true;
         }
@@ -6754,7 +6763,7 @@ static bool replaceLegacyHandoffSnapshot(AppState& st, int idx, const std::strin
     const float px = st.pan[0], py = st.pan[1], pz = st.pan[2];
     std::string err;
     st.handoffQuietOpen = true;
-    const bool opened = st.docMirror.open(st.worker, path, err);
+    const bool opened = st.docMirror.open(st.worker, path, err, false, st.settings.displayQuality);
     if (opened) applyOpenedDoc(st, path);
     st.handoffQuietOpen = false;
     if (!opened) {

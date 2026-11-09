@@ -122,6 +122,20 @@ const PMFormDef* pmFormForCommand(const std::string& cmdId, std::string& mode);
 
 // ---- live field state -----------------------------------------------------
 
+// One edge a stored fillet/chamfer ref names on the feature's INPUT body (the state just before
+// the feature ran — the feature has since rounded it away, so the viewport cannot pick it).
+struct PMEdgeShape {
+    nlohmann::json selector;                  // canonical pick selector of this edge
+    std::vector<std::array<float, 3>> pts;    // world polyline to draw (>= 2 points)
+    bool closed = false;                      // connect last -> first (a full circle)
+    // Where this edge's blend size handle sits and which way it pulls (doc_feature_edges `mid` /
+    // `grow`): a point ON the edge at half its length and the unit direction the blend face moves
+    // as the size grows. `hasFrame` only when the engine reported both.
+    std::array<float, 3> mid{};
+    std::array<float, 3> grow{};
+    bool hasFrame = false;
+};
+
 struct PMSelEntry {
     nlohmann::json selector;   // resolved selector object (kind/surf/centroid/…)
     std::string label;         // short chip text ("Edge")
@@ -131,6 +145,11 @@ struct PMSelEntry {
     uint32_t pickBody = 0;
     uint32_t pickTopo = 0;
     int      pickKind = -1;
+    // Blend edge wells only: the edges `selector` names on the feature's input body. A pick names
+    // one; a stored geometry query ({"of":"edge","parallel":"z"}) can name many. Empty until the
+    // engine answers (and for a pick made in this session, which draws from its own selector).
+    std::vector<PMEdgeShape> shapes;
+    std::string unresolved;    // why a stored ref named no edge on the input body ("" = fine)
 };
 
 struct PMField {
@@ -320,26 +339,57 @@ public:
     // all selected edges glow (not just the last-clicked one), including when the preview breaks.
     void collectActiveWellHighlights(std::vector<std::array<uint32_t, 3>>& out) const;
 
-    // A selected fillet/chamfer edge reconstructed in WORLD space from its selector, for the dashed
-    // 3D overlay that lets the user see + deselect edges that the live round has already eaten away.
-    // Stored as a world polyline so it covers every curve type the same way: a straight edge is two
-    // points; a circular edge (revolve!) is a sampled loop (`closed`); anything we can't reconstruct
-    // is a single centroid point (drawn as a small ring). `pickIndex` is the entry's position in the
-    // active well (passed back to removeActiveWellPick).
+    // A selected fillet/chamfer edge in WORLD space for the dashed 3D overlay that lets the user see
+    // + deselect edges the live round has already eaten away. Stored as a world polyline so it
+    // covers every curve type the same way: a straight edge is two points; a circular edge is a
+    // sampled loop (`closed`); a lone point is drawn as a small ring. `pickIndex` is the entry's
+    // position in the active well and `shapeIndex` the edge within it (both passed back to
+    // removeActiveWellPick); one stored ref can name many edges.
     struct EdgeSeg {
         std::vector<std::array<float, 3>> pts;  // world polyline (>=1 pt)
         bool closed = false;                    // connect last->first (full circle)
         int  pickIndex = -1;                    // index into the active well's pick list
+        int  shapeIndex = -1;                   // edge within that entry; -1 = its own selector
     };
-    // Reconstruct the original (pre-round) edges of the active fillet/chamfer well from their stored
-    // selectors (line: centroid ± ½·len·axis; circle: radius=len/2π loop in the axis plane). Empty
-    // unless a blend PM is active. The viewport draws these dashed and hit-tests them so a click near
-    // one deselects that edge.
+    // Every edge of the active fillet/chamfer well. An edge the engine resolved on the feature's
+    // input body (PMSelEntry::shapes — this is how a stored ref, which the live round has already
+    // consumed, comes back on edit) draws its real curve; a pick made in this session is rebuilt
+    // from its own selector (line: centroid ± ½·len·axis; circle: radius=len/2π loop in the axis
+    // plane). Empty unless a blend PM is active. The viewport draws these dashed and hit-tests
+    // them so a click near one deselects that edge.
     void collectActiveWellEdgeSegments(std::vector<EdgeSeg>& out) const;
 
-    // Remove the pick at `pickIndex` from the active edge well (the dashed-line deselect path) and
-    // schedule a live preview. Returns true if a pick was removed.
-    bool removeActiveWellPick(int pickIndex);
+    // One row per edge in the same order, for the Edges list in the form.
+    struct EdgeRow {
+        int pickIndex = -1;
+        int shapeIndex = -1;
+        std::string label;     // "Edge 3 (Line, 20 mm)"
+    };
+    std::vector<EdgeRow> activeWellEdgeRows() const;
+
+    // Where the Instant3D drag handle for a fillet/chamfer's size dimension(s) sits: ON the first
+    // selected edge, at its arc-length midpoint, pointing along the way the blend face grows (into
+    // the material of a convex edge, out into a concave corner). Read from the engine's
+    // doc_feature_edges answer for the edges well, so it does not depend on which well is armed.
+    // False — and no handle at all, never a guess along a world axis — until the engine has
+    // answered for an edge (or when the form is not a fillet/chamfer or is inactive).
+    struct BlendHandle {
+        std::array<float, 3> anchor{};  // world point on the edge
+        std::array<float, 3> dir{};     // unit world direction the size grows along
+    };
+    bool blendHandle(BlendHandle& out) const;
+
+    // Remove one edge from the active edge well (the dashed-line / list deselect path) and
+    // schedule a live preview. A stored ref that names several edges becomes one pick per
+    // remaining edge, so only now does its stored form change. Returns true if an edge was removed.
+    bool removeActiveWellPick(int pickIndex, int shapeIndex = -1);
+
+    // The list row under the cursor, so the viewport draws that edge hot ((-1,-1) = none).
+    void setHoveredWellEdge(int pickIndex, int shapeIndex) { hoverPick_ = pickIndex; hoverShape_ = shapeIndex; }
+    bool hoveredWellEdge(int& pickIndex, int& shapeIndex) const {
+        pickIndex = hoverPick_; shapeIndex = hoverShape_;
+        return hoverPick_ >= 0;
+    }
 
     // True when the active selector well wants BODY selectors (e.g. boolean targets/tools). The
     // selection observer uses this to resolve the picked element's owning body (resolvePick
@@ -464,7 +514,8 @@ private:
     friend struct PropertyManagerTestAccess;
     void close();
     void commit(AppState& st);     // OK
-    void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
+    // assemble {type,name,params,refs}; a new feature is named against `tree` (next free number)
+    void buildOpFeature(nlohmann::json& feature, const nlohmann::json& tree) const;
     bool applyPreview(AppState& st);  // add (first) or edit_feature; debounced
     // Reject stale form state and reload the target before accepting another user edit.
     bool formSourceCurrent(AppState& st);
@@ -488,6 +539,17 @@ private:
     bool flushDimText();
     void hydrateFilletEvidence(const nlohmann::json& evidence);
     void hydrateFilletFromMirror(AppState& st);
+    // Ask the engine where a reopened fillet/chamfer's stored edges are on the feature's input body
+    // (doc_feature_edges) and hand the answer to applyEdgeRefGeometry.
+    void requestEdgeRefGeometry(AppState& st);
+    // Attach a doc_feature_edges reply to the "edges" well: row i belongs to pick i, and only when
+    // the picks still hold the stored selectors the request was made for (`requested`).
+    bool applyEdgeRefGeometry(const nlohmann::json& reply,
+                              const std::vector<nlohmann::json>& requested);
+    // The visible "edges" well of a fillet/chamfer form (null for any other form).
+    PMField* blendEdgeWell();
+    const PMField* blendEdgeWell() const;
+    void drawEdgeList(PMField& well);
 
     bool active_ = false;
     bool editMode_ = false;        // true = reopened on an existing feature (no add op)
@@ -507,6 +569,7 @@ private:
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;
     bool previewInFlight_ = false; // async applyOps in flight (serialize first add_feature)
+    bool previewRolledBack_ = false; // the last applied preview rebuilt only up to its feature
     int formSourceRevision_ = -1;  // revision from which the cached full form was populated
     bool freshEditRequired_ = false;
 
@@ -552,6 +615,9 @@ private:
     // until the user re-arms by clicking a well chip or a region. Cleared on any well click /
     // setProfilePicks.
     bool suppressWellAutoArm_ = false;
+    // The Edges list row under the cursor; the viewport draws that edge hot.
+    int hoverPick_ = -1;
+    int hoverShape_ = -1;
 
 
     // Select-with-AI state. Responses are request-sequenced so a late result from a closed or

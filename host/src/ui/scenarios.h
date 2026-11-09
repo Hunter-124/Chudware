@@ -169,7 +169,7 @@
 // Without that override the per-shot private store is used; parallel runs need distinct stores
 // and displays. report.json names pixel/focus/copy failures and a failure exits non-zero.
 // CHUDWARE_SHOT=settings_routes clicks Quick Settings -> Prompts and alternates Enter/click
-// command-search activation across all eight AI sections, checking rendered section windows.
+// command-search activation across the AI tabs and sections, checking rendered section windows.
 // Use private HOME/XDG paths and CHUDWARE_ENGINE_DAEMON=0; failures exit non-zero and write
 // scratch/settings_routes_shots/report.json with observed items/windows.
 // CHUDWARE_SHOT=model_settings requires APPDATA=$PWD/scratch/model_settings_private,

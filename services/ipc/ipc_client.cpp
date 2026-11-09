@@ -285,7 +285,7 @@ bool EngineClient::usesBackgroundConnection(const std::string& method,
         "ping", "daemon_status", "worker_control_info", "agent_list_models",
         "subscription_accounts", "subscription_status", "subscription_usage",
         "omp_provider_list", "omp_auth_state", "omp_logout_accounts", "omp_models_list",
-        "omp_login", "omp_session_stats", "skills_list", "skills_get",
+        "omp_login", "omp_session_stats", "omp_config_get", "skills_list", "skills_get",
         "ai_prompt_baseline", "ai_tool_catalog", "fw_projects", "fw_status",
         "em_status", "sim_caps", "topology_capabilities", "topology_dfam"
     };

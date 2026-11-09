@@ -106,3 +106,43 @@ bound. If a previous probe already produced a fully validated all-edge result,
 the parent returns that result with a conservative search resolution; otherwise
 it returns the timeout. Aggregate budget exhaustion follows the same rule.
 This does not change the v1 worker protocol or relax isolation and validation.
+
+## Probe deadline and correction floor (v3, append-only)
+
+Supersedes the five-second per-probe limit above. An isolated probe's owning
+deadline is the search deadline: one probe may use all of the remaining 30-second
+aggregate budget, because a sound build plus full-solid validation of a large
+spline body can exceed five seconds, and a fixed per-probe cap made the same
+feature fail or succeed with machine load. A probe stopped by the search deadline
+is reported as budget exhaustion, naming the failure observed at the requested
+radius, not as a kernel build timeout. The 72-probe limit, the terminal handling
+of timeouts and the worker protocol are unchanged.
+
+A downward correction of a constant radius never goes below min(0.05 mm, 0.1% of the
+body's thinnest extent, a tenth of the request), or the edge-tolerance floor if larger. When only a
+smaller candidate validates, the fillet fails with the failure at the requested
+radius instead of returning that candidate.
+
+## Run-off mode (v4, append-only)
+
+Flags 16 and 32 together carry a run-off mode (`(flags >> 4) & 3`): 0 none, 1 ring, 2 cap,
+3 separate (see [feature parameters](feature_params.md), Fillet run-off). The worker
+recomputes the run-off plan from the deserialized source and selected edges, builds the
+extended or separately blended body and cuts it back, all inside the isolated process, and
+returns the trimmed result or a diagnostic like any other probe. Run-off applies to constant
+radii without contact joins; a worker given a mode it cannot honour returns a construction
+refusal, never an unmodified body. [`fillet_runoff.cpp`](../core/geom/fillet_runoff.cpp) owns
+the analysis, extension and trim; `dress.cpp` owns the ladder (unchanged request, then ring,
+cap and separate, then the radius search).
+
+## Swept-blend mode (v5, append-only)
+
+Flags 64 and 128 together carry a swept-blend scope (`(flags >> 6) & 3`): 0 none, 1 the
+prismatic selected edges that share no vertex with another selected edge, 2 every prismatic
+selected edge (see [feature parameters](feature_params.md), Swept blends). The worker
+recomputes the scope from the deserialized source and selected edges, sweeps those edges and
+blends the rest with the kernel builder inside the isolated process, and returns the result or
+a diagnostic like any other probe. A swept scope combined with a run-off mode, a second radius
+or a contact join is refused. Flags above 255 fail unavailable.
+[`blend_sweep.cpp`](../core/geom/blend_sweep.cpp) owns the construction; `dress.cpp` owns the
+ladder (unchanged request, run-off, swept blends, then the radius search).

@@ -273,29 +273,6 @@ def test_lock_cas_via_ssh_remote(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# chudware-cloud stays reserved regardless of the folder-only gate removal
-# ---------------------------------------------------------------------------
-
-def test_reserved_remote_still_rejected_for_all_ops(tmp_path):
-    project = tmp_path / "proj"
-    project.mkdir()
-    _write_part(project, "Bracket.step+")
-    v = Vault.open(project)
-    v.save()
-    item_id = v.status()["items"][0]["item_id"]
-    v.close()
-
-    assert remote.add_remote(project, "Cloud", kind="chudware-cloud")["ok"]
-
-    out = remote.sync(project, remote="Cloud")
-    assert out == {"ok": False, "reason": "reserved_remote", "hint": "Chudware Cloud is not available yet"}
-
-    out = remote.plm_lock(project, item_id, remote="Cloud")
-    assert out["ok"] is False
-    assert out["reason"] == "reserved_remote"
-
-
-# ---------------------------------------------------------------------------
 # unreachable ssh/https remotes fail typed, never a traceback
 # ---------------------------------------------------------------------------
 

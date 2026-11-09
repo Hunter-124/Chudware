@@ -689,6 +689,15 @@ struct ActivityItem {
     // inter-agent message's send time, a usage line's request start. Persisted; 0 = unknown.
     double eventTs = 0.0;
 
+    // Call ownership (rowKind 3, from agent.tool_call): `parentId` is the call id the runtime
+    // reports as the caller (the owning Eval for a CAD call bridged from Python; the spawning
+    // `task` call for a sub-agent's own calls), `subagentId` the sub-agent that made it. Empty =
+    // a root-agent call with no known parent. The timeline nests an owned row under its Eval row
+    // (stage "tool:<parentId>", title eval) or else its sub-agent card (stage
+    // "subrun:<subagentId>"). Persisted.
+    std::string parentId;
+    std::string subagentId;
+
     // Old sessions can contain retired corporate cards. Do not confuse their former
     // rowKind 7 with the still-supported inter-agent message line.
     bool isRetiredCorporateRow() const {
@@ -2169,9 +2178,10 @@ struct AppState {
     // brief confirmation toast ("Undo: ok" / "Undo: nothing to undo"). Returns the response so the
     // caller can branch further if it wants. No-op (returns a no_doc response) when no doc is open,
     // when the active tab is Drawing/ECAD (DocMirror still holds the previous part/asm), or when
-    // the live mirror has not yet rebound to the active tab after a switch.
-    core::OpsResponse docUndo();
-    core::OpsResponse docRedo();
+    // the live mirror has not yet rebound to the active tab after a switch. `sketchSession` is the
+    // active sketch editor's session id (0 = none): the engine then rebuilds only up to its sketch.
+    core::OpsResponse docUndo(uint64_t sketchSession = 0);
+    core::OpsResponse docRedo(uint64_t sketchSession = 0);
 };
 
 // Select one active project folder for PLM, Explorer, and the built-in agent.

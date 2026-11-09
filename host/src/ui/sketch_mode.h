@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include "imgui.h"
+#include "sketch_model_snap.h"
 #include "sketch_relations_panel.h"
 
 struct AppState;
@@ -245,10 +246,11 @@ public:
     // drawOverlay() has run this frame (defaults to true/safe before the first call).
     bool inSketchEntityHot() const { return entityHoverHot_; }
 
-    // Refresh the model ID buffer for tool-owned external picks and explicit relation picking.
+    // Refresh the model ID buffer for tool-owned external picks, explicit relation picking, and the
+    // model-geometry inference of the point-placing tools (it confirms candidates against the buffer).
     bool needsModelPicks() const {
         return active_ && (tool_ == SketchTool::Convert || tool_ == SketchTool::SmartDim ||
-                           relModelPicking_);
+                           relModelPicking_ || placesPoints());
     }
     bool modelSelectionAllowed() const {
         return active_ && tool_ == SketchTool::None && relModelPicking_;
@@ -422,6 +424,27 @@ private:
     void snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer = nullptr,
                    const char* excludeHandle = nullptr,
                    const std::set<std::string>* excludeEnts = nullptr) const;
+    // Model-geometry inference (sketch_model_snap.h). A visible model vertex / straight-edge midpoint /
+    // circle center, or a point on a straight/circular edge, under the cursor snaps the point being
+    // placed. The snap is recorded in the snap grammar above with the entity named "@m" — "@m.p",
+    // "mid:@m", "@m.center", "rim:@m" — and completed to "@m<k>" at the click, where the model pick
+    // is resolved to a persistent selector (modelRefs_[k]). applySketchOps binds the tokens into the
+    // commit batch as sketch_convert external references, the same mechanism as Convert Entities.
+    bool placesPoints() const;   // tools whose clicks place sketch points
+    bool queryModelSnap(AppState& st, const ImVec2& imgMin, int vw, int vh, const ImVec2& cursor,
+                        float reachPx, bool onEdge, ModelSnapHit& out);
+    void snapToModel(AppState& st, const ImVec2& imgMin, int vw, int vh, const ImVec2& cursor,
+                     bool hovered, float& u, float& v, std::string& snapH, SnapInfer& infer);
+    int internModelRef(AppState& st, const ModelSnapHit& hit);   // modelRefs_ index, -1 on failure
+    // The sketch entity of a model vertex/edge reference: reuses the one an existing external
+    // reference already owns, else converts it (sketch_convert, associative). "" on failure.
+    std::string modelRefEntity(AppState& st, const nlohmann::json& ref);
+    SketchModelSnap modelSnap_;               // candidate table for (current tessellation, sketch plane)
+    std::vector<nlohmann::json> modelRefs_;   // interned {kind, selector} refs behind "@m<k>" tokens
+    ModelSnapHit modelHit_;                   // this frame's model snap, valid while modelHitLive_
+    bool modelHitLive_ = false;
+    std::set<std::string> modelDownstream_;   // features that depend on this sketch (their geometry is not offered)
+    int modelDownstreamRevision_ = -1;        // document revision modelDownstream_ was computed at
     int hitTestHandle(const ImVec2& s, std::string& handleOut, float& uOut, float& vOut) const;
     // Nearest WHOLE entity under the screen point (line segment / circle rim / arc rim distance);
     // returns the index into ents_ or -1. Used by Trim / Extend / Offset hover + pick (C29-B).
@@ -538,6 +561,10 @@ private:
     long cancelRevision_ = -1;
     uint64_t sketchSessionId_ = 0;
     long sketchRevision_ = -1;
+    // This sketch's {params, refs} when the edit session began (DocMirror::featureContent). Esc
+    // finishes the sketch only while its content equals it, so edits to other features and an
+    // undo back to the entry state do not count as sketch edits.
+    nlohmann::json entryContent_;
 
     // C37-D: plane-pick (SolidWorks "select a plane to start") state. Driven by drawOverlay while
     // st.sketchPlanePickActive; -1 = no origin-plane hovered, else 0/1/2 = front/top/right.
@@ -977,13 +1004,16 @@ private:
     // ---- C37-D Smart Dimension state machine ----
     // Pick buffer (separate from toolUV_): points/entities collected for the next dimension.
     std::vector<DimPick> dimPicks_;
-    // External references projected into this sketch (key = datum string / selector JSON dump,
+    // Datum / face references projected into this sketch (key = datum string / selector JSON dump,
     // value = the fixed construction entity id), so re-picking the same source reuses one entity.
     std::unordered_map<std::string, std::string> projRefs_;
-    // Project an external ref (worker sketch_project_ref "ref" param) into the sketch as a fixed
-    // construction entity and append it to dimPicks_. Returns the entity id ("" on failure).
+    // Bring an external ref into the sketch and append it to dimPicks_. Model vertices and edges
+    // become associative external references (modelRefEntity, same as Convert Entities); datum
+    // planes / axes and faces still project through the worker (sketch_project_ref) as a fixed
+    // construction entity. `sub` ("mid" | "center") picks that point of the entity instead of the
+    // entity itself. Returns the entity id ("" on failure).
     std::string addProjectedDimRef(AppState& st, const nlohmann::json& ref,
-                                   const std::string& srcKey);
+                                   const std::string& srcKey, const char* sub = nullptr);
     // The constraint object being built (refs/type/axis filled by dimBuildPending), awaiting a
     // placement click. dimHasPending_ gates the live preview.
     bool dimHasPending_ = false;

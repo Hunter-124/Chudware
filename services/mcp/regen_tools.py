@@ -11,9 +11,9 @@ configuration binds an offline-safe provider instead. When the step cannot run, 
 still carries the detected failures and the runtime's reason.
 
 This is the shared surface the copilot / orchestrator call on a rebuild-failure event.
-LIVE: ``add_features`` (cad_tools.py) invokes ``diagnose_failed_document`` on
-every rebuild failure and attaches the fix-preview card to its failure response, and
-``regen_resolve`` records the user's accept/edit/reject as an ``ai_artifact_action``
+LIVE: ``add_features`` never calls this module on a rebuild failure (it attaches only the
+model-free ``structural_findings``); a model-proposed fix happens only on an explicit
+``regen_diagnose`` call. ``regen_resolve`` records the user's accept/edit/reject as an ``ai_artifact_action``
 correction trace. When no caller-supplied event sink exists (the MCP tool path), events are
 journaled to ``CACHE/telemetry/events.jsonl`` (the spec_sheet_matcher precedent) so the
 "every LLM call is flywheel-logged" guarantee stays real.
@@ -187,8 +187,8 @@ def register_regen_tools(mcp) -> None:
                       note: str = "") -> str:
         """Record the user's/agent's verdict on a regen fix-preview card: accept, edit, or reject.
 
-        ``card_json``: the ``card`` object from ``regen_diagnose`` (or the ``regen_diagnosis``
-        field of a failed ``add_features`` response). ``action``: ``"accept"`` | ``"edit"`` |
+        ``card_json``: the ``card`` object from ``regen_diagnose``.
+        ``action``: ``"accept"`` | ``"edit"`` |
         ``"reject"``. ``edit_ops_json`` (edit only): the amended fix-ops JSON array, re-applied
         to the ORIGINAL corrupted document.
 

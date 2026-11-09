@@ -9,6 +9,7 @@
 #include <functional>
 #include <cstdint>
 #include <nlohmann/json.hpp>
+#include "ui/copilot/subrun_usage.h"
 struct AppState;
 namespace ui {
 struct AgentDagSummary {
@@ -57,6 +58,7 @@ struct AgentTraceAgent {
     std::string status;           // running | done | failed | cancelled | stopped | ...
     double startTs = 0.0, endTs = 0.0;   // epoch seconds; endTs 0 while running
     int toolCount = 0, failCount = 0;
+    copilot::SubRunUsage usage;   // run totals from the latest sub-agent progress frame; zero until one arrives
     std::string lastStep;         // "Tool call · add_features" — the newest step, one line
     double lastStepTs = 0.0;
     int depth = 1;                // tree depth: 1 = spawned by the main agent

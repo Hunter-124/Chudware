@@ -1892,14 +1892,14 @@ bool AppState::isActiveMirrorDoc() const {
     return !t.docId.empty() && docMirror.hasDoc() && t.docId == docMirror.docId();
 }
 
-core::OpsResponse AppState::docUndo() {
+core::OpsResponse AppState::docUndo(uint64_t sketchSession) {
     if (!isActiveMirrorDoc()) {
         core::OpsResponse r;
         r.error_code = "no_doc";
         r.error_message = "no active CAD document";
         return r;
     }
-    core::OpsResponse r = docMirror.undo(worker);
+    core::OpsResponse r = docMirror.undo(worker, sketchSession);
     if (r.ok) {
         addLog("[doc] undo  rev=" + std::to_string(r.revision));
         if (!r.aicm_path.empty()) { std::string le; loadDocMesh(r.aicm_path, le); }
@@ -1919,14 +1919,14 @@ core::OpsResponse AppState::docUndo() {
     return r;
 }
 
-core::OpsResponse AppState::docRedo() {
+core::OpsResponse AppState::docRedo(uint64_t sketchSession) {
     if (!isActiveMirrorDoc()) {
         core::OpsResponse r;
         r.error_code = "no_doc";
         r.error_message = "no active CAD document";
         return r;
     }
-    core::OpsResponse r = docMirror.redo(worker);
+    core::OpsResponse r = docMirror.redo(worker, sketchSession);
     if (r.ok) {
         addLog("[doc] redo  rev=" + std::to_string(r.revision));
         if (!r.aicm_path.empty()) { std::string le; loadDocMesh(r.aicm_path, le); }
@@ -3281,8 +3281,12 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     const auto& userPlanes = cache.userPlanes;
     const auto& consumedPlanes = cache.consumedPlanes;
     const auto components = tree.find("components");
+    // A scan/mesh document (.ply/.stl/.obj opened as a mesh reference) carries geometry in
+    // `mesh_references` with no features; that counts as content so the datums auto-hide.
+    const auto meshRefs = tree.find("mesh_references");
     const bool hasSolidContent = cache.hasSolidFeatures ||
-        (components != tree.end() && components->is_array() && !components->empty());
+        (components != tree.end() && components->is_array() && !components->empty()) ||
+        (meshRefs != tree.end() && meshRefs->is_array() && !meshRefs->empty());
     // Seed the FM-eye visibility flags (planeVisEff/originVisEff) from the state computed HERE, so
     // the FeatureManager eye is correct on the very first frame after a doc loads/rebuilds — the FM
     // draws BEFORE the viewport publishes these each frame, so without this a fresh doc showed a

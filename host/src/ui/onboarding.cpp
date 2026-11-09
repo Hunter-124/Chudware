@@ -260,7 +260,7 @@ void drawPowerStep(AppState& st) {
     ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
     ImGui::Separator();
     ImGui::TextUnformatted("Optional: set up Copilot");
-    dimWrapped("Connect an AI provider now, or later in Settings > Providers.");
+    dimWrapped("Connect an AI provider now, or later in Settings > AI > Providers.");
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
 
     if (beginCard("##onboarding_oauth")) {

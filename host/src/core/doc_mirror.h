@@ -140,6 +140,10 @@ public:
     // new/open or the first ops-response. Use this to drive the feature tree.
     const nlohmann::json& tree() const;
 
+    // {params, refs} of feature `id` as the mirror holds them now (null when absent). Compares a
+    // feature's authored content across time, independent of other features and the revision.
+    nlohmann::json featureContent(const std::string& id) const;
+
     // Last rebuild feature_status array and whether it describes this revision.
     const nlohmann::json& featureStatus() const;
     bool featureStatusCurrent() const;
@@ -188,6 +192,9 @@ public:
     //                         try (0) — contracts/stepplus.md §17.
     int lastOpenedWriteback() const { return lastOpenedWriteback_; }
     const std::string& lastOpenedWritebackReason() const { return lastOpenedWritebackReason_; }
+    //   lastOpenedDisplayQuality — the display tier the engine opened the session at (empty when
+    //                              the response doesn't say, e.g. a reused session).
+    const std::string& lastOpenedDisplayQuality() const { return lastOpenedDisplayQuality_; }
 
     // ---- W1-B (item 6): owner-map lookups ----
     // The parsed feature->topology map from the latest response that carried one. TOLERANT of the
@@ -225,7 +232,12 @@ public:
     // undo step (no new undo snapshot). Set it on the 2nd..Nth applyOps of ONE user action that
     // can only be expressed as several batches (e.g. a rectangle's chained line ops), so a single
     // Ctrl+Z reverts the whole action.
-    OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce = false);
+    // `sketchSession` (the session_id of sketch_enter, 0 = none): the interactive sketch editor
+    // asks the engine to rebuild only the history up to its sketch (the reply's later features
+    // are rolled_back until sketch_exit rebuilds them), so an edit costs the sketch, not the
+    // whole part. Every reply of this mirror omits the `exact` statistics the GUI never reads.
+    OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce = false,
+                         uint64_t sketchSession = 0);
 
     // Non-blocking doc_apply_ops; Done runs on the GL thread in rpc.drain().
     // `current` is true for a still-owned response, including errors and rejections.
@@ -233,17 +245,21 @@ public:
     // require BOTH current and r.ok. A matching tree-only N+1 resync may reconcile an
     // accepted response; foreign/newer or superseded document state is never overwritten.
     // stale_revision auto-resyncs through `w` and fires the stale callback.
+    // `previewThrough` (a feature id): the property manager's live preview of that feature asks
+    // the engine to rebuild only the history up to it; its final edit omits this and rebuilds all.
     using ApplyAsyncDone = std::function<void(const OpsResponse& r, bool current)>;
     void applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::json& ops,
-                       ApplyAsyncDone done, bool coalesce = false, int timeoutMs = 120000);
+                       ApplyAsyncDone done, bool coalesce = false, int timeoutMs = 120000,
+                       const std::string& previewThrough = std::string());
 
     // Monotonic counter bumped on every applyOpsAsync submission (and reset()). Callers that
     // need their own generation guard can snapshot this before submit.
     uint64_t mutationGen() const { return mutationGen_; }
 
     // Undo / redo the most recent batch. Return the ops-response (same shape as applyOps).
-    OpsResponse undo(WorkerClient& w);
-    OpsResponse redo(WorkerClient& w);
+    // `sketchSession` as for applyOps.
+    OpsResponse undo(WorkerClient& w, uint64_t sketchSession = 0);
+    OpsResponse redo(WorkerClient& w, uint64_t sketchSession = 0);
 
     // Instant3D push-pull: drag a face of `body_id` (1-based PickHit body) whose picked FACE is
     // `topo_id` (1-based TopExp face index) by `distance` mm SIGNED along the face outward normal.
@@ -278,9 +294,11 @@ public:
     // asSolid (optional): when true the doc_open request carries {"as_solid": true} so a mesh-format
     // source (.stl/.obj/.ply/.3mf/.gltf/.glb/.3dm) is sewn into a real B-rep solid by the engine
     // instead of imported as a graphics body (no-op / ignored for B-rep sources). Default false
-    // keeps the request byte-identical for every existing caller.
+    // keeps the request byte-identical for every existing caller. displayQuality (optional) opens
+    // the engine session at that tier so a cache saved at it is served without a re-tier.
     bool save(WorkerClient& w, const std::string& path, std::string& err);
-    bool open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid = false);
+    bool open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid = false,
+              const std::string& displayQuality = {});
 
     // GL-thread adopt of a finished doc_open JSON (from AsyncRpc). Same post-conditions
     // as open() on success. Returns false if the envelope is an error or missing doc_id.
@@ -416,6 +434,7 @@ private:
     std::string    lastOpenedCacheMissReason_;                     // doc_open "cache_miss_reason"
     int            lastOpenedWriteback_ = 0;                       // cache.writeback: 1 saved, -1 refused
     std::string    lastOpenedWritebackReason_;                     // cache.writeback.reason
+    std::string    lastOpenedDisplayQuality_;                      // doc_open "display_quality"
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
     AcceptedOpsObserver acceptedOpsObserver_;

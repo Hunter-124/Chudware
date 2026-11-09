@@ -414,12 +414,10 @@ def test_author_env_injection_in_history(tmp_path, monkeypatch):
 
     monkeypatch.setenv("CHUDWARE_USER_ID", "sarah@example.com")
     monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Sarah")
-    monkeypatch.delenv("CHUDWARE_ACCOUNT_ID", raising=False)
     assert _user_author() == {
         "kind": "user",
         "id": "sarah@example.com",
         "display": "Sarah",
-        "account_id": None,
     }
     v = Vault.open(project)
     try:
@@ -433,7 +431,6 @@ def test_author_env_injection_in_history(tmp_path, monkeypatch):
         assert authored, entries
         assert authored[0]["author"]["display"] == "Sarah"
         assert authored[0]["author"]["kind"] == "user"
-        assert authored[0]["author"]["account_id"] is None
         # document.json must not carry author (byte-stability)
         head = v.status()["head"]
         tree = v._bind.read_tree(head)
@@ -445,25 +442,7 @@ def test_author_env_injection_in_history(tmp_path, monkeypatch):
         v.close()
 
 
-def test_reserved_aicad_cloud_remote(tmp_path):
-    project = tmp_path / "proj"
-    project.mkdir()
-    _write_part(project, "Bracket.step+")
-    v = Vault.open(project)
-    v.save()
-    v.close()
-
-    out = remote.add_remote(project, "Cloud", kind="chudware-cloud")
-    assert out["ok"] is True, out
-    assert out["remote"]["kind"] == "chudware-cloud"
-    assert out["remote"].get("reserved") is True
-
-    out = remote.sync(project, remote="Cloud")
-    assert out["ok"] is False
-    assert out["reason"] == "reserved_remote"
-
-
-def test_remote_identity_capabilities_and_account_reservation(tmp_path, monkeypatch):
+def test_remote_identity_and_capabilities(tmp_path, monkeypatch):
     project = tmp_path / "proj"
     project.mkdir()
     _write_part(project, "Bracket.step+")
@@ -479,26 +458,22 @@ def test_remote_identity_capabilities_and_account_reservation(tmp_path, monkeypa
         str(share),
         kind="folder",
         display_name="Sarah",
-        account_id="acct-42",
     )
     assert explicit["ok"], explicit
     profile = explicit["remote"]
     assert profile["identity"] == {
         "user_id": _user_author()["id"],
         "display": "Sarah",
-        "account_id": "acct-42",
     }
     assert profile["capabilities"] == ["snapshot_sync", "advisory_locks"]
 
     monkeypatch.delenv("CHUDWARE_USER_ID", raising=False)
     monkeypatch.delenv("CHUDWARE_USER_DISPLAY", raising=False)
-    monkeypatch.delenv("CHUDWARE_ACCOUNT_ID", raising=False)
     monkeypatch.setattr(remote.getpass, "getuser", lambda: "os-user")
     fallback = remote.add_remote(project, "backup", str(share), kind="folder")
     assert fallback["remote"]["identity"] == {
         "user_id": "os-user",
         "display": "os-user",
-        "account_id": None,
     }
 
 
@@ -517,7 +492,6 @@ def test_status_lists_live_locks_and_offline_remote_is_best_effort(
 
     monkeypatch.setenv("CHUDWARE_USER_ID", "alice")
     monkeypatch.setenv("CHUDWARE_USER_DISPLAY", "Alice")
-    monkeypatch.setenv("CHUDWARE_ACCOUNT_ID", "acct-alice")
     acquired = remote.plm_lock(src, item_id)
     assert acquired["ok"], acquired
 
@@ -528,7 +502,6 @@ def test_status_lists_live_locks_and_offline_remote_is_best_effort(
             "item_id": item_id,
             "user_id": "alice",
             "display": "Alice",
-            "account_id": "acct-alice",
             "acquired_at": acquired["lock"]["acquired_at"],
             "expires_at": acquired["lock"]["expires_at"],
         }]
@@ -607,7 +580,6 @@ def test_force_lock_override_returns_prior_holder(tmp_path, monkeypatch):
     assert forced["lock"]["user_id"] == "bob"
     assert forced["overrode"]["user_id"] == "alice"
     assert forced["overrode"]["display"] == "Alice"
-    assert "account_id" in forced["overrode"]
 
 
 def test_lock_cas_retry_recovers_from_deterministic_race(

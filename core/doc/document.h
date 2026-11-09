@@ -250,6 +250,23 @@ std::shared_ptr<const CompileResult> compile_cache_full_result(const CompileCach
 // restore); copies share it. Lets a saver reuse an encoding of unchanged contents.
 uint64_t compile_cache_stamp(const CompileCache& cache);
 
+// What a feature operated on: the solid its `body` ref (else the running top solid) named in the
+// state just BEFORE the feature ran. A fillet/chamfer consumes the edges it rounds, so the
+// displayed result no longer holds them; this is the body their refs resolve against.
+struct FeatureInput {
+    TopoDS_Shape body;              // null when unavailable
+    std::string body_id;            // feature id of that solid
+    bool from_checkpoint = false;   // read from `cache` without executing or meshing anything
+    std::string error;              // why `body` is null
+};
+// Taken from `cache`'s checkpoint when it holds one for exactly this `doc`/`env`/`quality`;
+// otherwise the document is compiled with the rollback bar placed just before the feature, on a
+// private copy of `cache` (nullptr = none) so every matching checkpoint is still reused. `cache`
+// itself is never changed. Never throws.
+FeatureInput compile_feature_input(const nlohmann::json& doc, const nlohmann::json& env,
+                                   const CompileCache* cache, ::geom::DisplayQuality quality,
+                                   const std::string& feature_id);
+
 // Display tessellation of already-solved bodies without executing any feature: meshes
 // r.shapes at `quality` with the doc's body/face appearances (same tiers, colors and AICM
 // layout as compile_document's surviving-body pass) and refreshes r.aicm, r.bodies_info

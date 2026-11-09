@@ -55,6 +55,7 @@ struct Agent {
     std::string id, parent, name, brief, status, model, note;
     double startTs = 0.0, endTs = 0.0;
     int toolCount = 0, failCount = 0;
+    copilot::SubRunUsage usage;   // OMP AgentProgress run totals; latest value of each
     long long dropped = 0;
     bool named = false;   // `name` is the spawner-assigned task name; role/purpose never replace it
     std::deque<Step> steps;
@@ -318,6 +319,7 @@ static void subagentLifecycle(TraceStore& t, const nlohmann::json& d, const std:
     const std::string st = agentStatusFrom(raw);
     {
         Agent& a = t.agents[(size_t)ai];
+        if (copilot::mergeSubRunUsage(a.usage, d) && !a.usage.model.empty()) a.model = a.usage.model;
         if (!assigned.empty()) {
             a.name = assigned;
             a.named = true;
@@ -730,6 +732,8 @@ static nlohmann::json serializeTrace(const TraceStore& t) {
                           {"startTs", a.startTs}, {"endTs", a.endTs},
                           {"toolCount", a.toolCount}, {"failCount", a.failCount},
                           {"dropped", a.dropped + (long long)skip}});
+        if (a.usage.requests > 0 || a.usage.contextTokens > 0 || a.usage.costUsd > 0.0)
+            agents.back()["usage"] = copilot::subRunUsageJson(a.usage);
         for (size_t i = skip; i < a.steps.size(); ++i) {
             const Step& s = a.steps[i];
             nodes.push_back({{"a", (int)ai}, {"k", kindName(s.kind)}, {"u", s.uid},
@@ -778,6 +782,7 @@ std::function<nlohmann::json()> agentDagSnapshot(const std::string& convId) {
         saved.note = capText(agent.note, kPersistText);
         saved.startTs = agent.startTs; saved.endTs = agent.endTs;
         saved.toolCount = agent.toolCount; saved.failCount = agent.failCount;
+        saved.usage = agent.usage;
         const size_t skip = agent.steps.size() > kPersistStepsPerAgent
             ? agent.steps.size() - kPersistStepsPerAgent : 0;
         saved.dropped = agent.dropped + (long long)skip;
@@ -829,6 +834,7 @@ void agentDagFromJson(const std::string& convId, const nlohmann::json& j) {
         a.endTs = x.value("endTs", 0.0);
         a.toolCount = x.value("toolCount", 0);
         a.failCount = x.value("failCount", 0);
+        if (x.contains("usage")) copilot::mergeSubRunUsage(a.usage, x["usage"]);
         a.dropped = x.value("dropped", (long long)0);
         t.agentIdx[a.id] = (int)t.agents.size();
         t.agents.push_back(std::move(a));
@@ -1656,6 +1662,7 @@ void agentTraceSubagents(AppState& st, const std::string& convId,
         v.startTs = a.startTs;
         v.endTs = v.status == "running" ? a.endTs : agentEndTs(a, v.status);
         v.toolCount = a.toolCount;
+        v.usage = a.usage;
         v.failCount = a.failCount;
         v.depth = std::max(1, entry.second);
         if (!a.steps.empty()) {

@@ -69,6 +69,9 @@ SIGNAL_CLASSES = ("power", "signal", "data", "shielded_drain", "ground")
 SHIELD_ENDS = ("from", "to", "both", "none")
 END_TREATMENTS = ("crimp", "ferrule", "solder", "tinned", "bare")
 NODE_KINDS = ("connector", "breakout", "clamp", "waypoint", "splice")
+#: Segment fields owned by ``recompute_derived``; every other segment field is author intent.
+SEGMENT_DERIVED = ("od_mm", "min_bend_radius_mm", "wires", "length_mm", "od_basis",
+                   "bend_radius_basis", "bend_radius_confidence")
 
 #: Optional wire properties consumed by electrical analyses.
 WIRE_PASSTHROUGH_KEYS = ("temp_rating_c", "stranded", "conductor_class", "r20_ohm_per_km",
@@ -189,6 +192,30 @@ def dedupe_path(path: list, tol: float = 1e-9) -> list:
         if not out or vdist(out[-1], p) > tol:
             out.append(list(p))
     return out
+
+
+def simplify_polyline(path: list, tol: float) -> list:
+    """Ramer-Douglas-Peucker: keep the end points and every vertex needed to stay within ``tol``."""
+    if len(path) <= 2:
+        return [list(p) for p in path]
+    keep = [False] * len(path)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(path) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        a, b = path[lo], path[hi]
+        ab = vsub(b, a)
+        den = vdot(ab, ab)
+        worst, at = -1.0, -1
+        for i in range(lo + 1, hi):
+            t = 0.0 if den == 0 else max(0.0, min(1.0, vdot(vsub(path[i], a), ab) / den))
+            d = vdist(path[i], vadd(a, vscale(ab, t)))
+            if d > worst:
+                worst, at = d, i
+        if worst > tol:
+            keep[at] = True
+            stack.extend(((lo, at), (at, hi)))
+    return [list(p) for p, k in zip(path, keep) if k]
 
 
 def closest_on_polyline(p: list, path: list) -> "tuple[float, int, float, list]":
@@ -329,6 +356,39 @@ def bundle_bend_radius(members: list, od: float) -> tuple[float, str, str]:
              "unknown insulation, cable construction and flex conditions require datasheets. "
              + NASA_BEND_SOURCE + " Convention: " + BEND_CONVENTION_SOURCE)
     return radius, basis, "low"
+
+
+def bundle_requirements(members: list, packing_factor: Optional[float],
+                        overrides: Optional[dict] = None) -> dict:
+    """OD and centerline bend radius a bundle of ``members`` must satisfy, as stored on segments.
+
+    The single source for :func:`recompute_derived` and the router, so a route is planned for the
+    requirement the later check applies. ``overrides`` is a segment dict whose ``override_od_mm``,
+    ``override_packing_factor`` and ``override_min_bend_radius_mm`` win over the estimate.
+    ``od_mm`` is None when the packing of three or more wires is unknown.
+    """
+    overrides = overrides or {}
+    pf = overrides.get("override_packing_factor", packing_factor)
+    if "override_od_mm" in overrides:
+        od, od_basis = _r(overrides["override_od_mm"]), "caller supplied segment OD"
+    elif pf is None and len(members) >= 3:
+        od, od_basis = None, "unknown: packing factor not specified"
+    else:
+        od = _r(bundle_od_mm([m["insulation_od_mm"] for m in members], pf))
+        od_basis = f"estimated from item ODs and area packing factor {pf!r}"
+    if od is None:
+        radius = overrides.get("override_min_bend_radius_mm")
+        return {"od_mm": None, "od_basis": od_basis, "min_bend_radius_mm": radius,
+                "bend_radius_basis": ("caller supplied segment centerline radius" if
+                                      radius is not None else "unknown: bundle OD is not specified"),
+                "bend_radius_confidence": "explicit" if radius is not None else "unknown"}
+    radius, basis, confidence = bundle_bend_radius(members, od)
+    if "override_min_bend_radius_mm" in overrides:
+        basis = ("caller supplied segment centerline radius; estimated radius without "
+                 f"override is {_r(radius)} mm")
+        radius, confidence = overrides["override_min_bend_radius_mm"], "explicit"
+    return {"od_mm": od, "od_basis": od_basis, "min_bend_radius_mm": _r(radius),
+            "bend_radius_basis": basis, "bend_radius_confidence": confidence}
 
 
 #: NEC (NFPA 70) Chapter 9, Table 1 — maximum conductor fill of a raceway cross-section:
@@ -559,6 +619,11 @@ def ensure_connector_nodes(h: dict) -> None:
             n["kind"] = "connector"
 
 
+def normalize_exit_dir(value: Any) -> list:
+    """Unit exit direction rounded to 6 decimals, as stored on a connector."""
+    return [_r(c, 6) for c in vunit(v3(value, "exit_dir"), "exit_dir")]
+
+
 def add_connector(h: dict, *, ref: str, family: str, pins: Optional[int], frame: dict,
                   pitch_mm: Optional[float] = None, rows: Optional[int] = None,
                   part_number: Optional[str] = None, variant: Optional[str] = None,
@@ -632,7 +697,7 @@ def add_connector(h: dict, *, ref: str, family: str, pins: Optional[int], frame:
     if attach:
         conn["attach"] = attach
     if exit_dir is not None:
-        conn["exit_dir"] = [_r(c, 6) for c in vunit(v3(exit_dir, "exit_dir"), "exit_dir")]
+        conn["exit_dir"] = normalize_exit_dir(exit_dir)
     h["connectors"].append(conn)
     ensure_connector_nodes(h)
     mutated(h)
@@ -642,6 +707,60 @@ def add_connector(h: dict, *, ref: str, family: str, pins: Optional[int], frame:
 def connector_exit_dir(conn: dict) -> list:
     """Direction the wires leave the connector (``exit_dir`` or the frame normal)."""
     return list(conn.get("exit_dir") or conn["frame"]["normal"])
+
+
+def edit_connector(h: dict, connector_id: str, frame: Any = None,
+                   exit_dir: Any = None) -> "tuple[dict, dict]":
+    """Move or re-aim a connector; validates like :func:`add_connector`.
+
+    ``frame`` may hold any of ``origin`` / ``normal`` / ``up``; omitted parts keep their value
+    (a new ``normal`` without ``up`` re-derives ``up``); a changed frame drops the stored ``attach``
+    face placement. Routes leave a connector along its old
+    frame, so every segment touching it is removed and its wires become unrouted.
+    Returns ``(connector, report)``; the report has ``changed``, ``removed_segments`` and
+    ``unrouted_wires``.
+    """
+    conn = get_connector(h, connector_id)
+    if frame is None and exit_dir is None:
+        raise HarnessError("nothing_to_edit", "edit_connector needs frame and/or exit_dir",
+                           hint="frame={origin, normal, up} (any subset) and/or exit_dir=[x, y, z]")
+    new_frame = conn["frame"]
+    if frame is not None:
+        if not isinstance(frame, dict) or not frame or set(frame) - {"origin", "normal", "up"}:
+            raise HarnessError("bad_frame", "frame must be a non-empty object with origin, normal and/or up")
+        old = conn["frame"]
+        up = frame["up"] if "up" in frame else (None if "normal" in frame else old["up"])
+        new_frame = make_frame(frame.get("origin", old["origin"]), frame.get("normal", old["normal"]), up)
+    new_exit = conn.get("exit_dir") if exit_dir is None else normalize_exit_dir(exit_dir)
+    if new_frame == conn["frame"] and new_exit == conn.get("exit_dir"):
+        return conn, {"changed": False, "removed_segments": [], "unrouted_wires": []}
+    if new_frame != conn["frame"]:
+        conn.pop("attach", None)  # the face placement no longer describes where the connector is
+    conn["frame"] = new_frame
+    if new_exit is not None:
+        conn["exit_dir"] = new_exit
+    report = unroute_connector(h, conn["id"])
+    mutated(h)
+    return conn, {"changed": True, **report}
+
+
+def remove_connector(h: dict, connector_id: str) -> dict:
+    """Delete a connector no wire references; returns the unroute report.
+
+    Segments that only touch its node (e.g. a stale junction) are removed with it.
+    """
+    conn = get_connector(h, connector_id)
+    users = [w["id"] for w in h["wires"]
+             if conn["id"] in (w["from"]["connector"], w["to"]["connector"])]
+    if users:
+        raise HarnessError("connector_in_use", f"connector {conn['id']} is wired by {users}",
+                           hint="remove those wires first (harness_edit action='remove_wire'), "
+                                "then remove the connector", wires=users)
+    report = unroute_connector(h, conn["id"])
+    h["connectors"].remove(conn)
+    h["nodes"][:] = [n for n in h["nodes"] if n["id"] != conn["id"]]
+    mutated(h)
+    return report
 
 
 def parse_endpoint(h: dict, ep: Any, what: str) -> dict:
@@ -823,21 +942,29 @@ def add_wire(h: dict, *, from_: Any, to: Any, insulation_od_mm: Any = None,
     return wire, warnings
 
 
-def remove_wire(h: dict, wire_id: str) -> None:
+def remove_wire(h: dict, wire_id: str) -> dict:
+    """Remove a wire and prune what only it used; returns the :func:`prune_graph` report."""
     w = get_wire(h, wire_id)
     h["wires"].remove(w)
     for c in h["connectors"]:
         for cav in c["cavities"]:
             ids = [x for x in str(cav.get("wire") or "").split(",") if x and x != wire_id]
             cav["wire"] = ",".join(ids) if ids else None
-    recompute_derived(h)
+    report = prune_graph(h)
     mutated(h)
+    return report
 
 
 # ----------------------------------------------------------------------------- segment graph
 
 def seg_length(seg: dict) -> float:
     return polyline_length(seg["path"])
+
+
+def segment_fields(seg: dict) -> dict:
+    """A segment's author-intent fields (overrides, sleeves...): everything but identity,
+    geometry and what ``recompute_derived`` owns."""
+    return {k: v for k, v in seg.items() if k not in ("id", "a", "b", "path") + SEGMENT_DERIVED}
 
 
 def _adjacency(h: dict) -> "dict[str, list]":
@@ -923,7 +1050,11 @@ def find_cycle_segments(h: dict) -> list:
 
 
 def add_segment(h: dict, a: str, b: str, path: list, **fields: Any) -> dict:
-    """Append a segment between existing nodes; its end points are snapped to the nodes."""
+    """Append a segment between existing nodes; its end points are snapped to the nodes.
+
+    Coordinates keep full precision: rounding a dense arc shifts its sampled bend radius, and
+    the end points must equal the node positions exactly.
+    """
     na, nb = get_node(h, a), get_node(h, b)
     if na is None or nb is None:
         raise HarnessError("unknown_node", f"segment endpoints {a!r}/{b!r} must be existing nodes")
@@ -935,8 +1066,7 @@ def add_segment(h: dict, a: str, b: str, path: list, **fields: Any) -> dict:
     pts = dedupe_path(pts)
     if len(pts) < 2:
         raise HarnessError("zero_length_segment", f"segment {a}->{b} has zero length")
-    seg = {"id": next_id("s", h["segments"]), "a": a, "b": b,
-           "path": [[_r(c) for c in p] for p in pts], "od_mm": None,
+    seg = {"id": next_id("s", h["segments"]), "a": a, "b": b, "path": pts, "od_mm": None,
            "min_bend_radius_mm": None, "wires": [], "length_mm": 0.0}
     seg.update(fields)
     h["segments"].append(seg)
@@ -957,12 +1087,13 @@ def split_segment_at(h: dict, seg_id: str, point: list, kind: str = "breakout",
     if vdist(q, path[-1]) <= tol:
         return seg["b"]
     nid = next_id("n", h["nodes"])
-    h["nodes"].append({"id": nid, "kind": kind, "pos": [_r(c) for c in q]})
-    first = dedupe_path(path[:i + 1] + [q])
-    second = dedupe_path([q] + path[i + 1:])
-    extra = {k: v for k, v in seg.items()
-             if k not in ("id", "a", "b", "path", "od_mm", "min_bend_radius_mm", "wires",
-                          "length_mm")}
+    pos = list(q)
+    node = {"id": nid, "kind": kind, "pos": pos}
+    h["nodes"].append(node)
+    first = dedupe_path(path[:i + 1] + [pos])
+    first[-1] = list(pos)  # dedupe may have dropped ``pos`` against a vertex within 1e-9
+    second = dedupe_path([pos] + path[i + 1:])
+    extra = segment_fields(seg)
     idx = h["segments"].index(seg)
     h["segments"].remove(seg)
     s1 = {"id": next_id("s", h["segments"]), "a": seg["a"], "b": nid, "path": first,
@@ -971,6 +1102,14 @@ def split_segment_at(h: dict, seg_id: str, point: list, kind: str = "breakout",
     s2 = {"id": next_id("s", h["segments"]), "a": nid, "b": seg["b"], "path": second,
           "od_mm": None, "min_bend_radius_mm": None, "wires": [], "length_mm": 0.0, **extra}
     h["segments"].insert(idx + 1, s2)
+    # Provenance: a wire running between the two halves passes straight through the new node. The
+    # halves also take this segment's place in the ``through`` of the nodes at its ends (an id the
+    # first half may reuse must not be left pointing at the far end).
+    node["through"] = [s1["id"], s2["id"]]
+    for end_id, half in ((seg["a"], s1), (seg["b"], s2)):
+        end = get_node(h, end_id)
+        if end and seg["id"] in (end.get("through") or []):
+            end["through"] = [half["id"] if x == seg["id"] else x for x in end["through"]]
     return nid
 
 
@@ -994,16 +1133,178 @@ def snap_to_graph(h: dict, point: list, tol: float) -> "Optional[tuple[float, st
     return best
 
 
-def wire_route_points(h: dict, wire: dict) -> list:
-    """The wire's centreline: its tree path from ``from`` to ``to``, as one polyline."""
+def _routed_wire_ids(h: dict) -> list:
+    return [w["id"] for w in h["wires"] if w.get("length_mm") is not None]
+
+
+def _clean_through(h: dict) -> None:
+    """Drop ``through`` from nodes whose two segments no longer both touch them (removed, merged
+    away or otherwise stale), so a segment id that ``next_id`` reuses can never match old provenance."""
+    ends: dict = {}
+    for s in h["segments"]:
+        for end in (s["a"], s["b"]):
+            ends.setdefault(end, set()).add(s["id"])
+    for n in h["nodes"]:
+        through = n.get("through")
+        if through is not None and not (len(set(through)) == 2 and set(through) <= ends.get(n["id"], set())):
+            del n["through"]
+
+
+def prune_graph(h: dict) -> dict:
+    """Drop what no wire uses: wireless segments, orphaned non-connector nodes, and breakouts left
+    with exactly the two halves of the split that made them (merged back into one segment when
+    their non-derived fields are identical). A breakout left with a branch and one trunk piece is
+    kept: merging them would turn the junction corner into a kink inside one bundle.
+
+    Returns ``{removed_segments, removed_nodes, merged_segments}`` and leaves derived state fresh.
+    """
+    recompute_derived(h)
+    removed_segments = [s["id"] for s in h["segments"] if not s["wires"]]
+    h["segments"][:] = [s for s in h["segments"] if s["wires"]]
+    merged: list = []
+    for node in [n for n in h["nodes"] if n["kind"] == "breakout"]:
+        touching = [s for s in h["segments"] if node["id"] in (s["a"], s["b"])]
+        if len(touching) != 2:
+            continue
+        s1, s2 = touching
+        if set(node.get("through") or ()) != {s1["id"], s2["id"]}:
+            continue
+        fields = [segment_fields(s) for s in touching]
+        if fields[0] != fields[1]:
+            continue
+        p1, a = (s1["path"], s1["a"]) if s1["b"] == node["id"] else (s1["path"][::-1], s1["b"])
+        p2, b = (s2["path"], s2["b"]) if s2["a"] == node["id"] else (s2["path"][::-1], s2["a"])
+        if a == b or a == node["id"] or b == node["id"]:
+            continue
+        s1.update(a=a, b=b, path=dedupe_path(p1 + p2))
+        far = get_node(h, b)  # s2 is gone: s1 now runs to the node s2 reached
+        if far and s2["id"] in (far.get("through") or []):
+            far["through"] = [s1["id"] if x == s2["id"] else x for x in far["through"]]
+        h["segments"].remove(s2)
+        h["nodes"].remove(node)
+        merged.append({"node": node["id"], "kept": s1["id"], "dropped": s2["id"]})
+    used = {end for s in h["segments"] for end in (s["a"], s["b"])}
+    removed_nodes = [n["id"] for n in h["nodes"] if n["kind"] != "connector" and n["id"] not in used]
+    h["nodes"][:] = [n for n in h["nodes"] if n["id"] not in removed_nodes]
+    _clean_through(h)
+    recompute_derived(h)
+    return {"removed_segments": removed_segments, "removed_nodes": removed_nodes + [m["node"] for m in merged],
+            "merged_segments": merged}
+
+
+def remove_segments(h: dict, segment_ids: list) -> dict:
+    """Delete segments (their wires become unrouted), then :func:`prune_graph`.
+
+    Returns the prune report with every removed segment id and the newly ``unrouted_wires``.
+    """
+    recompute_derived(h)
+    before = _routed_wire_ids(h)
+    gone = set(segment_ids)
+    removed = [s["id"] for s in h["segments"] if s["id"] in gone]
+    h["segments"][:] = [s for s in h["segments"] if s["id"] not in gone]
+    report = prune_graph(h)
+    after = set(_routed_wire_ids(h))
+    return {**report, "removed_segments": removed + report["removed_segments"],
+            "unrouted_wires": [w for w in before if w not in after]}
+
+
+def unroute_connector(h: dict, connector_id: str) -> dict:
+    """Remove every segment touching a connector's node; its wires become unrouted."""
+    return remove_segments(h, [s["id"] for s in h["segments"] if connector_id in (s["a"], s["b"])])
+
+
+def remove_segments_of_wires(h: dict, wire_ids: list) -> dict:
+    """Remove the segments carrying any of ``wire_ids`` so those wires can be routed afresh.
+
+    Refuses (``reroute_shared_segment``) when such a segment also carries other wires.
+    """
+    recompute_derived(h)
+    wanted = set(wire_ids)
+    doomed = [s for s in h["segments"] if wanted & set(s["wires"])]
+    shared = {w for s in doomed for w in s["wires"]} - wanted
+    if shared:
+        others = [w["id"] for w in h["wires"] if w["id"] in shared]
+        raise HarnessError("reroute_shared_segment",
+                           f"segments {[s['id'] for s in doomed if shared & set(s['wires'])]} also carry "
+                           f"wires that were not selected: {others}",
+                           hint="include those wires in wire_ids (or omit wire_ids to reroute all)",
+                           wires=others)
+    return remove_segments(h, [s["id"] for s in doomed])
+
+
+def wire_route(h: dict, wire: dict) -> "tuple[list, list]":
+    """The wire's centreline and its junctions: ``(points, junctions)``.
+
+    ``points`` is the tree path from ``from`` to ``to`` as one polyline; ``junctions`` are the
+    indices in it where the wire changes between two segments that are not the two halves of one
+    split (a node's ``through``): passing straight through a breakout or clamp is not a junction,
+    leaving along a branch is. Both are empty when the wire is unrouted.
+    """
     path = tree_path(h, wire["from"]["connector"], wire["to"]["connector"])
     if not path:
-        return []
+        return [], []
+    nodes = {n["id"]: n for n in h["nodes"]}
     pts: list = []
+    junctions: list = []
+    left = None  # (segment, node id) the wire has just reached the end of
     for seg, fwd in path:
         sp = seg["path"] if fwd else list(reversed(seg["path"]))
+        if pts and {left[0]["id"], seg["id"]} != set((nodes.get(left[1]) or {}).get("through") or ()):
+            junctions.append(len(pts) - 1)
         pts.extend(sp if not pts else sp[1:])
-    return pts
+        left = (seg, seg["b"] if fwd else seg["a"])
+    return pts, junctions
+
+
+def _continuation(h: dict, seg: dict, node_id: str, reach: float, max_points: int) -> list:
+    """Points leading away from ``node_id`` along the segment that continues ``seg`` through it,
+    until ``max_points`` or ``reach`` mm.
+
+    Only a node made by a split knows its through pair (``through``); a segment outside it (a
+    branch), or any segment at a node without provenance, has no continuation. Guessing one from
+    leg angles would hand a nearly tangent branch the trunk's points and turn its junction into a
+    false kink.
+    """
+    through = (get_node(h, node_id) or {}).get("through")
+    if not through or len(set(through)) != 2 or seg["id"] not in through:
+        return []
+    partner_id = next(x for x in through if x != seg["id"])
+    partner = next((s for s in h["segments"] if s["id"] == partner_id), None)
+    if partner is None or node_id not in (partner["a"], partner["b"]):
+        return []
+    pts = partner["path"] if partner["a"] == node_id else partner["path"][::-1]
+    out: list = []
+    walked, prev = 0.0, pts[0]
+    for p in pts[1:]:
+        walked += vdist(prev, p)
+        out.append(list(p))
+        prev = p
+        if len(out) >= max_points or walked >= reach:
+            break
+    return out
+
+
+def segment_check_path(h: dict, seg: dict, max_points: int = 64) -> "tuple[list, Optional[list]]":
+    """A segment's path extended with context from its through-continuation, for a bend check.
+
+    A segment cut out of a router arc (by a breakout or clamp inside it) starts or ends with a
+    chord or two of that arc, which alone read as a kink. At each end node made by a split, the
+    other half of the split (the node's ``through`` partner) lends its points, excluding the shared
+    node, until ``max_points`` or a length of pi x the segment's own ``min_bend_radius_mm``. Only
+    geometry is borrowed; the requirement stays the segment's. Returns ``(path, report_range)``:
+    ``report_range`` is ``[first, last]``, the segment's own vertex indices inside the extended
+    path, or None when there is no context.
+    """
+    path = [list(p) for p in seg["path"]]
+    radius = seg.get("min_bend_radius_mm")
+    if not radius or radius <= 0:
+        return path, None
+    reach = math.pi * radius
+    before = _continuation(h, seg, seg["a"], reach, max_points)
+    after = _continuation(h, seg, seg["b"], reach, max_points)
+    if not before and not after:
+        return path, None
+    return before[::-1] + path + after, [len(before), len(before) + len(path) - 1]
 
 
 def recompute_derived(h: dict) -> dict:
@@ -1048,31 +1349,7 @@ def recompute_derived(h: dict) -> dict:
     for s in h["segments"]:
         members = [by_id[i] for i in s["wires"] if i in by_id]
         if members:
-            segment_pf = s.get("override_packing_factor", pf)
-            if "override_od_mm" in s:
-                s["od_mm"] = _r(s["override_od_mm"])
-                s["od_basis"] = "caller supplied segment OD"
-            elif segment_pf is None and len(members) >= 3:
-                s["od_mm"] = None
-                s["od_basis"] = "unknown: packing factor not specified"
-            else:
-                s["od_mm"] = _r(bundle_od_mm([m["insulation_od_mm"] for m in members], segment_pf))
-                s["od_basis"] = f"estimated from item ODs and area packing factor {segment_pf!r}"
-            if s["od_mm"] is None:
-                s["min_bend_radius_mm"] = s.get("override_min_bend_radius_mm")
-                s["bend_radius_basis"] = ("caller supplied segment centerline radius" if
-                                          s["min_bend_radius_mm"] is not None else
-                                          "unknown: bundle OD is not specified")
-                s["bend_radius_confidence"] = ("explicit" if s["min_bend_radius_mm"] is not None else "unknown")
-            else:
-                radius, basis, confidence = bundle_bend_radius(members, s["od_mm"])
-                if "override_min_bend_radius_mm" in s:
-                    basis = ("caller supplied segment centerline radius; estimated radius without "
-                             f"override is {_r(radius)} mm")
-                    radius, confidence = s["override_min_bend_radius_mm"], "explicit"
-                s["min_bend_radius_mm"] = _r(radius)
-                s["bend_radius_basis"] = basis
-                s["bend_radius_confidence"] = confidence
+            s.update(bundle_requirements(members, pf, s))
         else:
             s["od_mm"] = None
             s["min_bend_radius_mm"] = None
@@ -1271,7 +1548,10 @@ def save_harness(doc_id: str, harness: dict, results: Optional[dict] = None) -> 
 def delete_harness(doc_id: str, harness_id: str) -> bool:
     for s in harness_studies(doc_id):
         if s.get("name") == harness_id and s.get("id"):
-            _call("sim_study_delete", {"doc_id": doc_id, "study_id": s["id"]})
+            res = _call("sim_study_delete", {"doc_id": doc_id, "study_id": s["id"]})
+            if isinstance(res, dict) and res.get("ok") is False:
+                raise HarnessError("not_deleted", f"document did not delete harness {harness_id!r}",
+                                   hint="check document write access and retry", detail=res)
             return True
     return False
 

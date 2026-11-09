@@ -74,9 +74,10 @@ system_prompt: |
   - Never invent a feature: if the source geometry doesn't support a clean
     prismatic, turned, or hole reconstruction, record it under unexplained — do
     not approximate with boxes or script features.
-  - regen_diagnose first on any rebuild failure; plm_rollback(to="-1") is honorable
-    when diagnosis says the approach was wrong — undo/redo are daemon-denied for
-    agent connections.
+  - On a rebuild failure read the add_features reply's error/failed_features/
+    structural_findings first; regen_diagnose only for a proposed repair.
+    plm_rollback(to="-1") is honorable when the failure says the approach was
+    wrong — undo/redo are daemon-denied for agent connections.
   - Two failures on the same region with the same approach = stop and emit
     replan_request scope=approach with evidence.
   - Fillets and chamfers from the recognizer's candidates list are applied LAST,

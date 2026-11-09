@@ -1,4 +1,4 @@
-"""Authoritative WebSocket relay for ``aicad.plm-live/1`` sessions."""
+"""Authoritative WebSocket relay for ``aicad.plm-live/2`` sessions."""
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from services.plm import manifest as manifest_mod
 from services.plm.vault import Vault, VaultError
 
-SCHEMA = "aicad.plm-live/1"
+SCHEMA = "aicad.plm-live/2"
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_OPS_BYTES = 1024 * 1024
 MAX_OPS = 1000
@@ -145,9 +145,7 @@ def _expect_keys(message: Mapping[str, Any], required: set[str], optional: set[s
         raise ProtocolFault("invalid_message", "The message contains unsupported fields.")
 
 
-def _bounded_text(value: Any, label: str, *, limit: int = 128, nullable: bool = False) -> str | None:
-    if nullable and value is None:
-        return None
+def _bounded_text(value: Any, label: str, *, limit: int = 128) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > limit or not _ID_RE.fullmatch(value):
         raise ProtocolFault("invalid_identity", f"{label} must be a non-empty plain string.")
     return value
@@ -162,14 +160,11 @@ def _uint64(value: Any, label: str) -> int:
 def _identity(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ProtocolFault("invalid_identity", "Participant identity must be an object.")
-    if value.keys() - {"id", "display", "account_id"} or not {"id", "display"} <= value.keys():
+    if value.keys() - {"id", "display"} or not {"id", "display"} <= value.keys():
         raise ProtocolFault("invalid_identity", "Participant identity has invalid fields.")
     participant_id = _bounded_text(value.get("id"), "Participant id")
     display = _bounded_text(value.get("display"), "Participant display", limit=256)
-    account_id = value.get("account_id")
-    if account_id is not None:
-        account_id = _bounded_text(account_id, "Participant account id", limit=256, nullable=True)
-    return {"id": participant_id, "display": display, "account_id": account_id}
+    return {"id": participant_id, "display": display}
 
 
 
@@ -909,7 +904,6 @@ class LivePlmServer:
                     "kind": "user",
                     "id": primary["id"],
                     "display": primary["display"],
-                    "account_id": primary.get("account_id"),
                 }
                 async with self._vault_lock:
                     await asyncio.to_thread(
@@ -996,7 +990,7 @@ async def _run_cli(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the aicad.plm-live/1 authoritative relay")
+    parser = argparse.ArgumentParser(description="Run the aicad.plm-live/2 authoritative relay")
     parser.add_argument("--project", required=True, help="Vault project folder")
     parser.add_argument("--listen", default="127.0.0.1:8765", help="HOST:PORT (default: 127.0.0.1:8765)")
     parser.add_argument("--token-file", help="0600 UTF-8 bearer-token file")

@@ -1792,10 +1792,7 @@ class Vault:
         kind = hist.kind_from_commit_message(cmeta["message"])
         scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])
-        author = {
-            "kind": "user", "id": "user", "display": "User",
-            "account_id": None,
-        }
+        author = {"kind": "user", "id": "user", "display": "User"}
         ai = None
         participants = None
         thumb_ref = None
@@ -1810,7 +1807,6 @@ class Vault:
                 try:
                     md = _json.loads(mraw.decode("utf-8"))
                     author = dict(md.get("author") or author)
-                    author.setdefault("account_id", None)
                     ai = md.get("ai")
                     participants = md.get("participants")
                 except Exception:
@@ -1851,10 +1847,7 @@ class Vault:
         scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])
         # pull author + ai from a representative item meta.json
-        author = {
-            "kind": "user", "id": "user", "display": "User",
-            "account_id": None,
-        }
+        author = {"kind": "user", "id": "user", "display": "User"}
         ai = None
         participants = None
         thumb_ref = None
@@ -1871,7 +1864,6 @@ class Vault:
                 import json as _json
                 md = _json.loads(mraw.decode("utf-8"))
                 author = dict(md.get("author") or author)
-                author.setdefault("account_id", None)
                 ai = md.get("ai")
                 participants = md.get("participants")
             if snapshot.item_prefix(pick_iid) + "thumbnail.png" in tree:
@@ -1902,15 +1894,7 @@ def _user_author() -> dict[str, Any]:
     """Session-aware user author with an OS identity fallback.
 
     Author lives ONLY in meta/commit (byte-stability law §0) — never document.json.
-    ``account_id`` is reserved now so later account-backed sharing does not need
-    a shape change.
     """
     uid = os.environ.get("CHUDWARE_USER_ID") or getpass.getuser() or "user"
     display = os.environ.get("CHUDWARE_USER_DISPLAY") or uid
-    account_id = os.environ.get("CHUDWARE_ACCOUNT_ID") or None
-    return {
-        "kind": "user",
-        "id": uid,
-        "display": display,
-        "account_id": account_id,
-    }
+    return {"kind": "user", "id": uid, "display": display}

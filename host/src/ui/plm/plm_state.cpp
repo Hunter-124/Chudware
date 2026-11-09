@@ -221,11 +221,9 @@ PlmRemoteRow parseRemote(const nlohmann::json& x) {
     r.kind     = getStr(x, "kind");
     r.url      = getStr(x, "url");
     r.name     = getStr(x, "name");
-    r.reserved = x.value("reserved", false) || r.kind == "chudware-cloud";
     if (auto id = x.find("identity"); id != x.end() && id->is_object()) {
-        r.identityUserId    = getStr(*id, "user_id");
-        r.identityDisplay   = getStr(*id, "display");
-        r.identityAccountId = getStr(*id, "account_id");
+        r.identityUserId  = getStr(*id, "user_id");
+        r.identityDisplay = getStr(*id, "display");
     }
     if (auto c = x.find("capabilities"); c != x.end() && c->is_array()) {
         for (const auto& cap : *c) {
@@ -238,7 +236,7 @@ PlmRemoteRow parseRemote(const nlohmann::json& x) {
     } else {
         // Profile predating capabilities: sync always existed; never advertise
         // locks the service has not confirmed.
-        r.canSync = !r.reserved;
+        r.canSync = true;
     }
     // Live editing is kind + capability driven (manifest.remote_mode). A live
     // remote's own snapshot capability is server-internal: sync/locks against
@@ -253,7 +251,6 @@ PlmLockRow parseLock(const nlohmann::json& x) {
     l.itemId     = getStr(x, "item_id");
     l.userId     = getStr(x, "user_id");
     l.display    = getStr(x, "display");
-    l.accountId  = getStr(x, "account_id");
     l.acquiredAt = getStr(x, "acquired_at");
     l.expiresAt  = getStr(x, "expires_at");
     return l;
@@ -322,19 +319,17 @@ bool plmLockLive(const PlmLockRow& l) {
 
 const PlmRemoteRow* plmTeamLockRemote() {
     for (const auto& rm : g_plmHub.remotes)
-        if (rm.canLock && !rm.reserved && !rm.canLive) return &rm;
+        if (rm.canLock && !rm.canLive) return &rm;
     return nullptr;
 }
 
 const PlmRemoteRow* plmTeamLiveRemote() {
     for (const auto& rm : g_plmHub.remotes)
-        if (rm.canLive && !rm.reserved) return &rm;
+        if (rm.canLive) return &rm;
     return nullptr;
 }
 
 std::string plmTeamFriendlyError(const std::string& reason, const std::string& hint) {
-    if (reason == "reserved_remote")
-        return "Chudware Cloud is not yet available.";
     if (reason == "remote_unreachable")
         return "The shared location could not be reached. Check the folder or "
                "address and your connection, then try again.";

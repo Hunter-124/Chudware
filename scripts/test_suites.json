@@ -208,7 +208,8 @@
   },
   "host": {
     "sketch": [
-      "test_sketch_consumers"
+      "test_sketch_consumers",
+      "test_sketch_model_snap"
     ],
     "topopt": [
       "test_sim_topology"

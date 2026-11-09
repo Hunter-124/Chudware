@@ -139,6 +139,39 @@ authorizes a model, and online selections preserve OMP's exact provider/model id
 
 Compaction uses the selected method exactly: Automatic follows the runtime's effective order with the experimental `snapcompact` removed (an order of only `snapcompact` becomes `soft`), so snapcompact never runs unless selected; Off disables it; explicit Snapcompact, Shake and Summary select `snapcompact`, `shake` and `soft` respectively as singleton orders. No silent fallback or substitution is allowed. If an exact manual operation cannot be supported, report that rather than changing the selected policy. Memory selections are off, local, hindsight, mnemopi and sharpshooter; the historical `mnemo` value migrates explicitly to `mnemopi`, without backend fallback.
 
+OMP runtime settings that Chudware does not own are never copied into `config.json`.
+Settings → AI shows rows of OMP's own settings panel under Chudware's tabs (Models, Context,
+Memory, Tools, Coding, Agents, Providers) with OMP's label, description, choices, order,
+validation and provenance. `services/agent/omp_settings.py` is the whole policy: which OMP
+(tab, group) feeds which Chudware tab, the keys never shown (Chudware's own controls, the
+per-session pins, terminal-only rows, credentials), and the keys Chudware overrides. The
+extension reads the rows through OMP's own panel definitions (`config_list`, `config_get`),
+validates a Chudware-layer value with the setting's own `parse` / `assertWritable`
+(`config_parse`) and writes OMP-scope values with `Setting.set` (`config_set`); the Python side
+shapes the reply (`omp_config_get` / `omp_config_set`). Memory rows are the group of the
+selected backend only.
+
+A change has one of two scopes. `omp`: the user's own OMP config, shared with their other OMP
+sessions. `chudware`: `<chudware root>/omp/cad-settings.yml` (the actor's state root in a cell),
+created with Chudware's defaults, passed as `--config` to every Chudware OMP process (sessions,
+helpers, the service runtime) before the per-session overlay, so the overlay's pins still win
+(the last `--config` file wins; verified against OMP 18.17). OMP RPC runtimes watch their
+`--config` files and apply an edit, including an atomic replace, within a second; the file is
+written by replacing it. `--config` files are nested YAML: OMP silently ignores a dotted key at
+the top level (`task.maxRuntimeMs: 0` pins nothing; `task:\n  maxRuntimeMs: 0` does), so every
+overlay and layer key is written nested, and a test fails on a dotted top-level key. The
+overlay pins `task.maxRuntimeMs: 0` (a CAD run never stops on a time limit, whatever the user's
+OMP config says), the task-list preference (`todo.enabled` / `todo.eager`), the memory backend
+and, in a tenancy cell, `browser.enabled` and `computer.enabled` off; each outranks the user's
+own OMP value (checked in the real-runtime settings test). The Chudware layer holds
+`lsp.enabled` and `lsp.diagnosticsOnWrite` (off) and
+`task.maxEffort` (`high`, measured: xhigh doubled a sub-agent turn's output tokens). LSP is a
+setting, not the `--no-lsp` flag, for conversation processes: OMP's `lsp.enabled` only gates the
+`lsp` tool and discovery, while the `write` tool starts language servers whenever
+`lsp.diagnosticsOnWrite` is on, so both are off by default. OMP refuses to start with a tool its
+settings disable, so `lsp` is listed in a conversation's `--tools` only while the layer turns
+LSP on, and a change applies to the next process. Tool-free helpers keep `--no-lsp`.
+
 Manual compaction receipts are verified against a new entry in the owning OMP journal,
 then include the actual method and current before/after context breakdown when available.
 Tokenizer estimates are marked; an unknown after-count invalidates the meter instead of
@@ -171,6 +204,16 @@ its `details.jobs`; and the root `todo` result's phases as the plan's todo list 
 runtime, so they cannot change the provider prefix or cost a cache hit. Sub-agent and
 `delegate` session frames keep their tool rows only. See
 [agent events](../../contracts/agent_events.md#omp-activity-surface-append-only-2026-11-05).
+
+OMP's `todo` is the only task-list tool online; Chudware's `task_list` is not advertised
+to this lane (`omp_tools.OMP_SUPERSEDED_TOOLS`). Settings → "Task list preference" becomes
+the conversation process's todo policy in its `--config` overlay: Off sets
+`todo.enabled: false` and drops the tool; the other three set `todo.enabled: true` (the
+preference outranks a user's own `todo.enabled: false`, which would stop OMP from starting
+with `todo` in `--tools`), and Encourage adds `todo.eager: preferred`, Require
+`todo.eager: always` (OMP forces a `todo` call on a chat's first message and re-nudges
+after compaction). Like the memory backend, a change applies when the chat's process
+next starts.
 
 Registration and activation are separate. The full authorized CAD catalog remains registered, but only the core/meta bootstrap and explicitly enabled categories are initially active. Inactive tools must appear in neither provider tool schemas nor the system prompt's `xd://` catalog. Merely marking a tool discoverable is insufficient: OMP lists mounted tools in that catalog. `enable_tools` republishes the active subset and waits for the calling root or child factory to apply the new generation before returning; tool availability must not depend on a later frame or another agent's refresh.
 
@@ -318,6 +361,33 @@ for the same agent leave the parent unknown rather than guessing; direct
 `write xd://` calls are not duplicated. A nested structured `ok:false` produces a
 failed row but remains ordinary diagnostic data in the returned tool result.
 
+The GUI keeps `parent_id` and `subagent_id` on each tool row (persisted with the session) and nests
+rows in the transcript instead of listing them flat: a call whose `parent_id` names an Eval's row
+sits under that Eval, any other call with a `subagent_id` under that sub-agent's card (stage
+`subrun:<subagent_id>`), and a sub-agent's own Eval under its card with its bridged calls under it.
+Rows with neither (including `parent_unknown`) stay top level. The owner shows "N calls · M failed ·
+last <tool>" and, opened, its 50 most recent calls under an "N earlier calls" line; failures inside
+are counted on the owner and in the turn receipt, whose jump opens the owners above them. The
+Eval's start (`status` phase `tool`) creates its running row, which its final `agent.tool_call`
+updates in place, so bridged calls nest under it while it runs.
+Copy/export still lists every row. `CHUDWARE_SHOT=toolnest` renders the nesting headlessly.
+
+A task sub-agent's `sub_run` card also carries its own run totals, which Main's context meter
+never shows. `omp_events._subagent_frame` maps OMP's `AgentProgress` (`subagent_progress`) onto
+the row as `requests`, `tokens` (input + output + cache writes), `context_tokens`,
+`context_window`, `cost_usd`, `duration_ms`, `resolved_model` and `retry_state`
+(`attempt`/`max_attempts`/`delay_ms`/`error`), each only when the frame has it as a finite
+non-negative number (a string for the model); lifecycle frames carry none. `feed.cpp` keeps the
+latest value of each in a `\x1eUSE\x1e` trailer on the card's detail (`copilot/subrun_usage.h`),
+so it persists with the session like the tool-row trailers and stays out of copied text.
+`retry_state` is a snapshot: a progress frame without it clears the pending retry. The card's
+second line reads "160 requests · ctx 346k / 1M · $6.58 · sonnet-5-5" (cost only above zero;
+the tooltip adds billed volume, run time and the full model id), and a running card asleep
+between provider retries shows a "waiting on provider retry" chip. `test_omp_events.py` pins the
+mapping; `CHUDWARE_SHOT=toolnest` shows the line and the chip. The AI workspace roster reads
+the same totals per sub-agent from the execution trace (`agent_dag.cpp`). Contract:
+[agent events](../../contracts/agent_events.md#task-sub-agent-run-usage-append-only-2026-11-06).
+
 The private CAD bridge preserves tool-authored `ValueError` and native `CoreError`
 diagnostics as failed tool calls, bounded to 2,000 characters through the existing secret
 scrubber and with the bridge's literal token/endpoint removed. The extension includes the
@@ -325,5 +395,20 @@ tool name and recovery reason instead of replacing them with only “CAD tool fa
 Unexpected exceptions remain generic; provider/control errors are not made public.
 `test_omp_bridge.py` covers the privacy/size boundary; the provider-free official-runtime
 fixture in `test_omp_extension.py` exercises root and child error presentation.
+
+CAD tool bodies run in the same worker process as the bridge's `ControlServer`, so a native
+call that holds the GIL (a numpy sort, one JSON decode of a large engine reply) leaves the
+server unable to accept anything, including the extension's poll for that very call, and
+it also starves every other agent's calls. Keep such work off the GIL (array operations
+that release it, no per-vertex Python objects, no `np.unique(axis=...)` on mesh tables);
+`render_part`'s `shot_planner._edge_faces` held it for 7-10 s on a 2.6M-vertex assembly and
+surfaced as `bridge timeout` on the render and on an unrelated render queued behind it. The
+extension gives a poll for a running call a 60 s wait (other bridge requests keep 5 s), never
+times one out and re-sends it (the server still executes an abandoned poll, which drains
+updates and drops a finished call), stops waiting on Stop, and sends `tool_cancel` when a
+poll fails so an abandoned call cannot keep running unowned. A dead worker still fails at
+once (`bridge unavailable`). `test_omp_bridge_gil.py` runs the real extension under Bun
+against a bridge whose tool pins the GIL; `test_shot_planner_edge_faces.py` pins the
+array implementation against the previous per-vertex one.
 
 The fork-only speech-to-text, repair and duplicate compaction endpoints are removed; no compatibility stubs or substitute RPC commands are promised. The official client and extension APIs are the boundary. See [worker RPC](../../contracts/worker_rpc.md) and [agent events](../../contracts/agent_events.md) for versioned contracts and [engineering notes](engineering-notes.md) for worker and persistence invariants.

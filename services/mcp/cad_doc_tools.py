@@ -8341,7 +8341,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Reference earlier operations in this batch as "$<index>" (zero-based), or
         existing features by ID. Dimensions accept numbers, unit strings and expressions.
         Normalizations are reported in interpreted; validation failures reject the
-        entire batch. Inspect error and any regen_diagnosis before retrying.
+        entire batch. Inspect error, failed_features and any structural_findings
+        (model-free; add_features never calls a model) before retrying.
         If the batch's own features build but an existing later feature fails,
         the edit is kept with auto_rollback.after, broken and hidden_features in
         the reply. Those later features remain in the tree, unbuilt. Repair them
@@ -8664,33 +8665,23 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             f'(plm_checkpoint / plm_timeline); this document was minted '
                             f'as "{mint_actual_name}", so keep calling it '
                             f'"{mint_actual_name}" from now on')
-                    # Rebuild failure -> IP-18 regen_diagnose fix-preview card.
-                    # Diagnoses the FAILED tree from the ops response (the
-                    # doc itself was already rolled back above), logs the model call as an
-                    # IP-18 correction trace, and attaches the accept/edit/reject card to
-                    # the failure response for the copilot/caller to surface. Best-effort:
-                    # any error (no provider, no tree) degrades to the plain failure dict.
+                    # Rebuild failure: attach ONLY the model-free structural findings
+                    # (pure analysis of the rejected tree; no provider/helper call).
+                    # A proposed repair is opt-in via regen_diagnose, which calls a model.
+                    # Best-effort: any error degrades to the plain failure dict.
                     try:
                         failed_tree = r.get("rejected_tree")
                         if failed_tree:
-                            from services.mcp.regen_tools import diagnose_failed_document
-                            engine_err = "; ".join(parts) or None
-                            diag = diagnose_failed_document(
-                                {"revision": r.get("revision", 0), "tree": failed_tree,
-                                 "owner_map": r.get("owner_map") or {},
-                                 "rebuild": {"feature_status": fs}},
-                                reference_document=({"revision": r.get("revision"), "tree": r["tree"]}
-                                                    if isinstance(r.get("tree"), dict) else None),
-                                engine_error=engine_err)
-                            if diag.get("ok"):
-                                card = dict(diag["card"])
-                                # strip in-process handles (not JSON-serializable intent)
-                                card.pop("_corrupted_document", None)
-                                card.pop("_fixed_document", None)
-                                fail_result["regen_diagnosis"] = card
-                            else:
-                                fail_result["regen_diagnosis"] = diag
-                    except Exception:  # noqa: BLE001 — diagnosis must never mask the failure
+                            from services.agent.regen_diagnosis import diagnostic_failures
+                            fail_result["structural_findings"] = {
+                                "failures": [x.to_dict() for x in diagnostic_failures(
+                                    {"revision": r.get("revision", 0), "tree": failed_tree,
+                                     "owner_map": r.get("owner_map") or {},
+                                     "rebuild": {"feature_status": fs}})],
+                                "hint": ("no model was called; regen_diagnose(doc_id=...) "
+                                         "can propose a fix on request (it calls a model)"),
+                            }
+                    except Exception:  # noqa: BLE001 — findings must never mask the failure
                         pass
                     return fail_result
 

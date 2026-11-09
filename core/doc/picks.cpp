@@ -31,6 +31,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <GCPnts_TangentialDeflection.hxx>
 #include <BRepGProp.hxx>
 #include <BRepClass_FaceClassifier.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
@@ -380,6 +381,94 @@ EdgePicks resolve_edge_picks(const TopoDS_Shape& shape, const nlohmann::json& se
     for (std::size_t s = 0; s < M; ++s) {
         if (ok[s]) out.edges.push_back(resolved[s]);
         else out.dangling.push_back("edges[" + std::to_string(s) + "]: " + reason[s]);
+    }
+    return out;
+}
+
+// ------------------------------------------------------------ resolve_edge_ref_elements
+
+std::vector<EdgeRefElement> resolve_edge_ref_elements(const TopoDS_Shape& shape,
+                                                      const nlohmann::json& edges_ref) {
+    const std::vector<nlohmann::json> elements = as_selector_list(edges_ref);
+    std::vector<EdgeRefElement> out(elements.size());
+    // The compiler resolves identical selectors once: resolving a twin as a second claim would
+    // hand it a different edge under the one-to-one assignment.
+    std::vector<std::size_t> twin(elements.size());
+    for (std::size_t i = 0; i < elements.size(); ++i) {
+        twin[i] = i;
+        for (std::size_t j = 0; j < i; ++j)
+            if (elements[j] == elements[i]) { twin[i] = twin[j]; break; }
+    }
+    nlohmann::json plain = nlohmann::json::array();
+    std::vector<std::size_t> plain_at;
+    for (std::size_t i = 0; i < elements.size(); ++i) {
+        if (twin[i] != i) continue;
+        if (!is_geom_query(elements[i])) {
+            plain.push_back(elements[i]);
+            plain_at.push_back(i);
+            continue;
+        }
+        QueryPicks qp = resolve_geom_query(shape, elements[i]);
+        if (!qp.error.empty()) out[i].error = qp.error;
+        else if (qp.edges.empty()) out[i].error = "the edge query matched no edges";
+        else out[i].edges = std::move(qp.edges);
+    }
+    if (!plain.empty()) {
+        // `edges` is the resolved subset in plain order; each failure is "edges[k]: <reason>".
+        EdgePicks picks = resolve_edge_picks(shape, plain);
+        std::vector<std::string> reason(plain.size());
+        std::vector<char> failed(plain.size(), 0);
+        for (const std::string& d : picks.dangling) {
+            const std::size_t close = d.find("]: ");
+            if (d.compare(0, 6, "edges[") != 0 || close == std::string::npos) continue;
+            const std::size_t k = std::strtoul(d.c_str() + 6, nullptr, 10);
+            if (k >= plain.size()) continue;
+            failed[k] = 1;
+            reason[k] = d.substr(close + 3);
+        }
+        std::size_t next = 0;
+        for (std::size_t k = 0; k < plain.size(); ++k) {
+            EdgeRefElement& element = out[plain_at[k]];
+            if (failed[k]) element.error = reason[k];
+            else if (next < picks.edges.size()) element.edges.push_back(picks.edges[next++]);
+        }
+    }
+    for (std::size_t i = 0; i < elements.size(); ++i)
+        if (twin[i] != i) out[i] = out[twin[i]];
+    return out;
+}
+
+// ------------------------------------------------------------------ sample_edge_polyline
+
+EdgePolyline sample_edge_polyline(const TopoDS_Edge& edge) {
+    EdgePolyline out;
+    try {
+        BRepAdaptor_Curve curve(edge);
+        auto push = [&out](const gp_Pnt& p) { out.points.push_back({p.X(), p.Y(), p.Z()}); };
+        if (curve.GetType() == GeomAbs_Line) {
+            push(curve.Value(curve.FirstParameter()));
+            push(curve.Value(curve.LastParameter()));
+            return out;
+        }
+        GCPnts_TangentialDeflection sampler(curve, 0.15, 0.05, 2);
+        for (int i = 1; i <= sampler.NbPoints(); ++i) push(sampler.Value(i));
+        if (out.points.size() < 2) {
+            out.points.clear();
+            push(curve.Value(curve.FirstParameter()));
+            push(curve.Value(curve.LastParameter()));
+        }
+    } catch (const Standard_Failure&) {
+        out.points.clear();  // a degenerate edge has no curve to draw
+        return out;
+    }
+    if (out.points.size() > 2) {
+        const auto& a = out.points.front();
+        const auto& b = out.points.back();
+        const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+        if (dx * dx + dy * dy + dz * dz < 1e-12) {
+            out.points.pop_back();
+            out.closed = true;
+        }
     }
     return out;
 }

@@ -27,6 +27,8 @@
 #include <nlohmann/json.hpp>
 
 #include <BRep_Builder.hxx>
+#include <BRep_Tool.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>  // I1/I3: circle wires for the loft test
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
@@ -34,6 +36,11 @@
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>  // near: flange bolt holes
 #include <GProp_GProps.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Wire.hxx>
 #include <gp_Ax1.hxx>
@@ -1404,4 +1411,68 @@ TEST_CASE("fastener geometry reports trimmed world-space bore and seat evidence"
         CHECK(c["axial_start"][1].get<double>() == doctest::Approx(15));
         CHECK(c["axial_start"][2].get<double>() == doctest::Approx(-3));
     }
+}
+
+TEST_CASE("edge ref elements keep which element named which edges") {
+    using chudware::doc::resolve_edge_ref_elements;
+    const double W = 40.0, H = 30.0, D = 20.0;
+    const TopoDS_Shape box = geom::make_box(W, H, D);
+    const json selectors = vertical_edge_selectors(W, H, D);
+    REQUIRE(selectors.size() == 4);
+    const json lost{{"kind", "edge"}, {"surf", "line"}, {"axis", {0, 0, 1}},
+                    {"centroid", {900, 900, 10}}, {"area_or_len", D}};
+    const json refs = json::array({
+        json{{"of", "edge"}, {"parallel", "z"}},                                    // 0: all four
+        json{{"of", "edge"}, {"parallel", "z"}, {"near", {0, 0, 10}}, {"count", 1}},  // 1: one
+        selectors[2],                                                               // 2: a pick
+        selectors[2],                                                               // 3: the same pick
+        lost,                                                                       // 4: names nothing
+        json{{"of", "edge"}, {"surf", "circle"}},                                   // 5: no circles
+    });
+    const auto rows = resolve_edge_ref_elements(box, refs);
+    REQUIRE(rows.size() == 6);
+    CHECK(rows[0].edges.size() == 4);
+    CHECK(rows[0].error.empty());
+    CHECK(rows[1].edges.size() == 1);
+    REQUIRE(rows[2].edges.size() == 1);
+    REQUIRE(rows[3].edges.size() == 1);
+    CHECK(rows[3].edges[0].IsSame(rows[2].edges[0]));  // identical picks are one pick
+    CHECK(rows[4].edges.empty());
+    CHECK_FALSE(rows[4].error.empty());
+    CHECK(rows[5].edges.empty());
+    CHECK_FALSE(rows[5].error.empty());
+    CHECK(resolve_edge_ref_elements(box, refs[0]).size() == 1);  // one object is one element
+    CHECK(resolve_edge_ref_elements(box, json(nullptr)).empty());
+}
+
+TEST_CASE("edge polylines: a line is two points, a circle a closed loop on its radius") {
+    using chudware::doc::sample_edge_polyline;
+    const double R = 7.0, Hgt = 12.0;
+    const TopoDS_Shape cylinder = BRepPrimAPI_MakeCylinder(R, Hgt).Shape();
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(cylinder, TopAbs_EDGE, edges);
+    int lines = 0, circles = 0;
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const TopoDS_Edge edge = TopoDS::Edge(edges(i));
+        if (BRep_Tool::Degenerated(edge)) continue;
+        const auto polyline = sample_edge_polyline(edge);
+        if (BRepAdaptor_Curve(edge).GetType() == GeomAbs_Line) {
+            ++lines;
+            CHECK(polyline.points.size() == 2);
+            CHECK_FALSE(polyline.closed);
+            continue;
+        }
+        ++circles;
+        CHECK(polyline.closed);
+        REQUIRE(polyline.points.size() >= 8);
+        for (const auto& p : polyline.points) {
+            CHECK(std::hypot(p[0], p[1]) == doctest::Approx(R));
+            CHECK((std::abs(p[2]) < 1e-9 || std::abs(p[2] - Hgt) < 1e-9));
+        }
+        const auto& a = polyline.points.front();
+        const auto& b = polyline.points.back();
+        CHECK(std::hypot(a[0] - b[0], a[1] - b[1]) > 1e-3);  // the repeated end point is dropped
+    }
+    CHECK(lines == 1);
+    CHECK(circles == 2);
 }

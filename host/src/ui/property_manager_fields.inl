@@ -4,10 +4,12 @@
 #include "imgui.h"  // editing timestamp only
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string_view>
 #include <vector>
 
@@ -836,6 +838,297 @@ void PropertyManager::hydrateFilletEvidence(const nlohmann::json& evidence) {
     }
 }
 
+// ---- blend edge wells: the edges a stored fillet/chamfer names -----------------------------
+//
+// A fillet/chamfer is shown LIVE and APPLIED while it is edited, so the displayed body no longer
+// holds the edges it rounds. Its stored refs (picks, or agent-authored geometry queries) are
+// therefore resolved by the engine on the feature's INPUT body (doc_feature_edges) and kept per
+// pick as PMSelEntry::shapes: that is what the viewport draws and what the user deselects.
+
+static bool pmBlendForm(const PMFormDef* form) {
+    return form && form->type &&
+           (std::strcmp(form->type, "fillet") == 0 || std::strcmp(form->type, "chamfer") == 0);
+}
+
+PMField* PropertyManager::blendEdgeWell() {
+    if (!pmBlendForm(form_)) return nullptr;
+    for (auto& f : fields_)
+        if (f.def->kind == PMFieldKind::SelectorWell && f.def->selKinds.edge &&
+            std::strcmp(f.def->key, "edges") == 0 && fieldVisible(*f.def, fields_)) return &f;
+    return nullptr;
+}
+
+const PMField* PropertyManager::blendEdgeWell() const {
+    return const_cast<PropertyManager*>(this)->blendEdgeWell();
+}
+
+// True while some pick of a blend edges well has no engine answer yet (neither drawable edges nor
+// a reason it has none): a reopened ref, or an edge picked in this session.
+static bool pmBlendEdgesUnanswered(const PMField& well) {
+    return std::any_of(well.picks.begin(), well.picks.end(), [](const PMSelEntry& pick) {
+        return pick.shapes.empty() && pick.unresolved.empty();
+    });
+}
+
+static const nlohmann::json* pmJsonField(const nlohmann::json& object, const char* key) {
+    if (!object.is_object()) return nullptr;
+    const auto it = object.find(key);
+    return it == object.end() ? nullptr : &*it;
+}
+
+static bool pmVec3(const nlohmann::json& v, std::array<float, 3>& out) {
+    if (!v.is_array() || v.size() != 3) return false;
+    for (size_t i = 0; i < 3; ++i) {
+        if (!v[i].is_number()) return false;
+        out[i] = v[i].get<float>();
+    }
+    return true;
+}
+
+// A pick's world polyline rebuilt from its own selector: a line from centroid ± ½·len·axis, a
+// circle as a loop of radius len/2π in the plane normal to its axis, anything else a single
+// centroid point (drawn as a ring). False when the selector carries no centroid.
+static bool pmSelectorPolyline(const nlohmann::json& sel, std::vector<std::array<float, 3>>& pts,
+                               bool& closed) {
+    const nlohmann::json* centroid = pmJsonField(sel, "centroid");
+    std::array<float, 3> c;
+    if (!centroid || !pmVec3(*centroid, c)) return false;
+    const nlohmann::json* surfJson = pmJsonField(sel, "surf");
+    const std::string surf = surfJson && surfJson->is_string() ? surfJson->get<std::string>() : "";
+    const nlohmann::json* axisJson = pmJsonField(sel, "axis");
+    std::array<float, 3> axis;
+    const bool hasAxis = axisJson && pmVec3(*axisJson, axis);
+    const nlohmann::json* lenJson = pmJsonField(sel, "area_or_len");
+    const bool hasLen = lenJson && lenJson->is_number();
+    closed = false;
+    if (surf == "line" && hasAxis && hasLen) {
+        const float half = 0.5f * lenJson->get<float>();
+        pts.push_back({c[0] - axis[0] * half, c[1] - axis[1] * half, c[2] - axis[2] * half});
+        pts.push_back({c[0] + axis[0] * half, c[1] + axis[1] * half, c[2] + axis[2] * half});
+        return true;
+    }
+    if (surf == "circle" && hasAxis && hasLen) {
+        float nx = axis[0], ny = axis[1], nz = axis[2];
+        const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+        const float r = lenJson->get<float>() / (2.0f * 3.14159265358979f);
+        if (nl > 1e-6f && r > 1e-6f) {
+            nx /= nl; ny /= nl; nz /= nl;
+            // Two basis vectors spanning the circle plane (u ⟂ n, v = n × u).
+            const float rx = (std::fabs(nx) < 0.9f) ? 1.0f : 0.0f;
+            const float ry = (std::fabs(nx) < 0.9f) ? 0.0f : 1.0f;
+            float ux = ny * 0.0f - nz * ry, uy = nz * rx - nx * 0.0f, uz = nx * ry - ny * rx;
+            const float ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+            if (ul > 1e-6f) {
+                ux /= ul; uy /= ul; uz /= ul;
+                const float vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;
+                const int N = 48;
+                pts.reserve(N);
+                for (int k = 0; k < N; ++k) {
+                    const float t = (float)k / (float)N * 2.0f * 3.14159265358979f;
+                    const float ct = std::cos(t) * r, st = std::sin(t) * r;
+                    pts.push_back({c[0] + ux * ct + vx * st, c[1] + uy * ct + vy * st,
+                                   c[2] + uz * ct + vz * st});
+                }
+                closed = true;
+                return true;
+            }
+        }
+    }
+    pts.push_back(c);
+    return true;
+}
+
+void PropertyManager::collectActiveWellEdgeSegments(std::vector<EdgeSeg>& out) const {
+    const PMField* well = blendEdgeWell();
+    if (!active_ || !well || !well->wellActive) return;
+    for (int i = 0; i < (int)well->picks.size(); ++i) {
+        const PMSelEntry& pick = well->picks[i];
+        if (!pick.shapes.empty()) {
+            for (int j = 0; j < (int)pick.shapes.size(); ++j) {
+                EdgeSeg seg;
+                seg.pts = pick.shapes[j].pts;
+                seg.closed = pick.shapes[j].closed;
+                seg.pickIndex = i;
+                seg.shapeIndex = j;
+                out.push_back(std::move(seg));
+            }
+            continue;
+        }
+        EdgeSeg seg;
+        if (!pmSelectorPolyline(pick.selector, seg.pts, seg.closed)) continue;
+        seg.pickIndex = i;
+        out.push_back(std::move(seg));
+    }
+}
+
+bool PropertyManager::blendHandle(BlendHandle& out) const {
+    const PMField* well = blendEdgeWell();
+    if (!active_ || !well) return false;
+    for (const PMSelEntry& pick : well->picks)
+        for (const PMEdgeShape& shape : pick.shapes) {
+            if (!shape.hasFrame) continue;
+            out.anchor = shape.mid;
+            out.dir = shape.grow;
+            return true;
+        }
+    return false;
+}
+
+// "Line, 20 mm" from an edge selector's own fields ("" when it carries neither).
+static std::string pmEdgeDetail(const nlohmann::json& sel, bool ips) {
+    const nlohmann::json* surf = pmJsonField(sel, "surf");
+    const nlohmann::json* len = pmJsonField(sel, "area_or_len");
+    std::string out;
+    if (surf && surf->is_string()) {
+        const std::string s = surf->get<std::string>();
+        out = s == "line" ? "Line" : s == "circle" ? "Circle" : "Curve";
+    }
+    if (len && len->is_number()) {
+        if (!out.empty()) out += ", ";
+        out += pmFormatDim(len->get<double>(), ips);
+    }
+    return out;
+}
+
+static std::vector<PropertyManager::EdgeRow> pmBlendEdgeRows(const PMField& well, bool ips) {
+    std::vector<PropertyManager::EdgeRow> rows;
+    auto add = [&](int pick, int shape, const nlohmann::json& sel, const std::string& note) {
+        PropertyManager::EdgeRow row;
+        row.pickIndex = pick;
+        row.shapeIndex = shape;
+        const std::string detail = note.empty() ? pmEdgeDetail(sel, ips) : note;
+        row.label = "Edge " + std::to_string(rows.size() + 1) +
+                    (detail.empty() ? std::string() : " (" + detail + ")");
+        rows.push_back(std::move(row));
+    };
+    for (int i = 0; i < (int)well.picks.size(); ++i) {
+        const PMSelEntry& pick = well.picks[i];
+        if (pick.shapes.empty()) {
+            add(i, -1, pick.selector, pick.unresolved.empty() ? std::string() : "not found");
+            continue;
+        }
+        for (int j = 0; j < (int)pick.shapes.size(); ++j)
+            add(i, j, pick.shapes[j].selector, std::string());
+    }
+    return rows;
+}
+
+std::vector<PropertyManager::EdgeRow> PropertyManager::activeWellEdgeRows() const {
+    const PMField* well = blendEdgeWell();
+    if (!active_ || !well || !well->wellActive) return {};
+    return pmBlendEdgeRows(*well, ips_);
+}
+
+// Take one edge out of a blend well. A ref that names several edges (a stored geometry query)
+// is replaced by one canonical pick per REMAINING edge, so its stored form changes only when the
+// user actually removes one of them.
+static bool pmEraseBlendEdge(PMField& well, int pickIndex, int shapeIndex) {
+    if (pickIndex < 0 || pickIndex >= (int)well.picks.size()) return false;
+    const PMSelEntry& pick = well.picks[pickIndex];
+    std::vector<PMSelEntry> kept;
+    if (shapeIndex >= 0 && pick.shapes.size() > 1) {
+        if (shapeIndex >= (int)pick.shapes.size()) return false;
+        for (int j = 0; j < (int)pick.shapes.size(); ++j) {
+            if (j == shapeIndex) continue;
+            PMSelEntry edge;
+            edge.selector = pick.shapes[j].selector;
+            edge.label = "Edge";
+            edge.shapes.push_back(pick.shapes[j]);
+            kept.push_back(std::move(edge));
+        }
+    }
+    well.picks.erase(well.picks.begin() + pickIndex);
+    well.picks.insert(well.picks.begin() + pickIndex, std::make_move_iterator(kept.begin()),
+                      std::make_move_iterator(kept.end()));
+    return true;
+}
+
+bool PropertyManager::removeActiveWellPick(int pickIndex, int shapeIndex) {
+    PMField* well = blendEdgeWell();
+    if (!active_ || !well || !well->wellActive || !pmEraseBlendEdge(*well, pickIndex, shapeIndex))
+        return false;
+    dirty_ = true;
+    lastEditTime_ = ImGui::GetTime();
+    return true;
+}
+
+// A click on an edge the well already holds as a stored ref takes it out instead of adding it a
+// second time. The displayed body only still has that edge when the feature's own round failed
+// (the history then builds on the body before it), but then this is the click that must toggle.
+static bool pmToggleStoredEdge(PMField& well, const nlohmann::json& selector) {
+    const nlohmann::json* centroid = pmJsonField(selector, "centroid");
+    const nlohmann::json* surf = pmJsonField(selector, "surf");
+    std::array<float, 3> c;
+    if (!centroid || !pmVec3(*centroid, c)) return false;
+    for (int i = 0; i < (int)well.picks.size(); ++i)
+        for (int j = 0; j < (int)well.picks[i].shapes.size(); ++j) {
+            const nlohmann::json& held = well.picks[i].shapes[j].selector;
+            const nlohmann::json* heldCentroid = pmJsonField(held, "centroid");
+            const nlohmann::json* heldSurf = pmJsonField(held, "surf");
+            std::array<float, 3> h;
+            if (!heldCentroid || !pmVec3(*heldCentroid, h)) continue;
+            if ((surf ? *surf : nlohmann::json()) != (heldSurf ? *heldSurf : nlohmann::json()))
+                continue;
+            if (std::fabs(h[0] - c[0]) < 1e-3f && std::fabs(h[1] - c[1]) < 1e-3f &&
+                std::fabs(h[2] - c[2]) < 1e-3f)
+                return pmEraseBlendEdge(well, i, j);
+        }
+    return false;
+}
+
+bool PropertyManager::applyEdgeRefGeometry(const nlohmann::json& reply,
+                                           const std::vector<nlohmann::json>& requested) {
+    PMField* well = blendEdgeWell();
+    const nlohmann::json* rows = pmJsonField(reply, "refs");
+    if (!well || !rows || !rows->is_array() || rows->size() != well->picks.size() ||
+        requested.size() != well->picks.size())
+        return false;
+    // The user changed the selection while the engine worked: the answer is for another list.
+    for (size_t i = 0; i < requested.size(); ++i)
+        if (well->picks[i].selector != requested[i]) return false;
+    for (size_t i = 0; i < rows->size(); ++i) {
+        const nlohmann::json& row = (*rows)[i];
+        PMSelEntry& pick = well->picks[i];
+        pick.shapes.clear();
+        pick.unresolved.clear();
+        const nlohmann::json* error = pmJsonField(row, "error");
+        if (error && error->is_string()) pick.unresolved = error->get<std::string>();
+        const nlohmann::json* edges = pmJsonField(row, "edges");
+        if (edges && edges->is_array()) {
+            for (const auto& edge : *edges) {
+                const nlohmann::json* selector = pmJsonField(edge, "selector");
+                const nlohmann::json* points = pmJsonField(edge, "points");
+                const nlohmann::json* closed = pmJsonField(edge, "closed");
+                if (!selector || !selector->is_object() || !points || !points->is_array()) continue;
+                PMEdgeShape shape;
+                shape.selector = *selector;
+                shape.closed = closed && closed->is_boolean() && closed->get<bool>();
+                for (const auto& p : *points) {
+                    std::array<float, 3> pt;
+                    if (pmVec3(p, pt)) shape.pts.push_back(pt);
+                }
+                const nlohmann::json* mid = pmJsonField(edge, "mid");
+                const nlohmann::json* grow = pmJsonField(edge, "grow");
+                if (mid && grow && pmVec3(*mid, shape.mid) && pmVec3(*grow, shape.grow)) {
+                    const float len = std::sqrt(shape.grow[0] * shape.grow[0] +
+                                                shape.grow[1] * shape.grow[1] +
+                                                shape.grow[2] * shape.grow[2]);
+                    if (len > 1e-6f) {
+                        for (float& g : shape.grow) g /= len;
+                        shape.hasFrame = true;
+                    }
+                }
+                if (shape.pts.size() >= 2) pick.shapes.push_back(std::move(shape));
+            }
+        }
+        // An answer that drew nothing is still an answer: without a reason the pick would look
+        // as if the engine had not been asked yet and be asked again after every preview.
+        if (pick.shapes.empty() && pick.unresolved.empty())
+            pick.unresolved = "the engine returned no drawable edge";
+    }
+    return true;
+}
+
 // Preserve active or invalid edits, including their original bare-unit interpretation.
 void PropertyManager::reformatDimDisplays() {
     for (auto& f : fields_) {
@@ -869,9 +1162,31 @@ bool PropertyManager::flushDimText() {
 
 // ---- op assembly ----------------------------------------------------------
 
-void PropertyManager::buildOpFeature(nlohmann::json& feature) const {
+// Display name for a NEW feature: the form title plus the next free number ("Fillet1", then
+// "Fillet2", ...). Numbering continues after the highest existing "<title><digits>" name so a
+// deleted middle feature never makes a later one reuse a live name.
+static std::string pmUniqueFeatureName(const nlohmann::json& tree, const std::string& title) {
+    long highest = 0;
+    const auto features = tree.is_object() ? tree.find("features") : tree.end();
+    if (tree.is_object() && features != tree.end() && features->is_array()) {
+        for (const auto& f : *features) {
+            if (!f.is_object()) continue;
+            const auto name = f.find("name");
+            if (name == f.end() || !name->is_string()) continue;
+            const std::string& s = name->get_ref<const std::string&>();
+            if (s.size() <= title.size() || s.compare(0, title.size(), title) != 0) continue;
+            const std::string digits = s.substr(title.size());
+            if (digits.size() > 9 ||
+                digits.find_first_not_of("0123456789") != std::string::npos) continue;
+            highest = std::max(highest, std::stol(digits));
+        }
+    }
+    return title + std::to_string(highest + 1);
+}
+
+void PropertyManager::buildOpFeature(nlohmann::json& feature, const nlohmann::json& tree) const {
     feature["type"] = form_->type;
-    feature["name"] = std::string(title_) + (targetId_.empty() ? "1" : "");  // overwritten by id_map naming
+    feature["name"] = targetId_.empty() ? pmUniqueFeatureName(tree, title_) : std::string(title_);
     nlohmann::json params = nlohmann::json::object();
     nlohmann::json refs   = nlohmann::json::object();
     // edit_feature merges patches, so absent/hidden form-owned keys must explicitly be removed.

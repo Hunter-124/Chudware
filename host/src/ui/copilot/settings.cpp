@@ -330,7 +330,7 @@ static void drawValidatedCredentialHint(AppState& st, const char* detail) {
     dimText(detail);
     if (ImGui::SmallButton("Manage credentials##provider_credentials")) {
         st.openSettings = true;
-        st.openSettingsTab = 3;
+        st.openSettingsTab = SettingsProviders;
     }
 }
 
@@ -375,7 +375,7 @@ bool drawFreeAiProviderCard(AppState& st) {
         }
     }
     drawValidatedCredentialHint(
-        st, "Free AI credentials are managed under Settings \xe2\x86\x92 Providers.");
+        st, "Free AI credentials are managed under Settings -> AI -> Providers.");
     if (active) {
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
         const ProviderModels& flapm = st.providerModels[ui::PROV_FREELLMAPI];
@@ -395,7 +395,7 @@ bool drawFreeAiProviderCard(AppState& st) {
     dimText("One-liner (Docker) sets up ~/freellmapi and starts the router. A native desktop "
             "tray app (macOS/Windows) is also available from Releases. Either way, open the "
             "dashboard afterward, add your free provider keys under Keys, then add the unified "
-            "key through Settings \xe2\x86\x92 Providers.");
+            "key through Settings -> AI -> Providers.");
     static const std::string kInstallCmd = "curl -fsSL https://freellmapi.co/install.sh | bash";
     if (ImGui::SmallButton("Copy install command##fla"))
         ImGui::SetClipboardText(kInstallCmd.c_str());
@@ -649,8 +649,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             changed = true;
         drawValidatedCredentialHint(
             st, bridgeAuth
-                    ? "This service uses the agent credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
-                    : "API keys are managed under Settings \xe2\x86\x92 Providers.");
+                    ? "This service uses the agent credential store. Add or replace its credential under Settings -> AI -> Providers."
+                    : "API keys are managed under Settings -> AI -> Providers.");
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
     } else if (s.provider == ui::PROV_XAI && ui::webGapReason("account_signin")) {
@@ -790,19 +790,19 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         }
 
         drawValidatedCredentialHint(
-            st, "Use the system-browser xAI sign-in above, or add an xAI API key under Settings \xe2\x86\x92 Providers.");
+            st, "Use the system-browser xAI sign-in above, or add an xAI API key under Settings -> AI -> Providers.");
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
         // Subscription-only providers: no API key field — the credential is an OAuth grant.
         if (s.provider == ui::PROV_KIMISUB) {
-            dimText("Kimi Code (agent service). Sign in under Settings \xe2\x86\x92 Providers; "
+            dimText("Kimi Code (agent service). Sign in under Settings -> AI -> Providers; "
                     "the service resolves the credential from its own auth store — no Moonshot "
                     "API key required for this path.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
             ImGui::TextUnformatted("Wire provider: kimi-code \xc2\xb7 model: k3 (default)");
             ImGui::PopStyleColor();
         } else {
-            dimText("Cursor (agent service). Sign in under Settings \xe2\x86\x92 Providers; "
+            dimText("Cursor (agent service). Sign in under Settings -> AI -> Providers; "
                     "the service resolves the credential from its own auth store — no API key.");
             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
             ImGui::TextUnformatted("Wire provider: cursor \xc2\xb7 model: composer-2.5 (default)");
@@ -812,7 +812,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     } else if (s.provider == ui::PROV_ZENMUX) {
         // Omp-service provider — the credential lives in the service's own auth store,
         // wired up via Settings → Providers sign-in (drawOmpProviderManager), not config.json.
-        dimText("ZenMux (agent service). Sign in under Settings \xe2\x86\x92 Providers; no API "
+        dimText("ZenMux (agent service). Sign in under Settings -> AI -> Providers; no API "
                 "key field here — the service resolves the credential from its own auth store.");
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
         ImGui::TextUnformatted("Wire provider: zenmux \xc2\xb7 model: x-ai/grok-4.5-free (default)");
@@ -820,7 +820,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (cloud) {
         drawValidatedCredentialHint(
-            st, "API keys are managed under Settings \xe2\x86\x92 Providers.");
+            st, "API keys are managed under Settings -> AI -> Providers.");
     } else {
         ImGui::TextUnformatted("Base URL");
         ImGui::SetNextItemWidth(-1);
@@ -829,7 +829,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
             refreshModelAvailability(st, true);  // re-probe the new endpoint
         }
         drawValidatedCredentialHint(
-            st, "If this local endpoint requires authentication, add its supported credential under Settings \xe2\x86\x92 Providers. This AI tab never writes keys.");
+            st, "If this local endpoint requires authentication, add its supported credential under Settings -> AI -> Providers. This AI tab never writes keys.");
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
         // Local availability status.
         const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
@@ -956,7 +956,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
 // Quick-settings helpers + overlay body (Copilot gear). Full providers/roles/prompts live in Settings.
 //
 // Max nesting depth and the subagent tool-call budget are drawn every frame by TWO surfaces
-// (Quick settings and Settings → AI → Harness). Each used to keep its own load-once static, so a
+// (Quick settings and Settings → AI → Agents). Each used to keep its own load-once static, so a
 // change in one showed in the other only after a restart. They now share ONE process-wide cache
 // per knob: the saver refreshes it, and it is re-read from config.json every few seconds so an
 // external writer shows up too. GUI thread only.
@@ -1185,7 +1185,7 @@ void drawAISettingsBody(AppState& st, bool busy) {
     // ---- Limits + memory ----
     if (ui::kit::cardBegin("q_card_limits", "Limits & memory", "settings")) {
         static const char* kDepthLabels[] = {"0", "1", "2", "3", "4"};
-        // The shared cache (see loadMaxSubagentDepth) — also read by Settings → AI → Harness.
+        // The shared cache (see loadMaxSubagentDepth) — also read by Settings → AI → Agents.
         int depth = std::max(0, std::min(4, loadMaxSubagentDepth()));
         if (segRow("##q_depth", "Max nesting",
                    "Max subagent nesting: how many levels deep a subagent may spawn its own "
@@ -1227,7 +1227,7 @@ void drawAISettingsBody(AppState& st, bool busy) {
         ImGui::SameLine(0.0f, gap);
         deepLink("Providers##q_open_prov", SettingsProviders);
         ImGui::SameLine(0.0f, gap);
-        deepLink("Prompts##q_open_prompts", SettingsAiPrompts);
+        deepLink("Prompts##q_open_prompts", SettingsAiRolePrompts);
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
     cpMenuHint("Opens the full Settings window.");
@@ -2195,7 +2195,7 @@ void drawModelDropdown(AppState& st, bool busy) {
                          ink, gl);
         }
         if (gHov) ImGui::SetTooltip("AI settings");
-        if (openSet) { st.openSettings = true; st.openSettingsTab = 3; /* Providers */ ImGui::CloseCurrentPopup(); }
+        if (openSet) { st.openSettings = true; st.openSettingsTab = SettingsProviders; ImGui::CloseCurrentPopup(); }
     }
     ImGui::Separator();
 
@@ -2320,7 +2320,7 @@ void drawModelDropdown(AppState& st, bool busy) {
         if (webDemoPicker)
             ImGui::TextUnformatted(ui::webGapReason("account_signin"));
         else
-            ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
+            ImGui::TextUnformatted("Sign in to a provider in Settings -> AI -> Providers to add models.");
         ImGui::PopStyleColor();
     }
 
@@ -2332,7 +2332,7 @@ void drawModelDropdown(AppState& st, bool busy) {
         const size_t kShow = 3;
         for (size_t i = 0; i < s_deadCredProviders.size() && i < kShow; ++i)
             ImGui::TextWrapped("%s credential is dead \xe2\x80\x94 %s. Re-authenticate in "
-                               "Settings -> Providers to get its models back.",
+                               "Settings -> AI -> Providers to get its models back.",
                                s_deadCredProviders[i].label.c_str(),
                                s_deadCredProviders[i].cause.c_str());
         if (s_deadCredProviders.size() > kShow)

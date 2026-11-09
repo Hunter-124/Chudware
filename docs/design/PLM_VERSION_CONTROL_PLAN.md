@@ -3,14 +3,11 @@
 Status: adopted design record (2026-07-03). The implementation lives in `services/plm/`,
 and the frozen schemas live in [`contracts/plm.md`](../../contracts/plm.md) (`aicad.plm/1`,
 plus [`contracts/plm_live.md`](../../contracts/plm_live.md) for live co-editing). This
-document remains the design-intent record, not an as-built spec. Two places where reality
+document remains the design-intent record, not an as-built spec. One place where reality
 moved past it:
 
 - **Post-v1 live co-editing.** A self-hosted PLM server with live co-editing landed after
   v1, beyond the §6 "Real-time co-editing" v1 non-goal.
-- **Hosted remote.** A Chudware-hosted remote is only a reserved configuration seam and is
-  not implemented; `services/plm/remote.py` answers `reserved_remote`. Sharing uses
-  filesystem or self-hosted git remotes.
 
 This design replaced two earlier proposals (in-app document version control and a
 PDM-lite) and answers their open questions; detailed schemas are frozen in
@@ -37,7 +34,6 @@ PDM-lite) and answers their open questions; detailed schemas are frozen in
 3. **Local-first, lightweight.** Full functionality with no account, no server,
    no network. A project's entire history lives in a hidden per-project store.
    Self-hosting = pointing a project at any git remote the user controls.
-   A hosted remote would use the same seam; none is implemented.
 4. **One obvious structure.** The tool imposes the layout; users never design
    a vault. No configurable lifecycle state machines, no admin screens, no
    check-in policies to author.
@@ -148,7 +144,6 @@ BOM so a released rev is exact even if the rebuild engine evolves.
 | Local | per-project hidden vault, no network | yes |
 | Shared folder / USB | vault sync to a filesystem remote | yes |
 | Self-hosted | any git remote the user controls (bare repo over SSH, Gitea, GitHub…) | yes |
-| Hosted remote | a Chudware-hosted remote | reserved seam only (config entry); not implemented |
 
 Team concurrency v1 = **advisory edit locks + sync, no merging** (merging
 feature trees is where every PLM gets complicated). "Sync" is one button:
@@ -227,7 +222,7 @@ each.
 | Items & releases | part numbers/rev letters, release pinning + BOM freeze, where-used index, drawing title-block rev stamp | vault core |
 | In-editor GUI | history panel, rev badges, checkpoint/release toolbar, compare view — every doc kind | vault core, change intelligence |
 | Project Hub | full-screen master workspace (grid, activity, release board, where-used, Copilot dock) + guided tour + manual section | items & releases, in-editor GUI |
-| Sharing & team sync v1 | remote profiles (folder/SSH/any git host), one-button Sync, advisory locks, copy-as-variant conflict guard, hosted-remote seam (config-only) | vault core, items & releases |
+| Sharing & team sync v1 | remote profiles (folder/SSH/any git host), one-button Sync, advisory locks, copy-as-variant conflict guard | vault core, items & releases |
 
 Sequencing intent: contract → vault core is the spine; change intelligence and items &
 releases parallelize after the vault core; the in-editor GUI follows change intelligence;
@@ -240,4 +235,3 @@ the Project Hub is the capstone; sharing can run parallel to the GUI work.
 - Custom lifecycle states, approval workflows, e-signatures (later, behind
   Advanced, if ever)
 - ECO/change-order management
-- Server implementation for a hosted remote (seam reserved only)

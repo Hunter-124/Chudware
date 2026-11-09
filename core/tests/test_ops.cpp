@@ -22,8 +22,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <filesystem>
 #include <thread>
 #include <cstdint>
 #include <limits>
@@ -53,6 +55,7 @@ extern char** environ;
 #include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRep_Builder.hxx>
+#include <BRepTools.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -62,6 +65,7 @@ extern char** environ;
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepGProp.hxx>
+#include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
@@ -80,6 +84,7 @@ extern char** environ;
 #include <gp_Ax3.hxx>
 #include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Lin.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
@@ -220,6 +225,49 @@ TopoDS_Shape cylinder_z(const gp_Pnt& base, double r, double h) {
 constexpr double PI = 3.14159265358979323846;
 
 }  // namespace
+
+// A fillet corner patch (a cylindrical face with a degenerated edge) next to same-domain
+// cylinders, taken from a real part. Merging them made OCCT 7.9.1 dereference a null
+// pcurve and killed the daemon on every later boolean of that part.
+TEST_CASE("unify_same_domain survives a fillet corner patch beside same-domain faces") {
+    TopoDS_Shape patch;
+    BRep_Builder builder;
+    const auto fixture = std::filesystem::path(__FILE__).parent_path() /
+                         "fixtures/fillet_corner_patch.brep";
+    REQUIRE(BRepTools::Read(patch, fixture.string().c_str(), builder));
+    const auto area = [](const TopoDS_Shape& shape) {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(shape, props);
+        return props.Mass();
+    };
+    const TopoDS_Shape unified = geom::unify_same_domain(patch);
+    REQUIRE_FALSE(unified.IsNull());
+    CHECK(area(unified) == doctest::Approx(area(patch)).epsilon(1e-9));
+    bool patch_kept = false;
+    for (TopExp_Explorer fx(unified, TopAbs_FACE); fx.More() && !patch_kept; fx.Next())
+        patch_kept = geom::is_degenerate_patch(TopoDS::Face(fx.Current()));
+    CHECK(patch_kept);
+}
+
+// The servo_lever screw-hole cut: the cut result has a planar face carrying a degenerated
+// edge beside a coplanar face. Merging them made OCCT ask the planar reference face for
+// the degenerated edge's pcurve, which it derives from a 3D curve the edge lacks, and
+// dereference the null result (daemon SIGSEGV in ComputeMinEdgeSize).
+TEST_CASE("unify_same_domain survives a planar face with a degenerated edge") {
+    TopoDS_Shape body;
+    BRep_Builder builder;
+    const auto fixture = std::filesystem::path(__FILE__).parent_path() /
+                         "fixtures/planar_degenerate_patch.brep";
+    REQUIRE(BRepTools::Read(body, fixture.string().c_str(), builder));
+    const auto volume = [](const TopoDS_Shape& shape) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shape, props);
+        return props.Mass();
+    };
+    const TopoDS_Shape unified = geom::unify_same_domain(body);
+    REQUIRE_FALSE(unified.IsNull());
+    CHECK(volume(unified) == doctest::Approx(volume(body)).epsilon(1e-9));
+}
 
 // 1. FUSE two overlapping boxes. Box A: 20x20x20 at the origin. Box B: 20x20x20
 //    translated by (+10,+10,+10) -> the two overlap in a 10x10x10 cube. The union
@@ -1145,6 +1193,77 @@ TEST_CASE("fillet returns failure when no selected-edge candidate validates") {
     CHECK(result.probes > 1);
 }
 
+TEST_CASE("fillet correction never accepts a radius below the real-fillet minimum") {
+#if defined(__unix__) || defined(__APPLE__)
+    const ScopedInProcessBlend isolation;
+#endif
+    // 40x30x20 block, 2 mm request: the minimum is min(0.05, 0.1% of 20, 0.2) = 0.02 mm.
+    const TopoDS_Shape box = geom::make_box(40, 30, 20);
+    static double largest_valid = 0.0;
+    static double smallest_probed = 0.0;
+    smallest_probed = std::numeric_limits<double>::max();
+    const geom::FilletValidation validate{geom::FilletValidationPolicy::basic_solid,
+        [](const TopoDS_Shape& candidate) -> geom::FilletValidationResult {
+            const double radius = first_cylinder_radius(candidate);
+            smallest_probed = std::min(smallest_probed, radius);
+            if (radius > largest_valid)
+                return {geom::FilletValidationStatus::rejected, "local face restriction"};
+            return {};
+        }};
+    SUBCASE("only smaller candidates would validate") {
+        largest_valid = 0.015;
+        const auto result = geom::fillet_edges(box, 2.0, Eigen::Vector3d(0, 0, 1),
+                                               std::nullopt, validate);
+        CHECK(result.failure != geom::FilletFailure::none);
+        CHECK(result.shape.IsNull());
+        CHECK(result.covered_edges == 0);
+        CHECK(smallest_probed >= 0.02 - 1e-9);
+        // The reply carries the cause observed at the requested radius.
+        CHECK(result.reason.find("local face restriction") != std::string::npos);
+    }
+    SUBCASE("a candidate at or above the minimum is kept") {
+        largest_valid = 0.03;
+        const auto result = geom::fillet_edges(box, 2.0, Eigen::Vector3d(0, 0, 1),
+                                               std::nullopt, validate);
+        REQUIRE_MESSAGE(result.failure == geom::FilletFailure::none, result.reason);
+        CHECK(result.effective_radius >= 0.02);
+        CHECK(result.effective_radius <= 0.03);
+        CHECK(result.covered_edges == 4);
+        CHECK(cylinders_at_radius(result.shape, result.effective_radius) >= 4);
+    }
+}
+
+TEST_CASE("a fillet build failure names the failing selected edge where it is") {
+#if defined(__unix__) || defined(__APPLE__)
+    const ScopedInProcessBlend isolation;
+#endif
+    // 100 mm on a 6 mm-thick box cannot start on any vertical edge; refusing every
+    // smaller candidate makes the reply report the failure at the request.
+    const TopoDS_Shape box = geom::make_box(40, 6, 20);
+    const std::vector<TopoDS_Edge> edges = narrow_box_vertical_edges(box);
+    for (const TopoDS_Edge& edge : edges) REQUIRE_FALSE(edge.IsNull());
+    const geom::FilletValidation validate{geom::FilletValidationPolicy::basic_solid,
+        [](const TopoDS_Shape&) -> geom::FilletValidationResult {
+            return {geom::FilletValidationStatus::rejected, "refused"};
+        }};
+    const auto result = geom::fillet_edges(box, 100.0, edges, std::nullopt, validate);
+    INFO("reason=" << result.reason);
+    REQUIRE(result.failure != geom::FilletFailure::none);
+    const auto at = result.reason.find("blend along selected edge ");
+    REQUIRE(at != std::string::npos);
+    int pick = 0;
+    double x = 0, y = 0, z = 0;
+    REQUIRE(std::sscanf(result.reason.c_str() + at,
+                        "blend along selected edge %d near (%lf, %lf, %lf)",
+                        &pick, &x, &y, &z) == 4);
+    REQUIRE(pick >= 1);
+    REQUIRE(pick <= static_cast<int>(edges.size()));
+    BRepExtrema_DistShapeShape distance(BRepBuilderAPI_MakeVertex(gp_Pnt(x, y, z)).Vertex(),
+                                        edges[pick - 1]);
+    REQUIRE(distance.IsDone());
+    CHECK(distance.Value() < 2e-3);
+}
+
 TEST_CASE("fillet lower correction creates real geometry without a fixed floor") {
     const TopoDS_Shape box = geom::make_box(40, 30, 20);
     double request = 0.0;
@@ -1707,21 +1826,23 @@ TEST_CASE("incomplete fillet validation is terminal without correcting the radiu
     CHECK(result.shape.IsNull());
 }
 
-TEST_CASE("fillet timeout does not retry or return a partial result") {
+TEST_CASE("a slow isolated fillet probe within the search budget is not failed") {
 #if defined(__unix__) || defined(__APPLE__)
     if (chudware::util::shape_isolation_active()) {
+        // A sound build that takes longer than five seconds (a large spline body plus
+        // full-solid validation) must build the same on a busy machine as on an idle one.
         const TopoDS_Shape box = geom::make_box(40, 30, 20);
         const TopoDS_Edge edge = edge_between(box, gp_Pnt(0, 0, 0), gp_Pnt(0, 0, 20));
         REQUIRE_FALSE(edge.IsNull());
         setenv("CHUDWARE_TEST_BLEND_DELAY_MS", "5500", 1);
-        const auto failed = geom::fillet_edges(box, 2, std::vector<TopoDS_Edge>{edge});
+        const auto slow = geom::fillet_edges(box, 2, std::vector<TopoDS_Edge>{edge});
         unsetenv("CHUDWARE_TEST_BLEND_DELAY_MS");
-        CHECK(failed.failure == geom::FilletFailure::timed_out);
-        CHECK(failed.shape.IsNull());
-        CHECK(failed.covered_edges == 0);
-        CHECK(failed.probes == 1);
-        const auto healthy = geom::fillet_edges(box, 2, std::vector<TopoDS_Edge>{edge});
-        CHECK_FALSE(healthy.shape.IsNull());
+        INFO("failure=" << static_cast<int>(slow.failure) << ", reason=" << slow.reason);
+        CHECK(slow.failure == geom::FilletFailure::none);
+        REQUIRE_FALSE(slow.shape.IsNull());
+        CHECK(slow.effective_radius == 2.0);
+        CHECK(slow.probes == 1);
+        CHECK(cylinders_at_radius(slow.shape, 2.0) >= 1);
     }
 #endif
 }
@@ -2061,4 +2182,472 @@ TEST_CASE("thread: segmented internal cut continues across the section boundary"
         CHECK_FALSE(inside_any_solid(result.shape, groove));
         CHECK(inside_any_solid(result.shape, crest));
     }
+}
+
+#include <BRepAlgoAPI_BuilderAlgo.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <TopTools_ListOfShape.hxx>
+#include <TopoDS_Shell.hxx>
+
+namespace {
+
+// 40 x 30 x 10 block with a 2 x 2 mm relief slot open at its x = 0 end and at the bottom
+// (x -1..25, y 12..14, z -1..2): the slot ceiling (z = 2) meets the end wall (x = 0) along a
+// 2 mm edge, like the ear relief of servo_bracket_L. `imprinted` also carries an edge
+// imprinted INTO its top face by a general fuse, which is what a boss tangent to that face
+// leaves behind: an INTERNAL edge of the face with no skin use.
+TopoDS_Shape relief_block(bool imprinted) {
+    const TopoDS_Shape slotted = geom::cut(
+        BRepPrimAPI_MakeBox(40.0, 30.0, 10.0).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(-1, 12, -1), 26.0, 2.0, 3.0).Shape());
+    REQUIRE_FALSE(slotted.IsNull());
+    if (!imprinted) return slotted;
+    TopTools_ListOfShape args;
+    args.Append(slotted);
+    args.Append(BRepBuilderAPI_MakeEdge(gp_Pnt(10, 10, 10), gp_Pnt(30, 20, 10)).Edge());
+    BRepAlgoAPI_BuilderAlgo imprint;
+    imprint.SetArguments(args);
+    imprint.Build();
+    REQUIRE(imprint.IsDone());
+    TopExp_Explorer solids(imprint.Shape(), TopAbs_SOLID);
+    REQUIRE(solids.More());
+    return solids.Current();
+}
+
+int internal_edge_uses(const TopoDS_Shape& shape) {
+    int uses = 0;
+    for (TopExp_Explorer f(shape, TopAbs_FACE); f.More(); f.Next())
+        for (TopExp_Explorer e(f.Current(), TopAbs_EDGE); e.More(); e.Next())
+            if (e.Current().Orientation() == TopAbs_INTERNAL) ++uses;
+    return uses;
+}
+
+}  // namespace
+
+TEST_CASE("is_watertight: seams and boolean imprints keep a body closed, a missing face opens it") {
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    CHECK(geom::is_watertight(box));
+    CHECK(geom::is_watertight(cylinder_z(gp_Pnt(0, 0, 0), 4.0, 10.0)));  // seam + apex-free skin
+    CHECK(geom::is_watertight(relief_block(false)));
+
+    const TopoDS_Shape imprinted = relief_block(true);
+    REQUIRE(internal_edge_uses(imprinted) == 1);
+    CHECK(geom::is_watertight(imprinted));
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(imprinted, TopAbs_EDGE, edges);
+    int embedded_only = 0;
+    const auto uses = geom::edge_boundary_uses(imprinted, edges);
+    for (int i = 1; i <= edges.Extent(); ++i)
+        if (uses[static_cast<std::size_t>(i)].boundary == 0 &&
+            uses[static_cast<std::size_t>(i)].embedded)
+            ++embedded_only;
+    CHECK(embedded_only == 1);  // the imprint is embedded, never free
+
+    // Negative control: five of the six faces is a genuinely open shell.
+    BRep_Builder builder;
+    TopoDS_Shell open_shell;
+    builder.MakeShell(open_shell);
+    int added = 0;
+    for (TopExp_Explorer f(box, TopAbs_FACE); f.More() && added < 5; f.Next(), ++added)
+        builder.Add(open_shell, f.Current());
+    CHECK_FALSE(geom::is_watertight(open_shell));
+    CHECK_FALSE(geom::is_watertight(TopoDS_Shape()));
+}
+
+// servo_bracket_L: an earlier boss left a 0.1 mm boolean imprint INTERNAL to an ear face. The
+// closure check counted ancestor faces, so it read that imprint as a free edge in every
+// chamfer result and rejected the chamfer of the ear relief's end edge at ANY distance (down
+// to 0.1 mm) as "could not construct a valid closed blend ... size feasibility is
+// undetermined". Symmetric, two-distance and distance-angle chamfers share the check.
+TEST_CASE("chamfer: an internal imprint elsewhere on the body does not fail a shallow relief edge") {
+    const TopoDS_Shape body = relief_block(true);
+    REQUIRE(internal_edge_uses(body) == 1);
+    REQUIRE(count_solids(body) == 1);
+
+    TopoDS_Edge relief_edge;
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(body, TopAbs_EDGE, edges);
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const TopoDS_Edge edge = TopoDS::Edge(edges(i));
+        BRepAdaptor_Curve curve(edge);
+        if (curve.GetType() != GeomAbs_Line) continue;
+        const gp_Pnt mid = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()));
+        if (mid.Distance(gp_Pnt(0, 13, 2)) < 1e-6) relief_edge = edge;
+    }
+    REQUIRE_FALSE(relief_edge.IsNull());
+    const std::vector<TopoDS_Edge> picked{relief_edge};
+    const double before = solid_volume(body);
+
+    // Each chamfer removes a right-triangle prism along the 2 mm edge.
+    int dropped = -1;
+    const auto check = [&](const TopoDS_Shape& out, double removed) {
+        REQUIRE_FALSE(out.IsNull());
+        CHECK(dropped == 0);
+        CHECK(geom::is_watertight(out));
+        CHECK(BRepCheck_Analyzer(out).IsValid());
+        CHECK(count_solids(out) == 1);
+        CHECK(internal_edge_uses(out) == 1);  // the unrelated imprint is carried through
+        CHECK(before - solid_volume(out) == doctest::Approx(removed).epsilon(1e-6));
+    };
+    SUBCASE("symmetric 2 x 2 mm") {
+        check(geom::chamfer_edges(body, 2.0, picked, &dropped), 4.0);
+    }
+    SUBCASE("two-distance 2 x 1 mm") {
+        check(geom::chamfer_edges_two_distance(body, 2.0, 1.0, picked, &dropped), 2.0);
+    }
+    SUBCASE("distance-angle 2 mm at 45 degrees") {
+        check(geom::chamfer_edges_distance_angle(body, 2.0, PI / 4.0, picked, std::nullopt, &dropped),
+              4.0);
+    }
+}
+
+// ---- inside-corner fillets wider than the faces they roll on ---------------------------
+//
+// Each body is a 60 x 40 x 5 plate with a feature standing on it. Expected volumes come from
+// the rolling-ball profile, not from a kernel result: a radius-R blend between a wall and a
+// floor leaves, at distance t from the wall, a gap g(t) = R - sqrt(R^2 - (R - t)^2) above
+// the floor (and, by symmetry, a width g(y) at height y).
+namespace {
+
+double blend_gap(double radius, double t) {
+    return radius - std::sqrt(std::max(0.0, radius * radius - (radius - t) * (radius - t)));
+}
+
+// Cross-section between wall, floor and blend, out to `reach` from the wall.
+double blend_area(double radius, double reach) {
+    constexpr int kSteps = 200000;
+    double area = 0.0;
+    for (int i = 0; i < kSteps; ++i) area += blend_gap(radius, (i + 0.5) * reach / kSteps);
+    return area * reach / kSteps;
+}
+
+// Volume of the blend around a cylinder of radius `boss`, up to `height` above the floor.
+double boss_blend_volume(double boss, double radius, double height) {
+    constexpr int kSteps = 200000;
+    double volume = 0.0;
+    for (int i = 0; i < kSteps; ++i) {
+        const double w = blend_gap(radius, (i + 0.5) * height / kSteps);
+        volume += PI * (2.0 * boss * w + w * w);
+    }
+    return volume * height / kSteps;
+}
+
+TopoDS_Shape plate_with(const TopoDS_Shape& feature) {
+    return geom::unify_same_domain(geom::fuse(geom::make_box(60, 40, 5), feature));
+}
+
+// The edges where a feature meets the plate's top face (z = 5), not the plate's own rim.
+// `min_x` leaves out edges nearer the x = 0 side, such as the rim of an edge break.
+std::vector<TopoDS_Edge> foot_edges(const TopoDS_Shape& body, double min_x = 1e-6) {
+    std::vector<TopoDS_Edge> out;
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(body, TopAbs_EDGE, edges);
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const TopoDS_Edge edge = TopoDS::Edge(edges(i));
+        const BRepAdaptor_Curve curve(edge);
+        bool flat = true;
+        for (const double f : {0.0, 0.5, 1.0}) {
+            const gp_Pnt p = curve.Value(curve.FirstParameter() +
+                                         f * (curve.LastParameter() - curve.FirstParameter()));
+            flat = flat && std::abs(p.Z() - 5.0) < 1e-6;
+        }
+        const gp_Pnt mid = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()));
+        if (flat && mid.X() > min_x && mid.X() < 60 - 1e-6 && mid.Y() > 1e-6 && mid.Y() < 40 - 1e-6)
+            out.push_back(edge);
+    }
+    return out;
+}
+
+// The plain kernel fillet at the full radius must fail, or the test proves nothing.
+bool plain_fillet_fails(const TopoDS_Shape& body, const std::vector<TopoDS_Edge>& edges,
+                        double radius) {
+    try {
+        BRepFilletAPI_MakeFillet plain(body);
+        for (const TopoDS_Edge& edge : edges) plain.Add(radius, edge);
+        plain.Build();
+        return !plain.IsDone() || plain.Shape().IsNull() ||
+               !BRepCheck_Analyzer(plain.Shape()).IsValid();
+    } catch (const Standard_Failure&) {
+        return true;
+    }
+}
+
+void check_runoff(const geom::FilletResult& result, const TopoDS_Shape& body, double radius,
+                  double added_volume) {
+    INFO("failure=" << static_cast<int>(result.failure) << ", reason=" << result.reason
+         << ", probes=" << result.probes << ", effective=" << result.effective_radius);
+    REQUIRE(result.failure == geom::FilletFailure::none);
+    REQUIRE_FALSE(result.shape.IsNull());
+    CHECK(result.effective_radius == radius);  // the request itself, not a corrected size
+    CHECK(result.covered_edges == result.selected_edges);
+    CHECK(count_solids(result.shape) == 1);
+    CHECK(geom::is_watertight(result.shape));
+    CHECK(BRepCheck_Analyzer(result.shape).IsValid());
+    CHECK(solid_volume(result.shape) - solid_volume(body) ==
+          doctest::Approx(added_volume).epsilon(2e-3));
+}
+
+}  // namespace
+
+TEST_CASE("a fillet taller than its boss ends flush with the boss top at the requested radius") {
+    constexpr double kBoss = 8.0, kHeight = 3.0, kRadius = 5.0;
+    const TopoDS_Shape body = plate_with(cylinder_z(gp_Pnt(30, 20, 5), kBoss, kHeight));
+    const auto edges = foot_edges(body);
+    REQUIRE(edges.size() == 1);
+    REQUIRE(plain_fillet_fails(body, edges, kRadius));
+    check_runoff(geom::fillet_edges(body, kRadius, edges), body, kRadius,
+                 boss_blend_volume(kBoss, kRadius, kHeight));
+}
+
+TEST_CASE("fillets taller than a low rib end flush with its top on both sides") {
+    constexpr double kRadius = 5.0;
+    const TopoDS_Shape body = plate_with(geom::make_box_at(28.5, 0, 5, 3, 40, 3));
+    const auto edges = foot_edges(body);
+    REQUIRE(edges.size() == 2);
+    REQUIRE(plain_fillet_fails(body, edges, kRadius));
+    check_runoff(geom::fillet_edges(body, kRadius, edges), body, kRadius,
+                 2.0 * 40.0 * blend_area(kRadius, 3.0));
+}
+
+TEST_CASE("a fillet wider than the strip of plate beside a rib runs off the plate edge") {
+    constexpr double kRadius = 4.0;
+    // The rib's left foot is 2 mm from the plate edge: the blend reaches 4 mm, so only the
+    // part inside the plate stays. Its right foot has room for the whole blend.
+    const TopoDS_Shape body = plate_with(geom::make_box_at(2, 0, 5, 3, 40, 15));
+    const auto edges = foot_edges(body);
+    REQUIRE(edges.size() == 2);
+    REQUIRE(plain_fillet_fails(body, edges, kRadius));
+    check_runoff(geom::fillet_edges(body, kRadius, edges), body, kRadius,
+                 40.0 * (blend_area(kRadius, kRadius) + blend_area(kRadius, 2.0)));
+}
+
+TEST_CASE("an inside-corner fillet taller than its wall runs off the wall top") {
+    constexpr double kRadius = 30.0;
+    // L bracket: a 35 mm base beside a wall that rises only 25 mm above it.
+    const TopoDS_Shape body = geom::unify_same_domain(geom::fuse(
+        geom::make_box_at(0, 0, 0, 40, 20, 5), geom::make_box_at(0, 0, 0, 5, 20, 30)));
+    const TopoDS_Edge corner = edge_between(body, gp_Pnt(5, 0, 5), gp_Pnt(5, 20, 5));
+    REQUIRE_FALSE(corner.IsNull());
+    const std::vector<TopoDS_Edge> edges{corner};
+    REQUIRE(plain_fillet_fails(body, edges, kRadius));
+    check_runoff(geom::fillet_edges(body, kRadius, edges), body, kRadius,
+                 20.0 * blend_area(kRadius, 25.0));
+}
+
+TEST_CASE("blends that collide when built together merge where they meet") {
+    constexpr double kBoss = 8.0, kHeight = 15.0, kRadius = 5.0;
+    // Two bosses 4 mm apart: each blend alone fits, but the two overlap.
+    const TopoDS_Shape first = cylinder_z(gp_Pnt(15, 20, 5), kBoss, kHeight);
+    const TopoDS_Shape second = cylinder_z(gp_Pnt(35, 20, 5), kBoss, kHeight);
+    const TopoDS_Shape body = plate_with(geom::fuse(first, second));
+    const auto edges = foot_edges(body);
+    REQUIRE(edges.size() == 2);
+    REQUIRE(plain_fillet_fails(body, edges, kRadius));
+
+    // The merged blend is the union of the two blends built one at a time.
+    const auto alone = [&](const TopoDS_Edge& edge) {
+        const auto one = geom::fillet_edges(body, kRadius, std::vector<TopoDS_Edge>{edge});
+        REQUIRE(one.failure == geom::FilletFailure::none);
+        return one.shape;
+    };
+    const double united = solid_volume(geom::fuse(alone(edges[0]), alone(edges[1])));
+    const double single = boss_blend_volume(kBoss, kRadius, kRadius);
+    REQUIRE(united - solid_volume(body) < 2.0 * single - 1.0);  // the blends really overlap
+    check_runoff(geom::fillet_edges(body, kRadius, edges), body, kRadius,
+                 united - solid_volume(body));
+}
+
+TEST_CASE("run-off continues over a chamfered plate edge") {
+    constexpr double kRadius = 4.0;
+    // The plate's x = 0 top edge is chamfered 1 mm, so its top face ends at x = 1. The rib's
+    // left foot is 2 mm beyond that: the blend runs off over the chamfer and is cut back
+    // flush with the plane through the rim.
+    TopoDS_Shape plate = geom::make_box(60, 40, 5);
+    const TopoDS_Edge lip = edge_between(plate, gp_Pnt(0, 0, 5), gp_Pnt(0, 40, 5));
+    REQUIRE_FALSE(lip.IsNull());
+    BRepFilletAPI_MakeChamfer chamfer(plate);
+    chamfer.Add(1.0, lip);
+    chamfer.Build();
+    REQUIRE(chamfer.IsDone());
+    const TopoDS_Shape body = geom::unify_same_domain(
+        geom::fuse(chamfer.Shape(), geom::make_box_at(3, 0, 5, 3, 40, 15)));
+    const auto edges = foot_edges(body, 2.5);
+    REQUIRE(edges.size() == 2);
+    REQUIRE(plain_fillet_fails(body, edges, kRadius));
+    check_runoff(geom::fillet_edges(body, kRadius, edges), body, kRadius,
+                 40.0 * (blend_area(kRadius, kRadius) + blend_area(kRadius, 2.0)));
+}
+
+// ---- blends whose end vertex joins more than one other face -----------------------------
+//
+// A hook finger stands against a wall's end face (y = 0, material at y < 0). Its tip is the
+// intersection of two radius-2.2 cylinders, one along z (the hook's outer curve, tangent to
+// the wall's front face x = 1.6) and one along x (the rounded tip, whose top line meets the
+// wall at z = kTop). The inside corner along that top line, from x = 0 to x = 1.6, ends at
+// (1.6, 0, kTop) where the wall's front face, the hook's curve and the tip all meet: the
+// kernel builder cannot close the blend there (it "succeeds" with a tolerance tens of
+// millimetres wide). The blend's cross-section is constant along the edge, so it is swept.
+namespace {
+
+constexpr double kHookTop = 10.0, kHookRadius = 2.2;
+
+TopoDS_Shape hook_against_wall() {
+    const TopoDS_Shape wall = geom::make_box_at(0, -10, 0, 1.6, 10, kHookTop + 5);
+    // The flat part of the finger (y < 0) ends level with the tip's top line, tangent to it.
+    const TopoDS_Shape flat = geom::make_box_at(-2.8, -1, -5, 4.4, 1, kHookTop + 5);
+    const TopoDS_Shape curve = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(-0.6, 0, -5), gp_Dir(0, 0, 1)), kHookRadius, kHookTop + 5).Shape();
+    const TopoDS_Shape tip = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(-3, 0, kHookTop - kHookRadius), gp_Dir(1, 0, 0)), kHookRadius, 4.6).Shape();
+    const TopoDS_Shape round = geom::common(geom::common(curve, tip),
+                                            geom::make_box_at(-3, 0, -5, 5, 3, kHookTop + 5));
+    return geom::unify_same_domain(geom::fuse(geom::fuse(wall, flat), round));
+}
+
+// The inside corner along the tip's top line, where it meets the wall.
+TopoDS_Edge hook_root_edge(const TopoDS_Shape& body) {
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(body, TopAbs_EDGE, edges);
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const BRepAdaptor_Curve curve(TopoDS::Edge(edges(i)));
+        if (curve.GetType() != GeomAbs_Line) continue;
+        const gp_Pnt a = curve.Value(curve.FirstParameter()), b = curve.Value(curve.LastParameter());
+        if (a.Distance(gp_Pnt(0, 0, kHookTop)) + b.Distance(gp_Pnt(1.6, 0, kHookTop)) < 1e-6 ||
+            b.Distance(gp_Pnt(0, 0, kHookTop)) + a.Distance(gp_Pnt(1.6, 0, kHookTop)) < 1e-6)
+            return TopoDS::Edge(edges(i));
+    }
+    return {};
+}
+
+// The kernel builder alone either fails or bridges the corner with a tolerance no blend of
+// this size needs; otherwise the test proves nothing.
+bool plain_blend_unusable(const TopoDS_Shape& body, const TopoDS_Edge& edge, double radius) {
+    try {
+        BRepFilletAPI_MakeFillet plain(body);
+        plain.Add(radius, edge);
+        plain.Build();
+        if (!plain.IsDone() || plain.Shape().IsNull()) return true;
+        double worst = 0.0;
+        for (TopExp_Explorer it(plain.Shape(), TopAbs_VERTEX); it.More(); it.Next())
+            worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Vertex(it.Current())));
+        return worst > 0.05 * radius || !BRepCheck_Analyzer(plain.Shape()).IsValid();
+    } catch (const Standard_Failure&) {
+        return true;
+    }
+}
+
+}  // namespace
+
+TEST_CASE("an inside-corner fillet ending where three faces meet the tip of a hook is built at its radius") {
+    constexpr double kRadius = 1.0;
+    const TopoDS_Shape body = hook_against_wall();
+    REQUIRE(count_solids(body) == 1);
+    const TopoDS_Edge edge = hook_root_edge(body);
+    REQUIRE_FALSE(edge.IsNull());
+    REQUIRE(plain_blend_unusable(body, edge, kRadius));
+
+    const geom::FilletResult result = geom::fillet_edges(body, kRadius, std::vector<TopoDS_Edge>{edge});
+    INFO("failure=" << static_cast<int>(result.failure) << ", reason=" << result.reason);
+    REQUIRE(result.failure == geom::FilletFailure::none);
+    CHECK(result.effective_radius == kRadius);
+    CHECK(count_solids(result.shape) == 1);
+    CHECK(BRepCheck_Analyzer(result.shape).IsValid());
+
+    // The rolling-ball centre stays kRadius from the wall and kHookRadius + kRadius from the
+    // tip's axis; the blend face is that cylinder.
+    const double centre_z = kHookTop - kHookRadius +
+        std::sqrt((kHookRadius + kRadius) * (kHookRadius + kRadius) - kRadius * kRadius);
+    bool blend_face = false;
+    for (TopExp_Explorer it(result.shape, TopAbs_FACE); it.More(); it.Next()) {
+        BRepAdaptor_Surface surface(TopoDS::Face(it.Current()));
+        if (surface.GetType() != GeomAbs_Cylinder) continue;
+        const gp_Cylinder cylinder = surface.Cylinder();
+        if (std::abs(cylinder.Radius() - kRadius) < 1e-6 &&
+            cylinder.Axis().Direction().IsParallel(gp_Dir(1, 0, 0), 1e-9) &&
+            gp_Lin(cylinder.Axis()).Distance(gp_Pnt(0, kRadius, centre_z)) < 1e-6)
+            blend_face = true;
+    }
+    CHECK(blend_face);
+
+    // The blend adds its cross-section along the 1.6 mm edge, less the sliver beyond the
+    // hook's curve at the far end.
+    const double contact = kRadius * kHookRadius / (kHookRadius + kRadius);
+    constexpr int kSteps = 20000;
+    double area = 0.0;
+    for (int i = 0; i < kSteps; ++i) {
+        const double y = (i + 0.5) * contact / kSteps;
+        const double arc = centre_z - std::sqrt(kRadius * kRadius - (y - kRadius) * (y - kRadius));
+        const double tip = kHookTop - kHookRadius + std::sqrt(kHookRadius * kHookRadius - y * y);
+        area += arc - tip;
+    }
+    area *= contact / kSteps;
+    const double added = solid_volume(result.shape) - solid_volume(body);
+    CHECK(added < area * 1.6);
+    CHECK(added > area * 1.6 * 0.95);
+}
+
+TEST_CASE("a chamfer on the hook's inside corner keeps its edge") {
+    const TopoDS_Shape body = hook_against_wall();
+    const TopoDS_Edge edge = hook_root_edge(body);
+    REQUIRE_FALSE(edge.IsNull());
+    int dropped = -1;
+    const TopoDS_Shape out = geom::chamfer_edges(body, 1.0, std::vector<TopoDS_Edge>{edge}, &dropped);
+    REQUIRE_FALSE(out.IsNull());
+    CHECK(dropped == 0);
+    CHECK(count_solids(out) == 1);
+    CHECK(BRepCheck_Analyzer(out).IsValid());
+    // Setbacks of 1 mm along the wall and along the tip's arc: the triangle they span with
+    // the corner, less the arc's bulge into it, along the 1.6 mm edge (less the end sliver).
+    const double theta = 1.0 / kHookRadius;
+    const double triangle = 0.5 * kHookRadius * std::sin(theta);
+    const double bulge = 0.5 * kHookRadius * kHookRadius * (theta - std::sin(theta));
+    const double added = solid_volume(out) - solid_volume(body);
+    CHECK(added < (triangle - bulge) * 1.6 * 1.001);
+    CHECK(added > (triangle - bulge) * 1.6 * 0.95);
+}
+
+TEST_CASE("both top edges of a wall rounded at half its thickness make a full round") {
+    // A 1.6 mm wall, 20 mm long, standing on a plate: rounding both top edges at 0.8 mm
+    // consumes the whole top face.
+    constexpr double kRadius = 0.8, kLength = 20.0;
+    const TopoDS_Shape body = geom::unify_same_domain(
+        geom::fuse(geom::make_box(30, 20, 3), geom::make_box_at(5, 9.2, 3, kLength, 1.6, 8)));
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(body, TopAbs_EDGE, edges);
+    std::vector<TopoDS_Edge> top;
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const BRepAdaptor_Curve curve(TopoDS::Edge(edges(i)));
+        const gp_Pnt m = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()));
+        if (std::abs(m.Z() - 11) < 1e-6 && std::abs(m.X() - 15) < 1e-6) top.push_back(TopoDS::Edge(edges(i)));
+    }
+    REQUIRE(top.size() == 2);
+    const geom::FilletResult result = geom::fillet_edges(body, kRadius, top);
+    INFO("failure=" << static_cast<int>(result.failure) << ", reason=" << result.reason);
+    REQUIRE(result.failure == geom::FilletFailure::none);
+    CHECK(result.effective_radius == kRadius);
+    CHECK(count_solids(result.shape) == 1);
+    CHECK(BRepCheck_Analyzer(result.shape).IsValid());
+    // Each round removes the square corner less its quarter disc.
+    CHECK(solid_volume(body) - solid_volume(result.shape) ==
+          doctest::Approx(2.0 * kLength * kRadius * kRadius * (1.0 - PI / 4.0)).epsilon(1e-3));
+    // The wall's top is one half cylinder about the wall's mid-plane: the rounds share their
+    // axis and together cover half a turn, with no strip of the old top face left between.
+    double round_area = 0.0;
+    for (TopExp_Explorer it(result.shape, TopAbs_FACE); it.More(); it.Next()) {
+        BRepAdaptor_Surface surface(TopoDS::Face(it.Current()));
+        if (surface.GetType() == GeomAbs_Plane) {
+            const bool old_top = surface.Plane().Axis().Direction().IsParallel(gp_Dir(0, 0, 1), 1e-9) &&
+                                 std::abs(surface.Plane().Location().Z() - 11.0) < 1e-6;
+            CHECK_FALSE(old_top);
+            continue;
+        }
+        if (surface.GetType() != GeomAbs_Cylinder) continue;
+        const gp_Cylinder cylinder = surface.Cylinder();
+        CHECK(cylinder.Radius() == doctest::Approx(kRadius));
+        CHECK(gp_Lin(cylinder.Axis()).Distance(gp_Pnt(15, 10.0, 11.0 - kRadius)) < 1e-6);
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(it.Current(), props);
+        round_area += props.Mass();
+    }
+    CHECK(round_area == doctest::Approx(PI * kRadius * kLength).epsilon(1e-4));
 }

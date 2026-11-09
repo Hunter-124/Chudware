@@ -29,6 +29,7 @@
 #include "metrics.h"            // logical dp scaling
 #include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation
 #include "widgets/kit.h"         // ui::kit::elide
+#include "settings_modal.h"      // SettingsRoute deep links (Configurations -> Settings General)
 #include "workspace_home.h"     // the empty-workspace home layout (wider column, Explorer tiles)
 
 #include <filesystem>
@@ -1210,7 +1211,7 @@ void drawLeftPane(AppState& st,
                 // Configurations moved to Settings → General. Legacy leftPaneTab
                 // values (View menu / stale state) redirect there once.
                 st.openSettings = true;
-                st.openSettingsTab = 1;  // General
+                st.openSettingsTab = SettingsGeneral;  // Configurations
                 st.leftPaneTab = kLeftPaneFeatureManager;
                 break;
 

@@ -1,6 +1,7 @@
 #include "geom/booleans.h"
 
 #include <BRepAlgoAPI_Common.hxx>
+#include <BRep_Tool.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepTools_History.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
@@ -11,6 +12,7 @@
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <TopoDS.hxx>
 
 #include "geom/op_history.h"
 
@@ -184,6 +186,28 @@ TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     return run_pair<BRepAlgoAPI_Common>(a, b);
 }
 
+bool is_degenerate_patch(const TopoDS_Face& face) {
+    for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next())
+        if (BRep_Tool::Degenerated(TopoDS::Edge(ex.Current()))) return true;
+    return false;
+}
+
+void keep_degenerate_patches(ShapeUpgrade_UnifySameDomain& unify, const TopoDS_Shape& input) {
+    // OCCT 7.9 (through 7.9.3 as packaged by Fedora) evaluates every boundary pcurve of a
+    // merge on the reference face (ComputeMinEdgeSize) without a null check. A degenerated
+    // edge of another face in the merge has no pcurve there: a non-planar reference skips
+    // degenerated edges when transforming pcurves, and a planar reference derives pcurves
+    // from the 3D curve, which a degenerated edge lacks. Merging any face that has a
+    // degenerated edge (a fillet corner patch, or a planar face a fillet left one on)
+    // dereferences a null pcurve and kills the process. Keeping every edge of such a face
+    // leaves it unmerged; every other face still unifies.
+    for (TopExp_Explorer fx(input, TopAbs_FACE); fx.More(); fx.Next()) {
+        if (!is_degenerate_patch(TopoDS::Face(fx.Current()))) continue;
+        for (TopExp_Explorer ex(fx.Current(), TopAbs_EDGE); ex.More(); ex.Next())
+            unify.KeepShape(ex.Current());
+    }
+}
+
 TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
     if (s.IsNull()) return s;
     try {
@@ -208,6 +232,7 @@ TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
         // Unify faces AND edges sharing a domain (concatBSplines=false): the seam between
         // two flush coplanar faces collapses to one face, matching build123d's clean().
         ShapeUpgrade_UnifySameDomain up(work, Standard_True, Standard_True, Standard_False);
+        keep_degenerate_patches(up, work);
         up.Build();
         TopoDS_Shape r = up.Shape();
         if (r.IsNull()) return s;

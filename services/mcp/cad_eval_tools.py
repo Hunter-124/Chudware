@@ -15,6 +15,8 @@ import os
 import re
 
 from .cad_common import (
+    COMPONENT_KEY_RE,
+    component_key_refusal,
     CoreError,
     _BBOX_INTENT_RE,
     _CLOSEUP_H,
@@ -1994,6 +1996,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         fallback_extrema_disjoint=true marks constituent separation established by
         positive solid distance when Booleans failed; method="fallback_extrema_disjoint"
         is used when no fuzzy Boolean was needed. Both fallbacks can occur in one pair.
+        clipped_common=true (method="clipped_common" when alone) marks an exact, not
+        approximate, Common recovered after the direct one failed by clipping one body
+        to the other's tight bounds. For an incomplete pair, summary names the first
+        failed pair and pair_failures[].detail lists the OCCT alert, operand (first=a,
+        second=b), world location and sub-shape tolerance: run query_geometry near that
+        point to find the face/feature; sub-shapes closer together than the other body's
+        coarse fillet tolerance (e.g. a 0.01 mm step) make OCCT merge them.
         Additional fallback attempts share a 10 s cooperative OCCT budget per pair;
         exhaustion leaves that pair incomplete rather than reporting a clear result.
         A threshold clearance has distance_status="lower_bound" and distance_lower_bound_mm,
@@ -2040,6 +2049,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 by_id = {b.get("component"): b.get("name") for b in bodies
                          if b.get("component") and b.get("name")}
                 members = [by_id.get(member, member) for member in members]
+                names = set(by_id.values())
+                for member in members:
+                    if (isinstance(member, str) and member not in names
+                            and COMPONENT_KEY_RE.fullmatch(member)):
+                        refusal = component_key_refusal(d, member, "check_interference")
+                        if refusal:
+                            raise ValueError(refusal)
             params = {"doc_id": d, "include_coincident": include_coincident,
                       "min_clearance_mm": min_clearance_mm, "clearance_mode": clearance_mode}
             if members is not None:

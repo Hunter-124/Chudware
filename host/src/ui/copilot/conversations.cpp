@@ -890,7 +890,7 @@ static nlohmann::json planStateToJson(const PlanState& ps) {
 // to avoid quadratic archive size; their complete final content is still queued before the
 // terminal session snapshot. Sequence assignment and all I/O are writer-only.
 static nlohmann::json rawActivityToJson(const ActivityItem& a) {
-    return {
+    nlohmann::json row = {
         {"stage", a.stage},
         {"title", a.title},
         {"detail", a.detail},
@@ -907,6 +907,9 @@ static nlohmann::json rawActivityToJson(const ActivityItem& a) {
         {"streaming", a.streaming},
         {"userToggled", a.userToggled},
     };
+    if (!a.parentId.empty()) row["parentId"] = a.parentId;
+    if (!a.subagentId.empty()) row["subagentId"] = a.subagentId;
+    return row;
 }
 
 static nlohmann::json rawPlanToJson(const PlanInfo& plan) {
@@ -980,6 +983,7 @@ static uint64_t activityStamp(const ActivityItem& a, bool appendOnly = false) {
     mix(a.durationMs); mix(a.tokensIn); mix(a.tokensOut); mix(a.opsCount);
     mix(a.expanded); mix(a.missionHeader); mix(a.rowKind); mix(a.ctxTokens);
     mix(a.streaming); mix(a.userToggled);
+    mix(std::hash<std::string>{}(a.parentId)); mix(std::hash<std::string>{}(a.subagentId));
     return h;
 }
 
@@ -1333,9 +1337,10 @@ static nlohmann::json serializeChatMessage(const ChatMsg& m) {
             if (!m.fromUser && !m.activity.empty()) {
                 nlohmann::json act = nlohmann::json::array();
                 const int nAct = (int)m.activity.size();
-                // Keep all thought/tool/plan/question rows, inter-agent messages and usage lines
-                // (rk 1/2/3/7/18/20/21) + last N stage rows so mid-turn kill/restart still has
-                // planning, tools and the agents' conversation visible.
+                // Keep all thought/tool/plan/question rows, inter-agent messages, usage lines and
+                // sub-run cards (rk 1/2/3/7/17/18/20/21: a card owns the calls nested under it, so
+                // trimming it would unnest them on reload) + last N stage rows so mid-turn
+                // kill/restart still has planning, tools and the agents' conversation visible.
                 std::vector<int> keepIdx;
                 keepIdx.reserve((size_t)nAct);
                 int stagesKept = 0;
@@ -1343,8 +1348,9 @@ static nlohmann::json serializeChatMessage(const ChatMsg& m) {
                 for (int ai = nAct - 1; ai >= 0; --ai) {
                     const auto& a = m.activity[(size_t)ai];
                     const bool priority = (a.rowKind == 2 || a.rowKind == 3 || a.rowKind == 7 ||
-                                           a.rowKind == 1 || a.rowKind == 18 || a.rowKind == 20 ||
-                                           a.rowKind == 21 || a.stage == "__stop_meta__");
+                                           a.rowKind == 1 || a.rowKind == 17 || a.rowKind == 18 ||
+                                           a.rowKind == 20 || a.rowKind == 21 ||
+                                           a.stage == "__stop_meta__");
                     if (priority) {
                         keepIdx.push_back(ai);
                     } else if (stagesKept < kMaxStages) {
@@ -1372,6 +1378,8 @@ static nlohmann::json serializeChatMessage(const ChatMsg& m) {
                         det = det.substr(0, cap - 1) + "\xe2\x80\xa6";
                     if (!det.empty()) row["detail"] = det;
                     if (a.eventTs > 0.0) row["ts"] = a.eventTs;
+                    if (!a.parentId.empty()) row["parent"] = a.parentId;
+                    if (!a.subagentId.empty()) row["subagent"] = a.subagentId;
                     act.push_back(std::move(row));
                 }
                 if (!act.empty()) entry["activity"] = std::move(act);
@@ -1773,6 +1781,8 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     a.reason = row.value("reason", std::string());
                     a.detail = row.value("detail", std::string());
                     a.eventTs = row.value("ts", 0.0);
+                    a.parentId = row.value("parent", std::string());
+                    a.subagentId = row.value("subagent", std::string());
                     cm.activity.push_back(std::move(a));
                 }
             }

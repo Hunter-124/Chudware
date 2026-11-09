@@ -1498,6 +1498,35 @@ struct TimelineSpan {
     float top = 0.0f, bottom = 0.0f;
 };
 
+// ---- calls nested under their owner ----------------------------------------------------------------
+// A tool call the root agent did not make itself nests under whoever did: the Eval whose Python
+// bridged it (stage "tool:<parentId>", an eval call), else the sub-agent's card
+// ("subrun:<subagentId>"). A sub-agent's own Eval therefore sits in that agent's card and owns its
+// bridged calls in turn. Owned rows are not drawn at top level: the owner summarizes them and, once
+// opened, lists the latest. The index is rebuilt when a call or card row changed (refreshNest) —
+// never per frame and never per row, because a message can hold thousands of calls.
+struct NestGroup {
+    size_t row = 0;                 // the owning row
+    std::vector<size_t> kids;       // its direct children, in arrival order
+    int calls = 0;                  // every descendant tool call
+    int failed = 0;                 // ... of which failed
+    size_t last = 0;                // the latest descendant by arrival ("last harness_route")
+    uint64_t sig = 1469598103934665603ULL;   // descendants' revisions: a change re-measures the owner
+};
+
+struct NestIndex {
+    std::vector<int32_t> owner;     // per activity row: its owning row, -1 = top level
+    std::vector<int32_t> group;     // per activity row: index into `groups`, -1 = owns nothing
+    std::vector<NestGroup> groups;
+    size_t rows = 0;                // activity rows covered
+    bool built = false;
+
+    bool owned(size_t i) const { return i < owner.size() && owner[i] >= 0; }
+    const NestGroup* groupOf(size_t i) const {
+        return i < group.size() && group[i] >= 0 ? &groups[size_t(group[i])] : nullptr;
+    }
+};
+
 struct ToolTimelineCache {
     std::vector<ToolTimelineRow> rows;
     uint64_t docsRevision = ~uint64_t(0);
@@ -1523,6 +1552,7 @@ struct ToolTimelineCache {
     size_t planItems = 0, planSummary = 0, planTitle = 0, planRow = size_t(-1);
     std::string planShape;
     float scale = -1.0f;
+    NestIndex nest;
 };
 
 static std::unordered_map<ImGuiID, ToolTimelineCache> s_toolTimelines;
@@ -1546,6 +1576,129 @@ static uint64_t timelineDocRevision(const AppState& st) {
     }
     if (changed) ++revision;
     return revision;
+}
+
+static bool isEvalCall(const ActivityItem& a) {
+    static constexpr char kEval[] = "eval";
+    if (a.rowKind != 3 || a.title.size() != 4) return false;
+    for (size_t i = 0; i < 4; ++i) {
+        const char c = a.title[i] >= 'A' && a.title[i] <= 'Z' ? char(a.title[i] + 32) : a.title[i];
+        if (c != kEval[i]) return false;
+    }
+    return true;
+}
+
+static void buildNestIndex(const std::vector<ActivityItem>& rows, NestIndex& out) {
+    const size_t n = rows.size();
+    out.owner.assign(n, -1);
+    out.group.assign(n, -1);
+    out.groups.clear();
+    out.rows = n;
+    out.built = true;
+    // Owners by the id their children name. The feed upserts by stage, so a repeat is a corrupt
+    // restore: the first one wins.
+    std::unordered_map<std::string_view, size_t> evals, agents;
+    bool anyOwned = false;
+    for (size_t i = 0; i < n; ++i) {
+        const ActivityItem& a = rows[i];
+        if (a.rowKind == 3) {
+            anyOwned = anyOwned || !a.parentId.empty() || !a.subagentId.empty();
+            if (a.stage.size() > 5 && a.stage.compare(0, 5, "tool:") == 0 && isEvalCall(a))
+                evals.emplace(std::string_view(a.stage).substr(5), i);
+        } else if (a.rowKind == 17 && a.stage.size() > 7 && a.stage.compare(0, 7, "subrun:") == 0) {
+            agents.emplace(std::string_view(a.stage).substr(7), i);
+        }
+    }
+    if (!anyOwned) return;
+    // An Eval owns the calls its Python bridged; any other call belongs to its sub-agent's card. A
+    // call whose owner never arrived (parent_unknown, a missing card) stays at top level. Owners may
+    // arrive AFTER their children: an Eval's own row lands when it finishes.
+    for (size_t i = 0; i < n; ++i) {
+        const ActivityItem& a = rows[i];
+        if (a.rowKind != 3) continue;
+        int32_t owner = -1;
+        if (!a.parentId.empty()) {
+            const auto it = evals.find(a.parentId);
+            if (it != evals.end()) owner = int32_t(it->second);
+        }
+        if (owner < 0 && !a.subagentId.empty()) {
+            const auto it = agents.find(a.subagentId);
+            if (it != agents.end()) owner = int32_t(it->second);
+        }
+        out.owner[i] = owner == int32_t(i) ? -1 : owner;
+    }
+    // A malformed restore can name a loop (or an absurdly deep chain): leave those rows at top level.
+    for (size_t i = 0; i < n; ++i) {
+        int32_t o = out.owner[i];
+        for (int hop = 0; o >= 0 && hop < 8; ++hop) {
+            if (size_t(o) == i) break;
+            o = out.owner[size_t(o)];
+        }
+        if (o >= 0) out.owner[i] = -1;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const ActivityItem& a = rows[i];
+        const bool failed = a.status == "fail";
+        bool direct = true;
+        int32_t o = out.owner[i];
+        for (int hop = 0; o >= 0 && hop < 8; ++hop, direct = false, o = out.owner[size_t(o)]) {
+            int32_t& slot = out.group[size_t(o)];
+            if (slot < 0) {
+                slot = int32_t(out.groups.size());
+                out.groups.emplace_back();
+                out.groups.back().row = size_t(o);
+            }
+            NestGroup& g = out.groups[size_t(slot)];
+            if (direct) g.kids.push_back(i);
+            ++g.calls;
+            if (failed) ++g.failed;
+            g.last = i;   // rows ascend, so the latest write is the latest descendant
+            g.sig = (g.sig ^ (a.revision + 1)) * 1099511628211ULL;
+            g.sig = (g.sig ^ i) * 1099511628211ULL;
+        }
+    }
+}
+
+// Bring the index up to date with the message. Returns the lowest row whose nesting changed (an
+// Eval landed over calls already drawn, a card gained a call), size_t(-1) when none did: every
+// row from there on has a stale visibility, live-frontier and measured height. Owners whose
+// descendants changed are re-measured here; their spans go stale with the lowered updateFrom.
+static size_t refreshNest(ToolTimelineCache& cache, const ChatMsg& m) {
+    NestIndex& nx = cache.nest;
+    const size_t n = m.activity.size();
+    // The event seam marks the first row it changed (uiActivityDirtyFrom); rows from there on are
+    // all that can have moved. Streamed text and thoughts change neither an owner nor a call, so
+    // they only extend the index.
+    const bool fresh = !nx.built || n < nx.rows;
+    bool relevant = fresh;
+    for (size_t i = fresh ? n : std::min(m.uiActivityDirtyFrom, nx.rows); i < n && !relevant; ++i)
+        relevant = m.activity[i].rowKind == 3 || m.activity[i].rowKind == 17;
+    if (!relevant) {
+        nx.owner.resize(n, -1);
+        nx.group.resize(n, -1);
+        nx.rows = n;
+        return size_t(-1);
+    }
+    NestIndex prev = std::move(nx);
+    nx = NestIndex{};
+    buildNestIndex(m.activity, nx);
+    size_t low = size_t(-1);
+    const size_t common = std::min(prev.owner.size(), n);
+    for (size_t i = 0; i < common; ++i)
+        if (prev.owner[i] != nx.owner[i]) { low = i; break; }
+    for (const NestGroup& g : nx.groups) {
+        const NestGroup* before = prev.groupOf(g.row);
+        if (before && before->sig == g.sig) continue;
+        low = std::min(low, g.row);
+        if (g.row < cache.rows.size()) {
+            ToolTimelineRow& row = cache.rows[g.row];
+            row.height = row.drawerHeight = row.evidenceHeight = row.artifactHeight = -1.0f;
+            row.settled = false;
+        }
+    }
+    for (const NestGroup& g : prev.groups)
+        if (g.row < n && !nx.groupOf(g.row)) low = std::min(low, g.row);
+    return low;
 }
 
 static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
@@ -1595,6 +1748,7 @@ static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::
     const bool messageChanged = cache.revision != m.revision || cache.running != m.running ||
         cache.activityCount != m.activity.size();
     if (!layoutChanged && !messageChanged) return cache;
+    const size_t nestLow = refreshNest(cache, m);
     size_t updateFrom = 0;
     if (!layoutChanged && cache.running == m.running &&
         m.activity.size() >= cache.activityCount && m.uiActivityDirtyFrom > 0 &&
@@ -1603,6 +1757,13 @@ static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::
         if (updateFrom > 0) --updateFrom;
         if (m.activity.size() != cache.activityCount && cache.lastVisible != size_t(-1))
             updateFrom = std::min(updateFrom, cache.lastVisible);
+        if (updateFrom > cache.rows.size() ||
+            (updateFrom > 0 && !cache.rows[updateFrom - 1].valid)) updateFrom = 0;
+    }
+    // Ownership changed above the dirty row: what the rows from there on show, which one is the
+    // live frontier and how tall they are is stale.
+    if (nestLow < updateFrom) {
+        updateFrom = nestLow;
         if (updateFrom > cache.rows.size() ||
             (updateFrom > 0 && !cache.rows[updateFrom - 1].valid)) updateFrom = 0;
     }
@@ -1654,7 +1815,8 @@ static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::
             const bool close = !a.userToggled && (a.rowKind == 2 || isThinkingItem(a));
             if (a.streaming || a.status == "running" || (close && a.expanded)) {
                 a.streaming = false;
-                if (a.status == "running" && !settleUnfinishedCompaction(a, "interrupted"))
+                if (a.status == "running" && !settleUnfinishedCompaction(a, "interrupted") &&
+                    !settleUnfinishedTool(a, "interrupted"))
                     a.status = "done";
                 if (close) a.expanded = false;
                 ++a.revision;
@@ -1662,6 +1824,7 @@ static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::
             }
         }
         if (a.stage != "__stop_meta__" && a.rowKind != 9 && !a.isRetiredCorporateRow() &&
+            !cache.nest.owned(i) &&
             (!isProseOutputRow(a) || ui::streamTextVisible(a.detail))) cache.lastVisible = i;
         const size_t rowBytes = a.detail.size() + a.title.size() + a.reason.size() + a.stage.size();
         if (i >= cache.rows.size()) {
@@ -1946,6 +2109,18 @@ static void drawToolArgs(const std::string& args, const ui::Fonts& fonts,
                           /*failure=*/false);
 }
 
+// What a row needs to draw the calls nested under it (see NestIndex).
+struct NestCtx {
+    AppState*          st = nullptr;
+    ChatMsg*           m = nullptr;
+    ToolTimelineCache* cache = nullptr;
+    const ui::Fonts*   fonts = nullptr;
+    bool               changed = false;   // a nested row's disclosure was toggled: re-measure
+};
+static void drawNestSummary(const NestCtx& nc, const NestGroup& g, float room);
+static void drawNestedCalls(NestCtx& nc, const NestGroup& g);
+static void drawSubRunNest(NestCtx& nc, ActivityItem& card, const NestGroup& g);
+
 // M14 — one tool call as ONE dense rounded LOG LINE, not a card: the tool
 // icon, the HUMAN title (tool_phrase.h turns `add_features` into "Building geometry"), the target it
 // acts on, a right-aligned latency/cache figure and the disclosure chevron. Nothing was dropped to
@@ -1963,7 +2138,8 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                                 int failCount, bool liveFrontier,
                                 const std::vector<ActivityItem*>* group = nullptr,
                                 const std::vector<ActivityItem>* timeline = nullptr,
-                                std::vector<ToolTimelineRow>* cachedRows = nullptr) {
+                                std::vector<ToolTimelineRow>* cachedRows = nullptr,
+                                NestCtx* nest = nullptr) {
     const float gap = ui::metrics::U(1.5f);
     // Chat-display prefs (cached in ai_prefs — safe to read per row per frame).
     const int  detailLvl = ui::chatToolDetail();
@@ -2032,7 +2208,13 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
 
     // Drawer state is settled BEFORE anything is drawn: the header's click target and the
     // animated body both need it, and a grouped card's drawer is its members' drawers stacked.
-    const bool open = a.userToggled ? a.expanded : (a.expanded || liveFrontier);
+    // Calls nested under this row (the CAD calls its Python bridged): the owner's disclosure is its
+    // own explicit state. The live frontier never opens it — an Eval that just finished must not
+    // unfurl fifty rows under the cursor.
+    const NestGroup* const ng = nest && timeline
+        ? nest->cache->nest.groupOf(size_t(&a - timeline->data())) : nullptr;
+    float nestTopY = -1.0f;   // screen y where the nested list starts; the row's copy menu stops above it
+    const bool open = ng ? a.expanded : (a.userToggled ? a.expanded : (a.expanded || liveFrontier));
     // A summarized exception whose raw text IS its inline line has nothing extra to reveal, so it
     // must not advertise a chevron onto an empty drawer.
     // Visual evidence — the images a call returned to the agent (a render, a section, a clash
@@ -2059,6 +2241,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     // Simplified mode has no disclosure, no args drawer and no engine ids at all — artifacts still
     // reach the user, drawn inline below instead of behind an expander.
     if (simple) hasDrawer = false;
+    if (ng) hasDrawer = true;   // the nested calls are always worth a chevron
     const ImGuiID animKey = ImGui::GetID("##toolrow_anim");
     const bool    wantOpen = open && hasDrawer;
     const float   openE = ui::chatCollapseAnim() ? collapseEase(animKey, wantOpen)
@@ -2205,7 +2388,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     const std::string clockS = (!simple && metaTs > 0.0) ? chatRowClock(metaTs) : std::string();
     // Right-hand lanes: the chevron cell (reserved whether or not this row has a drawer, so the
     // figures form one column down the turn) and the meta figure right-aligned against it.
-    const RowLanes lanes = rowLanes(!simple);
+    const RowLanes lanes = rowLanes(!simple || ng != nullptr);
     const float metaW = metaS.empty() ? 0.0f : ImGui::CalcTextSize(metaS.c_str()).x + gap;
 
     // ---- header: icon  Title [n]  dim target ........ meta  [chevron]
@@ -2349,6 +2532,14 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         ImGui::Unindent(ind);
     }
 
+    // The calls nested under this row, summarized on a line of their own under the header.
+    if (ng) {
+        const float ind = titleX - ImGui::GetCursorStartPos().x;
+        ImGui::Indent(ind);
+        drawNestSummary(*nest, *ng, lanes.metaRight - ImGui::GetCursorPosX());
+        ImGui::Unindent(ind);
+    }
+
     // The whole header (title line + inline error) toggles the drawer; the chevron says so.
     if (hasDrawer) {
         const HeaderHit hh = headerHit(topY, ImGui::GetItemRectMax().y + rowPadY());
@@ -2367,7 +2558,9 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     }
     if (openE > 0.0f && hasDrawer) {
         CollapseBody cb = beginCollapseBody(animKey, openE, "##toolanim");
-        if (groupN > 1) {
+        if (simple) {
+            // A simplified row has no drawer of its own; only the calls nested under it open.
+        } else if (groupN > 1) {
             // Grouped: every member's drawer stacked, each under its own dim target line.
             // Only successes ever group (toolPhrase hands failures an empty groupKey), so
             // there is no per-member failure chrome to reproduce here.
@@ -2410,6 +2603,10 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 drawToolArgs(argsBody, fonts, rowCache);
             drawArtifacts(parts);
         }
+        if (ng) {
+            nestTopY = ImGui::GetCursorScreenPos().y;
+            drawNestedCalls(*nest, *ng);
+        }
         endCollapseBody(cb);
     }
     // The evidence itself, after the drawer: header (what was called) -> drawer (how) -> what came
@@ -2432,9 +2629,106 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         ImGui::Unindent(ind);
     }
     ImRect rowRect = endRowShell(sh);
+    if (nestTopY >= 0.0f) rowRect.Max.y = ImMin(rowRect.Max.y, nestTopY);
     {
         chatCopyContext(rowRect, "##tool_copy", [&] { return chatActivityCopyText(a); });
 
+    }
+}
+
+static constexpr size_t kNestShown = 50;   // most recent nested calls an opened owner lists
+
+// "412 calls · 9 failed · last harness_route": the one line an owner says about what hangs under it.
+static void drawNestSummary(const NestCtx& nc, const NestGroup& g, float room) {
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const std::string head = std::to_string(g.calls) + (g.calls == 1 ? " call" : " calls");
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+    ImGui::TextUnformatted(head.c_str());
+    ImGui::PopStyleColor();
+    float used = ImGui::GetItemRectSize().x;
+    if (g.failed > 0) {
+        const std::string bad = " \xc2\xb7 " + std::to_string(g.failed) + " failed";
+        ImGui::SameLine(0, 0);
+        ImGui::TextColored(ui::kit::toneOn(ui::kit::Tone::Err, surf), "%s", bad.c_str());
+        used += ImGui::GetItemRectSize().x;
+    }
+    const std::string& tool = nc.m->activity[g.last].title;
+    if (!tool.empty() && room - used > ui::metrics::U(24.0f)) {
+        ImGui::SameLine(0, 0);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(chatEllipsize(" \xc2\xb7 last " + tool, room - used).c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+// An opened owner's calls: the most recent kNestShown in arrival order, drawn exactly like top-level
+// rows but indented, under a count of what the cap left out (failures among them named). A call that
+// owns calls itself (a sub-agent's Eval) nests in turn.
+static void drawNestedCalls(NestCtx& nc, const NestGroup& g) {
+    std::vector<ActivityItem>& rows = nc.m->activity;
+    const size_t first = g.kids.size() > kNestShown ? g.kids.size() - kNestShown : 0;
+    const float ind = ui::metrics::U(10.0f);
+    ImGui::Indent(ind);
+    if (first > 0) {
+        int failed = 0;
+        for (size_t q = 0; q < first; ++q)
+            if (rows[g.kids[q]].status == "fail") ++failed;
+        std::string line = first == 1 ? std::string("1 earlier call")
+                                      : std::to_string(first) + " earlier calls";
+        if (failed > 0) line += " \xc2\xb7 " + std::to_string(failed) + " failed";
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textTertiary);
+        ImGui::TextUnformatted(line.c_str());
+        ImGui::PopStyleColor();
+    }
+    for (size_t q = first; q < g.kids.size(); ++q) {
+        const size_t k = g.kids[q];
+        ActivityItem& c = rows[k];
+        const bool wasOpen = c.expanded, wasToggled = c.userToggled;
+        ImGui::PushID(int(k));
+        drawToolCallRowImpl(*nc.st, c, *nc.fonts, /*failCount=*/1, /*liveFrontier=*/false, nullptr,
+                            &rows, &nc.cache->rows, &nc);
+        ImGui::PopID();
+        if (c.expanded != wasOpen || c.userToggled != wasToggled) {
+            ++c.revision;
+            ++nc.m->revision;
+            nc.m->uiActivityDirtyFrom = std::min(nc.m->uiActivityDirtyFrom, k);
+            nc.changed = true;
+        }
+    }
+    ImGui::Unindent(ind);
+}
+
+// A sub-agent card's body: the summary line toggles the list of the calls it made.
+static void drawSubRunNest(NestCtx& nc, ActivityItem& card, const NestGroup& g) {
+    const bool open = card.expanded;
+    const RowLanes lanes = rowLanes(true);
+    const float topY = ImGui::GetCursorScreenPos().y;
+    drawNestSummary(nc, g, lanes.metaRight - ImGui::GetCursorPosX());
+    const float centerY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
+    const HeaderHit hh = headerHit(topY, ImGui::GetItemRectMax().y);
+    if (hh.clicked) { card.expanded = !open; card.userToggled = true; }
+    headerChevron(lanes, centerY, open ? 1.0f : 0.0f, hh.hovered);
+    if (open) drawNestedCalls(nc, g);
+}
+
+// Open every owner above `row` so it is on screen. `nest` is the message's index, found by the caller
+// in the message id scope.
+static void revealNestedRow(ChatMsg& m, const NestIndex* nest, size_t row) {
+    if (!nest) return;
+    bool opened = false;
+    for (int hop = 0; hop < 8 && nest->owned(row); ++hop) {
+        row = size_t(nest->owner[row]);
+        if (row >= m.activity.size()) break;
+        ActivityItem& owner = m.activity[row];
+        if (owner.expanded && owner.userToggled) continue;
+        owner.expanded = owner.userToggled = true;
+        ++owner.revision;
+        m.uiActivityDirtyFrom = std::min(m.uiActivityDirtyFrom, row);
+        opened = true;
+    }
+    if (opened) {
+        ++m.revision;
+        m.uiCachedH = -1.0f;
     }
 }
 
@@ -2498,6 +2792,7 @@ struct StageCost {
 // outcomes distinct in the expanded receipt instead of flattening every row to \"retried\".
 struct ReceiptFail {
     ImGuiID     anchor = 0;
+    size_t      row = 0;     // the failing call's own activity row (the anchor is its top-level owner's)
     std::string title;
     std::string why;
     std::string meta;
@@ -2519,6 +2814,12 @@ struct TurnReceipt {
 TurnReceipt buildReceipt(const ChatMsg& m) {
     TurnReceipt r;
     const auto timeline = s_toolTimelines.find(ImGui::GetID("##tool_timeline_cache"));
+    // A nested call has no row of its own at top level: a jump to its failure lands on the owner.
+    const NestIndex* nest = timeline != s_toolTimelines.end() ? &timeline->second.nest : nullptr;
+    auto topRow = [&](size_t i) {
+        for (int hop = 0; nest && nest->owned(i) && hop < 8; ++hop) i = size_t(nest->owner[i]);
+        return i;
+    };
     for (size_t i = 0; i < m.activity.size(); ++i) {
         const ActivityItem& a = m.activity[i];
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
@@ -2556,7 +2857,8 @@ TurnReceipt buildReceipt(const ChatMsg& m) {
                 else if (outcome.timeout) ++r.unknown;
                 else ++r.retried;
                 ReceiptFail f;
-                f.anchor = activityAnchorId((int)i);
+                f.anchor = activityAnchorId((int)topRow(i));
+                f.row    = i;
                 f.title  = ui::toolPhrase(a.title, a.reason, /*ok=*/false).title;
                 f.meta   = outcome.structured ? outcome.chip
                                               : (outcome.failure ? "retried" : "");
@@ -2688,6 +2990,7 @@ void drawTurnReceipt(AppState& st, ChatMsg& m) {
     }
     Entry& entry = receipts[id];
     const auto timeline = s_toolTimelines.find(ImGui::GetID("##tool_timeline_cache"));
+    const NestIndex* nest = timeline == s_toolTimelines.end() ? nullptr : &timeline->second.nest;
     const uint64_t layout = timeline == s_toolTimelines.end() ? 0 : timeline->second.layoutRevision;
     if (entry.revision != m.revision || entry.stamp != m.ts ||
         entry.count != m.activity.size() || entry.layout != layout) {
@@ -2768,7 +3071,11 @@ void drawTurnReceipt(AppState& st, ChatMsg& m) {
                 ImGui::PushID((int)i);
                 const bool hit = ui::kit::row("##fail", f.title.c_str(), rs);
                 ImGui::PopID();
-                if (hit) { timelineScrollTo(f.anchor); chatLogBreakStick(); }
+                if (hit) {
+                    revealNestedRow(m, nest, f.row);
+                    timelineScrollTo(f.anchor);
+                    chatLogBreakStick();
+                }
             }
         }
         if (!r.files.empty()) {
@@ -2883,6 +3190,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
     bool indexChanged = false;
     size_t settledPrefix = prefixIndexed ? knownSpans : 0;
     bool prefixSettled = true;
+    NestCtx nestCtx{&st, &m, &toolCache, &fonts};
     for (size_t i = beginRow; i < endRow; ++i) {
         if (prefixIndexed && i >= prefixVisibleEndRow && i < prefixEndRow) {
             spacer(suffixHeight);
@@ -2892,7 +3200,8 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
         ActivityItem& a = m.activity[i];
         // Hidden stop metadata, provider-call rows, and retired corporate cards are not
         // drawn inline. Provider calls aggregate into the collapsible Provider log.
-        if (a.stage == "__stop_meta__" || a.rowKind == 9 || a.isRetiredCorporateRow()) continue;
+        if (a.stage == "__stop_meta__" || a.rowKind == 9 || a.isRetiredCorporateRow() ||
+            toolCache.nest.owned(i)) continue;
         const size_t spanFirst = i;
         const bool liveFrontier = turnRunning && (i == lastVisible);
         // Deferred scroll-to-anchor: the receipt / cost strip requested this row LAST frame, when
@@ -2942,28 +3251,33 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
             const ToolOutcomePresentation uncachedOutcome = firstTool ? ToolOutcomePresentation{}
                                                                       : toolOutcomePresentation(a);
             const ToolOutcomePresentation& aOutcome = firstTool ? firstTool->outcome : uncachedOutcome;
-            if (aOutcome.failure && !(firstTool ? firstTool->images
-                                                : hasImageArtifacts(splitToolRowDetail(a.detail).arts))) {
+            // A row that owns nested calls is drawn alone: a fold would bury what it holds.
+            const bool ownsCalls = toolCache.nest.groupOf(i) != nullptr;
+            if (!ownsCalls && aOutcome.failure && !(firstTool ? firstTool->images
+                                                              : hasImageArtifacts(splitToolRowDetail(a.detail).arts))) {
                 const ui::copilot::ToolOutcomeKind aKind = aOutcome.info.kind;
                 size_t j = i + 1;
+                size_t lastIdx = i;   // the run's last member; calls nested under an owner are not on this line
                 while (j < m.activity.size()) {
+                    if (toolCache.nest.owned(j)) { ++j; continue; }
                     const ActivityItem& n = m.activity[j];
                     const ToolTimelineRow* next = cachedTool(j);
                     const ToolOutcomePresentation fallback = next ? ToolOutcomePresentation{} : toolOutcomePresentation(n);
                     const ToolOutcomePresentation& nOutcome = next ? next->outcome : fallback;
-                    if (n.rowKind != 3 || !nOutcome.failure) break;
+                    if (n.rowKind != 3 || !nOutcome.failure || toolCache.nest.groupOf(j)) break;
                     // A failed geometry check may return a diagnostic image. Never fold away
                     // an attempt's evidence in favour of the last attempt's error summary.
                     if (next ? next->images : hasImageArtifacts(splitToolRowDetail(n.detail).arts)) break;
                     if (n.title != a.title || n.reason != a.reason) break;
                     if (nOutcome.info.kind != aKind) break;
                     ++failCount;
+                    lastIdx = j;
                     ++j;
                 }
-                drawIdx = j - 1;
-                frontIdx = j - 1;
-                i = j - 1;  // loop ++i advances past the coalesced run
-            } else if (ui::chatGroupToolCalls() && aOutcome.succeeded &&
+                drawIdx = lastIdx;
+                frontIdx = lastIdx;
+                i = lastIdx;  // loop ++i advances past the coalesced run
+            } else if (!ownsCalls && ui::chatGroupToolCalls() && aOutcome.succeeded &&
                        a.status != "running" && a.stage != "artifacts") {
                 // Fold a run of consecutive successful calls that phrase to the same groupKey
                 // into ONE card ("Rendering the part x 3") instead of N near-identical cards.
@@ -2972,21 +3286,25 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
                 const std::string& key = firstTool ? firstTool->groupKey : uncachedKey;
                 if (!key.empty()) {
                     size_t j = i + 1;
+                    size_t lastIdx = i, members = 1;
                     while (j < m.activity.size()) {
+                        if (toolCache.nest.owned(j)) { ++j; continue; }
                         const ActivityItem& n = m.activity[j];
                         const ToolTimelineRow* next = cachedTool(j);
                         const ToolOutcomePresentation fallback = next ? ToolOutcomePresentation{} : toolOutcomePresentation(n);
                         const ToolOutcomePresentation& nOutcome = next ? next->outcome : fallback;
                         if (n.rowKind != 3 || !nOutcome.succeeded || n.status == "running") break;
-                        if (n.stage == "artifacts") break;
+                        if (n.stage == "artifacts" || toolCache.nest.groupOf(j)) break;
                         if (next ? next->groupKey != key
                                  : ui::toolPhrase(n.title, n.reason, true).groupKey != key) break;
+                        lastIdx = j;
+                        ++members;
                         ++j;
                     }
-                    if (j > i + 1) {
-                        groupCount = j - i;
-                        frontIdx = j - 1;
-                        i = j - 1;   // loop ++i advances past the folded run
+                    if (lastIdx > i) {
+                        groupCount = members;
+                        frontIdx = lastIdx;
+                        i = lastIdx;   // loop ++i advances past the folded run
                     }
                 }
             }
@@ -3016,13 +3334,14 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
                 std::vector<ActivityItem*> group;
                 if (groupCount > 1) {
                     group.reserve(groupCount);
-                    for (size_t k = firstIdx; k <= frontIdx; ++k) group.push_back(&m.activity[k]);
+                    for (size_t k = firstIdx; k <= frontIdx; ++k)
+                        if (!toolCache.nest.owned(k)) group.push_back(&m.activity[k]);
                 }
                 const bool beforeExpanded = m.activity[drawIdx].expanded;
                 const bool beforeToggled = m.activity[drawIdx].userToggled;
                 drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount, frontier,
                                     group.size() > 1 ? &group : nullptr, &m.activity,
-                                    &toolCache.rows);
+                                    &toolCache.rows, &nestCtx);
                 if (m.activity[drawIdx].expanded != beforeExpanded ||
                     m.activity[drawIdx].userToggled != beforeToggled) {
                     ++m.activity[drawIdx].revision;
@@ -3063,7 +3382,11 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
         } else if (a.rowKind == 16) {
             drawAdvisorCard(a, fonts);
         } else if (a.rowKind == 17) {
-            drawSubRunCard(a, fonts, turnRunning && a.status == "running");
+            const bool live = turnRunning && a.status == "running";
+            if (const NestGroup* kids = toolCache.nest.groupOf(i))
+                drawSubRunCard(a, fonts, live, [&] { drawSubRunNest(nestCtx, a, *kids); });
+            else
+                drawSubRunCard(a, fonts, live);
         } else if (a.rowKind == 18) {
             // Plan position marker — the plan/objectives section renders HERE, where the plan
             // first arrived in the event stream, instead of pinned to the top of the turn.
@@ -3116,6 +3439,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
         }
         ImGui::PopID();
     }
+    if (nestCtx.changed) indexChanged = true;
     if (indexed) {
         spacer(suffixHeight);
         if (indexChanged) {

@@ -177,7 +177,6 @@ def test_vault_backed_plm_family_exposes_optional_project_path():
 
     assert schemas["plm_lock"]["properties"]["force"]["default"] is False
     assert schemas["plm_add_remote"]["properties"]["display_name"]["default"] == ""
-    assert schemas["plm_add_remote"]["properties"]["account_id"]["default"] == ""
 
 def test_plm_item_add_file_as_project_root_teaches_complete_call(tmp_path, tools):
     target = tmp_path / "spec.md"
@@ -531,7 +530,6 @@ def test_remote_identity_and_force_parameters_reach_mcp_backend(
         "team",
         "https://example.invalid/team",
         "Sarah",
-        "acct-42",
     ))
     assert added["ok"]
     assert seen["add"] == (
@@ -542,7 +540,6 @@ def test_remote_identity_and_force_parameters_reach_mcp_backend(
             "kind": "https",
             "url": "https://example.invalid/team",
             "display_name": "Sarah",
-            "account_id": "acct-42",
         },
     )
 

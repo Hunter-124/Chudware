@@ -1,6 +1,11 @@
 #pragma once
 
+#include <array>
+#include <optional>
+
 #include <nlohmann/json.hpp>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Shape.hxx>
 
 namespace chudware::geom {
@@ -58,5 +63,28 @@ namespace chudware::geom {
 // Options: min_dihedral_dev_deg (default 5, in [0, 90)): edges whose deviation is below it
 // are "smooth". Throws std::invalid_argument for malformed options.
 nlohmann::json edge_analysis(const TopoDS_Shape& shape, const nlohmann::json& options);
+
+// Where a fillet/chamfer size handle on `edge` belongs and which way it pulls, read at the
+// edge's ARC-LENGTH midpoint on a body whose edge->face ancestors are `edge_faces`
+// (TopExp::MapShapesAndAncestors(body, TopAbs_EDGE, TopAbs_FACE, ...)).
+//   mid   a point ON the edge curve at half its length.
+//   grow  unit vector along which the blend face moves as its size increases, in the model
+//         frame: for a CONVEX edge the inward bisector of the two faces' outward normals,
+//         -(nA + nB)/|nA + nB| (the round removes material, so the face sinks into the body);
+//         for a CONCAVE edge the opposite, +(nA + nB)/|nA + nB| (the round adds material, so
+//         the face rises out into the open corner). Convex/concave comes from the same
+//         oriented-traversal test as edge_analysis, never from a centroid guess. Absent
+//         unless the edge borders exactly two distinct faces whose normals do not cancel
+//         (a knife edge) and whose traversals give a sign.
+// std::nullopt when the edge has no curve to measure (degenerate or unbounded).
+struct EdgeBlendFrame {
+    std::array<double, 3> mid{};
+    std::optional<std::array<double, 3>> grow;
+    // Same oriented-traversal sign as `grow`: true for an inside corner (the blend adds
+    // material), false for an outside one. Set exactly when `grow` is.
+    std::optional<bool> concave;
+};
+std::optional<EdgeBlendFrame> edge_blend_frame(const TopoDS_Edge& edge,
+                                               const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces);
 
 } // namespace chudware::geom

@@ -65,8 +65,10 @@
 #include "widgets/ribbon.h"
 #include "viewport_panel.h"
 #include "layout.h"  // overlayBand: demoreview Simulation-column clip check
+#include "settings_modal.h"  // SettingsRoute: settings scenarios open pages/tabs by route
 #include "copilot/copilot_internal.h"  // projectchat: session store, root reconciliation, Sessions probe
 #include "ui/copilot/inline_image_refs.h"  // copilot_showcase: Sessions titles never show "[Image #N]"
+#include "ui/copilot/subrun_usage.h"  // toolnest: the sub-agent usage trailer the card renders
 #include "util/time_local.h"  // copilot_showcase: local-midnight session timestamps
 #include "sim/sim_scene.h"
 #include "../ui_theme.h"
@@ -1380,7 +1382,7 @@ void shotScrollTo(const char* label, const char* window = nullptr, bool frameWho
             if (owner != name && (owner.size() <= name.size() ||
                 owner.compare(0, name.size(), name) != 0 || owner[name.size()] != '/')) continue;
         } else if (window && (name.find(window) != std::string::npos ||
-                   (std::strstr(window, "##ai_") && name.find("##ai_sub_body") != std::string::npos))) {
+                   (std::strstr(window, "##ai_") && name.find("##tab_") != std::string::npos))) {
             // Scan the requested editor or its Settings scroll body for unsubmitted controls.
         } else if (name.find("SimulationManager") == std::string::npos &&
                    name.find("Firmware") == std::string::npos &&
@@ -3702,9 +3704,44 @@ void steerStatusTick(AppState& st) {
         if (!steerCheck("cancel_returns_queued_message_to_composer_merged", merged,
                         {{"composer", composed}, {"queued", st.queuedPrompts.size()}}))
             return;
+        P.queued = P.dir + "/steerstatus_07_cancelled.png";
+        P.settle = 8;
+        P.step = 8;
+        return;
+    }
+    case 8: {
+        // Edit on the unread steer: a run that already read it keeps it pinned; one that drops
+        // it unread hands it back as the first queued message, open in the in-place editor.
+        const std::string conv = st.activeConvId();
+        ui::applySteerWithdrawal(st, conv, "s-pin-b", /*withdrawn=*/false, /*edit=*/true, "");
+        const bool kept = st.chat.size() == 5 && ::pendingSteerTail(st.chat) == 4 &&
+                          st.queuedPrompts.empty();
+        if (!steerCheck("withdraw_refused_keeps_the_pinned_steer", kept,
+                        {{"conv", conv}, {"size", st.chat.size()},
+                         {"queued", st.queuedPrompts.size()}}))
+            return;
+        ui::applySteerWithdrawal(st, conv, "s-pin-b", /*withdrawn=*/true, /*edit=*/true, "");
+        const bool requeued = st.chat.size() == 4 && ::pendingSteerTail(st.chat) == 4 &&
+                              st.queuedPrompts.size() == 1 &&
+                              st.queuedPrompts[0] == "And make it PETG." &&
+                              st.queuedPromptDrafts.size() == 1 &&
+                              ui::queuedPromptEditHoldsDrain();
+        if (!steerCheck("withdrawn_steer_reopens_as_first_queued_message_in_editor", requeued,
+                        {{"size", st.chat.size()}, {"queued", st.queuedPrompts}}))
+            return;
+        P.settle = 8;
+        P.step = 9;
+        return;
+    }
+    case 9: {
+        // Drawn frames later the editor is still open on it, so the drain never sends it.
+        if (!steerCheck("editor_holds_the_withdrawn_steer",
+                        ui::queuedPromptEditHoldsDrain() && st.queuedPrompts.size() == 1,
+                        {{"queued", st.queuedPrompts.size()}}))
+            return;
         P.report["ok"] = true;
         P.done = true;
-        P.capture = P.dir + "/steerstatus_07_cancelled.png";
+        P.capture = P.dir + "/steerstatus_08_withdrawn_edit.png";
         return;
     }
     default:
@@ -3731,6 +3768,312 @@ bool steerStatusEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
         out << P.report.dump(2) << '\n';
         out.close();
         std::printf("steerstatus: report -> %s ok=%d\n", path.c_str(), (int)P.report.value("ok", false));
+        std::fflush(stdout);
+        if (P.failed || !out) {
+            std::fflush(nullptr);
+            core::framestats::flushReport();
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// CHUDWARE_SHOT=toolnest: one finished assistant turn in which a sub-agent made nearly every call —
+// the shape of the live TBOT session that flooded the transcript with 4,491 flat tool rows. A Main
+// read, the Harness sub-agent's card, its direct calls, one Harness Eval whose Python bridged 60 CAD
+// calls (some failed; they land BEFORE the Eval's own row, as live), a small Main Eval with its own
+// bridged calls, the Main `task` call and a closing Main call. Captures:
+//   01 collapsed   — the card and Main's Eval summarize what hangs under them;
+//   02 agent open  — the card's calls in arrival order, its Eval collapsed to a summary;
+//   03 eval open   — that Eval's 50 latest bridged calls under "10 earlier calls · 1 failed";
+//   04 retry       — owners closed, the run live again with a second sub-agent (Scout) asleep
+//                    between provider retries: "waiting on provider retry" beside its totals.
+// Every sub-agent card's second line is its own requests / context / spend / model, from the
+// progress frames (services/agent/omp_events.py::_subagent_usage).
+// Captures + toolnest_report.json land in scratch/toolnest_shots; a failed check exits non-zero.
+struct ToolNestShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0;
+    double started = 0.0;
+    std::string dir, capture, queued;
+    nlohmann::json report;
+};
+ToolNestShot g_toolNest;
+
+bool toolNestCheck(const std::string& name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_toolNest;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("toolnest: %s %s\n", ok ? "PASS" : "FAIL", name.c_str());
+    std::fflush(stdout);
+    if (!ok) {
+        P.report["failure"] = name;
+        P.failed = P.done = true;
+        P.queued.clear();
+        P.capture = P.dir + "/toolnest_FAILED.png";
+    }
+    return ok;
+}
+
+// The turn, folded through the real feed (feedTurnActivity) exactly as the OMP producer reports it:
+// `parent` is the caller (the spawning task call, or the Eval that bridged the call), `agent` the
+// sub-agent that made it.
+void toolNestSeed(AppState& st) {
+    st.chat.clear();
+    st.designStarted = true;
+    const double now = chatNowEpoch();
+    ChatMsg user;
+    user.fromUser = true;
+    user.ts = now - 900.0;
+    user.text = "Replace the hand-modelled cylinder and sphere harness parts with a real wiring-harness "
+                "study of the belly.";
+    st.chat.push_back(std::move(user));
+    ChatMsg turn;
+    turn.ts = now - 880.0;
+    st.chat.push_back(std::move(turn));
+    ChatMsg& A = st.chat.back();
+    int seq = 0;
+    const auto call = [&](const std::string& id, const char* tool, const std::string& target, bool ok,
+                          const char* parent, const char* agent, const char* args = "{}") {
+        nlohmann::json ev = {{"id", id}, {"tool_name", tool}, {"target", target},
+                             {"args_preview", args}, {"latency_ms", 120 + 37 * (seq++ % 11)},
+                             {"ok", ok}};
+        if (!ok) {
+            const std::string name = tool;
+            ev["error_preview"] =
+                name == "harness_route" ? "route_check_failed: final bundle s2 violates bend or clearance"
+                : name == "verify_battery" || name == "harness_check"
+                    ? "check_failed: 6 routes violate the minimum bend radius"
+                    : "bad_args: unknown connector id";
+        }
+        if (*parent) ev["parent_id"] = parent;
+        if (*agent) ev["subagent_id"] = agent;
+        ::feedTurnActivity(A, "agent.tool_call", ev);
+    };
+    const std::string purpose = "Harness: replace the hand-modelled harness with a real wiring study";
+    call("m-read", "read", "PLAN.md", true, "", "");
+    // The card's run totals, as the producer maps AgentProgress onto sub_run: lifecycle frames carry
+    // none, each progress frame the latest of every value (retry_state only while the sub-agent
+    // sleeps between provider retries).
+    ::feedTurnActivity(A, "sub_run", {{"id", "Harness"}, {"purpose", purpose}, {"status", "running"}});
+    const auto progress = [&](int requests, long long tokens, int context, double cost, int ms,
+                              const nlohmann::json& retry) {
+        nlohmann::json ev = {{"id", "Harness"}, {"purpose", purpose}, {"status", "running"},
+                             {"requests", requests}, {"tokens", tokens}, {"context_tokens", context},
+                             {"context_window", 1000000}, {"cost_usd", cost}, {"duration_ms", ms},
+                             {"resolved_model", "anthropic/claude-sonnet-5-5:high"}};
+        if (retry.is_object()) ev["retry_state"] = retry;
+        ::feedTurnActivity(A, "sub_run", ev);
+    };
+    // The sub-agent's own calls (parent = the Main task call), then its Eval's bridged calls, then
+    // the Eval's own row: it lands when the Eval finishes.
+    const char* const kDirect[] = {"inspect_part", "harness_add_connector", "harness_add_wire",
+                                   "harness_route", "harness_check"};
+    for (int i = 0; i < 30; ++i)
+        call("h-" + std::to_string(i), kDirect[i % 5], "belly harness " + std::to_string(i),
+             i % 11 != 7, "task-1", "Harness");
+    progress(96, 3100000, 212000, 3.94, 130000,
+             {{"attempt", 2}, {"max_attempts", 5}, {"delay_ms", 8000}, {"error", "429 rate limited"}});
+    const char* const kBridged[] = {"harness_add_connector", "harness_add_wire", "harness_route"};
+    for (int i = 0; i < 60; ++i)
+        call("hb-" + std::to_string(i), kBridged[i % 3], "wire w" + std::to_string(i / 3),
+             i % 9 != 8, "h-eval", "Harness");
+    call("h-eval", "eval", "route every wire", true, "task-1", "Harness",
+         "for w in wires:\n    tool.harness_add_connector(**w.a)\n    tool.harness_add_wire(**w)\n"
+         "    tool.harness_route(wire=w.id)");
+    for (int i = 30; i < 33; ++i)
+        call("h-" + std::to_string(i), "harness_check", "belly harness", true, "task-1", "Harness");
+    progress(160, 5240000, 346000, 6.58, 252000, nullptr);   // the retry resolved: no retry_state
+    ::feedTurnActivity(A, "sub_run", {{"id", "Harness"}, {"purpose", purpose}, {"status", "done"}});
+    // Main's own Eval, with a handful of bridged calls of its own. Its start status arrives first,
+    // as live, so its row exists (running) before the calls it bridges.
+    ::feedTurnActivity(A, "status", {{"phase", "tool"}, {"text", "Running eval"},
+                                     {"tool_name", "eval"}, {"tool_call_id", "m-eval"}});
+    for (int i = 0; i < 6; ++i)
+        call("mb-" + std::to_string(i), i % 2 ? "measure_clearance" : "describe_part",
+             "belly part " + std::to_string(i), true, "m-eval", "");
+    call("m-eval", "eval", "survey the belly parts", true, "", "",
+         "for p in parts:\n    tool.describe_part(part=p)");
+    call("task-1", "task", "Harness", true, "", "");
+    call("m-verify", "verify_battery", "belly harness", false, "", "");
+    A.text = "The Harness sub-agent built the wiring study: connectors, wires and routes replace the "
+             "hand-modelled cylinders. Six routes still fail the bend check; the verification battery "
+             "flags them.";
+    markChatHistoryDirty();
+}
+
+void toolNestTick(AppState& st) {
+    auto& P = g_toolNest;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "toolnest") == 0;
+        if (!P.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        std::error_code ec;
+        P.dir = std::filesystem::absolute(std::string(repo ? repo : ".") + "/scratch/toolnest_shots", ec)
+                    .lexically_normal().string();
+        std::filesystem::remove_all(P.dir, ec);
+        std::filesystem::create_directories(P.dir, ec);
+        P.started = pipingNow();
+        P.report = {{"scenario", "toolnest"}, {"ok", false}, {"checks", nlohmann::json::array()},
+                    {"captures", nlohmann::json::array()}};
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120) { toolNestCheck("timeout", false, {{"step", P.step}}); return; }
+    if (st.frame < 5 || !P.capture.empty()) return;
+    st.activeWorkspace = AppState::Workspace::Model;
+    st.showAIPanel = true;
+    if (P.settle > 0) { --P.settle; return; }
+    if (!P.queued.empty()) { P.capture = P.queued; P.queued.clear(); return; }
+
+    // Open or close an owner the way a click does: the row's own state, revisions and the
+    // message's caches.
+    const auto setOwnerOpen = [&](ChatMsg& m, int rowKind, const std::string& stage, bool open) {
+        for (size_t i = 0; i < m.activity.size(); ++i) {
+            ActivityItem& a = m.activity[i];
+            if (a.rowKind != rowKind || a.stage != stage) continue;
+            a.expanded = open;
+            a.userToggled = true;
+            ++a.revision;
+            ++m.revision;
+            m.uiActivityDirtyFrom = std::min(m.uiActivityDirtyFrom, i);
+            m.uiCachedH = -1.0f;
+            return true;
+        }
+        return false;
+    };
+    const auto card = [](ChatMsg& m, const char* stage) -> const ActivityItem* {
+        for (const ActivityItem& a : m.activity)
+            if (a.rowKind == 17 && a.stage == stage) return &a;
+        return nullptr;
+    };
+    switch (P.step) {
+    case 0: {
+        glfwSetWindowSize(st.win, 1280, 1000);
+        toolNestSeed(st);
+        ChatMsg& A = st.chat.back();
+        const auto count = [&](auto pred) {
+            int n = 0;
+            for (const ActivityItem& a : A.activity) n += pred(a) ? 1 : 0;
+            return n;
+        };
+        const int harness = count([](const ActivityItem& a) { return a.subagentId == "Harness"; });
+        const int bridged = count([](const ActivityItem& a) { return a.parentId == "h-eval"; });
+        const int top = count([](const ActivityItem& a) {
+            return a.rowKind == 3 && a.parentId.empty() && a.subagentId.empty(); });
+        if (!toolNestCheck("feed_stamps_subagent_and_parent",
+                           harness == 94 && bridged == 60 && top == 4,
+                           {{"subagent_rows", harness}, {"bridged_rows", bridged}, {"top_level", top}}))
+            return;
+        const ActivityItem* harnessCard = card(A, "subrun:Harness");
+        const auto use = harnessCard ? ui::copilot::subRunUsageFromDetail(harnessCard->detail)
+                                     : ui::copilot::SubRunUsage{};
+        if (!toolNestCheck("card_keeps_latest_usage_across_frames",
+                           harnessCard && harnessCard->status == "done" && use.requests == 160 &&
+                               use.contextTokens == 346000 && use.contextWindow == 1000000 &&
+                               std::fabs(use.costUsd - 6.58) < 1e-9 && !use.retrying &&
+                               use.model == "anthropic/claude-sonnet-5-5:high",
+                           {{"requests", use.requests}, {"context_tokens", use.contextTokens},
+                            {"cost_usd", use.costUsd}, {"retrying", use.retrying},
+                            {"model", use.model}}))
+            return;
+        // An Eval whose final call never arrives did not succeed: the turn's end settles its
+        // row as stopped, never done.
+        ChatMsg orphan;
+        orphan.running = true;
+        ::feedTurnActivity(orphan, "status", {{"phase", "tool"}, {"text", "Running eval"},
+                                              {"tool_name", "eval"}, {"tool_call_id", "orphan"}});
+        ::feedTurnActivity(orphan, "run_finished", {{"status", "done"}});
+        const std::string orphanStatus =
+            orphan.activity.empty() ? std::string() : orphan.activity.front().status;
+        if (!toolNestCheck("unfinished_eval_settles_stopped", orphanStatus == "stopped",
+                           {{"status", orphanStatus}}))
+            return;
+        P.queued = P.dir + "/toolnest_01_collapsed.png";
+        P.settle = 12;
+        P.step = 1;
+        return;
+    }
+    case 1: {
+        if (!toolNestCheck("agent_card_opens",
+                           setOwnerOpen(st.chat.back(), 17, "subrun:Harness", true), {})) return;
+        glfwSetWindowSize(st.win, 1340, 1900);
+        P.queued = P.dir + "/toolnest_02_agent_open.png";
+        P.settle = 14;
+        P.step = 2;
+        return;
+    }
+    case 2: {
+        if (!toolNestCheck("eval_opens", setOwnerOpen(st.chat.back(), 3, "tool:h-eval", true), {})) return;
+        glfwSetWindowSize(st.win, 1340, 3000);
+        P.settle = 16;
+        P.step = 3;
+        return;
+    }
+    case 3:
+        P.queued = P.dir + "/toolnest_03_eval_open.png";
+        P.step = 4;
+        return;
+    case 4: {
+        // The run goes live again: owners closed, a second sub-agent asleep between provider retries.
+        ChatMsg& A = st.chat.back();
+        if (!toolNestCheck("owners_close",
+                           setOwnerOpen(A, 3, "tool:h-eval", false) &&
+                               setOwnerOpen(A, 17, "subrun:Harness", false), {})) return;
+        ::feedTurnActivity(A, "sub_run", {
+            {"id", "Scout"}, {"purpose", "Scout: survey the belly cavity clearances"},
+            {"status", "running"}, {"requests", 9}, {"tokens", 1200000},
+            {"context_tokens", 466000}, {"context_window", 1000000}, {"cost_usd", 2.14},
+            {"duration_ms", 61000}, {"resolved_model", "anthropic/claude-opus-4-1"},
+            {"retry_state", {{"attempt", 2}, {"max_attempts", 5}, {"delay_ms", 8000},
+                             {"error", "429 rate limited: retry after 8s"}}}});
+        A.running = true;
+        A.liveStatus = "Waiting for Scout";
+        glfwSetWindowSize(st.win, 1280, 1100);
+        P.settle = 14;
+        P.step = 5;
+        return;
+    }
+    case 5: {
+        const ActivityItem* scout = card(st.chat.back(), "subrun:Scout");
+        const auto use = scout ? ui::copilot::subRunUsageFromDetail(scout->detail)
+                               : ui::copilot::SubRunUsage{};
+        if (!toolNestCheck("retry_state_reaches_the_card",
+                           scout && scout->status == "running" && use.retrying &&
+                               use.retryAttempt == 2 && use.retryMax == 5 && use.requests == 9,
+                           {{"retrying", use.retrying}, {"attempt", use.retryAttempt},
+                            {"requests", use.requests}}))
+            return;
+        P.report["ok"] = true;
+        P.done = true;
+        P.capture = P.dir + "/toolnest_04_retry.png";
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+bool toolNestEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_toolNest;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        std::printf("toolnest: screenshot -> %s (%dx%d)\n", P.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = false;
+    if (P.done && P.capture.empty()) {
+        const std::string path = P.dir + "/toolnest_report.json";
+        std::ofstream out(path, std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        std::printf("toolnest: report -> %s ok=%d\n", path.c_str(), (int)P.report.value("ok", false));
         std::fflush(stdout);
         if (P.failed || !out) {
             std::fflush(nullptr);
@@ -8869,11 +9212,182 @@ void uxQualityTick(AppState& st) {
                      st.docMirror.tree() == s.baseline["sketch_tree"],
                      {{"active_tool", st.sketchMode->activeToolCmd()},
                       {"revision", st.docMirror.revision()}})) return;
-        st.sketchMode->exitSketch(st, true);
+        uxNext(21241, 0); return;
+    // Esc ladder (2D): armed tool -> disarm only; then (nothing armed/selected, no edits) -> Finish.
+    case 21241:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(21242);
+        return;
+    case 21242:
+        if (!uxCheck("sketch_escape_disarms_tool_without_leaving",
+                     st.sketchMode->active() && std::string(st.sketchMode->activeToolCmd()).empty() &&
+                     st.docMirror.revision() == s.baseline["sketch_revision"],
+                     {{"active_tool", st.sketchMode->activeToolCmd()},
+                      {"active", st.sketchMode->active()}})) return;
+        uxNext(21243, 0); return;
+    case 21243:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(21244);
+        return;
+    case 21244: {
+        if (!uxCheck("sketch_escape_finishes_unedited_sketch", !st.sketchMode->active(),
+                     {{"tree", st.docMirror.tree()}})) return;
+        const auto built = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Esc profile"},
+                {"refs", {{"plane", "plane.top"}}},
+                {"params", {{"entities", nlohmann::json::array({
+                    {{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}}, {"radius", 4.0},
+                     {"construction", false}}})},
+                    {"constraints", nlohmann::json::array()}}}}}}}));
+        s.secondary = built.id_map.is_object() ? built.id_map.value("$0", std::string()) : "";
+        if (!built.aicm_path.empty()) { std::string le; st.loadDocMesh(built.aicm_path, le); }
+        if (!uxCheck("sketch_escape_fixture", built.ok && !s.secondary.empty() &&
+                     st.sketchMode->enterForFeature(st, s.secondary),
+                     {{"error", built.error_message}, {"tree", built.tree}})) return;
+        s.baseline["esc_entry"] = st.docMirror.featureContent(s.secondary);
+        st.sketchMode->selectEntities({"e1"});
+        uxNext(21245, 4); return;
+    }
+    case 21245:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(21246);
+        return;
+    case 21246: {
+        if (!uxCheck("sketch_escape_clears_selection_without_leaving",
+                     st.sketchMode->active() && !st.sketchMode->hasEditableSelection(), {})) return;
+        st.sketchMode->selectEntities({"e1"});
+        s.baseline["esc_revision"] = st.docMirror.revision();
+        if (!uxCheck("sketch_escape_edit_fixture",
+                     st.sketchMode->onRibbonCommand(st, "sk_construction") &&
+                     st.docMirror.revision() != s.baseline["esc_revision"],
+                     {{"revision", st.docMirror.revision()}})) return;
+        uxNext(21247, 2); return;
+    }
+    case 21247:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(21248);
+        return;
+    case 21248:
+        if (!uxCheck("sketch_escape_after_edit_clears_selection_only",
+                     st.sketchMode->active() && !st.sketchMode->hasEditableSelection(), {})) return;
+        uxNext(21249, 0); return;
+    case 21249:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(21250);
+        return;
+    case 21250:
+        if (!uxCheck("sketch_escape_keeps_edited_sketch_open", st.sketchMode->active(),
+                     {{"revision", st.docMirror.revision()}})) return;
+        // Real Ctrl+Z through the sketcher's own undo path, back to the entry content.
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        uxNext(21251, 1); return;
+    case 21251:
+        if (s.input.key(ImGuiKey_Z)) uxNext(21252);
+        return;
+    case 21252: {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        if (!uxCheck("sketch_escape_undo_restores_entry_content",
+                     st.sketchMode->active() &&
+                     st.docMirror.featureContent(s.secondary) == s.baseline["esc_entry"],
+                     {{"content", st.docMirror.featureContent(s.secondary)},
+                      {"entry", s.baseline["esc_entry"]}})) return;
+        // An edit to a DIFFERENT feature must not count as a sketch edit.
+        const auto other = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Other feature"},
+                {"refs", {{"plane", "plane.top"}}},
+                {"params", {{"entities", nlohmann::json::array()},
+                            {"constraints", nlohmann::json::array()}}}}}}}));
+        if (!uxCheck("sketch_escape_other_feature_edit", other.ok, {{"error", other.error_message}}))
+            return;
+        uxNext(21253, 4); return;
+    }
+    case 21253:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(21254);
+        return;
+    case 21254:
+        if (!uxCheck("sketch_escape_finishes_after_undo_and_other_feature_edit",
+                     !st.sketchMode->active(), {{"tree", st.docMirror.tree()}})) return;
         uxNext(213, 8); return;
     case 213:
         if (!uxCheck("enter_actual_3d_sketch", st.sketch3dMode &&
                      st.sketch3dMode->enterNew(st), {{"tree", st.docMirror.tree()}})) return;
+        uxNext(2131, 4); return;
+    // Esc ladder (3D): armed tool -> disarm only; then (nothing armed/selected, no edits) -> Finish;
+    // an edited sketch is never left by Esc.
+    case 2131:
+        if (!uxCheck("sketch3d_escape_fixture", st.sketch3dMode->onRibbonCommand(st, "sk3d_line"),
+                     {})) return;
+        uxNext(2132, 2); return;
+    case 2132:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2133);
+        return;
+    case 2133:
+        if (!uxCheck("sketch3d_escape_disarms_tool_without_leaving", st.sketch3dMode->active(),
+                     {})) return;
+        uxNext(2134, 0); return;
+    case 2134:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2135);
+        return;
+    case 2135: {
+        if (!uxCheck("sketch3d_escape_finishes_unedited_sketch", !st.sketch3dMode->active(),
+                     {{"tree", st.docMirror.tree()}})) return;
+        if (!uxCheck("sketch3d_escape_fixture_armed", st.sketch3dMode->enterNew(st) &&
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_point"),
+                     {{"tree", st.docMirror.tree()}})) return;
+        s.baseline["esc3d_entry"] = st.docMirror.featureContent(st.sketch3dMode->sketchId());
+        // A committed edit of the sketch's own content lands while the Point tool is armed (the Esc
+        // ladder must still take the tool step first, then refuse to leave an edited sketch).
+        const int beforeEdit = st.docMirror.revision();
+        nlohmann::json editedParams = {
+            {"entities", nlohmann::json::array({
+                {{"id", "e1"}, {"type", "point"}, {"p", {1.0, 2.0, 3.0}}}})},
+            {"constraints", nlohmann::json::array()}};
+        const auto edit = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", st.sketch3dMode->sketchId()}, {"params", editedParams}}}));
+        if (!uxCheck("sketch3d_escape_edit_fixture",
+                     edit.ok && st.docMirror.revision() != beforeEdit,
+                     {{"error", edit.error_message}, {"revision", st.docMirror.revision()}})) return;
+        uxNext(2136, 4); return;
+    }
+    case 2136:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2137);
+        return;
+    case 2137:
+        if (!uxCheck("sketch3d_escape_after_edit_disarms_tool_only", st.sketch3dMode->active(),
+                     {{"revision", st.docMirror.revision()}})) return;
+        uxNext(2140, 0); return;
+    case 2140:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2141);
+        return;
+    case 2141: {
+        if (!uxCheck("sketch3d_escape_keeps_edited_sketch_open", st.sketch3dMode->active(),
+                     {{"revision", st.docMirror.revision()}})) return;
+        const auto undone = st.docUndo();
+        if (!uxCheck("sketch3d_escape_undo_restores_entry_content",
+                     undone.ok && st.docMirror.featureContent(st.sketch3dMode->sketchId()) ==
+                                      s.baseline["esc3d_entry"],
+                     {{"error", undone.error_message}})) return;
+        uxNext(2142, 2); return;
+    }
+    case 2142:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2143);
+        return;
+    case 2143: {
+        if (!uxCheck("sketch3d_escape_finishes_after_undo_to_entry", !st.sketch3dMode->active(),
+                     {{"tree", st.docMirror.tree()}})) return;
+        if (!uxCheck("sketch3d_escape_other_feature_fixture", st.sketch3dMode->enterNew(st),
+                     {{"tree", st.docMirror.tree()}})) return;
+        const auto other = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Other feature"},
+                {"refs", {{"plane", "plane.top"}}},
+                {"params", {{"entities", nlohmann::json::array()},
+                            {"constraints", nlohmann::json::array()}}}}}}}));
+        if (!uxCheck("sketch3d_escape_other_feature_edit", other.ok,
+                     {{"error", other.error_message}})) return;
+        uxNext(2144, 4); return;
+    }
+    case 2144:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2145);
+        return;
+    case 2145:
+        if (!uxCheck("sketch3d_escape_ignores_edits_to_other_features", !st.sketch3dMode->active(),
+                     {{"tree", st.docMirror.tree()}})) return;
+        if (!uxCheck("sketch3d_escape_restore_active_sketch", st.sketch3dMode->enterNew(st), {})) return;
         uxNext(214, 8); return;
     case 214:
         if (!uxContext(st, "sketch3d", {{"sk3d_line", true}, {"sketch3d_exit", true},
@@ -18653,12 +19167,19 @@ void settingsRouteTick(AppState& st) {
         }
         return p.input.click(shotPoint(*item));
     };
+    // Every AI tab and section route is reached through search: tabs, then sections inside tabs.
     static const char* queries[] = {"Session knobs", "Model roles", "Role prompts",
         "Skill editor", "Rule triggers", "Artifact validity", "Tool families", "Prompt assembly",
-        "AI provider"};
-    static const char* windows[] = {"##ai_harness_session", "##ai_model_roles", "##roleeditor",
+        "Plan preference", "Harness organization", "Vision routing", "Compaction",
+        "Project memory", "Auto-Learn", "LSP", "Max subagent nesting", "Maintenance",
+        "Developer", "AI provider"};
+    static const char* windows[] = {"##ai_harness_session", "##ai_basic_models", "##roleeditor",
         "##set_skill_list", "##set_trig_list", "##bench_artifact",
-        "##ai_tools_global", "##ai_dev_preview", "##tab_providers"};
+        "##ai_tools_global", "##ai_dev_preview",
+        "##ai_harness_session", "##ai_harness_org", "##ai_vision_routing", "##ai_compaction",
+        "##ai_memory", "##ai_memory", "##tab_coding", "##ai_subagent_limits", "##ai_maintenance",
+        "##tab_developer", "##tab_providers"};
+    static_assert(sizeof(queries) == sizeof(windows), "one expected window per search query");
     switch (p.step) {
     case 0:
         st.showAIPanel = true;
@@ -18688,9 +19209,9 @@ void settingsRouteTick(AppState& st) {
     case 5:
         // Exercise both search activation paths.
         if (p.route % 2 == 0) {
-            if (p.input.key(ImGuiKey_Enter)) next(6);
+            if (p.input.key(ImGuiKey_Enter)) next(6, 15);
         } else if (click("##row", "CommandSearch")) {
-            next(6);
+            next(6, 15);
         }
         break;
     case 6:
@@ -19001,14 +19522,14 @@ void modelSettingsTick(AppState& st) {
         p.baseline = p.reply; p.queryReady = false;
         st.showCommandSearch = true; next(1); break;
     case 1:
-        ImGui::GetIO().AddInputCharactersUTF8("Harness");
+        ImGui::GetIO().AddInputCharactersUTF8("Model roles");
         next(2); break;
     case 2:
         if (p.input.key(ImGuiKey_Enter)) next(3, 30);
         break;
     case 3: {
-        // A settings-search jump intentionally enables the global Advanced disclosure;
-        // turn it off with the real checkbox before checking Basic.
+        // Basic is the starting disclosure (a search jump to the Models tab leaves it alone);
+        // if anything turned Advanced on, turn it off with the real checkbox before checking Basic.
         if (st.settings.showAdvanced || p.input.phase) {
             if (click("##kit_check", "##settings_nav")) next(3, 8);
             break;
@@ -19326,7 +19847,7 @@ void modelSettingsTick(AppState& st) {
         st.showCommandSearch = true; next(229); break;
     }
     case 229:
-        ImGui::GetIO().AddInputCharactersUTF8("Harness");
+        ImGui::GetIO().AddInputCharactersUTF8("Model roles");
         next(230); break;
     case 230:
         if (p.input.key(ImGuiKey_Enter)) next(231, 30);
@@ -19459,9 +19980,12 @@ void modelSettingsTick(AppState& st) {
         if (!p.queryReady) break;
         if (!check("discard_restores_confirmed_assignment",
                    p.reply["model_sizes"] == p.baseline["model_sizes"] && !draftPresent(), p.reply)) return;
-        p.queryReady = false; next(35); break;
+        p.queryReady = false;
+        // Compaction lives on the Context tab.
+        st.openSettings = true; st.openSettingsTab = SettingsAiContext;
+        next(35, 20); break;
     case 35:
-        if (clickNative("##comp_mode", "##ai_memory", "Compaction (next turn)")) next(36);
+        if (clickNative("##comp_mode", "##ai_compaction", "Compaction (next turn)")) next(36);
         break;
     case 36:
         if (click("Snapcompact", "##Combo")) next(37, 20);
@@ -19473,15 +19997,16 @@ void modelSettingsTick(AppState& st) {
         if (!check("snapcompact_preserved_for_text_only_chat",
                    strategy == "snapcompact" &&
                    shotItem("Unavailable for this model: image input required. The selection is preserved.",
-                            false, "##ai_memory") &&
-                   shotItem("Compaction (next turn)", false, "##ai_memory") &&
-                   shotItem("Project memory", false, "##ai_memory") &&
-                   shotItem("No live agent session. Session controls are unavailable.", false, "##ai_memory") &&
-                   shotItem("Policy saved for future sessions; no live application reported.", false, "##ai_memory"),
+                            false, "##ai_compaction") &&
+                   shotItem("Compaction (next turn)", false, "##ai_compaction") &&
+                   shotItem("No live agent session. Session controls are unavailable.", false, "##ai_compaction") &&
+                   shotItem("Policy saved for future sessions; no live application reported.", false, "##ai_compaction"),
                    {{"strategy", strategy}, {"items", ui::audit::observedItems()}})) return;
         p.capture = "scratch/model_settings_shots/08_compaction_pending.png"; next(38); break;
     }
     case 38:
+        // Back to the Models tab for the narrow-width checks.
+        st.openSettings = true; st.openSettingsTab = SettingsAiModels;
         glfwSetWindowSize(st.win, 1000, 720);
         next(39, 20); break;
     case 39: {
@@ -21975,6 +22500,7 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- mid-run message delivery captions (CHUDWARE_SHOT=steerstatus) ----------
     steerStatusTick(st);
+    toolNestTick(st);
     compactUiTick(st);
     chatInlineTick(st);
     composerSpellTick(st);
@@ -22464,6 +22990,34 @@ void ScenarioRunner::runAppearance(AppState& st) {
     if (apSettle > 0) { --apSettle; return; }
     if (!apCapture.empty()) return;  // only advance when no capture is pending
     std::string err;
+    // CHUDWARE_SHOT_SETTINGS_TAB=ai: every AI tab, Basic then Advanced at the normal width, then
+    // narrow (1000x720) and phone (560x760) widths where the tab strip wraps.
+    struct AiShot { int route; const char* name; bool advanced; int w, h; };
+    static const AiShot kAiShots[] = {
+        {SettingsAiModels,   "models_basic",    false, 0, 0},
+        {SettingsAiBehavior, "behavior_basic",  false, 0, 0},
+        {SettingsAiContext,  "context_basic",   false, 0, 0},
+        {SettingsAiMemory,   "memory_basic",    false, 0, 0},
+        {SettingsProviders,  "providers_basic", false, 0, 0},
+        {SettingsAiModels,   "models",    true, 0, 0},
+        {SettingsAiBehavior, "behavior",  true, 0, 0},
+        {SettingsAiContext,  "context",   true, 0, 0},
+        {SettingsAiMemory,   "memory",    true, 0, 0},
+        {SettingsAiTools,    "tools",     true, 0, 0},
+        {SettingsAiCoding,   "coding",    true, 0, 0},
+        {SettingsAiAgents,   "agents",    true, 0, 0},
+        {SettingsProviders,  "providers", true, 0, 0},
+        {SettingsAiDeveloper, "developer", true, 0, 0},
+        {SettingsAiRolePrompts, "role_prompts", true, 0, 0},
+        {SettingsAiRules,    "rules",     true, 0, 0},
+        {SettingsAiSkills,   "skills",    true, 0, 0},
+        {SettingsAiModels,   "models_narrow",    true, 1000, 720},
+        {SettingsAiCoding,   "coding_narrow",    true, 1000, 720},
+        {SettingsAiModels,   "models_phone",     true, 560, 760},
+        {SettingsAiAgents,   "agents_phone",     true, 560, 760},
+    };
+    static bool aiSeries = false, runtimeWaited = false;
+    static size_t aiShot = 0;
     switch (apStep) {
         case 0: {  // modeled part: box 60x40x10 (mirrors evalmass's single-feature build)
             if (!st.docMirror.newPart(st.worker, err)) {
@@ -22486,12 +23040,17 @@ void ScenarioRunner::runAppearance(AppState& st) {
             apSettle = kSettle; ++apStep; break;
         }
         case 1: {  // open Settings, jumped to the Appearance tab (index 0) by default.
-            // CHUDWARE_SHOT_SETTINGS_TAB overrides the target index so this scenario doubles as
-            // the capture path for any Settings tab (including the retired indices, which the
-            // modal folds onto AI + the sub-tab that absorbed them).
+            // CHUDWARE_SHOT_SETTINGS_TAB overrides the target SettingsRoute so this scenario
+            // doubles as the capture path for any Settings page, AI tab or section (including the
+            // retired indices 4..7, which the modal folds onto the AI tab that absorbed them).
+            // The value "ai" captures every AI tab instead (case 3): Basic and Advanced at the
+            // normal width, then at the narrow and phone widths.
             const char* tabEnv = std::getenv("CHUDWARE_SHOT_SETTINGS_TAB");
             int tab = 0;
-            if (tabEnv && tabEnv[0]) {
+            if (tabEnv && std::strcmp(tabEnv, "ai") == 0) {
+                aiSeries = true;
+                tab = SettingsAI;
+            } else if (tabEnv && tabEnv[0]) {
                 char* end = nullptr;
                 long v = std::strtol(tabEnv, &end, 10);
                 if (end != tabEnv && v >= 0 && v < 32) tab = (int)v;
@@ -22505,6 +23064,33 @@ void ScenarioRunner::runAppearance(AppState& st) {
         case 2: {  // capture the modal over the modeled part
             apCapture = apSavePath + "/appearance_01_settings.png";
             apSettle = kSettle; ++apStep; break;
+        }
+        case 3: {  // AI tab series: open the next tab (done when the table is exhausted)
+            if (!aiSeries || aiShot >= sizeof(kAiShots) / sizeof(kAiShots[0])) {
+                apDone = true;
+                std::printf("appearance: scenario complete\n");
+                std::fflush(stdout);
+                break;
+            }
+            const AiShot& shot = kAiShots[aiShot];
+            if (shot.w > 0) glfwSetWindowSize(st.win, shot.w, shot.h);
+            st.settings.showAdvanced = shot.advanced;
+            st.openSettings = true;
+            st.openSettingsTab = shot.route;
+            // The first Advanced tab starts the OMP runtime that answers omp_config_get: give
+            // that first read time to land before capturing.
+            const bool firstAdvanced = shot.advanced && !runtimeWaited;
+            if (firstAdvanced) runtimeWaited = true;
+            apSettle = firstAdvanced ? 240 : kSettle * 4;
+            ++apStep; break;
+        }
+        case 4: {  // capture the AI tab opened by case 3, then go back for the next one
+            char file[96];
+            std::snprintf(file, sizeof(file), "/appearance_ai_%02d_%s.png", (int)aiShot + 1,
+                          kAiShots[aiShot].name);
+            apCapture = apSavePath + file;
+            ++aiShot;
+            apSettle = kSettle; apStep = 3; break;
         }
         default:
             apDone = true;
@@ -23571,6 +24157,11 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     bool steerBreak = false;
     if (steerStatusEndFrame(st, dw, dh, screenshotPath, steerBreak))
         return steerBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // toolnest: nested-call transcript captures + report; exits non-zero on failure.
+    bool toolNestBreak = false;
+    if (toolNestEndFrame(st, dw, dh, screenshotPath, toolNestBreak))
+        return toolNestBreak ? FrameAction::Break : FrameAction::Continue;
 
     bool compactUiBreak = false;
     if (compactUiEndFrame(st, dw, dh, screenshotPath, compactUiBreak))

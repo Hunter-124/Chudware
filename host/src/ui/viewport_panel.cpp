@@ -1043,8 +1043,19 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
     const nlohmann::json& params = feat->contains("params") && (*feat)["params"].is_object()
                                        ? (*feat)["params"] : nlohmann::json::object();
 
+    // A fillet/chamfer's handles sit ON the first selected edge and pull along the way the blend
+    // face grows. That frame comes from the engine's answer for the PM's edges well; until it has
+    // one there is nothing true to draw, and no handle beats one beside the world origin.
+    const bool blend = type == "fillet" || type == "chamfer";
+    ui::PropertyManager::BlendHandle blendAt;
+    if (blend) {
+        const bool pmOnFeature = st.propertyManager && st.propertyManager->active() &&
+                                 st.propertyManager->targetId() == fid;
+        if (!pmOnFeature || !st.propertyManager->blendHandle(blendAt)) return out;
+    }
+
     float anchor[3]; float extent = 1.0f;
-    bool hasAnchor = featureAnchor(st, fid, anchor, extent);
+    bool hasAnchor = !blend && featureAnchor(st, fid, anchor, extent);
 
     // Resolve a Combo field's currently-selected value (to honour DimIf enable conditions).
     auto comboValueOf = [&](const char* key) -> std::string {
@@ -1095,23 +1106,13 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
         c.rangeMin = fd.dimMin;
         c.rangeMax = fd.dimMax;
         c.dirW = dimWorldDir(fd.key);
-        // Dress-up dimensions belong on the affected surface, not at the whole body's centre
-        // plus an arbitrary fraction of its size (which placed the fillet radius on a shell's
-        // floor). Use a real face created by the feature, with no bbox-based displacement.
-        bool surfaceAnchored = false;
-        if (type == "fillet" || type == "chamfer") {
-            const auto owner = st.docMirror.ownerMap().find(fid);
-            if (owner != st.docMirror.ownerMap().end()) {
-                for (const auto& bf : owner->second.faces) {
-                    const uint64_t key = ((uint64_t)bf.first << 32) | bf.second;
-                    const auto face = st.faceNormalCache.find(key);
-                    if (face == st.faceNormalCache.end()) continue;
-                    const auto& geometry = face->second;
-                    for (int k = 0; k < 3; ++k) c.anchor[k] = geometry[k + 3];
-                    surfaceAnchored = true;
-                    break;
-                }
-            }
+        // Dress-up dimensions belong on the edge they round, not at the whole body's centre plus an
+        // arbitrary fraction of its size, and not along a world axis: the arrow for every size dim
+        // (radius, distance, second distance) pulls the way the blend face moves, and the angle
+        // dim keeps its own screen-space angle handle at the same spot.
+        if (blend) {
+            for (int k = 0; k < 3; ++k) c.anchor[k] = blendAt.anchor[k];
+            c.dirW = Vec3(blendAt.dir[0], blendAt.dir[1], blendAt.dir[2]);
         }
         // TASK A: the primary extrude/planar depth handle is constrained to the extruded surface and
         // oriented along the real extrusion axis (recovered from cached cap geometry), honouring the
@@ -1138,7 +1139,7 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
                 extrudeAnchored = true;
             }
         }
-        if (!extrudeAnchored && !surfaceAnchored && hasAnchor) {
+        if (!extrudeAnchored && hasAnchor) {
             // Spread the handles around the anchor so chips/arrows don't stack: nudge each one a
             // little further out along its own measured axis (or +Z for angles).
             Vec3 d = isAngle ? Vec3(0, 0, 1) : c.dirW;
@@ -1708,6 +1709,7 @@ static void drawManipArrow(ImDrawList* dl, const ImVec2& c, const ImVec2& tipP, 
 // (original) edge is drawn as a dashed 3D line at its old location so the user can see and click to
 // DESELECT edges the round has eaten away. Returns true while the cursor is over a dashed edge (the
 // caller suppresses the model pick); a left click over one removes that edge from the active well.
+// An edge also reads hot while its row in the form's Edges list is under the cursor.
 static bool drawBlendEdgeOverlay(AppState& st, const Renderer& renderer, ImGuiIO& io,
                                  const ImVec2& vr0, const ImVec2& vr1, int vw, int vh,
                                  bool imgHovered) {
@@ -1724,14 +1726,16 @@ static bool drawBlendEdgeOverlay(AppState& st, const Renderer& renderer, ImGuiIO
     float selF[4]; ui::Palette::withAlpha(ui::palette.statusWarn, selF, 0.90f);
     const ImU32 colSel = ui::Palette::toU32(selF);
     const ImU32 colHot = ui::Palette::toU32(ui::palette.accent);
+    float rimF[4]; ui::Palette::withAlpha(ui::palette.viewportEdge, rimF, 0.80f);
+    const ImU32 colRim = ui::Palette::toU32(rimF);   // keeps the ghost legible on light faces
     const float tol = 8.0f * S;
 
     // Project each edge polyline to screen. A point fails to project when it's behind the camera; we
     // keep per-point validity so partly-clipped loops still draw their visible spans.
-    struct Proj { std::vector<ImVec2> pts; std::vector<char> ok; bool closed; int pick; };
+    struct Proj { std::vector<ImVec2> pts; std::vector<char> ok; bool closed; int pick; int shape; };
     std::vector<Proj> projs; projs.reserve(segs.size());
     for (const auto& sg : segs) {
-        Proj pr; pr.closed = sg.closed; pr.pick = sg.pickIndex;
+        Proj pr; pr.closed = sg.closed; pr.pick = sg.pickIndex; pr.shape = sg.shapeIndex;
         pr.pts.reserve(sg.pts.size()); pr.ok.reserve(sg.pts.size());
         for (const auto& w : sg.pts) {
             ImVec2 sp; bool ok = ppProject(renderer, vr0, vr1, vw, vh, w.data(), sp);
@@ -1762,33 +1766,43 @@ static bool drawBlendEdgeOverlay(AppState& st, const Renderer& renderer, ImGuiIO
         return std::sqrt(best);
     };
 
-    int hotIdx = -1; float hotD = tol;
+    int hotPick = -1, hotShape = -1; float hotD = tol;
     if (imgHovered) {
         for (const auto& pr : projs) {
             float d = distToProj(pr, io.MousePos);
-            if (d < hotD) { hotD = d; hotIdx = pr.pick; }
+            if (d < hotD) { hotD = d; hotPick = pr.pick; hotShape = pr.shape; }
         }
     }
+    int listPick = -1, listShape = -1;
+    st.propertyManager->hoveredWellEdge(listPick, listShape);
 
     for (const auto& pr : projs) {
-        bool hot = (pr.pick == hotIdx);
+        bool hot = (pr.pick == hotPick && pr.shape == hotShape) ||
+                   (pr.pick == listPick && pr.shape == listShape);
         ImU32 col = hot ? colHot : colSel;
-        float thick = (hot ? 2.6f : 1.7f) * S;
+        float thick = (hot ? 3.0f : 2.2f) * S;
         int n = (int)pr.pts.size();
-        if (n == 1) { if (pr.ok[0]) dl->AddCircle(pr.pts[0], 4.0f * S, col, 12, thick); continue; }
+        if (n == 1) {
+            if (pr.ok[0]) {
+                dl->AddCircle(pr.pts[0], 4.0f * S, colRim, 12, thick + 2.0f * S);
+                dl->AddCircle(pr.pts[0], 4.0f * S, col, 12, thick);
+            }
+            continue;
+        }
         int last = pr.closed ? n : n - 1;
         for (int s = 0; s < last; ++s) {
             int j = (s + 1) % n;
             if (!pr.ok[s] || !pr.ok[j]) continue;
+            ppDashedLine(dl, pr.pts[s], pr.pts[j], colRim, thick + 2.0f * S, 7.0f * S, 5.0f * S);
             ppDashedLine(dl, pr.pts[s], pr.pts[j], col, thick, 7.0f * S, 5.0f * S);
         }
     }
 
-    if (hotIdx >= 0 && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        st.propertyManager->removeActiveWellPick(hotIdx);
+    if (hotPick >= 0 && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        st.propertyManager->removeActiveWellPick(hotPick, hotShape);
         return true;  // swallow the click (deselect, not a new pick)
     }
-    return hotIdx >= 0;
+    return hotPick >= 0;
 }
 
 // The push-pull handle for the single selected face: returns false when there is no single face
@@ -2731,7 +2745,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 const auto& tree = st.docMirror.tree();
                 if (tree.is_object()) {
                     auto tci = tree.find("components");
-                    if (tci != tree.end() && tci->is_array() && !tci->empty()) {
+                    auto tmi = tree.find("mesh_references");
+                    if ((tci != tree.end() && tci->is_array() && !tci->empty()) ||
+                        (tmi != tree.end() && tmi->is_array() && !tmi->empty())) {
                         hasSolidContent = true;
                     } else {
                         auto tfi = tree.find("features");

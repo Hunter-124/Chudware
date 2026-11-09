@@ -28,6 +28,7 @@
 // increment (A4/A5, faces) can reuse it for face picks.
 #pragma once
 
+#include <array>
 #include <map>
 #include <optional>
 #include <set>
@@ -68,6 +69,31 @@ struct EdgePicks {
 // fallback -> nearest-unique-edge mapping (see header note). Dangling reasons are
 // accumulated under the slot name "edges".
 EdgePicks resolve_edge_picks(const TopoDS_Shape& shape, const nlohmann::json& selectors);
+
+// One element of a fillet/chamfer `edges` ref slot, resolved to the unique edges it names.
+struct EdgeRefElement {
+    std::vector<TopoDS_Edge> edges;  // empty when the element named no edge on `shape`
+    std::string error;               // why it named none (empty on success)
+};
+
+// Resolve an `edges` ref slot — one selector/query object, or a list that may MIX geometry
+// queries and pick selectors — against `shape` exactly as the feature compiler does (queries
+// through resolve_geom_query; the plain pick selectors together through resolve_edge_picks'
+// one-to-one assignment; identical selectors are one pick), but keep WHICH element named WHICH
+// edges, so a caller can show and edit them one by one. A query may name many edges
+// ({"of":"edge","parallel":"z"}); a pick selector names one. Result is index-aligned with the
+// slot's elements (a single object is one element).
+std::vector<EdgeRefElement> resolve_edge_ref_elements(const TopoDS_Shape& shape,
+                                                      const nlohmann::json& edges_ref);
+
+// World-space polyline of one edge for display: two points for a line, an angular/chord
+// deflection sampling for any other curve. A closed edge drops its repeated last point and
+// sets `closed`. Empty `points` when the edge has no curve (degenerate).
+struct EdgePolyline {
+    std::vector<std::array<double, 3>> points;
+    bool closed = false;
+};
+EdgePolyline sample_edge_polyline(const TopoDS_Edge& edge);
 
 // The result of resolving a list of face selectors against a body: the unique faces
 // that resolved, plus one human-readable reason string per dangling selector.

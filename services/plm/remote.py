@@ -2,7 +2,7 @@
 
 Team concurrency v1 = advisory locks + sync, no merging (``aicad.plm/1`` §6).
 The vault (``.aicadvault/``) is a plain git repo (dulwich primary), so every
-non-``chudware-cloud`` remote kind — ``folder`` (bare repo on a filesystem
+remote kind — ``folder`` (bare repo on a filesystem
 path), ``ssh``, and ``https`` — shares one fetch/CAS-push implementation built
 on ``dulwich.client.get_transport_and_path``: dulwich already dispatches the
 wire protocol (local, git+ssh, smart-http) purely from the URL string, so the
@@ -11,8 +11,6 @@ switch (see ``_fetch_folder``/``_cas_push`` below). Destinations require explici
 local approval via ``add_remote``; fetched manifest edits never authorize a new
 destination. URLs are credential-free; auth uses local transport credentials.
 Auth failures surface as ``{ok:false, reason:"remote_auth"}``, never a traceback.
-``chudware-cloud`` stays reserved/config-only (contract §6.1): every sync/lock
-call against it returns ``{ok:false, reason:"reserved_remote"}``.
 
 Public surface (used by MCP / worker_rpc and by chudware-web session bootstrap)::
 
@@ -407,8 +405,7 @@ def _fetch_folder(repo: Repo, remote_url: str, remote_name: str = "origin") -> d
     location, or an ``https://`` location — ``porcelain.fetch`` resolves the
     transport via ``dulwich.client.get_transport_and_path`` purely from the
     URL string, so this one implementation already covers contract §6.1's
-    ``folder | ssh | https`` remote kinds. (``chudware-cloud`` never reaches
-    here; callers gate it before calling in.)
+    ``folder | ssh | https`` remote kinds.
 
     Also imports tracking refs under ``refs/remotes/<name>/`` and ensures
     ``refs/heads/*`` + HEAD are present after the fetch.
@@ -714,10 +711,7 @@ def clone_from_remote(
 # add_remote
 # ---------------------------------------------------------------------------
 
-def _remote_identity(
-    display_name: str | None = None,
-    account_id: str | None = None,
-) -> dict[str, Any]:
+def _remote_identity(display_name: str | None = None) -> dict[str, Any]:
     """Identity stored with a local remote profile, with an OS-user fallback."""
     author = _user_author()
     user_id = str(author.get("id") or "").strip()
@@ -726,14 +720,7 @@ def _remote_identity(
         user_id = getpass.getuser() or "user"
     if not display or display == "User":
         display = user_id
-    resolved_account = account_id
-    if resolved_account is None:
-        resolved_account = author.get("account_id")
-    return {
-        "user_id": user_id,
-        "display": display,
-        "account_id": str(resolved_account).strip() if resolved_account else None,
-    }
+    return {"user_id": user_id, "display": display}
 
 
 def _normalize_live_url(value: str) -> str:
@@ -783,12 +770,11 @@ def add_remote(
     kind: str = "folder",
     url: str | None = None,
     display_name: str | None = None,
-    account_id: str | None = None,
 ) -> dict[str, Any]:
     """Register a remote profile in the project manifest (contract §6.1 / §7).
 
-    ``chudware-cloud`` remains parseable but reserved. Live-server profiles use
-    the frozen WebSocket mode and keep bearer tokens outside the manifest.
+    Live-server profiles use the frozen WebSocket mode and keep bearer tokens
+    outside the manifest.
     """
     try:
         kind = (kind or "folder").strip()
@@ -799,9 +785,7 @@ def add_remote(
             return _err("invalid_mode", "remote name must not be an option or invalid ref")
         remote_url = url if url is not None else (str(path) if path is not None else None)
 
-        if kind == "chudware-cloud":
-            remote_url = None
-        elif kind == "folder":
+        if kind == "folder":
             if not remote_url:
                 return _err("invalid_mode", "a folder remote needs a path")
             try:
@@ -841,10 +825,8 @@ def add_remote(
                 identity = dict(identity)
                 if display_name is not None:
                     identity["display"] = str(display_name).strip()
-                if account_id is not None:
-                    identity["account_id"] = str(account_id).strip() or None
             else:
-                identity = _remote_identity(display_name, account_id)
+                identity = _remote_identity(display_name)
             entry = {
                 "id": (existing or {}).get("id") or ("r" + uuid.uuid4().hex[:8]),
                 "kind": kind,
@@ -857,16 +839,12 @@ def add_remote(
                     else manifest.REMOTE_CAPABILITIES
                 ),
             }
-            if kind == "chudware-cloud":
-                entry["reserved"] = True
             if existing is not None:
                 existing.update(entry)
                 for secret_key in list(existing):
                     if secret_key.casefold() in SECRET_FIELDS:
                         existing.pop(secret_key, None)
                 existing.pop("credential_repair_required", None)
-                if kind != "chudware-cloud":
-                    existing.pop("reserved", None)
                 entry = existing
             else:
                 remotes.append(entry)
@@ -921,8 +899,6 @@ def sync(project_dir: str | os.PathLike, remote: str = "origin") -> dict[str, An
         if entry is None:
             return _err("not_found", f"no remote named {remote!r}")
         remote_kind = entry.get("kind")
-        if remote_kind == "chudware-cloud":
-            return _err("reserved_remote", "Chudware Cloud is not available yet")
         if manifest.remote_mode(entry) == "live":
             return _err(
                 "live_join_required",
@@ -1141,7 +1117,6 @@ def _replay_divergent(
                                 "kind": author.get("kind", "user"),
                                 "id": author.get("id", "user"),
                                 "display": display,
-                                "account_id": author.get("account_id"),
                             }
                             new_data = json.dumps(md, indent=2, sort_keys=True).encode("utf-8")
                         except Exception:
@@ -1226,12 +1201,11 @@ def _write_lock_blob(repo: Repo, doc: dict[str, Any]) -> bytes:
     return blob.id
 
 
-def _lock_holder() -> tuple[str, str, str | None]:
+def _lock_holder() -> tuple[str, str]:
     author = _user_author()
     return (
         str(author.get("id") or "user"),
         str(author.get("display") or "User"),
-        str(author["account_id"]) if author.get("account_id") else None,
     )
 
 
@@ -1252,12 +1226,11 @@ def _lock_user_id(entry: dict[str, Any]) -> str:
 
 
 def _public_lock(entry: dict[str, Any]) -> dict[str, Any]:
-    """Stable status/override shape, tolerant of pre-account lock blobs."""
+    """Stable status/override shape, tolerant of lock blobs that carry only ``holder``."""
     return {
         "item_id": str(entry.get("item_id") or ""),
         "user_id": _lock_user_id(entry),
         "display": str(entry.get("display") or _lock_user_id(entry)),
-        "account_id": entry.get("account_id"),
         "acquired_at": str(entry.get("acquired_at") or ""),
         "expires_at": str(entry.get("expires_at") or ""),
     }
@@ -1285,8 +1258,6 @@ def list_locks(
         if entry is None:
             return _ok(locks=[])
         kind = entry.get("kind")
-        if kind == "chudware-cloud":
-            return _err("reserved_remote", "Chudware Cloud is not available yet")
         if manifest.remote_mode(entry) == "live":
             return _err(
                 "live_join_required",
@@ -1364,8 +1335,6 @@ def _lock_mutate(
             if entry is None:
                 return _err("not_found", f"no remote named {remote!r}")
             remote_kind = entry.get("kind")
-            if remote_kind == "chudware-cloud":
-                return _err("reserved_remote", "Chudware Cloud is not available yet")
             if manifest.remote_mode(entry) == "live":
                 return _err(
                     "live_join_required",
@@ -1381,7 +1350,7 @@ def _lock_mutate(
         finally:
             v.close()
 
-        holder_id, holder_display, holder_account_id = _lock_holder()
+        holder_id, holder_display = _lock_holder()
         for _attempt in range(_CAS_RETRIES):
             repo = _open_vault_repo(project_dir)
             try:
@@ -1420,7 +1389,6 @@ def _lock_mutate(
                         "holder": holder_id,
                         "user_id": holder_id,
                         "display": holder_display,
-                        "account_id": holder_account_id,
                         "acquired_at": _now_iso(),
                         "expires_at": time.strftime(
                             "%Y-%m-%dT%H:%M:%SZ",
@@ -1484,7 +1452,6 @@ def plm_add_remote(
     name: str,
     url: str | None = None,
     display_name: str | None = None,
-    account_id: str | None = None,
 ) -> dict[str, Any]:
     return add_remote(
         project_dir,
@@ -1493,7 +1460,6 @@ def plm_add_remote(
         kind=kind,
         url=url,
         display_name=display_name,
-        account_id=account_id,
     )
 
 

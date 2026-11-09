@@ -139,11 +139,15 @@ std::string build_obstacles(const json& params, const Scene& scene, double od_mm
             const auto& item = list[i];
             const std::string prefix = "keepouts[" + std::to_string(i) + "]";
             if (!item.is_object()) return prefix + " must be an object";
+            // Both refusals spell out the accepted forms: callers otherwise guess field names.
+            const char* const forms =
+                "; a keepout is {\"aabb\": [[xmin,ymin,zmin],[xmax,ymax,zmax]], \"name\"?, \"clearance_mm\"?} "
+                "or {\"body\": id|name|component, \"clearance_mm\"?}";
             for (auto it = item.begin(); it != item.end(); ++it)
                 if (it.key() != "body" && it.key() != "aabb" && it.key() != "clearance_mm" && it.key() != "name")
-                    return prefix + " has unknown field: " + it.key();
+                    return prefix + " has unknown field: " + it.key() + forms;
             const bool body = item.contains("body"), box = item.contains("aabb");
-            if (body == box) return prefix + " must specify exactly one of body or aabb";
+            if (body == box) return prefix + " must specify exactly one of body or aabb" + forms;
             double gap = default_clearance_mm;
             if (item.contains("clearance_mm") &&
                 (!number(item["clearance_mm"], gap) || gap < 0 || gap > kMaxCoordinate))
@@ -191,7 +195,9 @@ std::string build_obstacles(const json& params, const Scene& scene, double od_mm
     for (size_t j = 0; j < scene.bodies.size(); ++j) {
         if (ignored[j]) continue;
         const auto& b = scene.bodies[j];
-        const std::string prefix = "scene body " + std::to_string(b.id);
+        const std::string prefix =
+            (b.name.empty() || b.name.size() > kMaxName ? std::string("body") : b.name) +
+            " (#" + std::to_string(b.id) + ")";
         if (b.pos.size() / 3 > 3 * kMaxTriangles)
             return prefix + " has too many vertices (maximum 3000000)";
         if (b.name.size() > kMaxName || b.component.size() > kMaxName)
@@ -205,7 +211,8 @@ std::string build_obstacles(const json& params, const Scene& scene, double od_mm
                 return prefix + " has non-finite or out-of-range vertex coordinates";
         if (result.owners.size() >= kMaxOwners) return "too many obstacle owners (maximum 4096)";
         const int owner = static_cast<int>(result.owners.size());
-        add_owner(b.id, b.name.empty() ? "body" : b.name, false, clearance[j]);
+        const size_t before = triangles.size();
+        size_t degenerate = 0;
         for (size_t n = 0; n < b.idx.size(); n += 3) {
             TriF t{};
             t.owner = owner;
@@ -215,9 +222,17 @@ std::string build_obstacles(const json& params, const Scene& scene, double od_mm
                 for (size_t k = 0; k < 3; ++k) t.v[3 * v + k] = b.pos[3 * vertex + k];
             }
             const V3 a(t.v[0], t.v[1], t.v[2]), c(t.v[3], t.v[4], t.v[5]), d(t.v[6], t.v[7], t.v[8]);
-            if (norm2(cross(c - a, d - a)) == 0.0) return prefix + " contains a degenerate triangle";
+            if (norm2(cross(c - a, d - a)) == 0.0) { ++degenerate; continue; }
             triangles.push_back(t);
         }
+        const bool usable = triangles.size() > before;
+        if (degenerate > 0) {
+            std::string note = prefix + ": skipped " + std::to_string(degenerate) +
+                               " degenerate (zero-area) display triangles";
+            if (!usable) note += "; no usable triangles remain, body ignored";
+            result.warnings.push_back(std::move(note));
+        }
+        if (usable) add_owner(b.id, b.name.empty() ? "body" : b.name, false, clearance[j]);
     }
     for (const auto& box : boxes) {
         if (result.owners.size() >= kMaxOwners) return "too many obstacle owners (maximum 4096)";

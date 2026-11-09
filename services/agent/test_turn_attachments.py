@@ -25,6 +25,7 @@ import zlib
 
 from services.agent import agent_turn
 from services.agent import mission_dispatch
+from services.agent import skills
 
 
 class _RecordingProvider:
@@ -65,6 +66,8 @@ def _png(path, *, pixels=b"\x00\xff\x00\x00"):
 
 
 def _run(request, provider, **kw):
+    # Skill injection dedupes per session process-wide; every run here is a fresh conversation.
+    skills.reset_session()
     return agent_turn.run_turn(
         request,
         provider,
@@ -229,9 +232,7 @@ def test_no_attachments_is_byte_identical_to_before():
     c = _RecordingProvider()
     _run("summarize this part", c, attachments=[])
     assert a.seen_messages == b.seen_messages == c.seen_messages
-    assert a.seen_messages == [
-        {"role": "user", "content": [{"type": "text", "text": "summarize this part"}]}
-    ]
+    assert _images(_request_msg(a)) == []
 
 
 def test_attachments_ride_alongside_history(tmp_path):

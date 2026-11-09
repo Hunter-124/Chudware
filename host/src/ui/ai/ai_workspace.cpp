@@ -238,11 +238,12 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
 // ---- Options view (v3): run-behavior + workspace-visibility knobs -------------------
 // The model / API key / privacy controls are reachable ONLY on the main Settings page
 // (Settings -> AI). This view keeps the run-behavior knobs (same config.json fields, no
-// parallel store, shared verbatim with Settings -> AI -> Harness via
-// drawHarnessSessionKnobs) + the shared generation controls + the command-center visibility
-// prefs (agent.ui_*). 2-col stretch-same tables keep every label/control pair aligned
-// regardless of label length (a fixed SameLine(labelW) crowded longer labels against their
-// control) and a left indent keeps content off the panel's glass edge.
+// parallel store, shared verbatim with Settings -> AI -> Behavior via
+// drawHarnessSessionKnobs and drawSubagentLimitKnobs) + the shared generation controls + the
+// command-center visibility prefs (agent.ui_*). 2-col stretch-same tables keep every
+// label/control pair aligned regardless of label length (a fixed SameLine(labelW) crowded
+// longer labels against their control) and a left indent keeps content off the panel's glass
+// edge.
 static void drawOptionsView(AppState& st, bool busy) {
     const float S = ui::uiScale;
     const ImGuiTableFlags gridFlags =
@@ -279,12 +280,13 @@ static void drawOptionsView(AppState& st, bool busy) {
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
-    // Shared with Settings -> AI -> Harness: the exact same widgets/fields, one source of
-    // truth. Covers plan/subagent/advisor preference, role adoption, proactive advisor,
-    // vision, offline mode, show-thoughts, project memory, redaction,
-    // refine-pass cap, max subagent nesting, memory budget.
+    // Shared with Settings -> AI -> Behavior and Agents: the exact same widgets/fields, one
+    // source of truth. Covers plan/subagent/advisor preference, proactive advisor, vision,
+    // offline mode, show-thoughts, redaction, chat display and, in Advanced mode, the subagent
+    // tool-call budget and max nesting.
     sectionHeader("Workflow");
     if (ui::drawHarnessSessionKnobs(st, S)) saveSettings(st.settings);
+    if (st.settings.showAdvanced) ui::drawSubagentLimitKnobs(S);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));
 
     sectionHeader("Generation");
@@ -295,7 +297,7 @@ static void drawOptionsView(AppState& st, bool busy) {
     sectionHeader("More");
     if (ImGui::Button("Open full AI settings\xE2\x80\xA6")) {
         st.openSettings    = true;
-        st.openSettingsTab = 2;   // Settings modal tab order: Appearance 0, General 1, AI 2
+        st.openSettingsTab = SettingsAI;
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     ImGui::PushStyleColor(ImGuiCol_Text,

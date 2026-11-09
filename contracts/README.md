@@ -30,6 +30,10 @@ Board physics contract revision 2 documents the KiCad STEP sidecar's unknown
 geometry fields and retained `aicad.boardphys/1` identifier.
 PLM contract revision 3 documents KiCad file tracking and ECAD diff sections;
 the manifest's `aicad.plm/1` schema identifier remains unchanged.
+PLM contract revision 4 removes the reserved hosted remote kind and the reserved
+account identity field ([plm.md Appendix I](plm.md#appendix-i--reserved-hosted-remote-and-account-identity-removed-contract-revision-4));
+the manifest identifier again remains unchanged, while the live-session protocol,
+whose participant identity changed on the wire, moves to `aicad.plm-live/2`.
 
 Schema ids keep the historical `aicad.` prefix for data compatibility.
 
@@ -134,7 +138,7 @@ Domain seams:
 - `sourcing_schema.md` — sourcing schema (`aicad.sourcing/1`).
 - `fabrication_services.md` — quote-your-own-geometry fabrication services (`aicad.fab/1`).
 - `plm.md` — PLM / version control (`aicad.plm/1`, `aicad.plm/2`).
-- `plm_live.md` — PLM live-session protocol (`aicad.plm-live/1`).
+- `plm_live.md` — PLM live-session protocol (`aicad.plm-live/2`).
 - `plm_planning.md` — PLM planning (`aicad.planning/1`, `aicad.planning/2`).
 - `cad_graph.md` — CAD project graph, v1.
 

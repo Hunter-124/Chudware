@@ -168,6 +168,7 @@ private:
     std::string docId_;                 // guard: auto-exit if the active doc changes
     std::string cancelCheckpoint_;
     long cancelRevision_ = -1;
+    nlohmann::json entryContent_;       // this sketch's {params, refs} at entry; Esc leaves only while equal
 
     // cached persisted params (source of truth for edits; refreshed from the doc tree)
     nlohmann::json entJson_ = nlohmann::json::array();

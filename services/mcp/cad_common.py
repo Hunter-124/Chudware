@@ -2357,6 +2357,36 @@ def note_document_saved(doc_id: str, result: dict) -> None:
                 docs[doc_id] = {**record, "path": path, "saved": saved}
 
 
+COMPONENT_KEY_RE = re.compile(r"k\d+(?:#\d+)?")
+
+
+def component_key_refusal(doc_id: str, key: str, tool: str) -> Optional[str]:
+    """Why an assembly component KEY (``k23``, or a pattern instance ``k23#2``) names no placed
+    body, or None when it is not a key this document can judge (a part document, or a
+    component literally NAMED like a key). Callers resolve keys against ``asm_world_bodies``
+    first; this only runs for the leftovers, so a suppressed / failed / nonexistent component
+    is refused by name instead of falling through to some other resolver."""
+    try:
+        comps = [c for c in ((cb.call("doc_tree", {"doc_id": doc_id}) or {}).get("tree") or {})
+                 .get("components") or [] if isinstance(c, dict)]
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the original error
+        return None
+    if not comps or any(c.get("name") == key for c in comps):
+        return None
+    base = key.split("#", 1)[0]
+    row = next((c for c in comps if c.get("id") == base), None)
+    if row is None:
+        ids = ", ".join(str(c.get("id")) for c in comps if not c.get("suppressed"))
+        return (f"{tool}: {key!r} is not a component of this assembly. Pass a component id "
+                f"(or exact name) from: {ids}.")
+    label = f"{key!r} ({row.get('name') or base})"
+    if row.get("suppressed"):
+        return (f"{tool}: component {label} is suppressed, so it has no placed body. "
+                "Unsuppress it or leave it out of the selection.")
+    return (f"{tool}: component {label} has no placed body in the solved assembly "
+            "(its source failed to load or build) — see describe_assembly.")
+
+
 def _known_touched_saved_path(doc_id: str) -> Optional[str]:
     """Return a known current deliverable, never an older path over recovery work."""
     with _TOUCHED_LOCK:

@@ -1,6 +1,6 @@
 """Authoritative PLM live-session client and synchronous worker manager.
 
-The wire side implements the frozen ``aicad.plm-live/1`` protocol.  The manager
+The wire side implements the frozen ``aicad.plm-live/2`` protocol.  The manager
 keeps WebSocket I/O on one asyncio thread while the Python worker remains a
 synchronous RPC process.  Bearer tokens are process inputs only; profiles and
 vault history never receive them.
@@ -26,7 +26,7 @@ from websockets.exceptions import ConnectionClosed
 
 from services.plm import manifest
 
-SCHEMA = "aicad.plm-live/1"
+SCHEMA = "aicad.plm-live/2"
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_OPS_BYTES = 1024 * 1024
 MAX_OPS = 1000
@@ -96,12 +96,10 @@ def _uint(value: Any, field: str) -> int:
 def _participant(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise LiveClientError("invalid_participant", "A live participant identity is required.")
-    participant = {
+    return {
         "id": _text(value.get("id"), "participant id"),
         "display": _text(value.get("display"), "participant display name"),
-        "account_id": _text(value.get("account_id"), "participant account", nullable=True),
     }
-    return participant
 
 
 def _snapshot(value: Any) -> dict[str, Any]:
@@ -786,7 +784,6 @@ class LiveClientManager:
         return _participant({
             "id": identity.get("user_id"),
             "display": identity.get("display"),
-            "account_id": identity.get("account_id"),
         })
 
     def _core_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:

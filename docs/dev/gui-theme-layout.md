@@ -16,7 +16,7 @@ individual panels contain is covered in [gui-architecture.md](gui-architecture.m
 | `host/src/ui/metrics.h` | DPI-aware fonts and spacing; every GUI dimension scales through it |
 | `host/src/ui/layout.cpp/.h` | Dockspace, pinned glass columns, overlay band, `resetOverlayColumns()` |
 | `host/src/render/backdrop_text.cpp/.h` | Same-frame, per-fragment contrast for Copilot and shared AI-chat text |
-| `host/src/ui/settings_modal.cpp` | Settings dialog (theme toggle, AI provider, units, glass knobs) |
+| `host/src/ui/settings_modal.cpp` | Settings window: a table of categories (Appearance, General, AI); AI is a tab strip over Chudware sections and OMP's own settings (see [GUI architecture](gui-architecture.md) "Settings window") |
 | `host/src/ui/file_dialog.cpp`, `equations_dialog.cpp`, `profiler_window.cpp` | App-level modals |
 | `host/src/ui/toast.cpp`, `cursors.cpp` | Notifications, cursor set |
 | `host/src/ui/provider_usage.h/.cpp` | The single AI-provider usage poller; Settings and the composer usage rings both read it. Never add a second poller |

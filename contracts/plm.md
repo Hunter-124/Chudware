@@ -244,20 +244,12 @@ never data loss.
 {"id": "r1", "kind": "folder", "url": "/mnt/share/Gearbox.git", "name": "Team NAS"}
 {"id": "r2", "kind": "ssh",    "url": "git@host:gearbox.git",     "name": "Self-host"}
 {"id": "r3", "kind": "https",  "url": "https://git.example/gearbox.git", "name": "Gitea"}
-{"id": "r4", "kind": "chudware-cloud", "url": null, "name": "Chudware Cloud", "reserved": true}
 ```
 
-- **`kind`** ∈ **`folder` | `ssh` | `https` | `chudware-cloud`**.
+- **`kind`** ∈ **`folder` | `ssh` | `https`** (plus `plm-server`, Appendix E).
 - `folder` = a bare git repo on a filesystem path (shared drive / USB, plan §3.3
   Tier "Shared folder"). `ssh`/`https` = any git remote the user controls (bare
   repo over SSH, Gitea, GitHub, …) — self-hosting for free.
-- **`chudware-cloud` is RESERVED, config-only.** It MAY appear in the manifest as a
-  configured entry, but **no `plm_*` tool implements sync against it in
-  `aicad.plm/1`** — every remote tool MUST return
-  `{ok:false, reason:"reserved_remote", hint:"Chudware Cloud is not available yet"}`
-  for a `kind:"chudware-cloud"` remote. Implementation is behind the **Pillar-12
-  human gate** (plan §3.3, non-goal §6). The seam exists so the config surface is
-  stable; the behavior is deliberately absent.
 
 Credential-bearing remote URLs are rejected before a link or remote can enter
 new history. A destination carried by versioned metadata is not network
@@ -347,19 +339,19 @@ envelope. Signatures take one object; responses are the shape shown.
 | `plm_compare` | `{project_id, commit_a, commit_b, item_id}` | `{ok, doc_diff, eval_compare?}` | **Reuses** `doc_diff` (semantic) + `eval_compare` (visual); this tool orchestrates, it does not re-specify diffing. |
 | `plm_status` | `{project_id}` | `{ok, items:[…], head, dirty, ai_mode, remotes, locks}` | Project state for the Hub/badges. |
 | `plm_set_ai_mode` | `{project_id, mode}` | `{ok, ai_mode}` | `mode` ∈ `manual|assisted|managed` (§4). |
-| `plm_add_remote` | `{project_id, kind, url?, name}` | `{ok, remote}` | Register a remote profile (§6.1); `chudware-cloud` accepted config-only. |
-| `plm_sync` | `{project_id, remote_id}` | `{ok, pulled, pushed, conflicts_copied:[…]}` | One-button sync (§6.3–6.4). `chudware-cloud` → `reserved_remote`. |
+| `plm_add_remote` | `{project_id, kind, url?, name}` | `{ok, remote}` | Register a remote profile (§6.1). |
+| `plm_sync` | `{project_id, remote_id}` | `{ok, pulled, pushed, conflicts_copied:[…]}` | One-button sync (§6.3–6.4). |
 | `plm_lock` | `{project_id, item_id, remote_id}` | `{ok, lock}` | Advisory lock via CAS (§6.3). |
 | `plm_unlock` | `{project_id, item_id, remote_id}` | `{ok}` | Release a lock via CAS. |
 
 **Reserved (named, NOT specified by `aicad.plm/1`)** — slots so the tool family +
 enums are stable; do not implement under this contract:
 `plm_branch`, `plm_merge`, `plm_where_used` (where-used is derived; its dedicated
-tool is reserved for the project Hub), `plm_cloud_login` (Pillar-12 gate).
+tool is reserved for the project Hub).
 
 **Reason codes** (`reason` field): `no_vault`, `invalid_project`, `invalid_item`,
 `preflight_failed`, `stale_ref`, `unsaved_changes`, `locked`, `contended`,
-`reserved_remote`, `remote_unreachable`, `invalid_mode`, `not_found`.
+`remote_unreachable`, `invalid_mode`, `not_found`.
 
 ### 7.1 In-process `VaultClient` seam — `services/plm/client.py` (normative)
 
@@ -733,7 +725,7 @@ participant buildgraph node that produced it.
 
 Remote profiles gain one OPTIONAL kind, `plm-server`, with capabilities
 `snapshot_sync`, `live_coedit`, and `presence`. Its WebSocket live-session
-behavior is frozen separately as `aicad.plm-live/1` in
+behavior is frozen separately as `aicad.plm-live/2` in
 [`contracts/plm_live.md`](plm_live.md).
 
 This extension does not alter §6 dumb-remote sync or locks. Folder, SSH, and
@@ -786,3 +778,26 @@ than exploding a native ZIP container; the historical `.ecad+` handling above
 applies only to legacy files. `ecad_diff` retains its existing four board change
 lists and adds vias, zones and outline, plus schematic object sections including
 symbols, wires and labels.
+
+## Appendix I — Reserved hosted remote and account identity removed (contract revision 4)
+
+Contract revision 4 removes two seams that never had an implementation behind
+them. The manifest's `aicad.plm/1` schema identifier is unchanged: no manifest
+field changes shape, and a manifest written under an earlier revision still
+loads.
+
+- The reserved remote kind, its `reserved` profile flag, the `reserved_remote`
+  reason code and the reserved `plm_cloud_login` tool slot are removed from §6.1
+  and §7. `plm_add_remote` accepts `folder`, `ssh`, `https` and `plm-server`; any
+  other kind returns `invalid_mode`. A profile left in an older manifest under a
+  removed kind is not interpreted, and sync, lock and join against it return
+  `invalid_mode`.
+- The nullable `account_id` is removed from the remote profile `identity`
+  (`{user_id, display}`), from the §6.2 lock rows tools return, and from the §3.4
+  `author` record written for new entries, and the `plm_add_remote` `account_id`
+  argument and the `CHUDWARE_ACCOUNT_ID` environment override no longer exist.
+  `CHUDWARE_USER_ID` and `CHUDWARE_USER_DISPLAY` remain the OS-user identity
+  overrides. A lock blob or history entry written earlier may still carry a null
+  `account_id`; readers ignore it.
+- The live-session participant identity changes in lockstep and is versioned
+  there: `aicad.plm-live/2` ([`plm_live.md`](plm_live.md)).

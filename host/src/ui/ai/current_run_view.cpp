@@ -625,6 +625,11 @@ static std::string toolCountText(const AgentTraceAgent& a) {
     return s;
 }
 
+// "160 requests · ctx 346k / 1M · $6.58" — the model has its own row/segment where shown.
+static std::string traceUsageText(const AgentTraceAgent& a) {
+    return copilot::subRunUsageLine(a.usage, std::string());
+}
+
 static void drawRoster(AppState& st, float height) {
     ImGui::BeginChild("##current_roster", ImVec2(0, height),
                       ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
@@ -651,6 +656,8 @@ static void drawRoster(AppState& st, float height) {
         else if (e.reg) detail = !e.reg->statusNote.empty() ? e.reg->statusNote : e.reg->brief;
         else detail = e.tr->brief;
         std::string secondary = entryStatus(e);
+        const std::string usage = e.tr ? traceUsageText(*e.tr) : std::string();
+        if (!usage.empty()) secondary += " · " + usage;
         if (!detail.empty()) secondary += " · " + detail;
         std::string meta;
         if (e.tr) {
@@ -696,6 +703,8 @@ static void drawTraceFacts(const AgentTraceAgent& a, bool live) {
         if (a.lastStepTs > 0.0) last += " · " + kit::fmtAgo(a.lastStepTs);
         kit::keyValueRow("Last step", last.c_str());
     }
+    const std::string usage = traceUsageText(a);
+    if (!usage.empty()) kit::keyValueRow("Usage", usage.c_str());
 }
 
 // A sub-agent the trace knows but the registry does not (e.g. a Omp `task` sub-agent):
@@ -1226,6 +1235,10 @@ static void drawHubRoster(AppState& st, const ImVec2& size) {
         std::string secondary = e.status;
         const std::string model = hubModel(e);
         if (!model.empty()) secondary += " \xC2\xB7 " + model;
+        if (e.hasTrace) {
+            const std::string usage = traceUsageText(e.tr);
+            if (!usage.empty()) secondary += " \xC2\xB7 " + usage;
+        }
         const std::string& task = hubTask(e);
         if (!task.empty()) secondary += " \xC2\xB7 " + task;
         std::string meta;

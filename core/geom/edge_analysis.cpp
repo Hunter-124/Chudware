@@ -13,6 +13,7 @@
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
 #include <GProp_GProps.hxx>
 #include <Geom2d_Curve.hxx>
 #include <GeomAbs_CurveType.hxx>
@@ -545,6 +546,69 @@ json edge_analysis(const TopoDS_Shape& shape, const json& options) {
             {"unclassified_edges", std::move(unclassified)},
             {"skipped_edges", {{"seam_or_degenerate", seam_or_degenerate},
                                {"non_manifold_or_free", non_manifold_or_free}}}};
+}
+
+std::optional<EdgeBlendFrame> edge_blend_frame(
+    const TopoDS_Edge& edge, const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces) {
+    try {
+        const BRepAdaptor_Curve curve(edge);
+        const double f = curve.FirstParameter(), l = curve.LastParameter();
+        if (!std::isfinite(f) || !std::isfinite(l) || f == l) return std::nullopt;
+        // Half the ARC LENGTH, not half the parameter range: they differ on any non-uniformly
+        // parameterised curve (an ellipse, a spline) and the handle must sit mid-edge.
+        double t = 0.5 * (f + l);
+        const double length = GCPnts_AbscissaPoint::Length(curve);
+        if (std::isfinite(length) && length > 1e-12) {
+            const GCPnts_AbscissaPoint half(curve, 0.5 * length, f);
+            if (half.IsDone() && half.Parameter() >= f && half.Parameter() <= l)
+                t = half.Parameter();
+        }
+        gp_Pnt p;
+        gp_Vec tangent;
+        curve.D1(t, p, tangent);
+        EdgeBlendFrame out;
+        out.mid = {p.X(), p.Y(), p.Z()};
+
+        if (!edge_faces.Contains(edge) || tangent.SquareMagnitude() < 1e-24) return out;
+        std::vector<TopoDS_Face> faces;  // distinct: a seam lists its one face twice
+        for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromKey(edge)); it.More(); it.Next()) {
+            const TopoDS_Face face = TopoDS::Face(it.Value());
+            if (std::none_of(faces.begin(), faces.end(),
+                             [&](const TopoDS_Face& g) { return g.IsSame(face); }))
+                faces.push_back(face);
+        }
+        if (faces.size() != 2) return out;
+        const int sign_a = traversal_sign(faces[0], edge), sign_b = traversal_sign(faces[1], edge);
+        if (sign_a == 0 || sign_b == 0 || sign_a == sign_b) return out;
+        const double fraction = (t - f) / (l - f);
+        gp_Vec na, nb;
+        if (!outward_normal(edge, faces[0], fraction, na) ||
+            !outward_normal(edge, faces[1], fraction, nb))
+            return out;
+
+        // Same sign test as edge_analysis: each face's traversal of the edge against nA x nB.
+        tangent.Normalize();
+        const gp_Vec cross = na.Crossed(nb);
+        const double sa = tangent.Multiplied(sign_a).Dot(cross);
+        const double sb = -tangent.Multiplied(sign_b).Dot(cross);
+        constexpr double kTiny = 1e-9;
+        bool convex = true;  // exactly tangent faces: either answer is the one surface normal
+        if (std::abs(sa) > kTiny && std::abs(sb) > kTiny) {
+            if ((sa > 0) != (sb > 0)) return out;
+            convex = sa > 0;
+        } else if (std::abs(sa) > kTiny || std::abs(sb) > kTiny) {
+            convex = (std::abs(sa) > kTiny ? sa : sb) > 0;
+        }
+        gp_Vec bisector = na.Added(nb);
+        if (bisector.Magnitude() < 1e-6) return out;  // knife edge: no bisector
+        bisector.Normalize();
+        if (convex) bisector.Reverse();
+        out.grow = std::array<double, 3>{bisector.X(), bisector.Y(), bisector.Z()};
+        out.concave = !convex;
+        return out;
+    } catch (const Standard_Failure&) {
+        return std::nullopt;
+    }
 }
 
 } // namespace chudware::geom

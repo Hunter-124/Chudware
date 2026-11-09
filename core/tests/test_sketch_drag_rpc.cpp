@@ -330,3 +330,134 @@ TEST_CASE("guarded sketch preview preserves foreign edits and undo history") {
     CHECK(exited.contains("revision"));
     doc_close(doc_id);
 }
+
+namespace {
+// The status row of feature `id` in an ops response (null when absent).
+json status_of(const json& response, const std::string& id) {
+    for (const auto& row : response.at("rebuild").at("feature_status"))
+        if (row.value("id", std::string()) == id) return row;
+    return json();
+}
+// Construction geometry never changes the profile regions the extrude consumes.
+json construction_line(const char* id, double y) {
+    return json{{"id", id}, {"type", "line"}, {"construction", true},
+                {"p1", json::array({100.0, y})}, {"p2", json::array({120.0, y})}};
+}
+size_t entity_count(const json& tree, const std::string& fid) {
+    for (const auto& f : tree.at("features"))
+        if (f.value("id", std::string()) == fid) return f.at("params").at("entities").size();
+    return 0;
+}
+}  // namespace
+
+// An interactive sketch session compiles the history only up to its sketch: the edit reports every
+// later feature rolled back, leaves no rollback bar in the document, keeps one undo step per edit,
+// and sketch_exit rebuilds the complete history under a new revision.
+TEST_CASE("sketch session edits roll the history back to the sketch until exit") {
+    using namespace chudware::doc;
+    auto [doc_id, fid] = make_square_at_origin();
+    const json built = doc_apply_ops(doc_id, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", json{{"type", "extrude"}, {"name", "E"},
+            {"params", {{"depth", 5}, {"mode", "new"}}},
+            {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", fid},
+                                                    {"hint_index", 0}}})}}}}}},
+        json{{"op", "add_feature"}, {"feature", json{{"type", "box"}, {"name", "B"},
+            {"params", {{"length", 5}, {"width", 5}, {"height", 5}}}}}}}), false);
+    const std::string extrude = built.at("id_map").at("$0").get<std::string>();
+    const std::string box = built.at("id_map").at("$1").get<std::string>();
+    REQUIRE_MESSAGE(status_of(built, box).value("ok", false), built.dump());
+    const size_t before = entity_count(built.at("tree"), fid);
+
+    const auto session = doc_sketch_enter(doc_id, fid).at("session_id").get<std::uint64_t>();
+    const json add = json::array({json{{"op", "sketch_add_entity"}, {"sketch", fid},
+                                       {"entity", construction_line("e9", 0)}}});
+    const json edit = doc_apply_ops(doc_id, -1, add, false, true, false, session, false);
+    CHECK(status_of(edit, fid).value("rolled_back", true) == false);
+    CHECK(status_of(edit, extrude).value("rolled_back", false));
+    CHECK(status_of(edit, box).value("rolled_back", false));
+    CHECK(edit.at("rebuild").at("doc_status").at("rolled_back_to") == fid);
+    CHECK_FALSE(edit.contains("exact"));
+    CHECK_FALSE(edit.at("tree").contains("rollback_after"));
+    CHECK(entity_count(edit.at("tree"), fid) == before + 1);
+
+    // The sketch's own queries keep working against the rolled-back view.
+    CHECK(doc_sketch_solve(doc_id, fid, session).at("entities").size() == before + 1);
+    CHECK(doc_sketch_regions(doc_id, fid).is_object());
+
+    // Without the session the same kind of batch rebuilds everything.
+    const json other = doc_apply_ops(doc_id, -1, json::array({json{{"op", "sketch_add_entity"},
+        {"sketch", fid}, {"entity", construction_line("e10", 5)}}}), false);
+    CHECK_FALSE(status_of(other, box).value("rolled_back", true));
+    CHECK(doc_undo(doc_id).at("tree") == edit.at("tree"));
+
+    // Exit rolls forward under a new revision; the edit is one undo step.
+    const json shown = doc_apply_ops(doc_id, -1, json::array({json{{"op", "sketch_add_entity"},
+        {"sketch", fid}, {"entity", construction_line("e11", 10)}}}), false, true, false, session, false);
+    doc_sketch_solve(doc_id, fid, session);  // the editor re-solves after every edit
+    const json exited = doc_sketch_exit(doc_id, fid, shown.at("revision"), session);
+    CHECK(exited.at("revision").get<long>() > shown.at("revision").get<long>());
+    CHECK_FALSE(status_of(exited, extrude).value("rolled_back", true));
+    CHECK_FALSE(status_of(exited, box).value("rolled_back", true));
+    CHECK_FALSE(exited.at("tree").contains("rollback_after"));
+    CHECK(entity_count(doc_undo(doc_id).at("tree"), fid) == before + 1);
+    doc_close(doc_id);
+}
+
+// Convert Entities and the associative references it records resolve against the history through
+// the edited sketch, so they keep the session's edits rolled back instead of forcing the complete
+// rebuild. A property-manager preview of a feature behaves the same way until its final edit.
+TEST_CASE("sketch session and preview keep convert references in the rolled-back view") {
+    using namespace chudware::doc;
+    auto [doc_id, source] = make_square_at_origin();
+    const json built = doc_apply_ops(doc_id, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", json{{"type", "sketch"}, {"name", "B"},
+            {"params", {{"entities", json::array({construction_line("e1", 0)})},
+                        {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "add_feature"}, {"feature", json{{"type", "extrude"}, {"name", "E"},
+            {"params", {{"depth", 5}, {"mode", "new"}}},
+            {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", source},
+                                                    {"hint_index", 0}}})}}}}}},
+        json{{"op", "add_feature"}, {"feature", json{{"type", "box"}, {"name", "Bx"},
+            {"params", {{"length", 5}, {"width", 5}, {"height", 5}}}}}}}), false);
+    const std::string target = built.at("id_map").at("$0").get<std::string>();
+    const std::string extrude = built.at("id_map").at("$1").get<std::string>();
+    const std::string box = built.at("id_map").at("$2").get<std::string>();
+    REQUIRE_MESSAGE(status_of(built, box).value("ok", false), built.dump());
+
+    const auto session = doc_sketch_enter(doc_id, target).at("session_id").get<std::uint64_t>();
+    const json convert = doc_apply_ops(doc_id, -1, json::array({json{{"op", "sketch_convert"},
+        {"sketch", target},
+        {"refs", json::array({json{{"kind", "sketch_entity"}, {"sketch", source}, {"entity", "e1"}}})}}}),
+        false, true, false, session, false);
+    CHECK(convert.at("rebuild").at("doc_status").at("rolled_back_to") == target);
+    CHECK(status_of(convert, box).value("rolled_back", false));
+    bool has_refs = false;
+    for (const auto& f : convert.at("tree").at("features"))
+        if (f.value("id", std::string()) == target)
+            has_refs = f.at("params").contains("external_refs") && !f.at("params").at("external_refs").empty();
+    CHECK(has_refs);
+    // The sketch now carries associative references; its next edit is still rolled back.
+    const json next = doc_apply_ops(doc_id, -1, json::array({json{{"op", "sketch_add_entity"},
+        {"sketch", target}, {"entity", construction_line("e20", 15)}}}),
+        false, true, false, session, false);
+    CHECK(next.at("rebuild").at("doc_status").at("rolled_back_to") == target);
+    CHECK(status_of(next, box).value("rolled_back", false));
+    doc_sketch_solve(doc_id, target, session);
+    const json exited = doc_sketch_exit(doc_id, target, next.at("revision"), session);
+    CHECK_FALSE(status_of(exited, box).value("rolled_back", true));
+    CHECK_FALSE(exited.at("tree").contains("rollback_after"));
+
+    // A property-manager preview of the extrude rebuilds only through it.
+    const json edit = json::array({json{{"op", "edit_feature"}, {"id", extrude},
+                                        {"params", {{"depth", 6}}}}});
+    const json preview = doc_apply_ops(doc_id, -1, edit, false, true, false, 0, false, extrude);
+    CHECK(status_of(preview, box).value("rolled_back", false));
+    CHECK_FALSE(status_of(preview, extrude).value("rolled_back", true));
+    CHECK(preview.at("rebuild").at("doc_status").at("rolled_back_to") == extrude);
+    CHECK_FALSE(preview.at("tree").contains("rollback_after"));
+    const json final_edit = doc_apply_ops(doc_id, -1, edit, true);
+    CHECK_FALSE(status_of(final_edit, box).value("rolled_back", true));
+    CHECK_FALSE(final_edit.at("rebuild").at("doc_status").contains("rolled_back_to"));
+    doc_close(doc_id);
+}

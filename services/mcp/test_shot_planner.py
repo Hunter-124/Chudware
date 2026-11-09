@@ -517,17 +517,39 @@ def test_zero_or_null_camera_distance_autofits(distance):
 def test_assembly_component_target_uses_world_bounds_and_faces(monkeypatch):
     box = {"min": [20, 0, 0], "max": [30, 5, 6]}
     face = _face("Fcomponent", "top", (25, 2, 6), (0, 0, 1), 50)
+    # k9 is the SECOND placed body but its solids are STEP ordinals 1050-1051: doc_query's
+    # body_id is the position (2), never an ordinal (that was "body_id 1051 out of range").
+    bodies = [{"component": "k1", "body_id": 1, "source_ordinals": list(range(1, 1050)),
+               "bbox": {"min": [0, 0, 0], "max": [1, 1, 1]}},
+              {"component": "k9", "body_id": 7, "source_ordinals": [1050, 1051], "bbox": box}]
     def call(method, params):
         if method == "asm_world_bodies":
-            return {"bodies": [{"component": "k9", "body_id": 2,
-                                "source_ordinals": [3], "bbox": box}]}
-        assert method == "doc_query" and params["query"]["body_id"] == 3
+            return {"bodies": bodies}
+        assert method == "doc_query" and params["query"]["body_id"] == 2
         return {"matches": [face]}
     monkeypatch.setattr(ct_render.cb, "call", call)
     resolved, bounds, point = ct_render._render_target("doc-assembly", "k9", _BOX_BB)
     assert resolved["kind"] == "component" and resolved["matches"] == [face]
     assert bounds["min"] == (20, 0, 0) and bounds["max"] == (30, 5, 6)
     assert point is None
+
+
+@pytest.mark.parametrize("suppressed, fragment", [(True, "is suppressed"), (None, "not a component")])
+def test_assembly_component_key_without_a_body_is_refused_by_name(monkeypatch, suppressed, fragment):
+    comps = [{"id": "k1", "name": "base"}]
+    if suppressed:
+        comps.append({"id": "k35", "name": "xl4015", "suppressed": True})
+    def call(method, params):
+        if method == "asm_world_bodies":
+            return {"bodies": [{"component": "k1", "body_id": 1, "source_ordinals": [1],
+                                "bbox": {"min": [0, 0, 0], "max": [1, 1, 1]}}]}
+        assert method == "doc_tree"
+        return {"tree": {"components": comps}}
+    monkeypatch.setattr(ct_render.cb, "call", call)
+    with pytest.raises(ValueError, match=fragment) as err:
+        ct_render._render_target("doc-assembly", "k35" if suppressed else "k99", _BOX_BB)
+    assert "render_part" in str(err.value)
+
 
 def test_an_explicit_view_is_still_one_single_shot(monkeypatch):
     calls = _install(monkeypatch, _box(), _BOX_BB)

@@ -18,7 +18,7 @@ Per-feature discipline for solid modeling.
 2. **Preflight** — `preflight_ops` with the planned op when available (dangling refs, insane fillet vs wall, downstream break risk).
 3. **Apply** — `add_features([...])` with plain-word face/edge queries.
 4. **Verify** — `describe_part` / `measure_part` on the affected region; `check_feature_overlap` after booleans.
-5. **Rebuild failure** — `regen_diagnose` first; `undo` when the approach is wrong. Two identical failures ⇒ change approach or escalate, never a third blind retry.
+5. **Rebuild failure** — read the reply's `error` / `failed_features` / `structural_findings` first (no model is called); `regen_diagnose` only when you want a proposed repair; `undo` when the approach is wrong. Two identical failures ⇒ change approach or escalate, never a third blind retry.
 
 ## Ordering
 

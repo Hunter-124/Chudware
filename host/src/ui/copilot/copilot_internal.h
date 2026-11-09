@@ -364,7 +364,9 @@ void drawFirmTeamCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmCommCard(ActivityItem& a, const ui::Fonts& fonts);
 void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts);
 // `live`: the row is running inside a running turn — shimmer + elapsed instead of a static title.
-void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live);
+// `body` (optional) draws inside the card under the title: the calls this sub-agent made.
+void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live,
+                    const std::function<void()>& body = nullptr);
 
 // ---- AI-VC (agent version control) rollback (cards) ----
 // Shared with the AI workspace's checkpoint strip (ai/plan_board.cpp); the chat transcript
@@ -527,9 +529,23 @@ bool queuedSendNowSteers(AppState& st, size_t index);
 // True while the user is editing a queued message in the pinned stack: the composer's queue
 // drain waits so a message is never sent out from under its editor.
 bool queuedPromptEditHoldsDrain();
+// Open the pinned stack's in-place editor on queued message `index` (Enter saves, Esc reverts).
+void beginQueuedPromptEdit(AppState& st, size_t index);
+// Edit / Cancel on a pending steer (sent, not yet read): ask the run to take it back unread.
+// Taken back, its bubble leaves the stack and the exact draft it was sent from heads the chat's
+// queue, opened in the in-place editor (`edit`) or handed back to the composer (Cancel). If the
+// agent already read it, the bubble stays and a toast says so.
+void withdrawPendingSteer(AppState& st, const std::string& steerId, bool edit);
+// A withdraw request for this steer is in flight.
+bool steerWithdrawPending(const std::string& steerId);
+// One withdraw outcome (the control channel's GL-thread drain; scenarios drive it directly).
+// `error` names why the call failed or was refused; empty when the run simply kept it.
+void applySteerWithdrawal(AppState& st, const std::string& convId, const std::string& steerId,
+                          bool withdrawn, bool edit, const std::string& error);
 // The pinned stack under the live turn: pending steers (sent, not yet read by the agent) and the
-// queued messages (not yet sent), as dimmed bubbles with quiet per-message actions. Drawn by the
-// chat log INSIDE its scrolling child, after the last message; `width` is the log's width.
+// queued messages (not yet sent), as dimmed bubbles with per-message actions (Edit / Cancel on
+// both, Send now on queued ones). Drawn by the chat log INSIDE its scrolling child, after the
+// last message; `width` is the log's width.
 void drawPendingMessageStack(AppState& st, float width);
 void drawComposer(AppState& st, bool busy, bool canRun);
 

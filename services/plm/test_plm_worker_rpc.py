@@ -480,7 +480,6 @@ def test_remote_identity_and_force_parameters_reach_worker_backend(monkeypatch):
         name="team",
         url="https://example.invalid/team",
         display_name="Sarah",
-        account_id="acct-42",
     )
     assert added["ok"]
     assert seen["add"] == (
@@ -491,7 +490,6 @@ def test_remote_identity_and_force_parameters_reach_worker_backend(monkeypatch):
             "kind": "https",
             "url": "https://example.invalid/team",
             "display_name": "Sarah",
-            "account_id": "acct-42",
         },
     )
 

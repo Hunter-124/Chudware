@@ -1,5 +1,6 @@
 #include "geom/shell_sections.h"
 #include "geom/booleans.h"
+#include "geom/dress.h"
 #include "geom/face_normal.h"
 #include "geom/op_history.h"
 
@@ -984,16 +985,6 @@ double volume_of(const TopoDS_Shape& s) {
     return g.Mass();
 }
 
-bool watertight(const TopoDS_Shape& s) {
-    TopTools_IndexedDataMapOfShapeListOfShape ef;
-    TopExp::MapShapesAndAncestors(s, TopAbs_EDGE, TopAbs_FACE, ef);
-    for (int i = 1; i <= ef.Extent(); ++i) {
-        if (BRep_Tool::Degenerated(TopoDS::Edge(ef.FindKey(i)))) continue;
-        if (ef(i).Extent() < 2) return false;
-    }
-    return true;
-}
-
 // Every sampled point of a result face that is off the original skin must lie t from the
 // kept skin. Returns the worst deviation (negative when no inner point was sampled).
 double wall_deviation(const TopoDS_Shape& result, const TopoDS_Shape& kept_skin, double t,
@@ -1207,7 +1198,7 @@ TopoDS_Shape hollow(Context& cx, const Plan& plan, bool exact_prisms) {
     for (TopExp_Explorer e(out, TopAbs_SOLID); e.More(); e.Next()) ++n_solids;
     if (n_solids != 1) return bail("the hollowed body is not one solid");
     if (!BRepCheck_Analyzer(out).IsValid()) return bail("the hollowed body failed BRepCheck validation");
-    if (!watertight(out)) return bail("the hollowed body is not watertight");
+    if (!is_watertight(out)) return bail("the hollowed body is not watertight");
     std::vector<TopoDS_Face> kept = cx.laterals;
     kept.insert(kept.end(), plan.caps.begin(), plan.caps.end());
     int samples = 0;

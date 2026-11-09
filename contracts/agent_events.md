@@ -420,3 +420,18 @@ keep their existing tool rows.
 - Supersedes "board preamble injected into subagent prompts" under Subagent governance: no
   coordination-board text is injected into any prompt; the board reaches models only as
   `coordinate_*` tool results.
+
+## Task sub-agent run usage (append-only, 2026-11-06)
+
+The `sub_run` row of a task sub-agent (`id` = the sub-agent id) gains optional run totals from
+OMP's `subagent_progress` `AgentProgress` (`services/agent/omp_events.py::_subagent_usage`).
+Each key is present only when the frame carries it as a finite non-negative number (a string
+for the model); lifecycle frames carry none, so consumers keep the latest value of each:
+`requests` (assistant requests), `tokens` (input + output + cache writes over the run),
+`context_tokens` / `context_window` (the latest request's prefix vs the model's window),
+`cost_usd`, `duration_ms`, `resolved_model` (`<provider>/<id>[:level]`) and `retry_state`
+`{attempt?, max_attempts?, delay_ms?, error?}`. `retry_state` is a snapshot: present only
+while the sub-agent sleeps between provider retries, so a progress frame (one carrying
+`requests`) without it means no retry is pending. Additive; display-only. GUI: the card's
+second line "160 requests · ctx 346k / 1M · $6.58 · model" and a "waiting on provider retry"
+chip, stored in the card's private detail trailer.

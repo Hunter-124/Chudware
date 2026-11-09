@@ -50,11 +50,27 @@ struct PropertyManagerTestAccess {
         pm.hydrateFilletEvidence(evidence);
     }
     static void units(PropertyManager& pm, bool ips) { pm.ips_ = ips; pm.reformatDimDisplays(); }
-    static nlohmann::json feature(PropertyManager& pm, bool final = false) {
+    static nlohmann::json feature(PropertyManager& pm, bool final = false,
+                                  const nlohmann::json& tree = nlohmann::json::object()) {
         pm.committing_ = final;
         nlohmann::json result;
-        pm.buildOpFeature(result);
+        pm.buildOpFeature(result, tree);
         return result;
+    }
+    // The blend Edges well's data path, driven exactly as openForEdit/the viewport drive it.
+    static bool applyEdges(PropertyManager& pm, const nlohmann::json& reply) {
+        std::vector<nlohmann::json> requested;
+        if (const PMField* well = pm.blendEdgeWell())
+            for (const auto& p : well->picks) requested.push_back(p.selector);
+        return pm.applyEdgeRefGeometry(reply, requested);
+    }
+    static bool applyEdgesFor(PropertyManager& pm, const nlohmann::json& reply,
+                              const std::vector<nlohmann::json>& requested) {
+        return pm.applyEdgeRefGeometry(reply, requested);
+    }
+    static bool toggleStored(PropertyManager& pm, const nlohmann::json& selector) {
+        PMField* well = pm.blendEdgeWell();
+        return well && pmToggleStoredEdge(*well, selector);
     }
 };
 }
@@ -375,6 +391,244 @@ void fillet_expression_evidence_preserves_authored_values() {
     assert(Access::feature(raw).at("params").at("radius") == "Radius");
 }
 
+// One edge as doc_feature_edges reports it: canonical pick selector + the polyline to draw.
+json straight(double x, double y) {
+    return {{"selector", {{"kind", "edge"}, {"surf", "line"}, {"centroid", {x, y, 10.0}},
+                          {"axis", {0.0, 0.0, 1.0}}, {"area_or_len", 20.0}, {"hint_index", 3},
+                          {"owner_feature", nullptr}}},
+            {"points", {{x, y, 0.0}, {x, y, 20.0}}}, {"closed", false}};
+}
+
+// A reopened fillet/chamfer shows what it selected. The compiler consumed those edges from the
+// displayed body, so the engine resolves the stored refs on the feature's INPUT body and the form
+// lists, draws and deselects them one by one — whatever form the stored refs had.
+void stored_blend_edges_are_listed_drawn_and_removable() {
+    // Agent-authored refs (carrier_L's fillets): geometry queries carry no centroid, so until the
+    // engine resolves them there is nothing to draw — and a query can name many edges.
+    const json single = {{"of", "edge"}, {"near", {433.0, 17.5, -11.0}}, {"count", 1}};
+    const json many = {{"of", "edge"}, {"parallel", "z"}};
+    const json reply = {{"feature", "f112"}, {"refs", json::array({
+        {{"index", 0}, {"error", nullptr}, {"edges", json::array({straight(0, 0)})}},
+        {{"index", 1}, {"error", nullptr},
+         {"edges", json::array({straight(40, 0), straight(40, 30), straight(0, 30)})}}})}};
+    auto reopen = [&](PropertyManager& pm, const char* type) -> PMField& {
+        Access::open(pm, type, true);
+        Access::load(pm, {{"params", {{"radius", 1.5}}},
+                          {"refs", {{"edges", json::array({single, many})}}}});
+        PMField& well = Access::field(pm, "edges", PMFieldKind::SelectorWell);
+        well.wellActive = true;
+        return well;
+    };
+
+    PropertyManager pm;
+    PMField& well = reopen(pm, "fillet");
+    assert(well.picks.size() == 2);
+    std::vector<PropertyManager::EdgeSeg> segs;
+    pm.collectActiveWellEdgeSegments(segs);
+    assert(segs.empty());
+    assert(pm.activeWellEdgeRows().size() == 2);  // one row per stored ref until resolved
+
+    assert(Access::applyEdges(pm, reply));
+    segs.clear();
+    pm.collectActiveWellEdgeSegments(segs);
+    assert(segs.size() == 4);  // every edge of every ref is drawn
+    assert(segs[0].pickIndex == 0 && segs[0].shapeIndex == 0 && segs[0].pts.size() == 2);
+    assert(!segs[0].closed);
+    assert(segs[3].pickIndex == 1 && segs[3].shapeIndex == 2);
+    assert(std::abs(segs[3].pts[0][0]) < 1e-6f && std::abs(segs[3].pts[1][2] - 20.0f) < 1e-6f);
+    const auto rows = pm.activeWellEdgeRows();
+    assert(rows.size() == 4);  // ...and listed
+    assert(rows[1].pickIndex == 1 && rows[1].shapeIndex == 0);
+    assert(rows[2].label.rfind("Edge 3", 0) == 0);
+
+    // Looking changes nothing: both queries are still what a preview sends.
+    assert(Access::feature(pm)["refs"]["edges"] == json::array({single, many}));
+    assert(!pm.previewPending());
+    // Deselecting the middle edge of the multi-edge query turns that query into one canonical pick
+    // per remaining edge, keeps the untouched ref as authored, and schedules a live preview.
+    assert(pm.removeActiveWellPick(1, 1));
+    assert(pm.previewPending());
+    assert(well.picks.size() == 3);
+    assert(Access::feature(pm)["refs"]["edges"] ==
+           json::array({single, straight(40, 0)["selector"], straight(0, 30)["selector"]}));
+    segs.clear();
+    pm.collectActiveWellEdgeSegments(segs);
+    assert(segs.size() == 3 && segs[1].pickIndex == 1 && segs[2].pickIndex == 2);
+    // A single-edge ref goes whole; a bad index removes nothing.
+    assert(pm.removeActiveWellPick(0, 0));
+    assert(Access::feature(pm)["refs"]["edges"] ==
+           json::array({straight(40, 0)["selector"], straight(0, 30)["selector"]}));
+    assert(!pm.removeActiveWellPick(9, 0));
+    assert(pm.removeActiveWellPick(0, 0) && pm.removeActiveWellPick(0, 0));
+    assert(!Access::ready(pm));  // nothing left to round
+    well.wellActive = false;
+    assert(!pm.removeActiveWellPick(0, 0));
+
+    // Picks made in the GUI store canonical selectors: they draw from their own fields before
+    // (or without) an engine answer — a straight edge as its segment, a circle as a loop.
+    PropertyManager made; Access::open(made, "fillet", true);
+    const json line = straight(5, 5)["selector"];
+    const json circle = {{"kind", "edge"}, {"surf", "circle"}, {"centroid", {0.0, 0.0, 12.0}},
+                         {"axis", {0.0, 0.0, 1.0}}, {"area_or_len", 8.0 * 3.14159265358979}};
+    Access::load(made, {{"params", {{"radius", 1.0}}},
+                        {"refs", {{"edges", json::array({line, circle})}}}});
+    Access::field(made, "edges", PMFieldKind::SelectorWell).wellActive = true;
+    segs.clear();
+    made.collectActiveWellEdgeSegments(segs);
+    assert(segs.size() == 2 && segs[0].pts.size() == 2 && !segs[0].closed);
+    assert(segs[1].closed && segs[1].pts.size() == 48);
+    for (const auto& p : segs[1].pts)
+        assert(std::abs(std::hypot(p[0], p[1]) - 4.0f) < 1e-3f && std::abs(p[2] - 12.0f) < 1e-3f);
+    assert(made.activeWellEdgeRows().size() == 2 && made.removeActiveWellPick(1));
+    assert(Access::feature(made)["refs"]["edges"] == json::array({line}));
+
+    // A viewport pick of an edge a stored ref names takes it OUT instead of adding it twice (the
+    // displayed body only still has the edge when the feature's own round failed). The pick is
+    // numbered on another body, so hint_index differs; the geometry decides.
+    PropertyManager toggled;
+    PMField& toggledWell = reopen(toggled, "fillet");
+    assert(Access::applyEdges(toggled, reply));
+    json live = straight(40, 30)["selector"];
+    live["hint_index"] = 99;
+    assert(Access::toggleStored(toggled, live));
+    assert(toggledWell.picks.size() == 3 && toggled.activeWellEdgeRows().size() == 3);
+    assert(!Access::toggleStored(toggled, straight(5, 5)["selector"]));
+    json arc = straight(40, 0)["selector"];
+    arc["surf"] = "circle";
+    assert(!Access::toggleStored(toggled, arc));  // same spot, another kind of curve
+
+    // An answer for a list the user has since changed is dropped; an unresolved ref is listed as such.
+    PropertyManager stale;
+    PMField& staleWell = reopen(stale, "fillet");
+    const std::vector<json> asked = {single, many};
+    staleWell.picks.pop_back();
+    assert(!Access::applyEdgesFor(stale, reply, asked));
+    PropertyManager lost; Access::open(lost, "fillet", true);
+    Access::load(lost, {{"params", {{"radius", 1.5}}}, {"refs", {{"edges", single}}}});
+    Access::field(lost, "edges", PMFieldKind::SelectorWell).wellActive = true;
+    assert(Access::applyEdges(lost, {{"refs", json::array({
+        {{"index", 0}, {"error", "the edge query matched no edges"}, {"edges", json::array()}}})}}));
+    segs.clear();
+    lost.collectActiveWellEdgeSegments(segs);
+    assert(segs.empty());
+    assert(lost.activeWellEdgeRows().size() == 1);
+    assert(lost.activeWellEdgeRows()[0].label == "Edge 1 (not found)");
+
+    // Chamfer shares the path; any other form draws no blend overlay.
+    PropertyManager chamfer;
+    reopen(chamfer, "chamfer");
+    assert(Access::applyEdges(chamfer, reply));
+    segs.clear();
+    chamfer.collectActiveWellEdgeSegments(segs);
+    assert(segs.size() == 4);
+    PropertyManager extrude; Access::open(extrude, "extrude", true);
+    Access::field(extrude, "profile", PMFieldKind::SelectorWell).wellActive = true;
+    segs.clear();
+    extrude.collectActiveWellEdgeSegments(segs);
+    assert(segs.empty() && extrude.activeWellEdgeRows().empty());
+}
+
+// The engine's per-edge handle frame: where the size handle sits and the way the blend grows.
+json framed(json edge, const std::array<double, 3>& mid, const std::array<double, 3>& grow) {
+    edge["mid"] = mid;
+    edge["grow"] = grow;
+    return edge;
+}
+
+bool near3(const std::array<float, 3>& v, float x, float y, float z) {
+    return std::abs(v[0] - x) < 1e-5f && std::abs(v[1] - y) < 1e-5f && std::abs(v[2] - z) < 1e-5f;
+}
+
+// A fillet/chamfer's Instant3D handle is anchored ON the first selected edge and pulls along the way
+// the blend face grows — both from the engine's answer for the edges well, which exists whichever
+// well is armed. Until the engine has answered there is NO handle: never one at the world origin or
+// along a world axis.
+void blend_size_handle_sits_on_the_first_selected_edge() {
+    const double h = std::sqrt(0.5);
+    const json top = {{"of", "edge"}, {"near", {40.0, 15.0, 20.0}}, {"count", 1}};
+    const json corner = {{"of", "edge"}, {"near", {0.0, 0.0, 10.0}}, {"count", 1}};
+    const json reply = {{"refs", json::array({
+        {{"index", 0}, {"error", nullptr},
+         {"edges", json::array({framed(straight(40, 15), {40.0, 15.0, 20.0}, {-h, 0.0, -h})})}},
+        {{"index", 1}, {"error", nullptr},
+         {"edges", json::array({framed(straight(0, 0), {0.0, 0.0, 10.0}, {h, h, 0.0})})}}})}};
+    auto reopen = [&](PropertyManager& pm, const char* type) -> PMField& {
+        Access::open(pm, type, true);
+        Access::load(pm, {{"params", {{"radius", 1.5}}},
+                          {"refs", {{"edges", json::array({top, corner})}}}});
+        return Access::field(pm, "edges", PMFieldKind::SelectorWell);
+    };
+
+    for (const char* type : {"fillet", "chamfer"}) {
+        PropertyManager pm;
+        PMField& well = reopen(pm, type);
+        PropertyManager::BlendHandle handle;
+        assert(!pm.blendHandle(handle));            // nothing answered yet: no handle
+        assert(pmBlendEdgesUnanswered(well));       // ...so the engine is (still) to be asked
+
+        assert(Access::applyEdges(pm, reply));
+        assert(!pmBlendEdgesUnanswered(well));      // answered: not asked again per preview
+        assert(!well.wellActive);                   // the handle does not depend on an armed well
+        std::vector<PropertyManager::EdgeSeg> segs;
+        pm.collectActiveWellEdgeSegments(segs);
+        assert(segs.empty());
+        assert(pm.blendHandle(handle));
+        assert(near3(handle.anchor, 40.0f, 15.0f, 20.0f));
+        assert(near3(handle.dir, -(float)h, 0.0f, -(float)h));
+
+        // Deselecting the first edge hands the handle to the next one — still on a real edge.
+        well.wellActive = true;
+        assert(pm.removeActiveWellPick(0, 0));
+        assert(pm.blendHandle(handle));
+        assert(near3(handle.anchor, 0.0f, 0.0f, 10.0f) && near3(handle.dir, (float)h, (float)h, 0.0f));
+        assert(pm.removeActiveWellPick(0, 0));
+        assert(!pm.blendHandle(handle));            // no edge left, no handle
+    }
+
+    // Edges picked in this session carry only their own selector (a centroid and an axis): that
+    // draws the dashed overlay but says nothing of the faces, so it gives no handle either.
+    PropertyManager made; Access::open(made, "fillet", true);
+    Access::load(made, {{"params", {{"radius", 1.0}}},
+                        {"refs", {{"edges", json::array({straight(5, 5)["selector"]})}}}});
+    PropertyManager::BlendHandle none;
+    assert(!made.blendHandle(none));
+    assert(pmBlendEdgesUnanswered(Access::field(made, "edges", PMFieldKind::SelectorWell)));
+
+    // An edge the engine could not give a direction for (no `grow`) is skipped for the next one;
+    // a non-unit direction is normalised; a zero direction is no direction.
+    PropertyManager partial;
+    reopen(partial, "fillet");
+    assert(Access::applyEdges(partial, {{"refs", json::array({
+        {{"index", 0}, {"error", nullptr}, {"edges", json::array({
+            [&] { json e = straight(40, 15); e["mid"] = {40.0, 15.0, 20.0}; return e; }()})}},
+        {{"index", 1}, {"error", nullptr}, {"edges", json::array({
+            framed(straight(0, 0), {0.0, 0.0, 10.0}, {0.0, 3.0, 4.0})})}}})}}));
+    PropertyManager::BlendHandle skip;
+    assert(partial.blendHandle(skip));
+    assert(near3(skip.anchor, 0.0f, 0.0f, 10.0f) && near3(skip.dir, 0.0f, 0.6f, 0.8f));
+    PropertyManager degenerate;
+    reopen(degenerate, "chamfer");
+    assert(Access::applyEdges(degenerate, {{"refs", json::array({
+        {{"index", 0}, {"error", nullptr}, {"edges", json::array({
+            framed(straight(40, 15), {40.0, 15.0, 20.0}, {0.0, 0.0, 0.0})})}},
+        {{"index", 1}, {"error", nullptr}, {"edges", json::array({straight(0, 0)})}}})}}));
+    assert(!degenerate.blendHandle(skip));
+
+    // An answer that drew nothing is recorded as such, so it is not asked for again.
+    PropertyManager empty;
+    PMField& emptyWell = reopen(empty, "fillet");
+    assert(Access::applyEdges(empty, {{"refs", json::array({
+        {{"index", 0}, {"error", nullptr}, {"edges", json::array()}},
+        {{"index", 1}, {"error", nullptr}, {"edges", json::array()}}})}}));
+    assert(!pmBlendEdgesUnanswered(emptyWell) && !empty.blendHandle(skip));
+
+    // Only a fillet/chamfer has a blend handle; a closed form has none.
+    PropertyManager extrude; Access::open(extrude, "extrude", true);
+    assert(!extrude.blendHandle(skip));
+    PropertyManager closed;
+    assert(!closed.blendHandle(skip));
+}
+
 void unit_changes_preserve_invalid_and_uncommitted_text() {
     PropertyManager box; Access::open(box, "box", false, false);
     auto& length = Access::field(box, "length", PMFieldKind::Dim);
@@ -415,6 +669,22 @@ void unit_changes_preserve_invalid_and_uncommitted_text() {
     assert(pending.dimInputIps && pmParseDim(pending.dimBuf.data(), value, error, false, 25.4));
     assert(std::abs(value - 2.0) < 1e-4);
 }
+void new_features_are_numbered_past_existing_names() {
+    using Access = ui::PropertyManagerTestAccess;
+    const nlohmann::json tree = {{"features", nlohmann::json::array({
+        {{"id", "f1"}, {"name", "Fillet1"}},
+        {{"id", "f2"}, {"name", "Fillet3"}},        // gap: next is 4, never a reused number
+        {{"id", "f3"}, {"name", "Fillet2x"}},       // not "<title><digits>"
+        {{"id", "f4"}, {"name", "Fillets7"}},       // longer title is a different family
+        {{"id", "f5"}, {"name", "Chamfer9"}}})}};
+    PropertyManager fresh;
+    Access::open(fresh, "fillet");
+    assert(Access::feature(fresh, false, tree).value("name", "") == "Fillet4");
+    assert(Access::feature(fresh).value("name", "") == "Fillet1");   // empty document
+    PropertyManager edit;
+    Access::open(edit, "fillet", /*edit=*/true);
+    assert(Access::feature(edit, false, tree).value("name", "") == "Fillet");  // never renames
+}
 }
 
 int main() {
@@ -424,6 +694,9 @@ int main() {
     visibility_is_transitive_and_cycle_safe();
     edit_patch_removes_only_form_owned_inactive_values();
     fillet_expression_evidence_preserves_authored_values();
+    stored_blend_edges_are_listed_drawn_and_removable();
+    blend_size_handle_sits_on_the_first_selected_edge();
     unit_changes_preserve_invalid_and_uncommitted_text();
+    new_features_are_numbered_past_existing_names();
     return 0;
 }

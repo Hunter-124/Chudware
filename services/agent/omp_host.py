@@ -31,7 +31,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
-from services.agent import demo_lane
+from services.agent import demo_lane, omp_settings
 from services.agent.omp_bridge import BridgeError
 from services.agent.omp_questions import TurnQuestions
 from services.agent.online_turn import format_duration
@@ -337,6 +337,12 @@ _MEMORY_SHAPES = {
     "memory_search": (frozenset({"root", "query"}), frozenset({"limit"})),
     "memory_save": (frozenset({"root", "content"}), frozenset({"kind", "context", "source", "importance"})),
 }
+_CONFIG_SHAPES = {
+    "config_get": (frozenset({"keys"}), frozenset()),
+    "config_list": (frozenset({"sources"}), frozenset()),
+    "config_set": (frozenset({"key", "value"}), frozenset()),
+    "config_parse": (frozenset({"key", "value"}), frozenset()),
+}
 _TRANSIENT_SHAPES = {
     "get_login_providers": (frozenset(), frozenset()),
     "get_available_models": (frozenset(), frozenset()),
@@ -405,7 +411,7 @@ def _describe_model_rejection(client: Any, provider: str, model: str, exc: Excep
         )
         return (
             f"{provider} is not signed in to the agent service, so {provider}/{model} cannot run. "
-            f"Sign in under Settings -> Providers, or pick a model from a signed-in "
+            f"Sign in under Settings -> AI -> Providers, or pick a model from a signed-in "
             f"provider in the composer's model chip.{others}"
         )
     hints = ", ".join(sorted(m for m in same_provider if m)[:_MAX_MODEL_HINTS])
@@ -2232,6 +2238,58 @@ class OmpSessionHost:
             "queued": not send_now,
         }
 
+    def withdraw_steer(self, run_id, steer_id, *, credential_params=None) -> dict:
+        """Take one unread user steer back out of a live run without stopping it.
+
+        ``withdrawn: true`` means the model never sees it: OMP dropped it from its
+        steering queue (or it had not been handed to OMP yet). ``withdrawn: false``
+        means the run no longer holds it unread: the model has it (its ``agent_steer``
+        ``delivered`` frame names it), the run ended, or another unread steer with the
+        same text makes OMP's text-keyed removal ambiguous.
+        """
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
+        run_key = _nonempty_string(run_id)
+        steer_key = _nonempty_string(steer_id)
+        if run_key is None or steer_key is None:
+            return {"ok": False, "reason": "run_id and steer_id are required"}
+        with self._lock:
+            run = self._runs.get(tenancy.scoped_key(run_key))
+            if not _control_allowed(run, credential_params) and (run is not None or tenancy.in_cell()):
+                return _not_found()
+        kept = {"ok": True, "run_id": run_key, "steer_id": steer_key, "withdrawn": False,
+                "active": run is not None}
+        if run is None:
+            return kept
+        # control_lock orders this against the steer send itself and the post-prompt
+        # flush of pending_steers, so a steer is either still ours or already in OMP.
+        with run.control_lock:
+            with self._lock:
+                held = next((s for s in run.pending_steers if s.steer_id == steer_key), None)
+                if held is not None:
+                    run.pending_steers.remove(held)
+                    return {**kept, "withdrawn": True}
+                steer = next((s for s in run.undelivered if s.steer_id == steer_key), None)
+                client = run.client
+                if steer is None or client is None:
+                    return kept
+                if any(s is not steer and s.text == steer.text for s in run.undelivered):
+                    return {**kept, "reason": "ambiguous"}
+            try:
+                removed = _json_value(_bounded_call(
+                    lambda: client.remove_queued_message(steer.text, "steering"),
+                    _CONTROL_CALL_SECONDS))
+            except Exception as exc:  # noqa: BLE001 - RPC transport failures are retryable
+                return {**kept, "ok": False, "reason": str(exc)}
+            if not (isinstance(removed, Mapping) and removed.get("removed") is True):
+                return kept
+            with self._lock:
+                if steer in run.undelivered:
+                    run.undelivered.remove(steer)
+                # The same text may be sent again (an edit, or Send now).
+                run.steers.discard(steer.key)
+        return {**kept, "withdrawn": True}
+
     def status(self, run_id=None, session_id=None, *, credential_params=None) -> dict:
         """Return only the authenticated actor's control-plane snapshot."""
         if _delegate_refusal() is not None:
@@ -2576,6 +2634,18 @@ class OmpSessionHost:
             client = self._service_client_locked()
             return _json_value(client._omp_bridge.call(command_name, payload, timeout=30.0))
 
+    def config_call(self, command, params):
+        """Read OMP's settings, or write one to the user's own OMP config, in the service runtime."""
+        if _delegate_refusal() is not None:
+            return _delegate_refusal()
+        command_name = _nonempty_string(command)
+        if command_name not in _CONFIG_SHAPES:
+            raise ValueError(f"unsupported agent-service config command: {command_name!r}")
+        payload = _validated_payload(command_name, params, _CONFIG_SHAPES[command_name])
+        with self._service_lock:
+            client = self._service_client_locked()
+            return _json_value(client._omp_bridge.call(command_name, payload, timeout=30.0))
+
     def memory_call(self, command, params):
         if _delegate_refusal() is not None:
             return _delegate_refusal()
@@ -2693,7 +2763,7 @@ class OmpSessionHost:
                 overlay = _cad_session_overlay("off", compaction_settings)
                 if overlay is None:
                     raise HelperCompletionError("helper runtime settings overlay unavailable")
-                extra = ("--no-lsp", "--config", overlay)
+                extra = ("--no-lsp", *_cad_config_args(overlay))
                 if _binary_supports_flag(binary, "--no-mcp"):
                     extra += ("--no-mcp",)
                 kwargs["extra_args"] = extra
@@ -3164,7 +3234,7 @@ class OmpSessionHost:
             memory = memory_backend() if params.get("workspace_dir") else "off"
             overlay = _cad_session_overlay(memory)
             if overlay:
-                kwargs["extra_args"] = ("--config", overlay)
+                kwargs["extra_args"] = _cad_config_args(overlay)
         if clean_env is not None:
             kwargs["env"] = clean_env
         if binary is not None:
@@ -3185,9 +3255,10 @@ class OmpSessionHost:
             # repo-dev skills; CAD skills come from cad_skill), LSP docs, and a dozen
             # code devices (security_scan, debug, firmware, cpp_*, ast_*, github ...):
             # 106 KB of prompt + tool schema, 72 KB after (measured with get_state).
+            # LSP is off in Chudware's settings layer, where the user can turn it on.
             kwargs["no_skills"] = True
             # The user's own OMP MCP servers are not CAD tools.
-            extra: tuple[str, ...] = ("--no-lsp",)
+            extra: tuple[str, ...] = ()
             if binary is not None:
                 template = _cad_system_prompt_template(binary)
                 if template is not None:
@@ -3195,8 +3266,9 @@ class OmpSessionHost:
             if binary is not None and _binary_supports_flag(binary, "--no-mcp"):
                 extra += ("--no-mcp",)
             memory = _session_memory_backend(params, workspace)
+            todo = _session_todo_policy(params)
             overlay = (
-                _cad_session_overlay(memory)
+                _cad_session_overlay(memory, todo=todo)
                 if binary is not None and _binary_supports_flag(binary, "--config")
                 else None
             )
@@ -3206,8 +3278,14 @@ class OmpSessionHost:
                 raise RuntimeError("Cannot apply the selected compaction settings: runtime --config support is required")
             tools = list(CAD_SESSION_TOOLS)
             if overlay is not None:
-                extra += ("--config", overlay)
+                extra += _cad_config_args(overlay)
                 tools += _CAD_MEMORY_TOOLS[memory]
+                if todo == "off":
+                    tools.remove("todo")
+                # OMP refuses to start with a built-in tool its settings disable, so the lsp
+                # tool is listed only while Chudware's layer turns LSP on (for new processes).
+                if omp_settings.layer_value("lsp.enabled") is True:
+                    tools.append("lsp")
             kwargs["tools"] = tools
             kwargs["extra_args"] = extra
         from services.agent.omp_bridge import ExtensionBridge
@@ -4269,12 +4347,14 @@ def _binary_supports_flag(path: str, flag: str) -> bool:
 
 
 
-#: OMP settings every CAD conversation process runs with (``--config`` overlay).
+#: OMP settings every CAD conversation process runs with (``--config`` overlay). OMP reads
+#: nested YAML only: a dotted key at the top level is silently ignored.
 #: A user-level context file is the user's own coding-agent brief, not CAD policy:
 #: ~/.claude/CLAUDE.md ("git pull --rebase before starting; commit + push as you go")
 #: reached every CAD turn, and the GPT-6 sessions of 2026-09-28 pulled, committed and
 #: pushed the firmware repo inside the user's CAD project. Project-level context files
 #: in the workspace still load: those are the user's instructions for this project.
+#: A CAD run never stops on a time limit, so a user-level ``task.maxRuntimeMs`` must not apply.
 _CAD_SESSION_SETTINGS = (
     "# Written by Chudware for its CAD conversation processes; regenerated on use.\n"
     "disabledExtensions:\n"
@@ -4282,11 +4362,11 @@ _CAD_SESSION_SETTINGS = (
     "  - context-file:user:CLAUDE.md\n"
     "  - context-file:user:GEMINI.md\n"
     "  - context-file:user:copilot-instructions.md\n"
-    "browser.enabled: true\n"
-    "computer.enabled: true\n"
-    "async.enabled: true\n"
-    "task.maxRuntimeMs: 0\n"
+    "task:\n"
+    "  maxRuntimeMs: 0\n"
 )
+#: A tenancy cell has no desktop to browse or drive.
+_CAD_CELL_SETTINGS = "browser:\n  enabled: false\ncomputer:\n  enabled: false\n"
 #: Per-backend memory settings. OMP keys every backend's store by the process cwd,
 #: which is the CAD project folder, so memory never crosses projects; Mnemopi's scoping
 #: is pinned so a user-level `global` setting cannot pool all projects into one bank.
@@ -4304,6 +4384,18 @@ _CAD_MEMORY_TOOLS: dict[str, tuple[str, ...]] = {
     "local": (),
     "hindsight": (),
     "sharpshooter": (),
+}
+#: Settings → AI → "Task list preference" as OMP's own todo policy (``todo`` is the
+#: one task-list tool online; its frames drive the Tasks panel). Off removes the tool;
+#: Encourage has OMP suggest a list on a conversation's first message, Require forces
+#: one (``tool_choice=todo``); both also re-nudge after compaction. The preference alone
+#: decides: ``todo`` is in ``--tools``, and OMP refuses to start with a listed tool its
+#: settings disable, so a user's own ``todo.enabled: false`` must not reach the process.
+_CAD_TODO_SETTINGS = {
+    "off": "todo:\n  enabled: false\n",
+    "option": "todo:\n  enabled: true\n",
+    "encourage": "todo:\n  enabled: true\n  eager: preferred\n",
+    "require": "todo:\n  enabled: true\n  eager: always\n",
 }
 
 
@@ -4323,10 +4415,21 @@ def _session_memory_backend(params: Mapping[str, Any], workspace: str | None) ->
     return DEFAULT_MEMORY_BACKEND
 
 
+def _session_todo_policy(params: Mapping[str, Any]) -> str:
+    """The todo policy for a CAD conversation process (``params["task_list_preference"]``)."""
+    choice = params.get("task_list_preference")
+    if choice in _CAD_TODO_SETTINGS:
+        return choice
+    from services.agent.config import DEFAULT_TASK_LIST_PREFERENCE
+
+    return DEFAULT_TASK_LIST_PREFERENCE
+
+
 def _client_launch_params(params: Mapping[str, Any]) -> dict[str, Any]:
     # Retain process identity, not a turn's prompt, callbacks, or CAD tool bindings.
     launch = {key: params[key] for key in (
         "workspace_dir", "omp_session_dir", "system_prompt", "memory_backend",
+        "task_list_preference",
         "byok_key", "byok_tenant", "byok_provider",
         "mode", "plan_only", "turn_preferences",
     ) if key in params}
@@ -4344,19 +4447,16 @@ def _turn_compaction_settings(params: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _cad_session_overlay(memory: str, compaction: Mapping[str, Any] | None = None) -> str | None:
+def _cad_session_overlay(memory: str, compaction: Mapping[str, Any] | None = None, *,
+                         todo: str = "option") -> str | None:
     """Immutable policy overlay: one session must never rewrite another's settings."""
-    from services import paths
-
-    content = _CAD_SESSION_SETTINGS + _CAD_MEMORY_SETTINGS[memory]
+    content = _CAD_SESSION_SETTINGS + _CAD_MEMORY_SETTINGS[memory] + _CAD_TODO_SETTINGS[todo]
     if tenancy.in_cell():
-        content = content.replace("browser.enabled: true", "browser.enabled: false")
-        content = content.replace("computer.enabled: true", "computer.enabled: false")
+        content += _CAD_CELL_SETTINGS
     if compaction:
         content += "compaction: " + json.dumps(dict(compaction), sort_keys=True) + "\n"
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-    root = tenancy.actor_state_root() if tenancy.in_cell() else Path(paths.ROOT)
-    target = root / "omp" / f"cad-session-{memory}-{digest}.yml"
+    target = omp_settings.omp_dir() / f"cad-session-{memory}-{digest}.yml"
     try:
         if target.is_file() and target.read_text(encoding="utf-8") == content:
             return str(target)
@@ -4371,6 +4471,15 @@ def _cad_session_overlay(memory: str, compaction: Mapping[str, Any] | None = Non
         _LOG.warning("CAD session settings overlay unavailable: %s", exc)
         return None
     return str(target)
+
+
+def _cad_config_args(overlay: str) -> tuple[str, ...]:
+    """The ``--config`` files of every Chudware OMP process. A later file wins, so the
+    per-session pins in ``overlay`` outrank Chudware's settings layer (``omp_settings``)."""
+    try:
+        return ("--config", omp_settings.ensure_layer(), "--config", overlay)
+    except OSError as exc:
+        raise RuntimeError("Cannot write Chudware's OMP settings layer") from exc
 
 
 def _binary_candidate(source: str, candidate: str) -> tuple[str | None, str | None]:

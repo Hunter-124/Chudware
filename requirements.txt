@@ -93,7 +93,7 @@ pyproj==3.7.2
 # parity; a system `git` binary, when present, is an OPTIONAL subprocess accelerator only
 # (gc/repack) and is NEVER bundled. See contracts/plm.md.
 dulwich==1.2.12
-websockets==16.1          # BSD-3-Clause — aicad.plm-live/1 self-hosted relay/client
+websockets==16.1          # BSD-3-Clause — aicad.plm-live/2 self-hosted relay/client
 
 # Transitive dependencies that product code imports directly; declared so a venv rebuilt
 # from scratch has them. All permissively licensed (in-process OK).

@@ -132,6 +132,19 @@ const nlohmann::json& DocMirrorSnapshot::tree() const {
 DocMirror::DocMirror() : payload_(emptyMirrorPayload()) {}
 
 const nlohmann::json& DocMirror::tree() const { return *payload_->tree; }
+nlohmann::json DocMirror::featureContent(const std::string& id) const {
+    const nlohmann::json& doc = *payload_->tree;
+    if (!doc.is_object() || !doc.contains("features") || !doc["features"].is_array())
+        return nullptr;
+    for (const auto& f : doc["features"]) {
+        if (!f.is_object() || f.value("id", std::string()) != id) continue;
+        nlohmann::json content = nlohmann::json::object();
+        for (const char* key : {"params", "refs"})
+            if (f.contains(key)) content[key] = f[key];
+        return content;
+    }
+    return nullptr;
+}
 const nlohmann::json& DocMirror::featureStatus() const { return *payload_->featureStatus; }
 bool DocMirror::featureStatusCurrent() const {
     return revision_ >= 0 && payload_->featureStatusRevision == revision_;
@@ -543,7 +556,8 @@ std::string DocMirror::resolvePickAsm(WorkerClient& w, uint32_t body_id,
     return {};
 }
 
-OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce) {
+OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce,
+                                uint64_t sketchSession) {
     OpsResponse r;
     nlohmann::json res;
     std::string err;
@@ -556,8 +570,10 @@ OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool
         {"base_revision", baseRev},
         {"ops", ops},
         {"coalesce", coalesce},
+        {"with_exact", false},  // the GUI never reads the B-rep statistics; they cost a full integration
         {"_mutation_origin", "gui"}
     };
+    if (sketchSession) params["sketch_session_id"] = sketchSession;
     bool ok = w.call("doc_apply_ops", params, res, err);
     if (!ok) {
         r.error_code = "transport";
@@ -604,7 +620,8 @@ OpsResponse DocMirror::applyOps(WorkerClient& w, const nlohmann::json& ops, bool
 }
 
 void DocMirror::applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::json& ops,
-                              ApplyAsyncDone done, bool coalesce, int timeoutMs) {
+                              ApplyAsyncDone done, bool coalesce, int timeoutMs,
+                              const std::string& previewThrough) {
     OpsResponse early;
     if (docId_.empty()) {
         early.error_code = "no_doc";
@@ -622,8 +639,10 @@ void DocMirror::applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::js
         {"base_revision", baseRev},
         {"ops", ops},
         {"coalesce", coalesce},
+        {"with_exact", false},
         {"_mutation_origin", "gui"}
     };
+    if (!previewThrough.empty()) params["preview_through"] = previewThrough;
     const auto pendingObserver = readOnly ? PendingOpsObserver{} : pendingOpsObserver_;
     if (pendingObserver) pendingObserver(docId, true);
     // Generation, document and base revision guard normal admission. A later
@@ -700,13 +719,15 @@ void DocMirror::applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::js
         }, timeoutMs);
 }
 
-OpsResponse DocMirror::undo(WorkerClient& w) {
+OpsResponse DocMirror::undo(WorkerClient& w, uint64_t sketchSession) {
     OpsResponse r;
     if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
     nlohmann::json res;
     std::string err;
     const int baseRev = revision_;
-    if (!w.call("doc_undo", {{"doc_id", docId_}}, res, err)) {
+    nlohmann::json params = {{"doc_id", docId_}};
+    if (sketchSession) params["sketch_session_id"] = sketchSession;
+    if (!w.call("doc_undo", params, res, err)) {
         r.error_code = "transport"; r.error_message = err; return r;
     }
     if (res.contains("code")) {
@@ -726,13 +747,15 @@ OpsResponse DocMirror::undo(WorkerClient& w) {
     return r;
 }
 
-OpsResponse DocMirror::redo(WorkerClient& w) {
+OpsResponse DocMirror::redo(WorkerClient& w, uint64_t sketchSession) {
     OpsResponse r;
     if (docId_.empty()) { r.error_code = "no_doc"; r.error_message = "no document open"; return r; }
     nlohmann::json res;
     const int baseRev = revision_;
     std::string err;
-    if (!w.call("doc_redo", {{"doc_id", docId_}}, res, err)) {
+    nlohmann::json params = {{"doc_id", docId_}};
+    if (sketchSession) params["sketch_session_id"] = sketchSession;
+    if (!w.call("doc_redo", params, res, err)) {
         r.error_code = "transport"; r.error_message = err; return r;
     }
     if (res.contains("code")) {
@@ -950,6 +973,7 @@ bool DocMirror::adoptOpenResponse(const nlohmann::json& res, std::string& err) {
         const auto warm = res.find("warm");
         lastOpenedWarm_ = warm != res.end() && warm->is_boolean() && warm->get<bool>();
         lastOpenedCacheMissReason_ = jstr(res, "cache_miss_reason");
+        lastOpenedDisplayQuality_ = jstr(res, "display_quality");
         // cache.writeback: `entries` is present only when the engine attempted the write.
         lastOpenedWriteback_ = 0;
         lastOpenedWritebackReason_.clear();
@@ -973,12 +997,14 @@ bool DocMirror::adoptOpenResponse(const nlohmann::json& res, std::string& err) {
     return true;
 }
 
-bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid) {
+bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err, bool asSolid,
+                     const std::string& displayQuality) {
     nlohmann::json res;
     // Default (asSolid==false) keeps the request byte-identical to the historic {"path": path} shape;
     // only when asSolid is set do we add the optional engine flag that sews a mesh import into a solid.
     nlohmann::json params = {{"path", path}};
     if (asSolid) params["as_solid"] = true;
+    if (!displayQuality.empty()) params["display_quality"] = displayQuality;
     // doc_open runs in hostd's long tier: a cache-miss rebuild may legitimately take minutes.
     if (!w.call("doc_open", params, res, err, kLongEngineCallTimeoutMs)) return false;
     return adoptOpenResponse(res, err);

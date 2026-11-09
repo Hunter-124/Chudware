@@ -336,7 +336,7 @@ bool WorkerBridge::isServiceMethod(const std::string& method) {
     static constexpr const char* exactNames[] = {
         "omp_provider_list", "omp_auth_state", "omp_set_key", "omp_remove_key",
         "omp_logout_accounts", "omp_logout", "omp_login", "omp_models_list",
-        "ai_roles_get", "ai_roles_set",
+        "omp_config_get", "omp_config_set", "ai_roles_get", "ai_roles_set",
     };
     for (const char* name : exactNames)
         if (method == name) return true;

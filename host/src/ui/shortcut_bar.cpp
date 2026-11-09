@@ -93,8 +93,11 @@ void ShortcutBar::update(AppState& st, bool imgHovered, ShortcutContext context,
                      io.MousePos.y >= m_pos.y && io.MousePos.y < m_pos.y + barH &&
                      ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     }
-    // Toggle on 'S' — only when the viewport or its bar is hovered and no text widget owns input.
-    if ((imgHovered || barHovered) && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_S)) {
+    // Toggle on a bare 'S' — only when the viewport or its bar is hovered and no text widget owns
+    // input. Ctrl/Super/Alt chords (Ctrl+S save, Ctrl+Shift+S save-as) belong to the app shortcuts.
+    const bool modChord = io.KeyCtrl || io.KeySuper || io.KeyAlt;
+    if ((imgHovered || barHovered) && !io.WantTextInput && !modChord &&
+        ImGui::IsKeyPressed(ImGuiKey_S)) {
         if (m_visible) {
             dismiss();
             return;

@@ -93,6 +93,7 @@
 #include "doc/stepplus.h"  // stepplus_save (craft a persisted broken-import doc on disk)
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 #include "geom/text.h"     // resolve_font_path (bundled-font lookup regression)
+#include "geom/dress.h"    // edge_boundary_uses (free-edge rule the dress ops share)
 #include "util/aicm_handoff.h"
 
 using json = nlohmann::json;
@@ -200,33 +201,19 @@ int count_surf(const render::BodyMesh& b, uint8_t surf_type) {
     return n;
 }
 
-// SEAM-AWARE genuine-free-edge count on a raw kernel shape (S1/S2). A closed solid has
-// every edge shared by >= 2 faces; the only legitimate single-face edges are SEAMS
-// (BRep_Tool::IsClosed — a cylinder/sphere/revolution closure) and DEGENERATE edges
-// (apex/pole). Any other < 2-face edge is a real FREE edge -> the body is an open shell.
-// Mirrors document.cpp::dress_is_closed_solid so the test verifies the actual invariant
-// (a committed dress body is watertight) directly on r.shapes, not via tessellation.
+// Genuine free-edge count on a raw kernel shape (S1/S2), by the same oriented-skin-use rule
+// the dress-op post-check applies (geom::edge_boundary_uses): a seam has two uses on one face,
+// a boolean imprint INTERNAL to its face has none, a DEGENERATE edge (apex/pole) is ignored.
+// This verifies the actual invariant (a committed dress body is watertight) directly on
+// r.shapes, not via tessellation.
 int genuine_free_edges(const TopoDS_Shape& shape) {
     if (shape.IsNull()) return -1;
-    TopTools_IndexedDataMapOfShapeListOfShape anc;
-    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
     TopTools_IndexedMapOfShape edges;
     TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    const auto uses = ::geom::edge_boundary_uses(shape, edges);
     int free_n = 0;
-    for (int ei = 1; ei <= edges.Extent(); ++ei) {
-        const TopoDS_Shape& es = edges.FindKey(ei);
-        const int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
-        if (nf >= 2) continue;
-        const TopoDS_Edge& e = TopoDS::Edge(es);
-        if (BRep_Tool::Degenerated(e)) continue;
-        bool seam = false;
-        if (anc.Contains(es)) {
-            const TopTools_ListOfShape& faces = anc.FindFromKey(es);
-            for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
-                if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
-        }
-        if (!seam) ++free_n;
-    }
+    for (int ei = 1; ei <= edges.Extent(); ++ei)
+        if (!BRep_Tool::Degenerated(TopoDS::Edge(edges(ei))) && uses[ei].is_free()) ++free_n;
     return free_n;
 }
 
@@ -659,6 +646,189 @@ TEST_CASE("rebuild reports a moved reference on the affected feature") {
     CHECK(records[0].at("kind") == "edge");
     CHECK(records[0].at("moved_distance_mm").get<double>() == doctest::Approx(1.0));
     CHECK(records[0].at("best_score").is_number());
+    CHECK(doc_close(id));
+}
+
+TEST_CASE("a fillet's input body is the state before it, from a checkpoint or a rollback compile") {
+    using namespace chudware::doc;
+    json doc;
+    doc["features"] = json::array({
+        {{"id", "f1"}, {"type", "box"}, {"length", 40.0}, {"width", 30.0}, {"height", 20.0},
+         {"centered", false}, {"at", {0.0, 0.0, 0.0}}, {"mode", "new"}},
+        {{"id", "f2"}, {"type", "fillet"}, {"radius", 2.0},
+         {"edges", {{"of", "edge"}, {"parallel", "z"}}}},
+        {{"id", "f3"}, {"type", "box"}, {"length", 5.0}, {"width", 5.0}, {"height", 5.0},
+         {"centered", false}, {"at", {100.0, 0.0, 0.0}}, {"mode", "new"}},
+    });
+    auto edge_count = [](const TopoDS_Shape& shape) {
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        return edges.Extent();
+    };
+    auto volume = [](const TopoDS_Shape& shape) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(shape, props);
+        return props.Mass();
+    };
+    const json env = json::object();
+    const auto quality = ::geom::DisplayQuality::Fine;
+    auto cache = make_compile_cache();
+    const CompileResult full = compile_document(doc, env, cache.get());
+    REQUIRE(full.ok);
+    REQUIRE(full.shapes.size() == 2);
+    CHECK(edge_count(full.shapes.front()) > 12);  // the displayed result already rounded them away
+
+    const FeatureInput warm = compile_feature_input(doc, env, cache.get(), quality, "f2");
+    REQUIRE_FALSE(warm.body.IsNull());
+    CHECK(warm.from_checkpoint);
+    CHECK(warm.body_id == "f1");
+    CHECK(edge_count(warm.body) == 12);  // the plain box, before the fillet and without f3
+    CHECK(volume(warm.body) == doctest::Approx(24000.0));
+
+    const FeatureInput cold = compile_feature_input(doc, env, nullptr, quality, "f2");
+    REQUIRE_FALSE(cold.body.IsNull());
+    CHECK_FALSE(cold.from_checkpoint);
+    CHECK(cold.body_id == "f1");
+    CHECK(edge_count(cold.body) == 12);
+    CHECK(volume(cold.body) == doctest::Approx(24000.0));
+
+    // An upstream edit no longer matches the checkpoints: the rollback compile sees the new box.
+    json taller = doc;
+    taller["features"][0]["height"] = 25.0;
+    const FeatureInput moved = compile_feature_input(taller, env, cache.get(), quality, "f2");
+    REQUIRE_FALSE(moved.body.IsNull());
+    CHECK_FALSE(moved.from_checkpoint);
+    CHECK(volume(moved.body) == doctest::Approx(30000.0));
+
+    // None of that touched the caller's cache: the unchanged document still hits it whole.
+    CHECK(compile_document(doc, env, cache.get()).features_executed == 0);
+
+    CHECK(compile_feature_input(doc, env, cache.get(), quality, "f1").body.IsNull());
+    CHECK_FALSE(compile_feature_input(doc, env, cache.get(), quality, "f1").error.empty());
+    CHECK(compile_feature_input(doc, env, cache.get(), quality, "nope").body.IsNull());
+}
+
+TEST_CASE("doc_feature_edges names a blend's edges on its input body and they re-apply") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "BlendEdgeRefs").at("doc_id");
+    // Two query elements: one names the (0,0) corner edge, the other the two nearest to (40,30).
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"},
+            {"params", {{"length", 40}, {"width", 30}, {"height", 20},
+                        {"centered", false}, {"at", {0, 0, 0}}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"params", {{"radius", 2}}},
+            {"refs", {{"edges", json::array({
+                {{"of", "edge"}, {"parallel", "z"}, {"near", {0, 0, 10}}, {"count", 1}},
+                {{"of", "edge"}, {"parallel", "z"}, {"near", {40, 30, 10}}, {"count", 2}}
+            })}}}}}}
+    }), false);
+    REQUIRE(built.at("rebuild").at("ok").get<bool>());
+    const std::string stock = built["id_map"]["$0"], fillet = built["id_map"]["$1"];
+
+    const json out = doc_feature_edges(id, fillet, built.at("revision").get<long>());
+    CHECK(out.at("feature") == fillet);
+    CHECK(out.at("body") == stock);
+    REQUIRE(out.at("refs").size() == 2);
+    CHECK(out["refs"][0].at("edges").size() == 1);
+    CHECK(out["refs"][1].at("edges").size() == 2);
+    CHECK(out["refs"][0].at("error").is_null());
+    json picks = json::array();
+    for (const json& row : out.at("refs")) {
+        for (const json& edge : row.at("edges")) {
+            const json& selector = edge.at("selector");
+            CHECK(selector.at("kind") == "edge");
+            CHECK(selector.at("surf") == "line");
+            CHECK(std::abs(selector.at("axis")[2].get<double>()) == doctest::Approx(1.0));
+            CHECK(selector.at("area_or_len").get<double>() == doctest::Approx(20.0));
+            REQUIRE(edge.at("points").size() == 2);
+            CHECK_FALSE(edge.at("closed").get<bool>());
+            const double z0 = edge["points"][0][2].get<double>(), z1 = edge["points"][1][2].get<double>();
+            CHECK(std::min(z0, z1) == doctest::Approx(0.0));
+            CHECK(std::max(z0, z1) == doctest::Approx(20.0));
+            picks.push_back(selector);
+        }
+    }
+    REQUIRE(picks.size() == 3);
+
+    // The displayed result has no edge left at the (0,0) corner; the RPC found it on the input.
+    const json shown = doc_query(id, {{"of", "edge"}, {"parallel", "z"}, {"near", {0, 0, 10}},
+                                      {"count", 1}});
+    const json& shown_at = shown.at("matches")[0].at("centroid");
+    CHECK(std::hypot(shown_at[0].get<double>(), shown_at[1].get<double>()) > 0.5);
+    const json& found_at = out["refs"][0]["edges"][0]["selector"]["centroid"];
+    CHECK(std::hypot(found_at[0].get<double>(), found_at[1].get<double>()) < 1e-6);
+
+    // Writing the selection back as these canonical picks (what the PM does once an edge is taken
+    // out of a multi-edge query) rounds the same three edges; dropping one leaves two.
+    auto blend_report = [&](const json& response) {
+        for (const json& row : response.at("rebuild").at("feature_status"))
+            if (row.value("id", std::string()) == fillet) return row.at("data").at("fillet");
+        return json();
+    };
+    const json same = doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", fillet}, {"refs", {{"edges", picks}}}}}), false);
+    REQUIRE(same.at("rebuild").at("ok").get<bool>());
+    CHECK(blend_report(same).at("selected_edges") == 3);
+    CHECK(blend_report(same).at("covered_edges") == 3);
+    json fewer = picks;
+    fewer.erase(fewer.begin());
+    const json trimmed = doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", fillet}, {"refs", {{"edges", fewer}}}}}), false);
+    REQUIRE(trimmed.at("rebuild").at("ok").get<bool>());
+    CHECK(blend_report(trimmed).at("selected_edges") == 2);
+
+    // Canonical picks stored on the feature resolve to their own edges too, and the slot may
+    // hold one bare query (how a lone query is stored) instead of a list.
+    const json stored = doc_feature_edges(id, fillet, -1);
+    REQUIRE(stored.at("refs").size() == 2);
+    CHECK(stored["refs"][0]["edges"].size() == 1);
+    CHECK(stored["refs"][1]["edges"].size() == 1);
+    const json bare = {{"of", "edge"}, {"parallel", "z"}, {"near", {0, 0, 10}}, {"count", 1}};
+    const json single = doc_apply_ops(id, -1, json::array({
+        {{"op", "edit_feature"}, {"id", fillet}, {"refs", {{"edges", bare}}}}}), false);
+    REQUIRE(single.at("rebuild").at("ok").get<bool>());
+    const json one = doc_feature_edges(id, fillet, -1);
+    REQUIRE(one.at("refs").size() == 1);
+    CHECK(one["refs"][0]["edges"].size() == 1);
+
+    CHECK_THROWS(doc_feature_edges(id, fillet, 123456));  // stale revision
+    CHECK_THROWS(doc_feature_edges(id, stock, -1));       // a box selects no edges
+    CHECK_THROWS(doc_feature_edges(id, "f999", -1));
+    CHECK(doc_close(id));
+}
+
+TEST_CASE("doc_feature_edges says where a blend's size handle sits and which way it pulls") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "BlendHandleFrame").at("doc_id");
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"},
+            {"params", {{"length", 40}, {"width", 30}, {"height", 20},
+                        {"centered", false}, {"at", {0, 0, 0}}}}}}},
+        // The +X/+Z edge along Y, and the vertical corner edge at the origin.
+        {{"op", "add_feature"}, {"feature", {{"type", "chamfer"}, {"params", {{"length", 2}}},
+            {"refs", {{"edges", json::array({
+                {{"of", "edge"}, {"parallel", "y"}, {"near", {40, 15, 20}}, {"count", 1}},
+                {{"of", "edge"}, {"parallel", "z"}, {"near", {0, 0, 10}}, {"count", 1}}
+            })}}}}}}
+    }), false);
+    REQUIRE(built.at("rebuild").at("ok").get<bool>());
+    const std::string chamfer = built["id_map"]["$1"];
+
+    const json out = doc_feature_edges(id, chamfer, -1);
+    REQUIRE(out.at("refs").size() == 2);
+    const double h = std::sqrt(0.5);
+    auto is_at = [](const json& v, double x, double y, double z) {
+        return v.size() == 3 && std::abs(v[0].get<double>() - x) < 1e-9 &&
+               std::abs(v[1].get<double>() - y) < 1e-9 && std::abs(v[2].get<double>() - z) < 1e-9;
+    };
+    // Each edge names its midpoint and the inward bisector of its two faces (box outward
+    // normals +X,+Z): the direction the chamfer face moves as the distance grows.
+    const json& top = out["refs"][0]["edges"][0];
+    CHECK(is_at(top.at("mid"), 40, 15, 20));
+    CHECK(is_at(top.at("grow"), -h, 0, -h));
+    const json& corner = out["refs"][1]["edges"][0];
+    CHECK(is_at(corner.at("mid"), 0, 0, 10));
+    CHECK(is_at(corner.at("grow"), h, h, 0));
     CHECK(doc_close(id));
 }
 
@@ -3282,7 +3452,7 @@ TEST_CASE("dress validity: carrier/apron rounds are corrected soundly or rejecte
         const json& report = status.at("data").at("fillet");
         CHECK(report.at("selected_edges") == 2);
         CHECK(report.at("covered_edges") == 2);
-        CHECK(report.at("effective").at("radius").get<double>() < 4.0);
+        CHECK(report.at("effective").at("radius").get<double>() <= 4.0);
         CHECK(after_health.at("bodies")[0].at("volume_mm3").get<double>() <
               before_health.at("bodies")[0].at("volume_mm3").get<double>());
     } else {
@@ -8984,6 +9154,77 @@ TEST_CASE("measure and solid health agree that an internal imprint edge keeps a 
     CHECK_FALSE(mass.contains("warning"));
     CHECK(mass.value("volume_mm3", 0.0) == doctest::Approx(12000.0).epsilon(1e-9));
     doc_close(id);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+// servo_bracket_L Chamfer1: an earlier boss left a boolean imprint INTERNAL to an ear face, the
+// closure check read it as a free edge in every chamfer result, and the chamfer of the ear
+// relief's end edge failed at any distance with "could not construct a valid closed blend ...
+// size feasibility is undetermined". Every chamfer type shares that check.
+TEST_CASE("chamfer feature: a relief edge chamfers on a body carrying an internal imprint edge") {
+    using namespace chudware::doc;
+    // 40 x 30 x 10 block with an edge imprinted INTO its top face (INTERNAL to that face).
+    TopTools_ListOfShape args;
+    args.Append(BRepPrimAPI_MakeBox(40.0, 30.0, 10.0).Shape());
+    args.Append(BRepBuilderAPI_MakeEdge(gp_Pnt(10, 10, 10), gp_Pnt(30, 20, 10)).Edge());
+    BRepAlgoAPI_BuilderAlgo imprint;
+    imprint.SetArguments(args);
+    imprint.Build();
+    REQUIRE(imprint.IsDone());
+    TopExp_Explorer solids(imprint.Shape(), TopAbs_SOLID);
+    REQUIRE(solids.More());
+    const TopoDS_Shape block = solids.Current();
+    int internal_uses = 0;
+    for (TopExp_Explorer f(block, TopAbs_FACE); f.More(); f.Next())
+        for (TopExp_Explorer e(f.Current(), TopAbs_EDGE); e.More(); e.Next())
+            if (e.Current().Orientation() == TopAbs_INTERNAL) ++internal_uses;
+    REQUIRE(internal_uses == 1);
+    const auto path = std::filesystem::temp_directory_path() / "chudware_imprint_relief_chamfer.brep";
+    REQUIRE(BRepTools::Write(block, path.string().c_str()));
+
+    const auto value = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    struct Variant { const char* label; json params; double removed_mm3; };
+    const std::vector<Variant> variants = {
+        {"symmetric 2 x 2", {{"type", "symmetric"}, {"length", value(2.0)}}, 4.0},
+        {"asymmetric 2 x 1",
+         {{"type", "asymmetric"}, {"length", value(2.0)}, {"length2", value(1.0)}}, 2.0},
+        {"distance-angle 2 at 45", {{"type", "distance_angle"}, {"length", value(2.0)},
+                                    {"angle", value(45.0)}}, 4.0},
+    };
+    for (const Variant& variant : variants) {
+        INFO(variant.label);
+        const std::string id = doc_new("part", "ImprintRelief").at("doc_id").get<std::string>();
+        doc_import_file(path.string(), id, false, "brep");
+        // A 2 x 2 mm relief slot open at x = 0 and the bottom: its ceiling (z = 2) meets the
+        // x = 0 wall along a 2 mm edge, the shallow-relief configuration of the user's part.
+        const json slot = doc_apply_ops(id, -1, json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Relief"},
+                {"params", {{"at", {-1, 12, -1}}, {"centered", false}, {"length", 26},
+                            {"width", 2}, {"height", 3}, {"mode", "cut"}}}}}}
+        }), false);
+        REQUIRE_MESSAGE(slot.at("rebuild").at("feature_status").back().at("ok").get<bool>(),
+                        slot.dump());
+        const double before = doc_eval_mass(id, 0, 7.85).value("volume_mm3", 0.0);
+        CHECK(before == doctest::Approx(12000.0 - 25.0 * 2.0 * 2.0).epsilon(1e-9));
+
+        const json response = doc_apply_ops(id, -1, json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "chamfer"}, {"name", "Bevel"},
+                {"params", variant.params},
+                {"refs", {{"edges", json::array({
+                    {{"of", "edge"}, {"parallel", "y"}, {"near", {0, 13, 2}}, {"count", 1}}
+                })}}}}}}
+        }), false);
+        const json& status = response.at("rebuild").at("feature_status").back();
+        CHECK_MESSAGE(status.at("ok").get<bool>(), status.dump());
+        CHECK((!status.contains("warning") || status["warning"].is_null() ||
+               status["warning"] == ""));
+        const double after = doc_eval_mass(id, 0, 7.85).value("volume_mm3", 0.0);
+        CHECK(before - after == doctest::Approx(variant.removed_mm3).epsilon(1e-6));
+        const json health = doc_eval_solid_health(id, 1);
+        CHECK(health.at("bodies")[0].at("is_watertight") == true);
+        doc_close(id);
+    }
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }

@@ -1,4 +1,4 @@
-"""Focused contract tests for the aicad.plm-live/1 Python client seams."""
+"""Focused contract tests for the aicad.plm-live/2 Python client seams."""
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +12,7 @@ from services.plm import live_client, manifest, remote, worker_rpc
 from services.plm.live_client import LiveClient, LiveClientError, LiveClientManager, state_hash
 from services.plm.vault import Vault
 
-PARTICIPANT = {"id": "u-sarah", "display": "Sarah", "account_id": None}
+PARTICIPANT = {"id": "u-sarah", "display": "Sarah"}
 PROJECT_ID, ITEM_ID, SESSION_ID = "p-project", "i-item", "s-session"
 
 
@@ -213,7 +213,7 @@ def test_participant_presence_shapes_and_bound() -> None:
 def test_invalid_schema_session_and_hash_fail_closed() -> None:
     async def run(message):
         await _primed()._handle(message)
-    bad = _commit(1, _document(1)); bad["schema"] = "aicad.plm-live/2"
+    bad = _commit(1, _document(1)); bad["schema"] = "aicad.plm-live/1"
     with pytest.raises(LiveClientError) as error:
         asyncio.run(run(bad))
     assert error.value.reason == "invalid_schema"
@@ -235,7 +235,7 @@ def test_manager_lifecycle_and_local_doc_application(monkeypatch) -> None:
     profile = {"name": "live", "kind": "plm-server", "url": "ws://127.0.0.1/live",
                "capabilities": ["live_coedit"],
                "identity": {"user_id": PARTICIPANT["id"],
-                            "display": PARTICIPANT["display"], "account_id": None}}
+                            "display": PARTICIPANT["display"]}}
     class FakeClient:
         def __init__(self, _url, _project, _item, participant, _token, **kwargs):
             self.participant, self.session_id, self.last_seq = participant, SESSION_ID, 0

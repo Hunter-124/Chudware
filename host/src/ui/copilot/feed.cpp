@@ -7,6 +7,7 @@
 #include "agent_text.h"
 #include "stream_rows.h"
 #include "tool_outcome.h"
+#include "subrun_usage.h"
 #include "activity_settlement.h"
 #include <map>
 #include <tuple>
@@ -1012,7 +1013,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (a.status == "running" || a.status.empty()) {
                 if (ui::settleUnfinishedCompaction(a, jstr(data, "status"))) {
                     compactionClosed = true;
-                } else {
+                } else if (!ui::settleUnfinishedTool(a, jstr(data, "status"))) {
                     a.status = "done";
                     a.streaming = false;
                 }
@@ -1063,6 +1064,28 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (!statusText.empty() && m.running &&
             phase != "done" && phase != "error" && phase != "failed" && phase != "cancelled") {
             m.liveStatus = statusText;
+        }
+        // An Eval owns the CAD calls it bridges, but its own agent.tool_call row lands only when
+        // it finishes, after all of them. Give it its row at start (upserted in place by that
+        // final row) so a long Eval's calls nest under it while it runs instead of flooding the
+        // transcript until it ends.
+        if (phase == "tool" && jstr(data, "tool_name") == "eval") {
+            const std::string stageKey = "tool:" + jstr(data, "tool_call_id");
+            bool exists = stageKey.size() == 5;  // no call id: nothing to anchor
+            for (const auto& a : m.activity)
+                if (!exists && a.rowKind == 3 && a.stage == stageKey) exists = true;
+            if (!exists) {
+                finalizeLiveStreamBoxes(m);
+                ActivityItem ni;
+                ni.rowKind    = 3;
+                ni.stage      = stageKey;
+                ni.title      = "eval";
+                ni.status     = "running";
+                ni.startedTs  = chatNowEpoch();
+                ni.parentId   = jstr(data, "parent_id");
+                ni.subagentId = jstr(data, "subagent_id");
+                m.activity.push_back(std::move(ni));
+            }
         }
         if (phase == "done" || phase == "error" || phase == "failed" || phase == "cancelled") {
             if (phase != "done" && !m.compactionRun) ui::settleCompactionMessage(m, phase);
@@ -1307,6 +1330,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.stage   = stageKey;
         ni.title   = jstr(data, "tool_name");
         if (ni.title.empty()) ni.title = "tool";
+        // Call ownership: the timeline nests a row under its owning Eval / sub-agent card. An
+        // upsert that omits them (a re-delivered or late frame) keeps what the first one said.
+        if (const std::string parent = jstr(data, "parent_id"); !parent.empty()) ni.parentId = parent;
+        if (const std::string agent = jstr(data, "subagent_id"); !agent.empty()) ni.subagentId = agent;
         // ni.reason / ni.detail are authored by the Python harness or by the model, so they can
         // carry codepoints the font atlas has no glyph for — agent_events.py joins tool targets
         // with U+2192, which rendered as "DevicePocket ? MouthpieceSlot ?+2 more". Folded HERE,
@@ -1849,6 +1876,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ni.status = norm;
             if (norm == "running") ni.startedTs = chatNowEpoch();
             ni.detail = purpose;
+            ui::copilot::SubRunUsage use;
+            if (ui::copilot::mergeSubRunUsage(use, data)) ui::copilot::appendSubRunUsageTrailer(ni.detail, use);
             m.activity.push_back(std::move(ni));
         } else {
             // A delayed compaction frame cannot overwrite an already terminal outcome.
@@ -1867,6 +1896,13 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 existing->reason = stt;
             }
             existing->status = norm;
+            // The run totals of a task sub-agent: each progress frame replaces the values it
+            // carries, a lifecycle frame (none) leaves the latest ones standing.
+            ui::copilot::SubRunUsage use = ui::copilot::subRunUsageFromDetail(existing->detail);
+            if (ui::copilot::mergeSubRunUsage(use, data)) {
+                ui::copilot::stripSubRunUsageTrailer(existing->detail);
+                ui::copilot::appendSubRunUsageTrailer(existing->detail, use);
+            }
         }
         if (m.running) {
             if (norm == "running" && !purpose.empty()) m.liveStatus = purpose;

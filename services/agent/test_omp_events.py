@@ -727,6 +727,108 @@ class OmpEventMapperTests(unittest.TestCase):
         self.assertEqual((ended["name"], ended["purpose"], ended["status"]), ("HubTaskNames", "HubTaskNames", "done"))
         self.assertNotIn("task", (started["purpose"], ended["purpose"], terminal_progress["purpose"]))
 
+    def test_subagent_progress_carries_run_usage_only_when_present_and_numeric(self):
+        """AgentProgress's totals ride the sub_run row in snake_case; a frame that lacks one
+        (lifecycle, or a malformed value) omits the key so the GUI keeps the latest real value."""
+        state = RpcFrameState()
+
+        def row(frame):
+            [(kind, body)] = map_rpc_frame(frame, CTX, state)
+            self.assertEqual(kind, "sub_run")
+            return body
+
+        usage_keys = {
+            "requests", "tokens", "context_tokens", "context_window", "cost_usd",
+            "duration_ms", "resolved_model", "retry_state",
+        }
+
+        def progress(**fields):
+            return {
+                "type": "subagent_progress",
+                "payload": {
+                    "index": 0,
+                    "agent": "task",
+                    "parentToolCallId": "toolu_task_1",
+                    "progress": {"id": "Harness", "agent": "task", "status": "running", **fields},
+                },
+            }
+
+        started = row(
+            {
+                "type": "subagent_lifecycle",
+                "payload": {"id": "Harness", "agent": "task", "status": "started",
+                            "parentToolCallId": "toolu_task_1", "index": 0},
+            }
+        )
+        self.assertEqual(usage_keys & started.keys(), set())
+
+        full = row(
+            progress(
+                requests=160,
+                tokens=5_240_000,
+                contextTokens=346_000,
+                contextWindow=1_000_000,
+                cost=6.58123456,
+                durationMs=252_000,
+                resolvedModel="anthropic/claude-sonnet-5-5:high",
+                retryState={"attempt": 2, "maxAttempts": 5, "delayMs": 8000,
+                            "errorMessage": "429 rate limited", "startedAtMs": 1},
+            )
+        )
+        self.assertEqual(
+            {key: full[key] for key in usage_keys},
+            {
+                "requests": 160,
+                "tokens": 5_240_000,
+                "context_tokens": 346_000,
+                "context_window": 1_000_000,
+                "cost_usd": 6.581235,
+                "duration_ms": 252_000,
+                "resolved_model": "anthropic/claude-sonnet-5-5:high",
+                "retry_state": {"attempt": 2, "max_attempts": 5, "delay_ms": 8000,
+                                "error": "429 rate limited"},
+            },
+        )
+        self.assertEqual((full["id"], full["status"], full["parent_id"]), ("Harness", "running", "toolu_task_1"))
+
+        # The retry resolved: a snapshot without retryState carries no retry_state. Zero is a
+        # real value, and a model without a resolved id simply omits it.
+        settled = row(progress(requests=161, tokens=0, contextTokens=0, cost=0, durationMs=253_000))
+        self.assertNotIn("retry_state", settled)
+        self.assertNotIn("resolved_model", settled)
+        self.assertEqual(
+            (settled["requests"], settled["tokens"], settled["context_tokens"], settled["cost_usd"]),
+            (161, 0, 0, 0.0),
+        )
+        self.assertNotIn("context_window", settled)
+
+        # Anything that is not a finite non-negative number (or, for the model, a string) is absent.
+        malformed = row(
+            progress(
+                requests="many",
+                tokens=True,
+                contextTokens=-5,
+                contextWindow=None,
+                cost=float("nan"),
+                durationMs=float("inf"),
+                resolvedModel=7,
+                retryState="sleeping",
+            )
+        )
+        self.assertEqual(usage_keys & malformed.keys(), set())
+
+        # A retry with no usable fields is still a pending retry.
+        self.assertEqual(row(progress(requests=1, retryState={}))["retry_state"], {})
+
+        ended = row(
+            {
+                "type": "subagent_lifecycle",
+                "payload": {"id": "Harness", "agent": "task", "status": "completed",
+                            "parentToolCallId": "toolu_task_1", "index": 0},
+            }
+        )
+        self.assertEqual((ended["status"], usage_keys & ended.keys()), ("done", set()))
+
     def test_spawn_and_generic_lifecycle_keep_name_separate_from_role(self):
         kind, spawned = one(
             {

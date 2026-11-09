@@ -47,6 +47,14 @@ probes. Related tools: `measure_part` (mass, volume, centre of mass, inertia),
   Failures mean incomplete, never collision-free. An empty document is refused
   (`insufficient_bodies`); a single body returns `pairs_checked=0`, which is not clearance
   evidence.
+- A constituent Common that OCCT cannot finish is retried in order: clipped to the other
+  operand's tight bounds (`clipped_common`, exact), fuzzy (`method=fallback_fuzzy_*`,
+  `approximate`), then positive-distance extrema (`fallback_extrema_disjoint`). A pair none of
+  them settles stays in `pair_failures`; its `detail` names the OCCT alert, operand
+  (first=a, second=b), world location and sub-shape tolerance, and `summary` names the first
+  failed pair. An `UnableToOrientTheShape` alert whose shapes are all degenerated edges (sphere
+  pole, cone apex, fillet corner patch) is not a failure; an exact attempt that raises
+  `AcquiredSelfIntersection` is, because OCCT moved one operand's boundary.
 - `clearance_mode="threshold"` classifies against the requested clearance without exact gap
   work; its clearances carry `distance_status="lower_bound"`, never a measured gap.
 - `members=[...]` restricts checking to pairs within an exact-name selection (unknown names are

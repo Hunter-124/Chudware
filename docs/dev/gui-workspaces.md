@@ -70,7 +70,10 @@ Mates, Components, Reference. Material and the Add Folder control are part-only.
 - `ai_workspace.cpp` draws the shell; `agent_dag.cpp` owns per-conversation traces (an agent
   tree plus each agent's step timeline, capped at 2000 steps). `current_run_view.cpp` owns a
   single docked inspector and a roster that merges registry sub-agents with OMP `task`
-  sub-agents (read-only).
+  sub-agents (read-only). A trace sub-agent keeps the latest run totals of its `sub_run`
+  progress frames (`copilot/subrun_usage.h`, persisted in the trace JSON), shown on its roster
+  row and in the inspector as "160 requests · ctx 346k / 1M · $6.58"; none before the first
+  progress frame, and a transcript-rebuilt trace has none.
 - Activity, Plan and Sessions scope to the active project (`convProjectDir(st)`), whose
   authority is `AppState::workspaceDir`. Usage the backend does not report is labelled
   "Not reported", never estimated.
@@ -79,6 +82,12 @@ Mates, Components, Reference. Material and the Add Folder control are part-only.
   publication follows transcript durability.
 - Pasted images insert `[Image #N]` at the caret; sent images render at their reference
   positions. Tool-returned images render at the tool's completion position in the chat.
+- Tool rows nest under whoever made them (`activity_timeline.cpp`, `NestIndex`): a call
+  bridged from an Eval goes under that Eval's row, any other sub-agent call under the sub-agent's
+  `subrun:<id>` card; owned rows are not drawn at top level. The owner shows "N calls · M failed ·
+  last <tool>" and, opened, its 50 latest calls (indented, drawn like top-level rows) under an
+  "N earlier calls" line. The index is rebuilt only when a call or card row changes, never per
+  frame or per row; copy/export still lists every row.
 - Magic keywords are matched only by `ui/copilot/magic_keywords.h` (standalone prose, never in
   code spans); OMP applies their meaning, the GUI only presents them.
 - Composer spell check and completion: word logic is GL-free in `ui/copilot/spell_check.*`
@@ -89,8 +98,14 @@ Mates, Components, Reference. Material and the Add Folder control are part-only.
   hand-maintained, and "Add to dictionary" appends to `<appdata>/spell_words.txt`.
 - `ask_user` batches (`ui/copilot/ask_answers.*`) render as cards at the point they were
   asked. "Jump to latest" is a layout footer with a constant reserved height, never an overlay.
+- Messages sent while a turn runs pin under it (`ui/copilot/pending_stack.cpp`). A steer the
+  agent has not read yet offers Edit / Cancel: both call `agent_withdraw_steer`; taken back, it
+  becomes the first queued message (Edit opens it in place, Cancel returns it to the composer),
+  and a steer the agent already read stays put with a toast. Queued messages offer Edit / Send
+  now / Cancel. The actions are always drawn at a resting ink and brighten on hover.
 - Scenarios: `copilot_ui`, `copilot_showcase`, `chat_inline`, `chat_evidence`, `composer_spell`,
-  `projectchat`, `steerstatus`. Run them with `CHUDWARE_ENGINE_DAEMON=0` and isolated
+  `projectchat`, `steerstatus`, `toolnest` (the nested sub-agent / Eval transcript). Run them with
+  `CHUDWARE_ENGINE_DAEMON=0` and isolated
   `HOME`/XDG paths; parallel runs need distinct `CHUDWARE_SESSIONS_DIR` values and displays.
 - `copilot_showcase` is the offline visual tour of the column (transcript rows, pinned queued
   messages, Artifacts, Sessions, Quick settings, a ~320 px pass and a light-theme pass). Every

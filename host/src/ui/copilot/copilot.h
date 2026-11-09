@@ -56,7 +56,7 @@ bool placeSteerInTranscript(AppState& state, std::vector<ChatMsg>& msgs,
 // Shared AI settings fields (provider/model/auth, generation). Rendered by the Settings modal's
 // Providers tab as glass-grouped sections — one call per section, each inside its own glass
 // card, so the caller owns the headers. Privacy (offline mode) + assistant-thoughts live in the
-// AI Harness "Session knobs" grid now, and per-model visibility moved to Settings -> Providers
+// AI Behavior "Session knobs" grid now, and per-model visibility moved to Settings -> AI -> Providers
 // (per-provider model checkboxes) — so neither is a shared section anymore.
 // Returns true if a setting changed this frame (caller may persist).
 enum class AiSettingsSection {
@@ -65,7 +65,7 @@ enum class AiSettingsSection {
 };
 bool drawAiSettingsSection(AppState& state, bool busy, AiSettingsSection section);
 
-// Free AI (FreeLLMAPI) provider card — always reachable from Settings -> Providers even when
+// Free AI (FreeLLMAPI) provider card — always reachable from Settings -> AI -> Providers even when
 // the hosted catalog is unavailable. Renders active-editing or dormant-key-park UI depending
 // on whether Free AI is the current Settings::provider. Returns true if a field changed
 // (dormant-slot edits + the switch button persist immediately either way).
@@ -159,7 +159,7 @@ void drawSessionCostStrip(AppState& state);
 // Not persisted — lives for the process only.
 bool& assistantThoughtsVisible();
 
-// agent.max_subagent_depth in config.json (0–4). Shared by quick settings + Harness.
+// agent.max_subagent_depth in config.json (0–4). Shared by quick settings + Settings -> AI -> Agents.
 int  loadMaxSubagentDepth();
 void saveMaxSubagentDepth(int depth);
 

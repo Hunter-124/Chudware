@@ -78,11 +78,15 @@ bool panelHeader(const char* id, const PanelHeaderSpec& spec);
 // otherwise); every row spans the full width, so a shorter last row gets wider cells. Never
 // scrolls, never clips. A segment whose shown label differs from its full label tooltips
 // `tooltips[i]` (or the full label). Returns true when *selected changed.
+// `fitLabels` sizes each cell for its own label instead of every cell for the widest one (each
+// row still spans the full width, the spare room shared in proportion), so a strip of mixed
+// short and long names fits on fewer rows — a tab strip rather than a segmented switch.
 //   static const char* kFull[]  = {"Circuit", "Sizing", "Simulate", "BOM", "To Piping"};
 //   static const char* kShort[] = {"Circuit", "Size", "Run", "BOM", "Piping"};
 //   if (kit::formTabs("forms", kFull, kShort, 5, &f, kTips)) form_ = (Form)f;
 bool formTabs(const char* id, const char* const* fullLabels, const char* const* shortLabels,
-              int count, int* selected, const char* const* tooltips = nullptr);
+              int count, int* selected, const char* const* tooltips = nullptr,
+              bool fitLabels = false);
 
 // ---- stepper -------------------------------------------------------------------------------------
 // Setup -> Run -> Results track (one compact row, one text line tall) with an optional sub-chip

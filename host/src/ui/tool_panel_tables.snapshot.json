@@ -935,7 +935,7 @@
   "harness_cable_model": "Estimate per-length cable R/L/C, impedance and delay with cited basis.",
   "harness_check": "Check routed geometry, fill, exits, segregation and shield termination without writing a study.",
   "harness_connect": "Convenience pin-to-pin connection; for full wire metadata use harness_add_wire.",
-  "harness_edit": "Edit wires/defaults, edit_segment overrides, or add_clamp on a segment.",
+  "harness_edit": "Edit wires, defaults, segments, clamps and connectors; remove wires, segments or connectors; delete a harness.",
   "harness_electrical_check": "Check saved harness current, voltage drop, thermal/ampacity and protection.",
   "harness_formboard": "Write an SVG, DXF or PDF true-length formboard; reports overlap and length verification.",
   "harness_from_netlist": "Seed wires from a schematic. Map each 'REF:pin' to an endpoint or {connector:{definition},pin:n}.",
@@ -1071,7 +1071,7 @@
   "piping_solve": "Solve an ``aicad.piping/1`` pipe network for node pressures/heads and link flows.",
   "piping_spec_check": "ASME B31.3 pressure-design check of every run (wall, MAWP, utilization), flange ratings and support spans.",
   "piping_verify_cfd": "DAG verify node: compare 1D pipe-network pressure drop with 3D CFD pressure drop.",
-  "plm_add_remote": "Register a team-sync profile with optional account identity.",
+  "plm_add_remote": "Register a team-sync profile for a shared project location.",
   "plm_checkpoint": "Save a named checkpoint the user can return to. ``message`` describes the change in plain language. Returns ``{ok, commit, entry}``.",
   "plm_compare": "Compare an item between two history points — including a RENDERED GRAPHICAL DIFF of the geometry that changed.",
   "plm_graph_brief": "One-node dossier: identity, degree, edge-kind histogram, neighbors.",
@@ -2125,7 +2125,7 @@
    "prompt_note": "Connect the actual connector cavities; inspect the resulting connectivity before routing."
   },
   "harness_edit": {
-   "prompt_note": "Edit the existing harness and re-route or re-check affected derived results. add_clamp splits an interior segment; edit_segment sets or clears segment-specific OD, centerline bend radius and packing overrides."
+   "prompt_note": "Edit the existing harness and re-route or re-check affected derived results. add_clamp splits an interior segment; edit_segment sets or clears segment-specific OD, centerline bend radius and packing overrides; edit_connector moves or re-aims a connector (frame, exit_dir) and unroutes its wires; remove_wire, remove_segment and remove_connector prune unused geometry; delete_harness removes a scratch harness."
   },
   "harness_electrical_check": {
    "prompt_note": "Check conductor electrical limits using actual load, conductor and operating assumptions; review missing data and limitations."
@@ -2146,7 +2146,7 @@
    "prompt_note": "Review connector pinout and from/to tables, wire cut lengths, materials and missing allowances; routed length is not the complete cut length."
   },
   "harness_route": {
-   "prompt_note": "Route against the actual assembly and keepouts. Sourced bend and bundle estimates are assumptions, not cable-specific ratings; override with actual cable data and inspect assumptions, failures, clearances and bends."
+   "prompt_note": "Route against the actual assembly and keepouts. Sourced bend and bundle estimates are assumptions, not cable-specific ratings; override with actual cable data and inspect assumptions, failures, clearances and bends. On failure read wire, start/end and detail (endpoint, obstacle, distance_mm, free_mm) and fix the connector with harness_edit edit_connector instead of probing with more routes; reroute=True re-paths wires after geometry, keepout or connector changes."
   },
   "harness_to_bus_links": {
    "prompt_note": "Convert saved harness routes using complete firmware bus-link templates with explicit endpoints and topology; this produces firmware simulation bus_links, not harness_bus_check links."
@@ -2545,7 +2545,7 @@
    "prompt_note": "Verify node after piping_cfd_handoff (reuses its stored result with no args); compares dP budgets at tolerance_pct, not flow fields."
   },
   "plm_add_remote": {
-   "prompt_note": "Register before plm_sync/plm_lock. folder/ssh/https work via the url string; chudware-cloud is config-only. Folder remotes take a bare repo path in url."
+   "prompt_note": "Register before plm_sync/plm_lock. folder/ssh/https work via the url string. Folder remotes take a bare repo path in url."
   },
   "plm_checkpoint": {
    "prompt_note": "Always pass a plain-language message — it is how the point is found later. item_id scopes the checkpoint to one item. On reason='locked', call plm_item_set(item_id=<id>, start_new_rev=True), then retry."

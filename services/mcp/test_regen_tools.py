@@ -322,8 +322,7 @@ def _failed_candidate():
                          "error": "fillet: unresolved edge selection"}]}}
 
 
-@pytest.mark.parametrize("model_state", ["available", "unavailable", "unreachable"])
-def test_rejected_candidate_preview_keeps_native_feature_and_error(monkeypatch, model_state):
+def test_failed_add_features_carries_structural_findings_and_calls_no_model(monkeypatch):
     from services.mcp import cad_doc_tools as CT
     from services.mcp import core_bridge as cb
     from services.mcp import preflight_tools
@@ -346,7 +345,7 @@ def test_rejected_candidate_preview_keeps_native_feature_and_error(monkeypatch, 
     rollback["tree"]["features"].pop()
     original = copy.deepcopy(rollback)
     calls = []
-    prompts = []
+    model_calls = []
 
     def engine(method, params):
         calls.append(method)
@@ -359,17 +358,9 @@ def test_rejected_candidate_preview_keeps_native_feature_and_error(monkeypatch, 
             pytest.fail("native atomic rejection must not mutate the restored document")
         return {}
 
-    class EvidenceProvider(Provider):
-        def complete(self, system, messages, max_tokens=8000):
-            if model_state == "unreachable":
-                raise ProviderUnreachable("diagnostic provider unreachable")
-            prompts.append(json.loads(messages[-1]["content"][0]["text"].split("\n", 1)[1]))
-            return json.dumps({"diagnosis": "Native fillet failure; no inferred fix", "fix_ops": []})
-
-    def resolve_provider(*args):
-        if model_state == "unavailable":
-            raise ProviderUnreachable("diagnostic provider unavailable")
-        return EvidenceProvider()
+    def no_model(*args, **kwargs):
+        model_calls.append(args)
+        raise AssertionError("a failed add_features must not reach a model")
 
     monkeypatch.setattr(cb, "call", engine)
     monkeypatch.setattr(CT, "_doc", lambda doc_id: doc_id)
@@ -377,26 +368,24 @@ def test_rejected_candidate_preview_keeps_native_feature_and_error(monkeypatch, 
     monkeypatch.setattr(CT, "_publish_current", lambda doc_id: None)
     monkeypatch.setattr(CT, "_solve_sync_or_handoff", lambda name, fn, **kwargs: fn())
     monkeypatch.setattr(preflight_tools, "run_auto_preflight", lambda *args: {})
-    monkeypatch.setattr(RT, "_resolve_provider", resolve_provider)
-    monkeypatch.setattr(RT, "_journal_sink", lambda: lambda event: None)
-    monkeypatch.setattr(RT, "_verify", lambda *args: (None, {}))
+    monkeypatch.setattr(RT, "_resolve_provider", no_model)
+    monkeypatch.setattr(RT, "diagnose_failed_document", no_model)
+    monkeypatch.setattr(RD, "diagnose", no_model)
+    from services.agent.providers import omp_provider
+    monkeypatch.setattr(omp_provider, "helper_provider", no_model)
     result = json.loads(tools.functions["add_features"](
         doc_id="live", ops=[{"op": "add_feature", "feature": candidate["tree"]["features"][-1]}]))
     assert result["ok"] is False and result["rolled_back"] is True
     assert rollback == original
     assert "doc_revert" not in calls
-    failure = result["regen_diagnosis"]["failures"][-1]
+    assert not model_calls
+    assert "regen_diagnosis" not in result
+    findings = result["structural_findings"]
+    failure = findings["failures"][-1]
     assert failure["feature"] == "f61"
     assert failure["detail"] == candidate["rebuild"]["feature_status"][0]["error"]
     assert failure["options"]["name"] == "Ramp apron end cove"
-    if model_state == "available":
-        assert result["regen_diagnosis"]["kind"] == "fix_preview_card"
-        assert prompts[0]["features"][-1] == candidate["tree"]["features"][-1] | {"suppressed": False}
-        assert "f61 (Ramp apron end cove)" in prompts[0]["engine_error"]
-    else:
-        assert result["regen_diagnosis"]["ok"] is False
-        assert result["regen_diagnosis"]["reason"]
-        assert not prompts
+    assert "regen_diagnose" in findings["hint"]
 
 
 def test_native_failure_survives_unavailable_model_and_verifier(monkeypatch):

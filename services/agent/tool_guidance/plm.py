@@ -140,8 +140,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "plm_add_remote": {
         "prompt_note": (
             "Register before plm_sync/plm_lock. folder/ssh/https work via the "
-            "url string; chudware-cloud is config-only. Folder remotes take "
-            "a bare repo path in url."
+            "url string. Folder remotes take a bare repo path in url."
         ),
     },
     "plm_sync": {

@@ -117,6 +117,12 @@ uses engine `harness_route` and `harness_path_check` for centerlines, bends and
 clearance. Clearance is against display tessellation, not exact B-rep. Bundle OD and
 bend defaults are sourced estimates, not measured cable properties. Motion checking
 uses conservative transformed AABBs at sampled poses, not continuous motion.
+Routed geometry is stored at full precision, the router is sized with the same bundle
+requirement the later check applies, a wire turning at a breakout is checked as a fillet of
+its own bend radius, and segments no wire uses are pruned when wires are unrouted.
+`harness_route(reroute=True)` and `harness_edit` (`edit_connector`, `remove_segment`,
+`remove_connector`, `delete_harness`) edit persisted routing; failures carry the wire,
+endpoints and engine `detail` (see the contract's 2026-11-06 amendment).
 
 `services/harness/electrical.py`, `bus_electrical.py`, `cable_models.py` and
 `wire_data.py` implement electrical, bus, cable and cited property screens exposed by

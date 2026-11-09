@@ -24,6 +24,17 @@ bool settleUnfinishedCompaction(Activity& activity, const std::string& outcome) 
     return true;
 }
 
+// A tool row that started (an Eval's, upserted by its final call) and never got that call did
+// not succeed: Stop reads "cancelled", anything else "stopped" like a reloaded transcript.
+template <typename Activity>
+bool settleUnfinishedTool(Activity& activity, const std::string& outcome) {
+    if (activity.rowKind != 3 || activity.status != "running") return false;
+    activity.status = outcome == "cancelled" || outcome == "canceled" ? "cancelled" : "stopped";
+    activity.streaming = false;
+    ++activity.revision;
+    return true;
+}
+
 template <typename Message>
 void settleCompactionMessage(Message& message, const std::string& outcome) {
     for (auto& activity : message.activity)

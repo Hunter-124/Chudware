@@ -277,6 +277,13 @@ public:
                         nlohmann::json& result, std::string& err,
                         const std::string& provider = {});
 
+    // Take an unread steer back: agent_withdraw_steer {run_id, steer_id} → {ok, withdrawn}.
+    // withdrawn:false = the agent already read it (its delivery event follows) or the run
+    // ended. Same side-channel transport as steer.
+    bool callAgentWithdrawSteer(const std::string& runId, const std::string& steerId,
+                                nlohmann::json& result, std::string& err,
+                                const std::string& provider = {});
+
     // Interactive ask_user answer: agent_answer {run_id, batch_id, answers} or
     // {run_id, batch_id, declined:true} → {ok, run_id, batch_id, answered} | {ok:false, reason}.
     // Same mutex-bypass / side-channel transport as steer: the question blocks the in-flight

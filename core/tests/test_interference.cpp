@@ -31,6 +31,8 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
@@ -56,6 +58,8 @@ namespace chudware::doc {
 nlohmann::json interference_report_with_injected_failure_for_testing(
     const TopoDS_Shape& a, const TopoDS_Shape& b, bool threshold, bool coincident,
     bool fail_common, bool fail_cut, bool fail_retries, double retry_seconds = 10.0);
+nlohmann::json interference_report_with_unclipped_failure_for_testing(
+    const TopoDS_Shape& a, const TopoDS_Shape& b, bool threshold);
 }
 
 using json = nlohmann::json;
@@ -410,6 +414,62 @@ TEST_CASE("eval_interference: failed fallback remains incomplete") {
     CHECK(report["clearances"].empty());
     REQUIRE(report["pair_failures"].size() == 1);
     CHECK(report["pair_failures"][0]["reason"] == "boolean_failed");
+    CHECK(report["summary"].get<std::string>().find(
+              "First failed pair: a<->b (boolean_failed)") != std::string::npos);
+}
+
+TEST_CASE("eval_interference: a degenerated edge resting on a face is not an orientation failure") {
+    using chudware::doc::interference_report_with_injected_failure_for_testing;
+    // OCCT 7.9.1 raises UnableToOrientTheShape for the degenerated edge of a sphere pole or a
+    // cone apex that touches another solid, although Common is right. No injected failure.
+    const TopoDS_Shape plate = BRepPrimAPI_MakeBox(gp_Pnt(-10, -10, -10), gp_Pnt(10, 10, 0)).Shape();
+    SUBCASE("a sphere pole resting on the plate is a contact") {
+        const TopoDS_Shape ball = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 5), 5.0).Shape();
+        for (bool threshold : {false, true}) {
+            const json report = interference_report_with_injected_failure_for_testing(
+                ball, plate, threshold, true, false, false, false);
+            INFO(report.dump(2));
+            REQUIRE(report["complete"] == true);
+            CHECK(report["pair_failures"].empty());
+            CHECK(report["interferences"].empty());
+            REQUIRE(report["contacts"].size() == 1);
+            CHECK_FALSE(report["contacts"][0].contains("approximate"));
+            CHECK(report["contacts"][0]["distance"].get<double>() == doctest::Approx(0.0));
+        }
+    }
+    SUBCASE("a cone apex on the plate face keeps the exact overlap volume of the cone inside") {
+        const TopoDS_Shape cone = BRepPrimAPI_MakeCone(
+            gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, -1)), 0.0, 3.0, 6.0).Shape();
+        const json report = interference_report_with_injected_failure_for_testing(
+            cone, plate, false, false, false, false, false);
+        INFO(report.dump(2));
+        REQUIRE(report["complete"] == true);
+        CHECK(report["pair_failures"].empty());
+        REQUIRE(report["interferences"].size() == 1);
+        const json& hit = report["interferences"][0];
+        CHECK_FALSE(hit.contains("method"));
+        const double pi = 3.14159265358979323846;
+        CHECK(hit["overlap_volume_mm3"].get<double>() ==
+              doctest::Approx(pi * 3.0 * 3.0 * 6.0 / 3.0).epsilon(1e-6));
+    }
+}
+
+TEST_CASE("eval_interference: a failed Common is resolved exactly by clipping to the operand bounds") {
+    using chudware::doc::interference_report_with_unclipped_failure_for_testing;
+    const TopoDS_Shape a = BRepPrimAPI_MakeBox(10, 10, 10).Shape();
+    const TopoDS_Shape b = BRepPrimAPI_MakeBox(gp_Pnt(5, 0, 0), 10, 10, 10).Shape();
+    for (bool threshold : {false, true}) {
+        const json report = interference_report_with_unclipped_failure_for_testing(a, b, threshold);
+        INFO(report.dump(2));
+        REQUIRE(report["complete"] == true);
+        CHECK(report["pair_failures"].empty());
+        REQUIRE(report["interferences"].size() == 1);
+        const json& hit = report["interferences"][0];
+        CHECK(hit["method"] == "clipped_common");
+        CHECK(hit["clipped_common"] == true);
+        CHECK_FALSE(hit.contains("approximate"));
+        CHECK(hit["overlap_volume_mm3"].get<double>() == doctest::Approx(500.0).epsilon(1e-6));
+    }
 }
 
 TEST_CASE("eval_interference: exhausted fuzzy retry budget is not a clear pair") {

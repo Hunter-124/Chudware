@@ -21,7 +21,7 @@ _FRAME_LIMIT = 16 * 1024 * 1024
 _MAX_PENDING = 128
 _MAX_TOOLS = 64
 _MAX_PROGRESS = 32
-_OPERATIONS = frozenset({"auth_state", "auth_states", "set_api_key", "remove_api_key", "setup_providers", "memory_status", "memory_search", "memory_save", "settings_get", "settings_set", "compact", "model_metadata", "tool_state", "handoff", "cad_tool_loads_get", "cad_tool_loads_put", "cad_tool_loads_legacy", "cad_image_blobs_status", "cad_image_blob_import", "cad_image_context_refs"})
+_OPERATIONS = frozenset({"auth_state", "auth_states", "set_api_key", "remove_api_key", "setup_providers", "memory_status", "memory_search", "memory_save", "settings_get", "settings_set", "config_get", "config_list", "config_set", "config_parse", "compact", "model_metadata", "tool_state", "handoff", "cad_tool_loads_get", "cad_tool_loads_put", "cad_tool_loads_legacy", "cad_image_blobs_status", "cad_image_blob_import", "cad_image_context_refs"})
 _ACTIONS = frozenset({"bootstrap", "tool_ack", "poll", "is_pending", "model_policy", "result", "tool_start", "tool_poll", "tool_cancel"})
 
 
@@ -268,7 +268,7 @@ class ExtensionBridge:
                     result = data.get("result")
                     error = data.get("error")
                     limit = (_FRAME_LIMIT // 2 if pending.operation == "cad_image_context_refs"
-                             else 512 * 1024 if pending.operation in {"tool_state", "handoff"}
+                             else 512 * 1024 if pending.operation in {"tool_state", "handoff", "config_list"}
                              else _CONTROL_LIMIT)
                     if _encoded_size(result) > limit:
                         pending.error = "failed"

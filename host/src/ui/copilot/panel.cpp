@@ -28,6 +28,7 @@
 #include "ui/ai/agent_dag.h"      // one terminal-state source for every sub-agent surface
 #include "image_lightbox.h"
 #include "ui/omp_session_actions.h"  // OMP session recovery
+#include "ui/settings_modal.h"      // SettingsRoute deep links (Settings window opens on AI)
 #include "ui/workspace_home.h"      // empty-workspace home: wider chat column
 #include "ui/copilot/inline_image_refs.h"  // stripInlineImageMarkers — Sessions titles
 #include "util/time_local.h"        // chudware::util::localTime — Sessions recency groups
@@ -2859,7 +2860,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // The in-column gear uses showAISettingsOverlay instead.
     if (st.focusSettingsTab) {
         st.openSettings     = true;
-        st.openSettingsTab  = 2;
+        st.openSettingsTab  = SettingsAI;
         st.focusSettingsTab = false;
     }
 

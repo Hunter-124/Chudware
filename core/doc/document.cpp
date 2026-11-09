@@ -1936,45 +1936,6 @@ json normalize_feature(const json& raw) {
     return f;
 }
 
-// SEAM-AWARE closed-solid test (S2 / S1) — a mirror of session.cpp::eval_is_closed_solid
-// (kept private there, so duplicated here for the dress-op post-check). A valid closed
-// solid has every edge shared by >= 2 faces; the only single-face exceptions are SEAMS
-// (BRep_Tool::IsClosed — the 0/2pi closure of a cylinder/sphere/revolution skin) and
-// DEGENERATE edges (a cone apex / sphere pole). Any OTHER edge with < 2 incident faces is
-// a genuine FREE edge -> the shell is open (the part is not watertight). This is the case
-// the N2 negative-volume guard does NOT catch: a partial fillet/chamfer (some edges too
-// tight) or a freeform shell can hand back a body whose volume is positive but whose B-rep
-// is an open shell — eval_check then reports free_edges and STEP re-validation fails, yet
-// the feature committed ok:true. Using the seam-aware rule means a perfectly valid
-// cylinder/sphere/revolved body (which legitimately has seam edges) is NOT rejected.
-bool dress_is_closed_solid(const TopoDS_Shape& shape) {
-    try {
-        if (shape.IsNull()) return false;
-        TopTools_IndexedDataMapOfShapeListOfShape anc;
-        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
-        TopTools_IndexedMapOfShape edges;
-        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
-        if (edges.Extent() == 0) return false;  // no edges -> not a solid
-        for (int ei = 1; ei <= edges.Extent(); ++ei) {
-            const TopoDS_Shape& es = edges.FindKey(ei);
-            const int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
-            if (nf >= 2) continue;  // shared by two faces -> fine
-            const TopoDS_Edge& e = TopoDS::Edge(es);
-            if (BRep_Tool::Degenerated(e)) continue;  // apex/pole -> legitimate
-            bool seam = false;
-            if (anc.Contains(es)) {
-                const TopTools_ListOfShape& faces = anc.FindFromKey(es);
-                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
-                    if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
-            }
-            if (!seam) return false;  // a real free edge -> open shell
-        }
-        return true;
-    } catch (const Standard_Failure&) {
-        return false;  // conservative: an OCCT error means we can't vouch for closure
-    }
-}
-
 // Closure alone cannot detect a blend whose trimmed faces overlap or collapse.
 // Match eval_solid_health's non-destructive, per-solid CheckerSI policy, but run
 // it only for an actual dress result, before consuming the preceding body.
@@ -2049,11 +2010,25 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape, bool* timed_out 
                 it.Value().Indices(a, b);
                 if (ds.IsNewShape(a) || ds.IsNewShape(b)) continue;
                 std::ostringstream reason;
+                reason.imbue(std::locale::classic());
+                reason.setf(std::ios::fixed);
+                reason.precision(3);
+                // Sub-shape indices mean nothing outside the checker; name where.
+                const auto describe = [&](Standard_Integer index) {
+                    const TopoDS_Shape& sub = ds.Shape(index);
+                    TopAbs::Print(sub.ShapeType(), reason);
+                    Bnd_Box box;
+                    BRepBndLib::Add(sub, box);
+                    if (box.IsVoid()) return;
+                    double x0, y0, z0, x1, y1, z1;
+                    box.Get(x0, y0, z0, x1, y1, z1);
+                    reason << " near (" << (x0 + x1) / 2 << ", " << (y0 + y1) / 2 << ", "
+                           << (z0 + z1) / 2 << ")";
+                };
                 reason << "self-intersection between ";
-                TopAbs::Print(ds.Shape(a).ShapeType(), reason);
-                reason << " sub-shape index " << a << " and ";
-                TopAbs::Print(ds.Shape(b).ShapeType(), reason);
-                reason << " sub-shape index " << b;
+                describe(a);
+                reason << " and ";
+                describe(b);
                 return reason.str();
             }
         }
@@ -2068,7 +2043,7 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape, bool* timed_out 
 }  // namespace
 
 ::geom::FilletValidationResult validate_fillet_solid(const TopoDS_Shape& shape) {
-    if (!dress_is_closed_solid(shape))
+    if (!::geom::is_watertight(shape))
         return {::geom::FilletValidationStatus::rejected, "result is not a closed solid"};
     bool timed_out = false;
     std::string reason = dress_geometry_rejection(shape, &timed_out);
@@ -6726,7 +6701,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     auto bk_src = body_kinds.find(body_id);
                     const bool src_is_surface =
                         bk_src != body_kinds.end() && bk_src->second == "surface";
-                    if (!src_is_surface && !sub_tolerance && !dress_is_closed_solid(out)) {
+                    if (!src_is_surface && !sub_tolerance && !::geom::is_watertight(out)) {
                         char obuf[256];
                         std::snprintf(obuf, sizeof(obuf),
                             "%s produced an open/invalid body — some edges are too tight at %.4g mm "
@@ -7395,6 +7370,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     Handle(BRepTools_History) copy_history = new BRepTools_History(args, copier);
                     ShapeUpgrade_UnifySameDomain unify(copier.Shape(), Standard_True,
                                                        Standard_True, Standard_False);
+                    ::geom::keep_degenerate_patches(unify, copier.Shape());
                     st.data["attempted"] = true;
                     unify.Build();
                     TopoDS_Shape out = unify.Shape();
@@ -7974,7 +7950,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     }
                 }
 
-                if (unify_faces) {
+                bool degenerate_patch = false;
+                if (unify_faces)
+                    for (TopExp_Explorer fe(out, TopAbs_FACE); fe.More() && !degenerate_patch; fe.Next())
+                        degenerate_patch = ::geom::is_degenerate_patch(TopoDS::Face(fe.Current()));
+                // Internal edges are allowed here, so a kept edge cannot isolate a corner
+                // patch: skip unification rather than crash (geom::keep_degenerate_patches).
+                if (unify_faces && !degenerate_patch) {
                     try {
                         ShapeUpgrade_UnifySameDomain uni(out, Standard_True, Standard_True,
                                                          Standard_True);
@@ -8079,6 +8061,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (fix_orientation)
                     st.data["orientation"] = json{{"faces_flipped", orient_flipped},
                                                   {"conflicts", orient_conflicts}};
+                if (unify_faces && degenerate_patch)
+                    st.warning = "heal: unify_faces skipped: a curved face has a degenerated edge "
+                                 "(a fillet corner patch), which the kernel cannot merge safely";
                 if (rebuild_solid)
                     st.data["rebuild"] = json{{"lumps", rebuild_lumps},
                                               {"kept_volume_mm3", rebuild_kept},
@@ -11592,6 +11577,91 @@ std::shared_ptr<const CompileResult> compile_cache_full_result(const CompileCach
 }
 
 uint64_t compile_cache_stamp(const CompileCache& cache) { return cache.stamp; }
+
+FeatureInput compile_feature_input(const json& doc, const json& env, const CompileCache* cache,
+                                   ::geom::DisplayQuality quality, const std::string& feature_id) {
+    FeatureInput out;
+    try {
+        const CkptInputs in = ckpt_inputs(doc);
+        std::size_t index = in.features.size();
+        for (std::size_t i = 0; i < in.features.size(); ++i)
+            if (in.features[i].is_object() &&
+                in.features[i].value("id", std::string()) == feature_id) { index = i; break; }
+        if (index == in.features.size()) {
+            out.error = "feature '" + feature_id + "' is not in the active configuration's history";
+            return out;
+        }
+        const std::string previous = index > 0 && in.features[index - 1].is_object()
+            ? in.features[index - 1].value("id", std::string()) : std::string();
+        if (previous.empty()) {
+            out.error = "feature '" + feature_id + "' has no earlier feature, so no input body";
+            return out;
+        }
+        // The solid it targets: an explicit `body` ref, else the running top solid (body_ref()).
+        std::string wanted;
+        const json feat = normalize_feature(in.features[index]);
+        if (feat.contains("body")) {
+            wanted = selector_owner_id(feat["body"]);
+            if (wanted.empty()) {
+                out.error = "the body ref of '" + feature_id + "' does not name a feature id";
+                return out;
+            }
+        }
+        // Fast path: the checkpoint after the first `index` features IS the input state. The
+        // chain hash folds every earlier feature, so one equality proves the whole prefix.
+        if (cache && index < cache->snaps.size() && cache->snaps[index]) {
+            const std::vector<uint64_t> chain = cc_chain(doc, in.features, env,
+                in.active_configuration, quality, true, false);
+            if (index < chain.size() && index < cache->chain.size() &&
+                chain[index] == cache->chain[index]) {
+                const CompileCkpt& ck = *cache->snaps[index];
+                std::string id = wanted;
+                if (id.empty())
+                    for (auto it = ck.solid_order.rbegin(); it != ck.solid_order.rend(); ++it)
+                        if (!ck.consumed.count(*it)) { id = *it; break; }
+                const auto found = id.empty() ? ck.results.end() : ck.results.find(id);
+                if (found != ck.results.end() && std::holds_alternative<SolidResult>(*found->second)) {
+                    const TopoDS_Shape& shape = std::get<SolidResult>(*found->second).shape;
+                    if (!shape.IsNull()) {
+                        out.body = shape;
+                        out.body_id = id;
+                        out.from_checkpoint = true;
+                        return out;
+                    }
+                }
+            }
+        }
+        json prefix = doc;
+        prefix["rollback_after"] = previous;
+        std::shared_ptr<CompileCache> scratch = cache ? copy_compile_cache(*cache)
+                                                      : make_compile_cache();
+        const CompileResult pre = compile_document(prefix, env, scratch.get(), quality);
+        const bool rolled_back = std::any_of(pre.statuses.begin(), pre.statuses.end(),
+            [&](const FeatureStatus& st) { return st.id == feature_id && st.rolled_back; });
+        if (!rolled_back) {
+            out.error = "could not roll the history back to just before '" + feature_id + "'";
+            return out;
+        }
+        std::size_t chosen = pre.shapes.size();
+        if (wanted.empty()) {
+            if (!pre.shapes.empty()) chosen = pre.shapes.size() - 1;
+        } else {
+            for (std::size_t i = 0; i < pre.shapes.size() && i < pre.bodies_info.size(); ++i)
+                if (pre.bodies_info[i].name == wanted) { chosen = i; break; }
+        }
+        if (chosen >= pre.shapes.size() || pre.shapes[chosen].IsNull()) {
+            out.error = "no input body for '" + feature_id + "' before it" +
+                        (wanted.empty() ? std::string() : " (body '" + wanted + "' not found)");
+            return out;
+        }
+        out.body = pre.shapes[chosen];
+        out.body_id = chosen < pre.bodies_info.size() ? pre.bodies_info[chosen].name : wanted;
+    } catch (const std::exception& e) {
+        out.body = TopoDS_Shape();
+        out.error = std::string("input body unavailable: ") + e.what();
+    }
+    return out;
+}
 
 std::string compile_cache_encode(const CompileCache& cache, const json& doc, const json& env,
                                  ::geom::DisplayQuality quality, const std::string& engine_key,

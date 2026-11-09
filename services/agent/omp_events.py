@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -1394,6 +1395,69 @@ _SUBAGENT_TOOL_EVENTS = frozenset(
 )
 
 
+def _number(data: Mapping[str, Any], key: str) -> float | None:
+    """A present, finite, non-negative number; anything else is absent."""
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
+def _count(data: Mapping[str, Any], key: str) -> int | None:
+    """``_number`` as an int."""
+    value = _number(data, key)
+    return None if value is None else int(value)
+
+
+def _subagent_usage(body: Mapping[str, Any]) -> dict[str, Any]:
+    """OMP's ``AgentProgress`` run totals for a task sub-agent's ``sub_run`` card.
+
+    ``requests`` (assistant requests), ``tokens`` (input + output + cacheWrite
+    over the run), ``context_tokens`` / ``context_window`` (the latest request's
+    prefix against the model's window), ``cost_usd``, ``duration_ms`` and
+    ``resolved_model`` are added only when the frame carries them as numbers
+    (strings for the model): a lifecycle frame carries none, a progress frame
+    all of them, so the consumer keeps the latest value of each.
+    ``retry_state`` is a snapshot: present only while the sub-agent sleeps
+    between provider retries, so a progress frame without it means none is pending.
+    """
+    usage: dict[str, Any] = {}
+    for source, key in (
+        ("requests", "requests"),
+        ("tokens", "tokens"),
+        ("contextTokens", "context_tokens"),
+        ("contextWindow", "context_window"),
+        ("durationMs", "duration_ms"),
+    ):
+        value = _count(body, source)
+        if value is not None:
+            usage[key] = value
+    cost = _number(body, "cost")
+    if cost is not None:
+        usage["cost_usd"] = round(cost, 6)
+    model = body.get("resolvedModel")
+    if isinstance(model, str) and model.strip():
+        usage["resolved_model"] = _cap(model.strip(), 200)
+    retry = body.get("retryState")
+    if isinstance(retry, Mapping):
+        state: dict[str, Any] = {}
+        for source, key in (
+            ("attempt", "attempt"),
+            ("maxAttempts", "max_attempts"),
+            ("delayMs", "delay_ms"),
+        ):
+            value = _count(retry, source)
+            if value is not None:
+                state[key] = value
+        error = retry.get("errorMessage")
+        if isinstance(error, str) and error.strip():
+            state["error"] = _cap(error.strip(), 160)
+        usage["retry_state"] = state
+    return usage
+
+
 def _subagent_frame(
     kind: str,
     frame: Mapping[str, Any],
@@ -1467,6 +1531,7 @@ def _subagent_frame(
         row["agent_type"] = agent_type
     if description:
         row["description"] = description
+    row.update(_subagent_usage(body))
     return [(event, row)]
 
 

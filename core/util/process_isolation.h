@@ -52,6 +52,8 @@ struct FilletWorkerParameters {
     bool unequal_requested = false;
     bool recording = false;
     bool document_validation = false;
+    unsigned runoff = 0;  // 0 none, else a FilletRunoffMode
+    unsigned sweep = 0;   // 0 none, else a geom::SweepBlendScope
     std::chrono::steady_clock::time_point deadline;
 };
 

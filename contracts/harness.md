@@ -133,3 +133,147 @@ Outputs are bounded/paged. Formboard drawing-sheet integration is not supported.
 - Bundle estimates cite [RapidHarness](https://rapidharness.com/support/design-types/harnesses/bundle-diameters) and [One Pull Wire](https://onepullwire.com/5-steps-to-calculate-the-diameter-of-bundled-cable/). Default area packing factor is `1/(1.2**2)`, an example rather than universal packing; coverings and grouped/twisted construction are not inferred. Override from measurement or datasheet.
 - `services/harness/wire_data.py` cites ASTM B258 for AWG, ASTM B3/B193 and IEC 60028 for copper properties, IEC 60228 for metric resistance, NEC 310.16 and 310.15 for building-wire ampacity/corrections, and NASA MSFC-STD-3012A for its stated spaceflight conditions. NEC tables are limited to their specified conditions and 14 AWG and larger; neither thermal estimates nor spaceflight tables certify chassis wiring.
 - The same file's insulation table cites Paragon's wire chart, Midland fluoropolymer data, Testo emissivity, and the material-specific references recorded with each table entry. PVC, PTFE, FEP, ETFE, XLPE, silicone and TPE values are representative screening values, not specifications for an unidentified wire. Emissivity varies with surface and temperature; actual continuous rating and formulation require manufacturer data. Unknown/ambiguous material properties remain unknown.
+
+## 6. Amendment (2026-11-06): routing precision, junctions, graph editing
+
+Additive; it supersedes the earlier text only where stated.
+
+**Full-precision geometry.** Segment `path` points and node `pos` values are stored
+unrounded (rounding a dense arc shifts its sampled bend radius). A segment's end points
+equal its nodes' `pos` exactly, and a node created by a split (`breakout`, `clamp`) sits
+exactly on both halves. Derived scalars keep their rounding: `length_mm` 3 decimals,
+`od_mm` and `min_bend_radius_mm` 4 decimals.
+
+**One bundle requirement.** `harness_route` plans a joining segment for the OD and
+centerline bend radius that `recompute_derived` stores for it (same rounding, packing
+factor and segment overrides, computed by `model.bundle_requirements`), so the routed arc
+radius meets the later check. The engine check accepts a bend when
+`radius >= min_bend_radius_mm * (1 - 1e-6)` and ignores collinear interior vertices
+([worker RPC](worker_rpc.md#harness-routing-and-path-checks)).
+
+**Junction fillets.** A route endpoint on a connector node uses the connector exit
+direction. A non-connector join node (`breakout`, `clamp`, `waypoint`, `splice`) gets no
+router direction: a wire leaves a bundle with its own bend radius instead of merging
+tangentially. The full-wire check (`harness_route` final check, `harness_check`) sends the
+wire's concatenated centreline together with `junctions`, the indices where the wire changes
+between two segments that are not the two halves of one split (`model.wire_route`, using a
+node's `through`, below; omitted when there are none). A wire running straight through a
+breakout or clamp along the trunk is therefore not at a junction, while a wire leaving along a
+branch is; a node without `through` (legacy data) counts every join as a junction. The engine
+judges a turning vertex at a junction index as a fillet over the adjacent straight runs
+(`min(L_in, L_out) / tan(theta/2)`), never as a sampled arc or isolated kink, and reports
+a failure as `junction_fillet` with `available_fillet_radius_mm`; junction fillets are not
+clearance-checked ([worker RPC](worker_rpc.md#harness-routing-and-path-checks)).
+
+**Pruning.** Removing a wire, removing a segment, editing or removing a connector and
+`reroute` unroute wires, then: segments carrying no wire are deleted; non-connector nodes
+with no incident segment are deleted; a `breakout` left with exactly the two halves its
+`through` records is merged back into one segment when their non-derived fields (everything
+except `id`, `a`, `b`, `path`, `od_mm`, `min_bend_radius_mm`, `wires`, `length_mm`,
+`od_basis`, `bend_radius_basis`, `bend_radius_confidence`) are identical. A breakout left
+with a branch and one trunk piece is kept, since merging them would put the junction corner
+inside one bundle. Replies report
+`removed_segments`, `removed_nodes` and `merged_segments`.
+
+**`harness_route` additions.** `reroute: bool = false` first removes the segments carrying
+the selected wires so they are routed afresh; without it wires whose connectors are already
+joined are skipped. A segment that also carries unselected wires is refused with
+`reroute_shared_segment` and `wires` listing them. Replies add `removed_segments` when
+`reroute` is set; `segments` lists the segments this call created (split halves of them
+included). When the final check fails on a segment the call did not create, the
+`route_check_failed` error sets `predates_call: true`, names `segment` and `wires`, and
+hints `reroute=True` with those wires. Violation reports are in `detail` (formerly
+`result`).
+`prefer_paths` sent to the engine are the centrelines of the two trees being joined,
+simplified (Ramer-Douglas-Peucker, 0.5 mm) and ordered nearest the route endpoints first,
+within the engine's 128-polyline / 256-leg limit; dropped centrelines add a warning.
+
+**Join selection.** When joining two trees, the join is the closest attachment between them
+in either direction: every joinable node of one tree, measured from its routing departure
+point (a connector's origin plus `exit_dir` times twice the bundle requirement's bend
+radius, the exit stub the router builds; any other node's position), against the nearest
+attachment of the other tree, which is a joinable node or a point on a straight leg of one
+of its segments (then split). A node or leg is joinable only if the joining wires reach
+their own connectors from it without running through another connector (both of that
+connector's segments leave along its exit direction, a 180 degree reversal): a connector is
+a join end only when it is the own end of every wire using the join, and a segment can be
+tapped only on the side that keeps this true. A leg point keeps the largest own
+`min_bend_radius_mm` of the joining wires from both leg ends, so a wire turning at the
+junction has room for its fillet (arc chords never qualify), and it lies beyond the exit
+stub of a connector end of its segment (twice the bend radius the segment was routed for, or
+its requirement if older): a junction inside a stub would make its wires turn or double back
+within the straight the bundle must leave its connector with. Where the wires turn through a
+large angle (arriving from the departure point, continuing toward their connectors) more run
+is needed, `margin x tan(turn / 2)`: the point nearest the departure point yields to the best
+of a few others on the leg when it falls short. The start node and the real target point
+are what the router receives, so a connector that exits away from a bundle attaches ahead of
+its exit rather than behind it. When neither tree offers an attachment the call fails with
+`no_join_point`, naming the wire and the joining wires.
+
+**Bundle growth.** A join can turn a bundle routed for fewer wires into one with a larger
+requirement. `harness_route` therefore records, per segment it creates (split halves
+inherit), the bundle its route was planned for and the index of the route that made it. The
+k-th route of a call joins the same two trees in every pass, whatever it attaches to, so the
+index identifies the route's own wires and keys a floor on its bundle. After the routing
+loop it checks every segment; a failing segment that carries only selected wires, has no
+author fields (overrides, sleeves) and whose requirement exceeds what its route was planned
+for raises its route's floor to that requirement. The harness is then restored to its state
+at the start of the call and every route is made again, each planned for at least its floor.
+Every pass either raises a floor, which is bounded by the bundle of every selected wire, or
+ends the call, so the call converges; the reply then adds `repathed_segments` (ids discarded
+across passes) and `route_passes`. A route that cannot be made at its floor (no path, blocked
+exit stub, search budget) fails at once with the engine's `code`, the wire, endpoints and
+`detail` as for any route, plus `bundle_wires`, `od_mm`, `min_bend_radius_mm` and
+`route_passes`, and a hint stating the wires, the radius and the exit stub length it needs.
+A bundle that still fails at the size it was planned for fails with `route_check_failed`
+(`segment`, `wires`, `od_mm`, `min_bend_radius_mm`, `route_passes`). A failing segment that
+cannot be repaired by re-pathing (its requirement did not outgrow its route, it carries wires
+outside `wire_ids`, it has author fields, or the call did not create it) fails at once:
+`predates_call: true` when the call did not create it.
+
+**Node provenance, `through`.** A `breakout` or `clamp` node created by splitting a segment
+(`model.split_segment_at`) carries an optional `through: [first_half_id, second_half_id]`, the
+two segments that were one continuous bundle. It is kept correct as the graph changes: when a
+segment named in an end node's `through` is split, the half adjacent to that node replaces it;
+when `prune_graph` merges a breakout (second segment dropped into the first), the first
+replaces the second in the far node's `through`; a node whose two segments no longer both touch
+it loses `through` (so a segment id that `next_id` later reuses can never match stale
+provenance).
+
+**Arc context.** A segment cut out of a router arc (by a breakout or clamp inside it) begins
+or ends with a chord or two of that arc, which alone read as an isolated kink. The
+per-segment bundle checks (`harness_route` final check, `harness_check`) therefore send the
+segment's path extended with through-continuation context (`model.segment_check_path`): at
+each end node, the continuation of this segment is its `through` partner when the node records
+one; a branch (not in `through`) and any segment at a node without `through` have none, since
+guessing from leg angles would lend a nearly tangent branch the trunk's points. The
+continuation, oriented to continue the path, lends its
+points (excluding the shared node) until 64 points or a length of pi times this segment's
+`min_bend_radius_mm`. No continuation means no context on that side. `report_range`
+`[first, last]` is the segment's own vertex indices inside the extended path and is omitted
+when there is no context on either side. Only geometry is borrowed: the OD and bend
+requirement are the segment's. The engine estimates bends on the whole path but reports
+findings, `min_bend_radius_found_mm`, clearance and lengths for the range only
+([worker RPC](worker_rpc.md#harness-routing-and-path-checks)); the tools return finding
+`index` values and `length_mm` relative to the segment's own path, in `harness_check` and
+in a route failure's `detail`.
+
+**`harness_edit` additions.** Parameters `connector_id`, `frame` and `exit_dir`; actions:
+
+| Action | Behaviour |
+|---|---|
+| `remove_segment` | `segment_id`; its wires become unrouted, then prune; reports `unrouted_wires`. |
+| `edit_connector` | `connector_id` plus any of `frame{origin,normal,up}` (omitted parts keep their value) and `exit_dir`; validated like `harness_add_connector`. A changed frame drops the connector's stored `attach` face placement. Segments touching the connector are removed; reports `unrouted_wires`, `removed_segments` and `changed` (false, with nothing removed, when the values are unchanged). |
+| `remove_connector` | Only when no wire references the connector, else `connector_in_use` with `wires`; also removes its node. |
+| `delete_harness` | Deletes the harness study and returns `deleted_harness`; geometry built from it is not removed. |
+
+**Error context.** When the engine router or a path check refuses inside `harness_route`,
+the `HarnessError` keeps the engine `code`, prefixes the message with the wire id (or
+`bundle sN` / `wire wN` for checks), adds `wire`, `start` and `end`
+(`{node, kind, pos, connector?}`, `connector` being the ref), and carries the unchanged
+engine reply in `detail`. Engine fields such as `endpoint`, `obstacle`, `distance_mm`,
+`required_mm`, `inside_solid`, `stub_mm`, `free_mm`, `dir`, `expanded_nodes`, `grid_mm`
+and `max_nodes` are read from there; for blocked endpoints, blocked exit stubs
+(`exit_blocked`) and `budget` the `hint` states them. Fix a blocked connector with
+`harness_edit(action="edit_connector")` rather than creating new harnesses or probing with
+extra routes.

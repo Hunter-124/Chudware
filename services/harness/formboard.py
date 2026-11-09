@@ -156,7 +156,8 @@ def _components(segs: list) -> list:
         if ra == rb:
             raise M.HarnessError(
                 "not_a_tree", f"segment {s['id']} closes a loop; a formboard needs a tree",
-                hint="remove the redundant segment (harness_edit remove_segment) and re-route; "
+                hint="remove the redundant segment (harness_edit action='remove_segment', "
+                     "segment_id=...) and re-route; "
                      "wires follow the unique tree path between connectors")
         parent[ra] = rb
     groups: dict = {}

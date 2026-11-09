@@ -3,7 +3,8 @@
 //   * Pending steers  - sent to the running agent, which reads them at its next step. Their
 //     bubbles trail st.chat (isPendingSteer) and the chat log stops its windowed rows before
 //     them; placeSteerInTranscript moves one into the flow at the point the agent read it.
-//     Read-only here: only Stop withdraws a steer (the whole run), so there is nothing to cancel.
+//     Edit / Cancel take one back unread (withdrawPendingSteer): it becomes the first queued
+//     message, opened in the editor or handed back to the composer.
 //   * Queued messages - held by the composer until the run is free (st.queuedPrompts, with their
 //     attachment drafts). Each can be edited in place, sent now, or cancelled back into the
 //     composer.
@@ -27,8 +28,9 @@ enum class Tone { Quiet, Primary };
 // One bubble of the stack, snapshotted at the top of the frame so a mutation made by one
 // bubble's action never invalidates what the rest of the frame draws.
 struct StackItem {
-    bool steer = false;       // pending steer (read-only) vs queued message (actions)
+    bool steer = false;       // pending steer vs queued message
     size_t index = 0;         // st.chat index (steer) / st.queuedPrompts index (queued)
+    std::string steerId;      // the steer's correlation id (steers only)
     ImGuiID id = 0;           // identity for the motion state
     std::string text;
     int attach = 0;           // attachments + inline images riding with it
@@ -130,6 +132,7 @@ std::vector<StackItem> collectItems(const AppState& st, ImGuiID seed) {
         it.steer = true;
         it.index = i;
         it.id = stackKey(seed, "steer", m.steerId, 0);
+        it.steerId = m.steerId;
         it.text = m.text;
         it.attach = (int)m.imagePaths.size();
         it.context = (int)m.contextRefs.size();
@@ -169,12 +172,15 @@ struct Caption {
 };
 
 // The delivery states a steer can still be pinned in (the transcript draws the settled ones).
-Caption steerCaption(int state, const ui::AdaptiveSurface& surf) {
+Caption steerCaption(const std::string& steerId, int state, const ui::AdaptiveSurface& surf) {
+    if (steerWithdrawPending(steerId))
+        return {"Taking back\xe2\x80\xa6",
+                "Asking the agent to drop this message before it reads it.", surf.textTertiary};
     if (state == STEER_QUEUED)
         return {"Queued \xc2\xb7 after this step",
                 "The agent reads it when its current tool call returns. A wait on a job ends at "
-                "once; real work (a solve, a build) finishes first. Stop withdraws it unread and "
-                "sends it with your next message.",
+                "once; real work (a solve, a build) finishes first. Edit or Cancel takes it back "
+                "unread; Stop withdraws it and sends it with your next message.",
                 semanticOnGlass(ui::palette.statusWarn, surf)};
     return {"Sending\xe2\x80\xa6", "Handing your message to the running agent.", surf.textTertiary};
 }
@@ -312,8 +318,8 @@ Drawn drawBubble(AppState& st, const StackItem& it, float avail, float a, float 
         }
     }
 
-    // Caption row under the bubble, right-aligned to it: [actions]  label. The label is always
-    // there; the actions (queued messages only) fade in when the message is hovered.
+    // Caption row under the bubble, right-aligned to it: [actions]  label. The actions sit at a
+    // quiet resting ink and brighten while the message is hovered.
     const float rowY = bMax.y + k.metaGap;
     const char* label = "Queued";
     const char* labelTip = it.index == 0
@@ -321,7 +327,7 @@ Drawn drawBubble(AppState& st, const StackItem& it, float avail, float a, float 
         : "Goes out after the messages queued before it.";
     ImVec4 labelInk = surf.textTertiary;
     if (it.steer) {
-        const Caption c = steerCaption(it.state, surf);
+        const Caption c = steerCaption(it.steerId, it.state, surf);
         label = c.label;
         labelTip = c.tip;
         labelInk = c.ink;
@@ -336,11 +342,16 @@ Drawn drawBubble(AppState& st, const StackItem& it, float avail, float a, float 
     }
 
     Act act = Act::None;
-    if (!it.steer) {
+    // Queued: Edit / Send now / Cancel. Steer: Edit / Cancel (it is already sent), none while
+    // a take-back is in flight.
+    const bool steerActions = it.steer && !steerWithdrawPending(it.steerId);
+    if (!it.steer || steerActions) {
         const char* const names[3] = {"Edit", "Send now", "Cancel"};
-        float xs[3];
+        const bool shown[3] = {true, !it.steer, true};
+        float xs[3] = {0.0f, 0.0f, 0.0f};
         float x = labelX - ui::metrics::px(6.0f);
         for (int j = 2; j >= 0; --j) {
+            if (!shown[j]) continue;
             x -= actionWidth(names[j], k);
             xs[j] = x;
             x -= ui::metrics::px(2.0f);
@@ -350,20 +361,26 @@ Drawn drawBubble(AppState& st, const StackItem& it, float avail, float a, float 
                                                     ImVec2(right, rowY + k.btnH), false);
         const float hotT = ui::anim::toward(ImGui::GetID("##hot"), hot ? 1.0f : 0.0f,
                                             ui::anim::kFast);
-        const float actionA = hotT * a;
-        if (actionA > 0.01f) {
-            if (actionButton("##edit", names[0], ImVec2(xs[0], rowY), k, actionA, dy, Tone::Quiet,
-                             "Change this message before it is sent."))
-                act = Act::Edit;
-            if (actionButton("##now", names[1], ImVec2(xs[1], rowY), k, actionA, dy, Tone::Quiet,
-                             hotT > 0.25f ? sendNowTip(st, it.index) : nullptr))
-                act = Act::SendNow;
-            if (actionButton("##cancel", names[2], ImVec2(xs[2], rowY), k, actionA, dy,
-                             Tone::Quiet,
-                             "Take it out of the queue and put it back in the message box to "
-                             "change it. Anything already typed there stays below it."))
-                act = Act::Cancel;
-        }
+        const float actionA = (0.6f + 0.4f * hotT) * a;
+        const char* editTip = it.steer
+            ? "Take it back before the agent reads it and change it. Save keeps it queued for "
+              "after this turn; Send now hands it back to the agent."
+            : "Change this message before it is sent.";
+        const char* cancelTip = it.steer
+            ? "Take it back before the agent reads it and put it in the message box. Anything "
+              "already typed there stays below it."
+            : "Take it out of the queue and put it back in the message box to change it. "
+              "Anything already typed there stays below it.";
+        if (actionButton("##edit", names[0], ImVec2(xs[0], rowY), k, actionA, dy, Tone::Quiet,
+                         editTip))
+            act = Act::Edit;
+        if (shown[1] &&
+            actionButton("##now", names[1], ImVec2(xs[1], rowY), k, actionA, dy, Tone::Quiet,
+                         hotT > 0.25f ? sendNowTip(st, it.index) : nullptr))
+            act = Act::SendNow;
+        if (actionButton("##cancel", names[2], ImVec2(xs[2], rowY), k, actionA, dy, Tone::Quiet,
+                         cancelTip))
+            act = Act::Cancel;
     }
     Drawn out;
     out.act = act;
@@ -475,6 +492,8 @@ bool queuedPromptEditHoldsDrain() {
     return s_edit.active && ImGui::GetFrameCount() - s_edit.lastFrame <= 2;
 }
 
+void beginQueuedPromptEdit(AppState& st, size_t index) { beginEdit(st, st.activeConvId(), index); }
+
 void drawPendingMessageStack(AppState& st, float width) {
     const bool any = pendingSteerTail(st.chat) != st.chat.size() || !st.queuedPrompts.empty();
     const ImGuiID surfaceId = ImGui::GetID("##pending_stack");
@@ -555,6 +574,7 @@ void drawPendingMessageStack(AppState& st, float width) {
 
     Act act = Act::None;
     size_t actIndex = 0;
+    std::string actSteer;   // the steer the action names (empty = a queued message)
     std::unordered_map<ImGuiID, float> heights;
     for (const StackItem& it : items) {
         // A bubble that arrives eases in (fade + a short rise); one seen before stays put.
@@ -572,6 +592,7 @@ void drawPendingMessageStack(AppState& st, float width) {
             if (d.act != Act::None) {
                 act = d.act;
                 actIndex = it.index;
+                actSteer = it.steer ? it.steerId : std::string();
             }
             ImGui::SetCursorScreenPos(origin);
             ImGui::Dummy(ImVec2(avail, d.height));
@@ -585,6 +606,11 @@ void drawPendingMessageStack(AppState& st, float width) {
     S.heights = std::move(heights);
 
     // Applied after the whole stack drew, so the frame never mixes pre- and post-action rows.
+    if (!actSteer.empty()) {
+        if (act == Act::Edit || act == Act::Cancel)
+            withdrawPendingSteer(st, actSteer, act == Act::Edit);
+        return;
+    }
     switch (act) {
     case Act::Edit:    beginEdit(st, conv, actIndex); break;
     case Act::SendNow: queuedPromptSendNow(st, actIndex); break;

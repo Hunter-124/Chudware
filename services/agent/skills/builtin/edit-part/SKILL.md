@@ -53,8 +53,9 @@ How to model one solid part in Chudware. Prefer standard editable features over 
   unresolved failure can leave the repaired feature hidden behind the bar.
   Never present a rolled-back model as complete. If an incomplete handoff is
   intentional, state the rollback and every hidden feature ID in the summary.
-- **Rejected rebuild** → inspect the failure and `regen_diagnosis` if supplied;
-  undo when the diagnosis says the approach is wrong.
+- **Rejected rebuild** → read the reply's `error`, `failed_features` and
+  `structural_findings` (no model is called); call `regen_diagnose` only for a
+  proposed repair; undo when the failure says the approach is wrong.
 
 ## Deeper docs
 

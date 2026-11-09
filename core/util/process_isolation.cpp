@@ -652,7 +652,9 @@ IsolatedShapeResult ShapeBuildExecSession::run(const FilletWorkerParameters& par
         const unsigned flags = (parameters.variable ? 1u : 0u) |
                                (parameters.unequal_requested ? 2u : 0u) |
                                (parameters.recording ? 4u : 0u) |
-                               (parameters.document_validation ? 8u : 0u);
+                               (parameters.document_validation ? 8u : 0u) |
+                               ((parameters.runoff & 3u) << 4) |
+                               ((parameters.sweep & 3u) << 6);
         const auto deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             parameters.deadline.time_since_epoch()).count();
         std::array<std::string, 7> args{
@@ -834,7 +836,7 @@ int shape_build_worker_main(int argc, char** argv, const ShapeWorkerBuild& build
     long parent = 0;
     if (!parse_integer(argv[2], first_bits) || !parse_integer(argv[3], second_bits) ||
         !parse_integer(argv[4], flags) || !parse_integer(argv[5], deadline_ns) ||
-        !parse_integer(argv[6], parent) || (flags & ~15u) != 0 ||
+        !parse_integer(argv[6], parent) || (flags & ~255u) != 0 ||
         ((flags & 2u) && !(flags & 1u)) || parent <= 1 || ::getppid() != parent)
         return unavailable;
     FilletWorkerParameters parameters;
@@ -844,6 +846,8 @@ int shape_build_worker_main(int argc, char** argv, const ShapeWorkerBuild& build
     parameters.unequal_requested = (flags & 2u) != 0;
     parameters.recording = (flags & 4u) != 0;
     parameters.document_validation = (flags & 8u) != 0;
+    parameters.runoff = (flags >> 4) & 3u;
+    parameters.sweep = (flags >> 6) & 3u;
     parameters.deadline = std::chrono::steady_clock::time_point(
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::nanoseconds(deadline_ns)));

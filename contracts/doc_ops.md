@@ -53,6 +53,23 @@ Response (also returned by `doc_undo`/`doc_redo`/`doc_rebuild`):
   and applicable non-mesh result fields are unchanged. Part compilation may still
   construct its internal geometry/display cache. A later normal display request
   renders the committed state; this flag does not suppress geometry validation.
+- `sketch_session_id` is an optional request integer (the `session_id` of `sketch_enter`;
+  `doc_undo`/`doc_redo` accept it too). While it owns the active sketch and the batch contains
+  only `sketch_*` ops on that sketch, the history is compiled only up to the sketch:
+  every later feature reports `rolled_back:true`, `rebuild.doc_status.rolled_back_to`
+  names the sketch, and `exact` is omitted. The document, its undo history and `rollback_after`
+  are unchanged (the rollback is transient); every other reader still rebuilds the complete
+  history, and `sketch_exit` rebuilds it once (new revision, `auto_rollback` if the edits broke a
+  later feature). `sketch_convert` sources and associative `external_refs` resolve against the
+  history through the edited sketch; the refs of later sketches are refreshed at `sketch_exit`.
+  Documents with `sketch3d` `external_refs` always rebuild completely.
+- `with_exact` is an optional request boolean (default `true`); `false` omits the `exact`
+  statistics from the reply (interactive clients that never read them).
+- `preview_through` is an optional request feature id for property-manager previews. A batch that
+  only edits that feature (`edit_feature`) and is not the last feature compiles the history only
+  up to it, with the same reply shape and transient-rollback rules as `sketch_session_id`; the
+  client's final `edit_feature` (without the key) rebuilds the complete history, with the usual
+  `auto_rollback` handling.
 
 ## 2. Transactionality (normative)
 
@@ -461,12 +478,15 @@ Default tier: **`fine`**, overridable process-wide by `CHUDWARE_DISPLAY_QUALITY=
 (an unrecognised value falls back to `fine`), so headless renders and the GUI agree.
 
 Changing the tier invalidates the document's compile cache and its per-body mesh cache, so every
-body re-meshes at the new deflections. The RPC is `doc_set_display_quality` (worker_rpc §19).
+body re-meshes at the new deflections. The RPC is `doc_set_display_quality` (worker_rpc §19);
+setting the tier a document already has keeps its compile and caches.
 
 The desktop GUI persists its choice (Settings → General → Display quality, `display_quality` in
-config.json) and re-applies it with `doc_set_display_quality` (`origin: "system"`) to every
-part/assembly doc that is not at that tier — on restart and for docs opened afterwards — so the
-saved tier is not lost to the engine's `fine` default. A saved `fine` pushes nothing.
+config.json). Native opens pass it as `doc_open.display_quality` (2026-11-07), so the session
+starts at that tier and a build cache saved at it is served warm. Any other part/assembly doc
+that is not at the saved tier (new docs, imports, reused sessions) gets it via
+`doc_set_display_quality` (`origin: "system"`) — on restart and for docs opened afterwards — so
+the saved tier is not lost to the engine's `fine` default. A saved `fine` pushes nothing.
 
 ## 8. `asm_edit_component` transform semantics (append-only, 2026-09-04)
 

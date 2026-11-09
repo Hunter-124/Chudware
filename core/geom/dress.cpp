@@ -1,10 +1,14 @@
 #include "geom/dress.h"
+#include "geom/blend_sweep.h"
+#include "geom/booleans.h"
+#include "geom/fillet_runoff.h"
 #include "geom/op_history.h"
 #include "geom/shell_sections.h"
 #include "util/process_isolation.h"
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <cmath>
 #include <functional>
 #include <chrono>
@@ -107,6 +111,41 @@
 
 namespace geom {
 
+std::vector<EdgeBoundaryUses> edge_boundary_uses(const TopoDS_Shape& shape,
+                                                 const TopTools_IndexedMapOfShape& edges) {
+    std::vector<EdgeBoundaryUses> uses(static_cast<std::size_t>(edges.Extent()) + 1);
+    for (TopExp_Explorer faces(shape, TopAbs_FACE); faces.More(); faces.Next()) {
+        for (TopExp_Explorer it(faces.Current(), TopAbs_EDGE); it.More(); it.Next()) {
+            const TopoDS_Shape& edge = it.Current();
+            EdgeBoundaryUses& use = uses[static_cast<std::size_t>(edges.FindIndex(edge))];
+            if (edge.Orientation() == TopAbs_FORWARD || edge.Orientation() == TopAbs_REVERSED)
+                ++use.boundary;
+            else
+                use.embedded = true;
+        }
+    }
+    return uses;
+}
+
+// An OCCT blend can report IsDone despite leaving an open B-rep, so every blend result is
+// closure-checked (all-edge fillets and best-effort chamfers alike).
+bool is_watertight(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return false;
+    try {
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        if (edges.Extent() == 0) return false;
+        const std::vector<EdgeBoundaryUses> uses = edge_boundary_uses(shape, edges);
+        for (int ei = 1; ei <= edges.Extent(); ++ei)
+            if (!BRep_Tool::Degenerated(TopoDS::Edge(edges(ei))) &&
+                uses[static_cast<std::size_t>(ei)].is_free())
+                return false;
+        return true;
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+}
+
 namespace {
 
 // True if `edge` is a straight line whose direction is parallel to `dir` (either
@@ -146,42 +185,8 @@ bool is_blendable_edge(const TopoDS_Edge& edge,
     return true;
 }
 
-// Seam-aware watertight-solid test (mirrors document.cpp::dress_is_closed_solid). Every edge
-// of a closed solid is shared by >= 2 faces; the only single-face exceptions are SEAMS (the
-// 0/2pi closure of a cylinder/sphere/revolution skin) and DEGENERATE edges (a cone apex /
-// sphere pole). Any OTHER edge with < 2 incident faces is a genuine FREE edge -> the shell is
-// open. An OCCT blend can report IsDone despite leaving an open B-rep; this
-// closure check is required for both all-edge fillets and best-effort chamfers.
-bool blend_is_watertight(const TopoDS_Shape& shape) {
-    if (shape.IsNull()) return false;
-    try {
-        TopTools_IndexedDataMapOfShapeListOfShape anc;
-        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, anc);
-        TopTools_IndexedMapOfShape edges;
-        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
-        if (edges.Extent() == 0) return false;
-        for (int ei = 1; ei <= edges.Extent(); ++ei) {
-            const TopoDS_Shape& es = edges.FindKey(ei);
-            const int nf = anc.Contains(es) ? anc.FindFromKey(es).Extent() : 0;
-            if (nf >= 2) continue;
-            const TopoDS_Edge& e = TopoDS::Edge(es);
-            if (BRep_Tool::Degenerated(e)) continue;
-            bool seam = false;
-            if (anc.Contains(es)) {
-                const TopTools_ListOfShape& faces = anc.FindFromKey(es);
-                for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next())
-                    if (BRep_Tool::IsClosed(e, TopoDS::Face(it.Value()))) { seam = true; break; }
-            }
-            if (!seam) return false;
-        }
-        return true;
-    } catch (const Standard_Failure&) {
-        return false;
-    }
-}
-
-// An isolated blend probe has at most five seconds. Fillets use strict
-// fail-closed timeout handling; legacy chamfers retain their existing policy.
+// An isolated legacy blend probe (chamfers and best-effort edge dropping) has at
+// most five seconds. Fillet probes are bounded by their search budget instead.
 constexpr std::chrono::seconds kBlendTimeout{5};
 
 // Unique blendable edges of `shape`, optionally filtered to those parallel to `dir`.
@@ -204,14 +209,40 @@ std::vector<TopoDS_Edge> select_blendable(const TopoDS_Shape& shape,
     return sel;
 }
 
+// The largest vertex or edge tolerance of `shape`, and where it is.
+double max_tolerance(const TopoDS_Shape& shape, gp_Pnt* where = nullptr) {
+    double worst = 0.0;
+    for (TopExp_Explorer it(shape, TopAbs_VERTEX); it.More(); it.Next()) {
+        const TopoDS_Vertex vertex = TopoDS::Vertex(it.Current());
+        const double tolerance = BRep_Tool::Tolerance(vertex);
+        if (tolerance > worst) {
+            worst = tolerance;
+            if (where) *where = BRep_Tool::Pnt(vertex);
+        }
+    }
+    for (TopExp_Explorer it(shape, TopAbs_EDGE); it.More(); it.Next())
+        worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Edge(it.Current())));
+    return worst;
+}
+
+// A kernel blend can report success after "closing" a corner it could not build by
+// widening a vertex or edge tolerance to the size of the gap (tens of millimetres at a
+// hook's tip). No real blend of `size` needs more than a twentieth of it (or a micron).
+bool blend_tolerance_blown(double source_tolerance, double result_tolerance, double size) {
+    return result_tolerance > std::max({10.0 * source_tolerance, 0.05 * size, 1e-3});
+}
+
 // Chamfers retain their established best-effort subset behavior. Fillets use a
-// separate all-selected-edge builder below and never enter this fallback.
+// separate all-selected-edge builder below and never enter this fallback. When the
+// kernel cannot build every edge, prismatic edges are first chamfered exactly as swept
+// cross-sections (blend_sweep.h) and the kernel builds the rest on that body.
 template <class Builder, class AddFn>
-TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
-                                const std::vector<TopoDS_Edge>& good, AddFn add,
-                                int* n_dropped) {
+TopoDS_Shape blend_drop_failing(
+    const TopoDS_Shape& shape, const std::vector<TopoDS_Edge>& good, AddFn add, int* n_dropped,
+    double size, const std::function<SweepBlendProfile(const TopoDS_Edge&)>& sweep_profile) {
     if (n_dropped) *n_dropped = 0;
     if (good.empty()) return TopoDS_Shape();
+    const double source_tolerance = max_tolerance(shape);
 
     // `prov` (non-null only for the build whose shape is RETURNED) receives the blend's face/
     // edge provenance for owner attribution; bisect probes skip it.
@@ -223,7 +254,10 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
                 mk.Build();
                 if (!mk.IsDone()) return {};
                 TopoDS_Shape s = mk.Shape();
-                if (!blend_is_watertight(s)) return {};
+                if (!is_watertight(s) ||
+                    blend_tolerance_blown(source_tolerance, max_tolerance(s), size) ||
+                    !BRepCheck_Analyzer(s).IsValid())
+                    return {};
                 if (prov) *prov = op_provenance_encode(shape, s, mk);
                 return s;
             } catch (const Standard_Failure&) {
@@ -241,6 +275,57 @@ TopoDS_Shape blend_drop_failing(const TopoDS_Shape& shape,
 
     TopoDS_Shape all = build(good, recording ? &prov : nullptr);
     if (!all.IsNull()) return finish(all);
+
+    if (sweep_profile) {
+        TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+        std::size_t previous = 0;
+        for (const SweepBlendScope scope : {SweepBlendScope::isolated, SweepBlendScope::all}) {
+            const std::vector<std::size_t> chosen = sweep_blend_choose(good, edge_faces, scope);
+            if (chosen.size() <= previous) continue;
+            previous = chosen.size();
+            std::vector<TopoDS_Edge> swept, unswept;
+            std::vector<SweepBlendProfile> profiles;
+            for (std::size_t i = 0, next = 0; i < good.size(); ++i) {
+                if (next < chosen.size() && chosen[next] == i) {
+                    swept.push_back(good[i]);
+                    profiles.push_back(sweep_profile(good[i]));
+                    ++next;
+                } else {
+                    unswept.push_back(good[i]);
+                }
+            }
+            std::string* sidecar = recording ? &prov : nullptr;
+            auto result = chudware::util::isolate_shape_build([&]() -> TopoDS_Shape {
+                try {
+                    OpHistoryScope history(recording);
+                    const SweepBlendRun run = sweep_blend_edges(
+                        shape, swept, [&](std::size_t i) { return profiles[i]; }, unswept);
+                    if (run.shape.IsNull()) return {};
+                    TopoDS_Shape s = run.shape;
+                    if (!run.remaining.empty()) {
+                        Builder mk(run.shape);
+                        for (const TopoDS_Edge& e : run.remaining) add(mk, e);
+                        mk.Build();
+                        if (!mk.IsDone()) return {};
+                        s = mk.Shape();
+                        if (blend_tolerance_blown(source_tolerance, max_tolerance(s), size)) return {};
+                        if (recording) {
+                            TopTools_ListOfShape args;
+                            args.Append(run.shape);
+                            op_history_record(new BRepTools_History(args, mk));
+                        }
+                    }
+                    if (!is_watertight(s) || !BRepCheck_Analyzer(s).IsValid()) return {};
+                    if (sidecar) *sidecar = op_provenance_encode(shape, s, history.histories());
+                    return s;
+                } catch (const Standard_Failure&) {
+                    return {};
+                }
+            }, kBlendTimeout, sidecar);
+            if (result.ok && !result.shape.IsNull()) return finish(result.shape);
+        }
+    }
 
     // Bisect over the edge list instead of O(E²) one-edge-at-a-time rebuilds.
     // A crashing subset is indistinguishable from any other failed build, preserving the
@@ -760,6 +845,7 @@ ContactJoin join_contact_edges(const TopoDS_Shape& shape, double r,
         BRepBuilderAPI_Copy copier(fuse.Shape(), Standard_False, Standard_False);
         ShapeUpgrade_UnifySameDomain unify(copier.Shape(), Standard_True, Standard_True,
                                            Standard_False);
+        keep_degenerate_patches(unify, copier.Shape());
         // Preserve every selected ordinary edge (and its endpoints) through
         // unification so a collinear neighbour cannot swallow a picked edge.
         if (!manifold.empty()) {
@@ -869,7 +955,7 @@ private:
 
 std::string fillet_solid_rejection(const TopoDS_Shape& shape,
                                     std::chrono::steady_clock::time_point deadline) {
-    if (shape.IsNull() || !blend_is_watertight(shape) || !BRepCheck_Analyzer(shape).IsValid())
+    if (shape.IsNull() || !is_watertight(shape) || !BRepCheck_Analyzer(shape).IsValid())
         return "fillet result is not a valid closed solid";
     TopTools_IndexedMapOfShape solids, faces;
     TopExp::MapShapes(shape, TopAbs_SOLID, solids);
@@ -1483,7 +1569,7 @@ ShallowFillet shallow_fillet(const TopoDS_Shape& shape,
     cut.SetNonDestructive(Standard_True);
     cut.Build();
     if (!cut.IsDone() || cut.HasErrors() || cut.HasWarnings() || cut.Shape().IsNull() ||
-        solid_count(cut.Shape()) != 1 || !blend_is_watertight(cut.Shape()) ||
+        solid_count(cut.Shape()) != 1 || !is_watertight(cut.Shape()) ||
         !BRepCheck_Analyzer(cut.Shape()).IsValid()) return out;
     out.reason = "could not trace the shallow blend and every remaining selected edge";
     TopTools_IndexedMapOfShape result_faces, result_edges, tool_faces, claimed;
@@ -1642,12 +1728,142 @@ bool contour_face_covers_edge(
 
 constexpr char kPrecisionSidecar[] = "@fillet_precision ";
 
+std::string fillet_point_text(const gp_Pnt& p) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "(%.3f, %.3f, %.3f)", p.X(), p.Y(), p.Z());
+    return buf;
+}
+
+// OCCT reports which contours and corners it could not blend. Naming them by the
+// caller's selection order and a model-space point turns "could not build" into a
+// location the caller can inspect, reorder around, or reshape. `contours` holds each
+// selected edge's contour index read before Build; only the null-safe faulty-contour
+// and faulty-vertex lists are read afterwards (a failed stripe may have no spine).
+std::string fillet_build_failure(const BRepFilletAPI_MakeFillet& mk,
+                                 const std::vector<TopoDS_Edge>& selected,
+                                 const std::vector<int>& contours) {
+    std::string out = "the kernel could not build all selected edges";
+    try {
+        int listed = 0;
+        for (int i = 1; i <= mk.NbFaultyContours() && listed < 3; ++i) {
+            const int contour = mk.FaultyContour(i);
+            if (contour <= 0) continue;
+            const auto pick = std::find(contours.begin(), contours.end(), contour);
+            if (pick == contours.end()) continue;
+            const std::size_t index = static_cast<std::size_t>(pick - contours.begin());
+            BRepAdaptor_Curve curve(selected[index]);
+            const gp_Pnt mid = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()));
+            out += listed++ ? "; " : ": ";
+            out += "the blend along selected edge " + std::to_string(index + 1) + " near " +
+                   fillet_point_text(mid) + " failed";
+        }
+        for (int v = 1; v <= mk.NbFaultyVertices() && listed < 4; ++v) {
+            out += listed++ ? "; " : ": ";
+            out += "the corner at " + fillet_point_text(BRep_Tool::Pnt(mk.FaultyVertex(v))) +
+                   " could not be closed";
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return out;
+}
+
+// The first defect of an unusable fillet result, with where it is.
+std::string fillet_invalid_solid_reason(const TopoDS_Shape& shape) {
+    std::string out = "fillet result is not a valid closed solid";
+    try {
+        const auto at = [](const TopoDS_Shape& sub) {
+            Bnd_Box box;
+            BRepBndLib::Add(sub, box);
+            if (box.IsVoid()) return std::string();
+            double x0, y0, z0, x1, y1, z1;
+            box.Get(x0, y0, z0, x1, y1, z1);
+            return " near " + fillet_point_text(gp_Pnt((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2));
+        };
+        if (solid_count(shape) == 0) return out + " (it contains no solid)";
+        BRepCheck_Analyzer analyzer(shape);
+        if (!analyzer.IsValid()) {
+            for (const TopAbs_ShapeEnum kind : {TopAbs_VERTEX, TopAbs_EDGE, TopAbs_FACE}) {
+                for (TopExp_Explorer ex(shape, kind); ex.More(); ex.Next()) {
+                    if (analyzer.IsValid(ex.Current())) continue;
+                    const char* name = kind == TopAbs_VERTEX ? "vertex" : kind == TopAbs_EDGE ? "edge" : "face";
+                    return out + " (invalid " + name + at(ex.Current()) + ")";
+                }
+            }
+            return out + " (fails the B-rep validity check)";
+        }
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+        const std::vector<EdgeBoundaryUses> uses = edge_boundary_uses(shape, edges);
+        for (int i = 1; i <= edges.Extent(); ++i) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edges(i));
+            if (!BRep_Tool::Degenerated(edge) && uses[static_cast<std::size_t>(i)].is_free())
+                return out + " (open: free edge" + at(edge) + ")";
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return out;
+}
+
 std::string fillet_precision_sidecar(double first, double second) {
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << static_cast<int>(FilletFailure::construction_failed) << '\n'
         << kPrecisionSidecar << std::setprecision(17) << first << ' ' << second;
     return out.str();
+}
+
+// Concave blends that collide when built together (two bosses closer than a radius) can
+// still build one contour at a time. The union of the material each adds is the merged
+// blend: the rolling ball of each reaches the other, and the surfaces trim each other.
+TopoDS_Shape fillet_blend_union(const TopoDS_Shape& shape, const std::vector<TopoDS_Edge>& edges,
+                                double radius, std::string& why) {
+    std::map<int, std::vector<TopoDS_Edge>> groups;
+    {
+        BRepFilletAPI_MakeFillet probe(shape);
+        for (const TopoDS_Edge& edge : edges) probe.Add(radius, edge);
+        for (const TopoDS_Edge& edge : edges) {
+            const int contour = probe.Contour(edge);
+            if (contour <= 0) {
+                why = "a selected edge could not be added to a fillet contour";
+                return {};
+            }
+            groups[contour].push_back(edge);
+        }
+    }
+    if (groups.size() < 2 || groups.size() > 16) {
+        why = groups.size() < 2
+            ? "the selected edges form one contour, so there is nothing to build separately"
+            : "too many contours to build separately";
+        return {};
+    }
+    std::vector<TopoDS_Shape> materials;
+    for (const auto& group : groups) {
+        BRepFilletAPI_MakeFillet mk(shape);
+        for (const TopoDS_Edge& edge : group.second) mk.Add(radius, edge);
+        mk.Build();
+        const TopoDS_Shape blended = mk.IsDone() ? mk.Shape() : TopoDS_Shape();
+        if (blended.IsNull() || !is_watertight(blended) || !BRepCheck_Analyzer(blended).IsValid()) {
+            why = "contour " + std::to_string(group.first) + " does not build even alone";
+            return {};
+        }
+        if (op_history_recording()) {
+            TopTools_ListOfShape args;
+            args.Append(shape);
+            op_history_record(new BRepTools_History(args, mk));
+        }
+        const TopoDS_Shape added = cut(blended, shape);
+        if (added.IsNull()) {
+            why = "could not isolate the material one contour adds";
+            return {};
+        }
+        materials.push_back(added);
+    }
+    const TopoDS_Shape merged = fuse_many(shape, materials);
+    if (merged.IsNull()) {
+        why = "could not merge the separately built blends";
+        return {};
+    }
+    return unify_same_domain(merged);
 }
 
 struct FilletProbe {
@@ -1668,7 +1884,8 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                          const FilletValidation& validate,
                          std::chrono::steady_clock::time_point deadline,
                          chudware::util::ShapeBuildExecSession* worker,
-                         std::chrono::steady_clock::time_point probe_deadline) {
+                         std::chrono::steady_clock::time_point probe_deadline,
+                         int runoff = 0, int sweep = 0) {
     using chudware::util::ShapeBuildFailure;
     const bool recording = op_history_recording();
     std::string sidecar;
@@ -1676,8 +1893,7 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
         deadline - std::chrono::steady_clock::now());
     if (remaining.count() <= 0)
         return {{}, FilletFailure::budget_exhausted, "fillet search time budget exhausted", {}};
-    const auto timeout = std::min(std::chrono::duration_cast<std::chrono::milliseconds>(kBlendTimeout),
-                                  remaining);
+    const auto timeout = remaining;
     auto build = [&]() -> TopoDS_Shape {
         OpHistoryScope probe_history(recording);
         auto fail = [&](FilletFailure kind, const std::string& reason) -> TopoDS_Shape {
@@ -1698,6 +1914,69 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
             }
             TopoDS_Shape current = shape;
             const std::vector<TopoDS_Edge>* ordinary = &edges;
+            // Run-off: blend a body whose support faces are extended past their open rims,
+            // then trim back. The ordinary edges are the selection on that extended body.
+            FilletRunoff extension;
+            const std::vector<TopoDS_Edge> no_edges;
+            if (runoff) {
+                if (r2 || !selection.contact.empty())
+                    return fail(FilletFailure::unsupported_topology,
+                                "run-off applies to constant-radius manifold fillets only");
+                const auto mode = static_cast<FilletRunoffMode>(runoff);
+                const FilletRunoffPlan plan =
+                    fillet_runoff_plan(shape, edges, selection.edge_faces, r1);
+                if (!plan.applicable(mode))
+                    return fail(FilletFailure::unsupported_topology,
+                                plan.why.empty() ? "no support face ends at an open edge" : plan.why);
+                if (mode == FilletRunoffMode::separate) {
+                    std::string why;
+                    current = fillet_blend_union(shape, edges, r1, why);
+                    if (current.IsNull()) return fail(FilletFailure::construction_failed, why);
+                    ordinary = &no_edges;
+                } else {
+                    extension = fillet_runoff_extend(shape, edges, plan, r1, mode);
+                    if (extension.extended.IsNull())
+                        return fail(FilletFailure::construction_failed, extension.why);
+                    current = extension.extended;
+                    ordinary = &extension.edges;
+                }
+            }
+            // Swept blends: the chosen prismatic edges are blended exactly, one at a time;
+            // the kernel builder then blends the other selected edges on that body.
+            std::vector<TopoDS_Edge> unswept;
+            const bool used_sweep = sweep != 0;
+            if (sweep) {
+                if (r2 || runoff || !selection.contact.empty())
+                    return fail(FilletFailure::unsupported_topology,
+                                "swept blends apply to constant-radius manifold fillets only");
+                const std::vector<std::size_t> chosen = sweep_blend_choose(
+                    edges, selection.edge_faces, static_cast<SweepBlendScope>(sweep));
+                if (chosen.empty())
+                    return fail(FilletFailure::unsupported_topology,
+                                "no selected edge is straight between faces constant along it");
+                std::vector<TopoDS_Edge> swept;
+                for (std::size_t i = 0, next = 0; i < edges.size(); ++i) {
+                    if (next < chosen.size() && chosen[next] == i) {
+                        swept.push_back(edges[i]);
+                        ++next;
+                    } else {
+                        unswept.push_back(edges[i]);
+                    }
+                }
+                SweepBlendProfile profile;
+                profile.size = r1;
+                SweepBlendRun run = sweep_blend_edges(
+                    shape, swept, [&](std::size_t) { return profile; }, unswept);
+                if (run.shape.IsNull())
+                    return fail(FilletFailure::construction_failed,
+                                run.edge_failed
+                                    ? "selected edge " + std::to_string(chosen[run.failed] + 1) +
+                                          ": " + run.why
+                                    : run.why);
+                current = run.shape;
+                unswept = std::move(run.remaining);
+                ordinary = &unswept;
+            }
             ContactJoin join;
             if (!selection.contact.empty()) {
                 join = join_contact_edges(shape, r1, selection.contact, selection.manifold,
@@ -1738,7 +2017,7 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                             TopExp::MapShapesAndAncestors(current, TopAbs_EDGE, TopAbs_FACE, current_faces);
                             return fillet_no_contour_reason(rejected, current_faces);
                         };
-                        if (r2 || !selection.contact.empty())
+                        if (r2 || runoff || used_sweep || !selection.contact.empty())
                             return fail(FilletFailure::unsupported_topology,
                                         "selected edge " + std::to_string(i + 1) + ": " +
                                         no_contour_reason(edge));
@@ -1786,6 +2065,12 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                     for (const VertexRadius& v : vertex_radii)
                         mk->SetRadius(v.radius, v.contour, v.vertex);
                     const bool small_variable = r2 && std::max(r1, *r2) < 1e-2;
+                    // Contour indices must be read before Build: after a failed build
+                    // OCCT can leave a faulty stripe without a spine, and any spine
+                    // query (NbEdges, Edge, StripeStatus, Contour) then dereferences null.
+                    std::vector<int> contours;
+                    contours.reserve(ordinary->size());
+                    for (const TopoDS_Edge& edge : *ordinary) contours.push_back(mk->Contour(edge));
                     for (bool precise = false;; precise = true) {
                         if (precise) {
                             // OCCT's default 1e-4 approximation can exceed a tiny
@@ -1800,11 +2085,23 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                         mk->Build();
                         if (!mk->IsDone()) {
                             if (!precise && small_variable) continue;
-                            return fail(FilletFailure::construction_failed, "the kernel could not build all selected edges");
+                            return fail(FilletFailure::construction_failed,
+                                        fillet_build_failure(*mk, *ordinary, contours));
                         }
                         current = mk->Shape();
                         if (current.IsNull())
                             return fail(FilletFailure::construction_failed, "the fillet builder returned no shape");
+                        gp_Pnt gap_at;
+                        const double gap = max_tolerance(current, &gap_at);
+                        if (blend_tolerance_blown(max_tolerance(builder_input), gap,
+                                                  std::min(r1, r2.value_or(r1)))) {
+                            char size[32];
+                            std::snprintf(size, sizeof(size), "%.3g", gap);
+                            return fail(FilletFailure::invalid_geometry,
+                                        "the kernel could not close the blend's corner near " +
+                                            fillet_point_text(gap_at) + " (it bridged a " + size +
+                                            " mm gap with tolerance)");
+                        }
                         TopExp::MapShapes(current, TopAbs_FACE, faces);
                         std::array<double, 2> required_precision{0.0, 0.0};
                         for (const TopoDS_Edge& edge : *ordinary) {
@@ -1849,6 +2146,18 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                         break;
                     }
                 }
+                if (runoff) {
+                    // The blend, then the trim: histories chain in the order the ops ran.
+                    if (recording) {
+                        TopTools_ListOfShape args;
+                        args.Append(builder_input);
+                        op_history_record(new BRepTools_History(args, *mk));
+                    }
+                    std::string why;
+                    current = fillet_runoff_trim(extension, current, why);
+                    if (current.IsNull())
+                        return fail(FilletFailure::invalid_geometry, why);
+                }
                 if (used_shallow) {
                     if (faces.IsEmpty()) TopExp::MapShapes(current, TopAbs_FACE, faces);
                     if (result_edge_faces.IsEmpty())
@@ -1860,10 +2169,11 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                                     "the shallow selected edge did not retain its requested fillet");
                 }
                 if (recording) {
-                    if (!ordinary->empty() && !used_shallow && selection.contact.empty()) {
+                    if (!ordinary->empty() && !used_shallow && !runoff && !used_sweep &&
+                        selection.contact.empty()) {
                         provenance = op_provenance_encode(shape, current, *mk);
                     } else {
-                        if (!ordinary->empty()) {
+                        if (!ordinary->empty() && !runoff) {
                             TopTools_ListOfShape args;
                             args.Append(builder_input);
                             op_history_record(new BRepTools_History(args, *mk));
@@ -1879,9 +2189,9 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
                 if (!contact_evidence_valid(current, join.evidence, contact_why))
                     return fail(FilletFailure::invalid_geometry, contact_why);
             }
-            if (!blend_is_watertight(current) || !BRepCheck_Analyzer(current).IsValid() ||
+            if (!is_watertight(current) || !BRepCheck_Analyzer(current).IsValid() ||
                 solid_count(current) == 0)
-                return fail(FilletFailure::invalid_geometry, "fillet result is not a valid closed solid");
+                return fail(FilletFailure::invalid_geometry, fillet_invalid_solid_reason(current));
             FilletValidationResult validation;
             if (validate.in_process) {
                 validation = validate.in_process(current);
@@ -1920,6 +2230,8 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
         parameters.unequal_requested = unequal_requested;
         parameters.recording = recording;
         parameters.document_validation = validate.policy == FilletValidationPolicy::document_solid;
+        parameters.runoff = static_cast<unsigned>(runoff);
+        parameters.sweep = static_cast<unsigned>(sweep);
         parameters.deadline = probe_deadline;
         built = worker->run(parameters, sidecar);
     } else {
@@ -1958,6 +2270,8 @@ FilletProbe fillet_probe(const TopoDS_Shape& shape,
 
 constexpr int kFilletMaxProbes = 72;
 constexpr std::chrono::seconds kFilletSearchBudget{30};
+// Largest lower bound on a downward radius correction (see clamp_floor).
+constexpr double kFilletMinCorrected = 0.05;
 
 FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
                              const std::vector<TopoDS_Edge>& edges,
@@ -2034,32 +2348,63 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
     double best1 = 0.0, best2 = 0.0;
     bool have_best = false, terminal = false;
     FilletFailure last_failure = FilletFailure::construction_failed;
-    std::string last_reason;
+    std::string last_reason, requested_reason, runoff_reason, sweep_reason;
+    double last_radius = 0.0;
+    // Smallest accepted downward correction of a constant radius; set once the body
+    // scale is known (a fast-path success never corrects). Variable endpoints keep
+    // their precision-bounded search.
+    double clamp1 = 0.0;
+    const auto mm = [](double value) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.6g", value);
+        return std::string(buf);
+    };
+    // A budget stop reports what the search had established, not a kernel timeout.
+    const auto budget_reason = [&](const std::string& what) {
+        std::string out = what + " after " + std::to_string(result.probes) + " probe(s)";
+        if (!requested_reason.empty())
+            out += "; at the requested " + mm(requested) + " mm: " + requested_reason;
+        if (!last_reason.empty() && last_reason != requested_reason)
+            out += "; at " + mm(last_radius) + " mm: " + last_reason;
+        return out;
+    };
     const auto& precision_bound = selection.endpoint_resolution;
     std::array<double, 2> last_required{0.0, 0.0};
     struct ObservedUpper { double radius = 0.0, other = 0.0; bool present = false; };
     std::array<ObservedUpper, 2> upper;
     std::array<double, kFilletMaxProbes> constant_failures;
     int constant_failure_count = 0;
-    auto attempt = [&](double r1, double r2) {
+    auto attempt = [&](double r1, double r2, int runoff = 0, int sweep = 0) {
         if (result.probes >= kFilletMaxProbes || std::chrono::steady_clock::now() >= deadline) {
             terminal = true;
             result.failure = FilletFailure::budget_exhausted;
-            result.reason = "fillet search budget exhausted before establishing a verified result";
+            result.reason = budget_reason(result.probes >= kFilletMaxProbes
+                ? "fillet search reached its probe limit"
+                : "fillet search used its " + std::to_string(kFilletSearchBudget.count()) +
+                      " s budget");
             return false;
         }
         last_required = {0.0, 0.0};
         ++result.probes;
+        // A run-off or swept build is an extra attempt, not the search: it may use a quarter
+        // of the budget, so a slow one cannot starve the radius search that follows.
+        const auto limit = runoff || sweep
+            ? std::min(deadline, std::chrono::steady_clock::now() + kFilletSearchBudget / 4)
+            : deadline;
         FilletProbe probe;
         try {
             if (isolated) {
-                const auto probe_deadline = std::min(deadline,
-                    std::chrono::steady_clock::now() + kBlendTimeout);
+                // A probe may use the whole remaining budget: one real build plus
+                // full-solid validation of a large spline body can take well over
+                // five seconds, and a per-probe cap made such features fail or
+                // succeed with machine load. An isolated probe is still killed at
+                // the search deadline.
+                const auto probe_deadline = limit;
                 if (!worker) worker.emplace(shape, worker_edges);
                 probe = fillet_probe(shape, edges, selection, r1,
                                      requested2 ? std::optional<double>(r2) : std::nullopt,
-                                     requested2 && requested != *requested2, validate, deadline,
-                                     &*worker, probe_deadline);
+                                     requested2 && requested != *requested2, validate, limit,
+                                     &*worker, probe_deadline, runoff, sweep);
             } else {
                 // Unlike an expendable worker, an explicitly in-process build
                 // shares its input with the caller and later radius probes.
@@ -2082,8 +2427,8 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
                     throw std::runtime_error("invalid copied selection");
                 probe = fillet_probe(copied_shape, copied_edges, copied_selection, r1,
                                      requested2 ? std::optional<double>(r2) : std::nullopt,
-                                     requested2 && requested != *requested2, validate, deadline,
-                                     nullptr, deadline);
+                                     requested2 && requested != *requested2, validate, limit,
+                                     nullptr, limit, runoff, sweep);
             }
         } catch (...) {
             probe = {{}, FilletFailure::isolation_failed, "could not prepare fillet probe input", {}};
@@ -2095,9 +2440,28 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
             have_best = true;
             return true;
         }
+        if (probe.failure == FilletFailure::timed_out &&
+            std::chrono::steady_clock::now() >= deadline) {
+            // The search deadline stopped this probe; the build itself was not
+            // shown to hang.
+            probe.failure = FilletFailure::budget_exhausted;
+            probe.reason = budget_reason(
+                "fillet search used its " + std::to_string(kFilletSearchBudget.count()) +
+                " s budget while building " + mm(r1) + " mm");
+        }
+        if ((runoff || sweep) && !(probe.failure == FilletFailure::budget_exhausted &&
+                                   std::chrono::steady_clock::now() >= deadline)) {
+            // A failed run-off or swept blend only says the blend could not be built that
+            // way; the radius search that follows is unchanged, so no search state is
+            // touched. Even a crash or timeout of this extra build must not end the search.
+            if (probe.failure != FilletFailure::unsupported_topology)
+                (runoff ? runoff_reason : sweep_reason) = std::move(probe.reason);
+            return false;
+        }
         last_required = probe.required_precision;
         last_failure = probe.failure;
         last_reason = std::move(probe.reason);
+        last_radius = r1;
         if (last_failure == FilletFailure::unsupported_topology ||
             last_failure == FilletFailure::unsupported_precision ||
             last_failure == FilletFailure::invalid_selection ||
@@ -2122,6 +2486,16 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
         return false;
     };
     auto finish = [&]() {
+        // A correction to a radius no real part could carry is a failure, not a
+        // fillet: such sizes come from a failure that does not depend on radius.
+        if (!requested2 && best1 < requested && best1 < clamp1) {
+            result.failure = FilletFailure::construction_failed;
+            result.reason = "the largest radius that built a valid fillet, " + mm(best1) +
+                " mm, is below the " + mm(clamp1) + " mm minimum for a corrected radius";
+            if (!requested_reason.empty())
+                result.reason += "; at the requested " + mm(requested) + " mm: " + requested_reason;
+            return result;
+        }
         if (terminal && (result.failure == FilletFailure::timed_out ||
                          result.failure == FilletFailure::budget_exhausted)) {
             // The interrupted probe is not a radius bound. Report a conservative
@@ -2149,8 +2523,40 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
     const bool request_attempted = requested > 0.0 && (!requested2 || *requested2 > 0.0);
     if (request_attempted && attempt(requested, requested2.value_or(0.0))) return finish();
     if (terminal) return result;
+    if (request_attempted) requested_reason = last_reason;
+    // An inside-corner blend wider than the face it rolls on runs off that face's open edge
+    // instead of shrinking: build the request as asked before correcting the radius.
+    if (request_attempted && !requested2 && selection.contact.empty()) {
+        const FilletRunoffPlan plan =
+            fillet_runoff_plan(shape, edges, selection.edge_faces, requested);
+        for (const FilletRunoffMode mode : {FilletRunoffMode::ring, FilletRunoffMode::cap,
+                                            FilletRunoffMode::separate}) {
+            if (!plan.applicable(mode)) continue;
+            if (attempt(requested, 0.0, static_cast<int>(mode))) return finish();
+            if (terminal) return result;
+        }
+        if (!runoff_reason.empty())
+            requested_reason += "; run-off past the support face: " + runoff_reason;
+        // A straight edge between faces constant along it is blended exactly as a swept
+        // cross-section where the kernel cannot close its ends: first the edges that meet no
+        // other selected edge, then every such edge.
+        const auto isolated_edges =
+            sweep_blend_choose(edges, selection.edge_faces, SweepBlendScope::isolated);
+        const auto prismatic_edges =
+            sweep_blend_choose(edges, selection.edge_faces, SweepBlendScope::all);
+        if (!isolated_edges.empty()) {
+            if (attempt(requested, 0.0, 0, static_cast<int>(SweepBlendScope::isolated)))
+                return finish();
+            if (terminal) return result;
+        }
+        if (prismatic_edges.size() > isolated_edges.size()) {
+            if (attempt(requested, 0.0, 0, static_cast<int>(SweepBlendScope::all))) return finish();
+            if (terminal) return result;
+        }
+        if (!sweep_reason.empty()) requested_reason += "; swept blend: " + sweep_reason;
+    }
 
-    double scale = 0.0, floor = Precision::Confusion() * 2.0;
+    double scale = 0.0, thinnest = 0.0, floor = Precision::Confusion() * 2.0;
     try {
         Bnd_Box bounds;
         BRepBndLib::Add(shape, bounds);
@@ -2162,6 +2568,7 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
         double x0, y0, z0, x1, y1, z1;
         bounds.Get(x0, y0, z0, x1, y1, z1);
         scale = std::max({x1 - x0, y1 - y0, z1 - z0});
+        thinnest = std::min({x1 - x0, y1 - y0, z1 - z0});
         for (const TopoDS_Edge& e : edges) floor = std::max(floor, 2.0 * BRep_Tool::Tolerance(e));
     } catch (const Standard_Failure&) {
         result.failure = FilletFailure::invalid_geometry;
@@ -2174,6 +2581,13 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
         return result;
     }
     result.tolerance_mm = std::max(floor, scale * 1e-5);
+    // A downward correction stops at a size that is still a real fillet: a tenth of
+    // the request, 0.1% of the body's thinnest extent, or 0.05 mm, whichever is
+    // smallest. A genuinely small or thin body keeps its small corrections.
+    const auto clamp_floor = [&](double request) {
+        return std::max(floor, std::min({kFilletMinCorrected, thinnest * 1e-3, request * 0.1}));
+    };
+    if (!requested2) clamp1 = clamp_floor(requested);
 
     // Search only between bounds observed with the same opposite endpoint.
     // Construction rejection is an observation, not a monotonicity proof.
@@ -2412,8 +2826,9 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
                         search_interval(1, a, precision_bound[1], b, false, 2);
                     if (terminal || have_best) break;
                 }
-                if (a <= floor && (!requested2 || b <= floor)) break;
-                a = std::max(floor, a * 0.5);
+                const double low = requested2 ? floor : clamp1;
+                if (a <= low && (!requested2 || b <= floor)) break;
+                a = std::max(low, a * 0.5);
                 if (requested2) b = std::max(floor, b * 0.5);
             }
         }
@@ -2421,7 +2836,16 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
     if (terminal) return result;
     if (!have_best) {
         result.failure = last_failure;
-        result.reason = last_reason.empty() ? "no feasible all-edge fillet found" : last_reason;
+        if (!requested2 && request_attempted && result.probes > 1) {
+            result.reason = "no radius from " + mm(requested) + " down to " + mm(clamp1) +
+                " mm built a valid fillet on every selected edge (" +
+                std::to_string(result.probes) + " probes); at the requested " + mm(requested) +
+                " mm: " + requested_reason;
+            if (!last_reason.empty() && last_reason != requested_reason)
+                result.reason += "; at " + mm(last_radius) + " mm: " + last_reason;
+        } else {
+            result.reason = last_reason.empty() ? "no feasible all-edge fillet found" : last_reason;
+        }
         return result;
     }
 
@@ -2523,7 +2947,8 @@ int fillet_worker_main(int argc, char** argv, FilletValidationFn document_valida
                 source, edges, selection, parameters.radius,
                 parameters.variable ? std::optional<double>(parameters.radius2) : std::nullopt,
                 parameters.unequal_requested, validation, parameters.deadline, nullptr,
-                parameters.deadline);
+                parameters.deadline, static_cast<int>(parameters.runoff),
+                static_cast<int>(parameters.sweep));
             if (probe.failure == FilletFailure::none) {
                 if (probe.shape.IsNull()) return {};
                 sidecar = "0\n" + probe.provenance;
@@ -2614,7 +3039,13 @@ TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
     // Symmetric chamfer: the single-distance Add(d, edge) sets both legs to d.
     return blend_drop_failing<BRepFilletAPI_MakeChamfer>(
         shape, blendable_only(shape, edges),
-        [d](BRepFilletAPI_MakeChamfer& mk, const TopoDS_Edge& e) { mk.Add(d, e); }, n_dropped);
+        [d](BRepFilletAPI_MakeChamfer& mk, const TopoDS_Edge& e) { mk.Add(d, e); }, n_dropped, d,
+        [d](const TopoDS_Edge&) {
+            SweepBlendProfile profile;
+            profile.kind = SweepBlendProfile::Kind::chamfer;
+            profile.size = profile.size2 = d;
+            return profile;
+        });
 }
 
 
@@ -2633,7 +3064,16 @@ TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, do
             if (ef.Contains(e) && !ef.FindFromKey(e).IsEmpty())
                 mk.Add(d1, d2, e, TopoDS::Face(ef.FindFromKey(e).First()));
         },
-        n_dropped);
+        n_dropped, std::max(d1, d2), [d1, d2, &ef](const TopoDS_Edge& e) {
+            SweepBlendProfile profile;
+            profile.kind = SweepBlendProfile::Kind::chamfer;
+            profile.size = d1;
+            profile.size2 = d2;
+            if (ef.Contains(e) && !ef.FindFromKey(e).IsEmpty())
+                profile.has_reference = sweep_blend_face_normal(
+                    TopoDS::Face(ef.FindFromKey(e).First()), e, profile.reference_normal);
+            return profile;
+        });
 }
 
 TopoDS_Shape chamfer_edges_distance_angle(const TopoDS_Shape& shape, double d,
@@ -2653,7 +3093,18 @@ TopoDS_Shape chamfer_edges_distance_angle(const TopoDS_Shape& shape, double d,
                 ? *reference_face : TopoDS::Face(edge_faces.FindFromKey(edge).First());
             mk.AddDA(d, angle_rad, edge, face);
         },
-        n_dropped);
+        n_dropped, d, [d, angle_rad, &edge_faces, &reference_face](const TopoDS_Edge& edge) {
+            SweepBlendProfile profile;
+            profile.kind = SweepBlendProfile::Kind::chamfer_angle;
+            profile.size = d;
+            profile.size2 = angle_rad;
+            if (edge_faces.Contains(edge) && !edge_faces.FindFromKey(edge).IsEmpty()) {
+                const TopoDS_Face& face = reference_face
+                    ? *reference_face : TopoDS::Face(edge_faces.FindFromKey(edge).First());
+                profile.has_reference = sweep_blend_face_normal(face, edge, profile.reference_normal);
+            }
+            return profile;
+        });
 }
 
 TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
@@ -2763,7 +3214,7 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
                 BRepGProp::VolumeProperties(next, after);
                 const double removed = before.Mass() - after.Mass();
                 if (std::abs(removed - corner.volume) >
-                    std::max(1e-6, corner.volume * 1e-4) || !blend_is_watertight(next))
+                    std::max(1e-6, corner.volume * 1e-4) || !is_watertight(next))
                     return {};
                 current = next;
             }
@@ -2894,7 +3345,7 @@ std::string shell_brep_rejection(const TopoDS_Shape& out) {
     } catch (const Standard_Failure&) {
         return "result failed BRepCheck validation";
     }
-    if (!blend_is_watertight(out)) return "result is an open (non-watertight) shell";
+    if (!is_watertight(out)) return "result is an open (non-watertight) shell";
     return std::string();
 }
 

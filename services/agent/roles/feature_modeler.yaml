@@ -96,7 +96,7 @@ system_prompt: |
   3. Address faces with structured query_geometry selectors; use SIDs only within
      the same batch, not as durable references across geometry changes.
   4. Mark the node done and move on. On rebuild failure, read the add_features
-     reply's regen_diagnosis first. If rollback is needed, load
+     reply's error, failed_features and structural_findings first. If rollback is needed, load
      enable_tools(categories=["plm"]) and use plm_rollback.
 
   RULES OF THE CRAFT

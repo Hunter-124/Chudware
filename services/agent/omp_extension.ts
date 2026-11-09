@@ -6,6 +6,8 @@ import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { getBlobsDir } from "@oh-my-pi/pi-utils";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
+import { getSettingDef, getSettingsForTab, SETTING_TABS, type SettingDef, type SettingsDisplayEntry } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getOAuthCredentialProvider } from "@oh-my-pi/pi-ai/oauth";
@@ -166,13 +168,68 @@ function toolLoadNames(value: unknown): string[] {
 }
 const COMPACTION_KEYS = ["enabled", "methodOrder", "supersedeReads", "dropUseless", "keepRecentTokens"] as const;
 
+type ConfigOption = { value: string; label: string; description?: string };
+
+// OMP's own settings panel decides which settings can be shown as a checkbox or a list of
+// choices, which tab and group they sit in, and in what order: Chudware never restates it.
+type PanelDef = SettingDef & { type: "boolean" | "enum" | "submenu" };
+
+function renderable(def: SettingDef): def is PanelDef {
+  if (lookup(def.path)?.isCredential) return false;
+  if (def.type === "boolean" || def.type === "enum") return true;
+  return def.type === "submenu" && def.options.length > 0;
+}
+
+function panelDef(entries: readonly SettingsDisplayEntry[], key: string): PanelDef {
+  const def = getSettingDef(entries, key);
+  if (!def || !renderable(def)) unsupported();
+  return def;
+}
+
+function choices(def: PanelDef): ConfigOption[] {
+  return def.type === "boolean" ? []
+    : def.type === "enum" ? def.values.map(value => ({ value, label: value }))
+    : def.options.map(({ value, label, description }) => ({ value: String(value), label, description }));
+}
+
+// One OMP setting as OMP's own settings panel presents it: label, description and
+// choices come from its registry. `current` and `default` are option values; `visible`
+// is OMP's own condition for showing the row.
+function configEntry(settings: ExtensionAPI["pi"]["settings"], def: PanelDef) {
+  const handle = lookup(def.path)!;
+  const options = choices(def);
+  const choice = (value: unknown): string => {
+    const text = String(value);
+    if (def.schemaType !== "number") return text;
+    // OMP's panels offer "default" for thresholds whose default is a sentinel (-1);
+    // "0.90" and 0.9 are the same choice.
+    if (text === String(handle.default) && options.some(option => option.value === "default")) return "default";
+    return options.find(option => Number(option.value) === Number(value))?.value ?? text;
+  };
+  return { key: def.path, tab: def.tab, group: def.group ?? null, label: def.label, description: def.description,
+    type: def.schemaType, options, current: choice(handle.get(settings)), default: choice(handle.default),
+    source: settings.getProvenance(handle), visible: def.condition?.() ?? true };
+}
+
 function sleep(ms: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();
   setTimeout(resolve, ms);
   return promise;
 }
 
-async function request<T>(action: string, params: object = {}): Promise<T> {
+// A CAD tool body runs in the same worker process as this bridge's control server, so
+// one long GIL-holding native call in any tool (decoding a 40 MB engine reply took 1.7 s;
+// a bare numpy sort held it for 10 s) leaves every bridge request unanswered meanwhile.
+// Connecting to a dead worker fails at once; the idle timeout only bounds how long a live
+// but stalled one is given.
+const REQUEST_TIMEOUT_MS = 5000;
+// A poll for a running call gets a far longer wait. It must not be timed out and re-sent:
+// the server still executes the abandoned poll, which drains progress updates and drops a
+// finished call's state, so the re-sent poll would lose the result.
+const POLL_TIMEOUT_MS = 60_000;
+
+async function request<T>(action: string, params: object = {},
+    wait: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
   if (!endpoint || !token || !["unix", "named_pipe"].includes(transport || "")) throw new Error("bridge unavailable");
   const payload = JSON.stringify({ token, action, params }) + "\n";
   if (Buffer.byteLength(payload) > MAX_FRAME) throw new Error("bridge frame too large");
@@ -181,14 +238,16 @@ async function request<T>(action: string, params: object = {}): Promise<T> {
   const chunks: Buffer[] = [];
   let length = 0;
   let settled = false;
+  const abort = () => finish(new Error("bridge request aborted"));
   const finish = (error?: Error, value?: T) => {
     if (settled) return;
     settled = true;
+    wait.signal?.removeEventListener("abort", abort);
     socket.destroy();
     if (error) reject(error);
     else resolve(value as T);
   };
-  socket.setTimeout(5000, () => finish(new Error("bridge timeout")));
+  socket.setTimeout(wait.timeoutMs ?? REQUEST_TIMEOUT_MS, () => finish(new Error("bridge timeout")));
   socket.on("error", () => finish(new Error("bridge unavailable")));
   socket.on("connect", () => socket.write(payload));
   socket.on("data", (chunk: Buffer) => {
@@ -207,6 +266,8 @@ async function request<T>(action: string, params: object = {}): Promise<T> {
     } catch { finish(new Error("invalid bridge response")); }
   });
   socket.on("end", () => finish(new Error("bridge closed")));
+  if (wait.signal?.aborted) abort();
+  else wait.signal?.addEventListener("abort", abort, { once: true });
   return promise;
 }
 
@@ -506,6 +567,61 @@ async function control(pi: ExtensionAPI, ctx: ExtensionContext, settings: Extens
       }
       return { compaction: Object.fromEntries(handles.map(([key, handle]) => [key, handle.get(settings)])) };
     }
+    case "config_get": {
+      keysOnly(args, ["keys"]);
+      if (!Array.isArray(args.keys) || args.keys.length > 64 ||
+          args.keys.some(key => typeof key !== "string" || !key || key.length > 256)) invalid();
+      const panel = createSettingsHost().entries;
+      return { agentDir: settings.getAgentDir(),
+        settings: (args.keys as string[]).map(key => configEntry(settings, panelDef(panel, key))) };
+    }
+    case "config_list": {
+      // Every renderable setting of the requested OMP tabs and groups, in OMP's panel order.
+      keysOnly(args, ["sources"]);
+      if (!Array.isArray(args.sources) || args.sources.length > 16) invalid();
+      const panel = createSettingsHost().entries;
+      const seen = new Set<string>();
+      const listed: unknown[] = [];
+      for (const source of args.sources as Record<string, unknown>[]) {
+        keysOnly(source, ["tab", "groups"]);
+        const groups = source.groups;
+        if (typeof source.tab !== "string" || !SETTING_TABS.includes(source.tab as never) ||
+            !Array.isArray(groups) || groups.length > 32 || groups.some(group => typeof group !== "string")) invalid();
+        for (const def of getSettingsForTab(panel, source.tab as never)) {
+          if (!def.group || !groups.includes(def.group) || !renderable(def) || seen.has(def.path)) continue;
+          seen.add(def.path);
+          listed.push(configEntry(settings, def));
+        }
+      }
+      return { agentDir: settings.getAgentDir(), settings: listed };
+    }
+    case "config_set": {
+      // Persists to the user's own OMP config; every live runtime watches it.
+      keysOnly(args, ["key", "value"]);
+      if (typeof args.key !== "string" || typeof args.value !== "string" || args.value.length > 256) invalid();
+      const def = panelDef(createSettingsHost().entries, args.key);
+      const handle = lookup(def.path)!;
+      // "default" resets the setting, except where OMP lists a real choice of that name
+      // (service tiers): that choice is then the value.
+      let value: unknown;
+      if (args.value !== "default" || (def.schemaType !== "number" && choices(def).some(option => option.value === "default"))) {
+        try { value = handle.parse(args.value); } catch { invalid(); }
+      }
+      try { handle.set(settings, value as never); } catch { invalid(); }
+      await settings.flush();
+      return configEntry(settings, def);
+    }
+    case "config_parse": {
+      // OMP's own validation of a value Chudware persists in its own settings layer.
+      keysOnly(args, ["key", "value"]);
+      if (typeof args.key !== "string" || typeof args.value !== "string" || args.value.length > 256) invalid();
+      const handle = lookup(panelDef(createSettingsHost().entries, args.key).path)!;
+      try {
+        const value = handle.parse(args.value);
+        handle.assertWritable(value);
+        return { value };
+      } catch { invalid(); }
+    }
     case "compact": {
       keysOnly(args, ["mode", "instructions"]);
       if (args.mode !== undefined && args.mode !== "soft" && args.mode !== "snapcompact") unsupported();
@@ -715,7 +831,17 @@ export default async function cadExtension(pi: ExtensionAPI) {
             cancelCall();
             throw new Error("CAD tool cancelled");
           }
-          const state = await request<ToolState>("tool_poll", { id: started.id });
+          let state: ToolState;
+          try {
+            state = await request<ToolState>("tool_poll", { id: started.id }, { timeoutMs: POLL_TIMEOUT_MS, signal });
+          } catch (error) {
+            // Stop must not wait out a stalled worker's poll; the abort listener already sent the cancel.
+            if (signal?.aborted) throw new Error("CAD tool cancelled");
+            // The call is still running in the worker: a failed poll must not leave it running
+            // unowned, holding the worker's GIL against every other agent's calls.
+            cancelCall();
+            throw error;
+          }
           if (state.error && !state.done) throw new Error("CAD tool unavailable");
           for (const update of state.updates || []) onUpdate?.(update);
           if (state.done) {

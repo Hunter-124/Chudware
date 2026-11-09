@@ -1658,7 +1658,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             return finish(std::move(res));
         }
         if (api_key.empty() && provider == "freellmapi") {
-            res.error = "freellmapi: missing unified API key (Settings → Providers → Free AI — "
+            res.error = "freellmapi: missing unified API key (Settings → AI → Providers → Free AI — "
                         "grab it from your FreeLLMAPI dashboard's Keys page)";
             res.model = model;
             res.endpoint = base_url.empty() ? "http://localhost:3001/v1" : base_url;
@@ -1835,7 +1835,7 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
     if (provider == "cursor" || provider == "cursor-sub") {
         res.error =
             "Cursor is not available for in-app agent runs (no REST transport; its API is "
-            "Connect-RPC/protobuf). Pick a different provider in Settings -> Providers.";
+            "Connect-RPC/protobuf). Pick a different provider in Settings -> AI -> Providers.";
         res.error_excerpt = truncate_excerpt(res.error);
         res.model = str_or(cfg, "model");
         res.endpoint = "cursor";

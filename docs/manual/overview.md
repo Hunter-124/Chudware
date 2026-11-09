@@ -29,9 +29,9 @@ WORKFLOW
                                             auto_define=False to both when leaving sketches free.
                                             An invalid fillet/chamfer solid is rejected even if
                                             OCCT reports construction success. Atomic failure keeps
-                                            the prior live tree/revision; regen_diagnosis uses the
-                                            rejected candidate and native feature error. Provider
-                                            unavailability does not erase that native evidence.
+                                            the prior live tree/revision; structural_findings uses the
+                                            rejected candidate and native feature error. No model is
+                                            called on failure; regen_diagnose proposes a fix on request.
   3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
                                             most useful complementary shots (the planner
                                             measures ~200 cameras in the engine and picks the

@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "copilot_internal.h"
+#include "subrun_usage.h"
 #include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark doubles as the busy art
 
 // ============================ shared small-UI helpers ============================
@@ -1044,8 +1045,11 @@ std::string chatActivityCopyText(const ActivityItem& a) {
         if (!out.empty()) out += "\n";
         out += a.reason;
     }
-    if (!a.detail.empty() && a.detail != a.reason) {
-        const ui::ToolRowDetail parts = ui::splitToolRowDetail(a.detail);
+    // A sub-run card's usage trailer (subrun_usage.h) is display data, never copy text.
+    std::string detail = a.detail;
+    ui::copilot::stripSubRunUsageTrailer(detail);
+    if (!detail.empty() && detail != a.reason) {
+        const ui::ToolRowDetail parts = ui::splitToolRowDetail(detail);
         if (!parts.args.empty()) {
             if (!out.empty()) out += "\n";
             out += parts.args;

@@ -39,6 +39,9 @@ def scratch_daemon(monkeypatch):
     key = "pytest-" + uuid.uuid4().hex[:8]
     monkeypatch.setenv("CHUDWARE_INSTANCE_KEY", key)
     monkeypatch.setenv("CHUDWARE_HOSTD_LINGER_SECS", "2")
+    # hostd's developer-build worker falls back to the system python3, which lacks the
+    # service dependencies (yaml) and fails worker startup; run it under this interpreter.
+    monkeypatch.setenv("CHUDWARE_PYTHON", sys.executable)
     monkeypatch.delenv("CHUDWARE_HOSTD_SOCKET", raising=False)
     pids = []
     yield pids

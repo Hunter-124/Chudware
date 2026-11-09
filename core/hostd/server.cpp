@@ -1778,13 +1778,15 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
     // lives inside an active worker run, so an unmatched control call ends here
     // with its "no active agent run" reply and never queues behind a busy agent
     // lane.
-    if (method == "agent_cancel" || method == "agent_steer" || method == "agent_answer") {
+    if (method == "agent_cancel" || method == "agent_steer" ||
+        method == "agent_withdraw_steer" || method == "agent_answer") {
         json controlResult;
         std::string controlErr;
         bool workerRunMatched = false;
-        const char* action = method == "agent_cancel"  ? "cancel"
-                             : method == "agent_steer" ? "steer"
-                                                       : "answer";
+        const char* action = method == "agent_cancel"           ? "cancel"
+                             : method == "agent_steer"          ? "steer"
+                             : method == "agent_withdraw_steer" ? "withdraw_steer"
+                                                                : "answer";
         if (cell_ && method == "agent_cancel" && params.value("run_id", std::string()).empty()) {
             std::vector<std::string> own;
             {
@@ -1832,6 +1834,8 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
         }
         if (method == "agent_steer")
             return json{{"ok", true}, {"steered", false}, {"reason", "no active agent run"}};
+        if (method == "agent_withdraw_steer")
+            return json{{"ok", true}, {"withdrawn", false}, {"reason", "no active agent run"}};
         return json{{"ok", true}, {"cancelled", false}, {"reason", "no active agent run"}};
     }
 

@@ -25,7 +25,7 @@ static bool isDocumentReadOnlyMethod(const std::string& m) {
     static const std::set<std::string> kExact = {
         // doc reads
         "doc_list", "doc_tree", "doc_query", "doc_bbox", "doc_adjacency",
-        "doc_get_meta", "doc_validate", "doc_dry_run_ops", "doc_resolve_pick",
+        "doc_get_meta", "doc_validate", "doc_dry_run_ops", "doc_resolve_pick", "doc_feature_edges",
         "doc_mesh_ref_list", "doc_mesh_ref_mesh",
         // doc_rebuild recomputes + re-tessellates but never edits the model —
         // an ro GUI mirror tab activates via forced doc_rebuild (Phase 4:
@@ -101,7 +101,7 @@ bool DocRegistry::isReadOnlyMethod(const std::string& m) {
     // Keep desktop document-only semantics separate from this security allowlist.
     static const std::set<std::string> reads = {
         "doc_list", "doc_tree", "doc_query", "doc_bbox", "doc_adjacency",
-        "doc_get_meta", "doc_validate", "doc_resolve_pick", "doc_activate",
+        "doc_get_meta", "doc_validate", "doc_resolve_pick", "doc_feature_edges", "doc_activate",
         "doc_rebuild", "doc_dry_run_ops", "doc_dep_query", "doc_drawing_views",
         "doc_sketch_overview", "doc_sketch_regions", "doc_view_metrics", "doc_snapshot",
         "doc_face_edges", "doc_face_points", "doc_face_wires", "doc_formats", "doc_list_ops",

@@ -1153,6 +1153,79 @@ def test_registers_exact_shared_omp_worker_methods():
     assert "omp_validate_key" not in worker_rpc.WORKER_METHODS
 
 
+def _extension_rows():
+    def entry(key, tab, group, current="false", **fields):
+        return {"key": key, "tab": tab, "group": group, "label": key, "description": "", "type": "boolean",
+                "options": [], "current": current, "default": "false", "source": "default",
+                "visible": True, **fields}
+
+    return {row["key"]: row for row in (
+        entry("task.maxEffort", "tasks", "Subagents", "xhigh", type="enum"),
+        entry("task.maxConcurrency", "tasks", "Subagents", "32", type="number"),
+        entry("task.maxRuntimeMs", "tasks", "Subagents", "0", type="number"),
+        entry("compaction.enabled", "context", "Compaction"),
+        entry("mnemopi.autoRecall", "memory", "Mnemopi", visible=False),
+        entry("theme.dark", "appearance", "Theme"),
+    )}
+
+
+def test_omp_config_get_lists_the_policy_rows_for_the_selected_memory_backend(
+        online_lane, monkeypatch, tmp_path):
+    from services import paths
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "memory_backend", lambda *_: "mnemopi")
+    calls = []
+
+    def config_call(command, params):
+        calls.append((command, params))
+        return {"agentDir": "/omp", "settings": list(_extension_rows().values())}
+
+    monkeypatch.setattr(online_lane.host, "config_call", raising=False, value=config_call)
+    reply = worker_rpc.WORKER_METHODS["omp_config_get"]({}, lambda _: None)
+    assert reply["ok"] is True and reply["agentDir"] == "/omp"
+    assert reply["chudwareLayer"] == str(tmp_path / "omp" / "cad-settings.yml")
+    # Chudware pins and owns the other rows; OMP's Appearance has no Chudware tab.
+    assert [(entry["key"], entry["tab"], entry["scope"]) for entry in reply["settings"]] == [
+        ("task.maxEffort", "agents", "chudware"), ("task.maxConcurrency", "agents", "omp"),
+        ("mnemopi.autoRecall", "memory", "omp"),
+    ]
+    assert [command for command, _ in calls] == ["config_list"]
+    assert {"tab": "memory", "groups": ["Mnemopi"]} in calls[0][1]["sources"]
+    assert worker_rpc.WORKER_METHODS["omp_config_get"]({"extra": 1}, lambda _: None)["ok"] is False
+
+
+def test_omp_config_only_reaches_the_exposed_omp_settings(online_lane, monkeypatch, tmp_path):
+    from services import paths
+    from services.agent.omp_bridge import BridgeError
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "memory_backend", lambda *_: "off")
+    rows = _extension_rows()
+    calls = []
+
+    def config_call(command, params):
+        calls.append((command, params))
+        if command == "config_get":
+            # A credential, or a key that is no renderable OMP setting, is unsupported there.
+            if params["keys"][0] not in rows:
+                raise BridgeError("unsupported")
+            return {"settings": [rows[params["keys"][0]]]}
+        return {**rows[params["key"]], "current": params["value"]}
+
+    monkeypatch.setattr(online_lane.host, "config_call", raising=False, value=config_call)
+    set_config = worker_rpc.WORKER_METHODS["omp_config_set"]
+    # Pinned or owned by Chudware, another OMP tab, a credential, an unknown key: never written.
+    for key in ("task.maxRuntimeMs", "compaction.enabled", "theme.dark", "providers.openai.apiKey", "compaction"):
+        assert set_config({"key": key, "value": "0"}, lambda _: None)["ok"] is False, key
+    assert set_config({"key": "task.maxConcurrency", "value": 3}, lambda _: None)["ok"] is False
+    assert set_config({"key": "task.maxConcurrency", "value": "4", "scope": "omp"}, lambda _: None)["ok"] is False
+    assert all(command == "config_get" for command, _ in calls)
+    reply = set_config({"key": "task.maxConcurrency", "value": "4"}, lambda _: None)
+    assert reply["ok"] is True and reply["current"] == "4" and reply["tab"] == "agents"
+    assert ("config_set", {"key": "task.maxConcurrency", "value": "4"}) in calls
+
+
 def test_logout_accounts_uses_official_redacted_rows(online_lane, monkeypatch):
     def call(command, params=None, emit=None):
         assert command == "get_logout_accounts"

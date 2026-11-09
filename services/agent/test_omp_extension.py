@@ -636,7 +636,7 @@ os.environ["OMP_SCHEMA_TEST_CATALOG"] = str(catalog)
 bridge.publish_tools(definitions)
 overlay = root / "omp-test.yml"
 overlay.write_text(_CAD_SESSION_SETTINGS + _CAD_MEMORY_SETTINGS["off"] +
-                   f"tools.xdevDocs: {os.environ['OMP_SCHEMA_TEST_DOCS']}\n", encoding="utf-8")
+                   f"tools:\n  xdevDocs: {os.environ['OMP_SCHEMA_TEST_DOCS']}\n", encoding="utf-8")
 binary = os.environ["OMP_SCHEMA_TEST_BIN"]
 extra = ["--no-lsp"]
 if _binary_supports_flag(binary, "--no-mcp"):
@@ -690,6 +690,8 @@ def _run_extension_fixture(tmp_path, binary, docs_mode):
         "OMP_SCHEMA_TEST_REPORT": str(tmp_path / "report.json"),
         "OMP_SCHEMA_TEST_DOCS": docs_mode,
         "CHUDWARE_PROJECT_DIR": str(tmp_path), "CHUDWARE_PROJECT_SAVE_DIR": str(tmp_path),
+        # The runtime refuses to start without a selectable model; no request is ever sent.
+        "ANTHROPIC_API_KEY": "placeholder",
         "OMP_SCHEMA_CAD_EXTENSION": str(repo / "services" / "agent" / "omp_extension.ts"),
     })
     completed = subprocess.run([sys.executable, "-c", _RUNNER], cwd=tmp_path,
@@ -803,20 +805,21 @@ def test_official_omp_extension_schema_and_child_binding(tmp_path, docs_mode):
         if item["agent"] == "schema-child":
             assert item["cacheBefore"] == "fixture-inherited-cache"
     assert len(output["report"]["unchanged"]) == 4
+    # A replaced descriptor takes its new schema, but the first published description is pinned for
+    # the runtime (the provider-visible prefix; test_omp_bridge pins that), so the prompt keeps it.
     for item in output["report"]["replacements"]:
-        assert item["description"] == f"CAD schema probe revision {item['version']}"
+        assert item["description"] == "CAD schema probe"
         assert item["wire"]["required"] == ["version"]
         assert item["wire"]["properties"]["version"]["const"] == item["version"]
         assert item["oldArgsRejected"] and item["executable"]
-        assert item["catalogVisible"] and item["promptHasDescription"]
+        assert item["catalogVisible"] and not item["promptHasDescription"]
     assert len(output["report"]["replacements"]) == 2
     assert len(output["report"]["separateChanges"]) == 2
     for item in output["report"]["separateChanges"]:
-        assert item["schemaDescription"] == f"CAD schema probe revision {item['version']}"
+        assert item["schemaDescription"] == item["metadataDescription"] == "CAD schema probe"
         assert item["schemaWire"]["properties"]["version"]["const"] == item["version"] + 10
-        assert item["metadataDescription"] == f"CAD metadata only {item['version']}"
         assert item["metadataWire"] == item["schemaWire"]
-        assert item["executable"] and item["promptHasMetadata"]
+        assert item["executable"] and not item["promptHasMetadata"]
     for item in output["report"]["disableFromBase"]:
         assert not item["mounted"] and not item["topLevel"]
         assert not item["catalogVisible"] and not item["executable"]
@@ -1116,6 +1119,7 @@ def test_installed_omp_restores_mounted_devices_in_new_worker(tmp_path):
         "XDG_CACHE_HOME": str(tmp_path / "cache"), "PYTHONPATH": str(repo),
         "CHUDWARE_OMP_BIN": str(binary), "OMP_MOUNT_ROOT": str(tmp_path),
         "CHUDWARE_PROJECT_DIR": str(tmp_path), "CHUDWARE_PROJECT_SAVE_DIR": str(tmp_path),
+        "ANTHROPIC_API_KEY": "placeholder",  # the runtime needs a selectable model to start
     })
 
     def run_worker(**extra):
@@ -1179,6 +1183,7 @@ def test_official_omp_automatic_compaction_never_runs_snapcompact(tmp_path):
         "XDG_CACHE_HOME": str(tmp_path / "cache"), "PYTHONPATH": str(repo),
         "CHUDWARE_OMP_BIN": str(Path(configured).expanduser().resolve(strict=True)),
         "CHUDWARE_PROJECT_DIR": str(tmp_path), "CHUDWARE_PROJECT_SAVE_DIR": str(tmp_path),
+        "ANTHROPIC_API_KEY": "placeholder",  # the runtime needs a selectable model to start
     })
     completed = subprocess.run([sys.executable, "-c", _POLICY_RUNNER], cwd=tmp_path,
                                env=environment, capture_output=True, text=True,
@@ -1191,6 +1196,203 @@ def test_official_omp_automatic_compaction_never_runs_snapcompact(tmp_path):
     assert orders["auto"] == [method for method in orders["initial"] if method != "snapcompact"]
     assert orders["snapcompact"] == ["snapcompact"]
 
+
+_CONFIG_RUNNER = r'''
+import json
+import os
+import time
+from pathlib import Path
+from services.agent import worker_rpc
+from services.agent.omp_host import OmpSessionHost
+
+root = Path(os.environ["CHUDWARE_PROJECT_DIR"])
+host = OmpSessionHost()
+worker_rpc.get_default_omp_host = lambda: host
+get_config = worker_rpc.WORKER_METHODS["omp_config_get"]
+set_config = worker_rpc.WORKER_METHODS["omp_config_set"]
+sessions = []
+
+
+def start(name, **params):
+    session = host._get_or_create_session(
+        name, {"workspace_dir": str(root), "omp_session_dir": str(root / "sessions"),
+               "memory_backend": "off", "host_tools": [], **params}, None)
+    session.client._omp_bridge.wait_tools(timeout=60)
+    sessions.append(session)
+    return session
+
+
+def effective(session, keys):
+    rows = session.client._omp_bridge.call("config_get", {"keys": keys}, timeout=30)["settings"]
+    return {row["key"]: [row["current"], row["source"]] for row in rows}
+
+
+def settle(session, expected):
+    # A running CAD session picks an edited config file up on its own.
+    deadline = time.monotonic() + 20
+    while True:
+        seen = effective(session, list(expected))
+        if seen == expected or time.monotonic() >= deadline:
+            return seen
+        time.sleep(0.2)
+
+
+def launch(session):
+    command = session.client.command
+    return {"no_lsp": "--no-lsp" in command, "tools": command[command.index("--tools") + 1].split(","),
+            "configs": [command[i + 1] for i, flag in enumerate(command) if flag == "--config"]}
+
+
+try:
+    steps = {}
+    initial = get_config({}, lambda _: None)
+    user_config = Path(initial["agentDir"]) / "config.yml"
+    # The user's own OMP settings that a CAD session pins against (its overlay is nested YAML).
+    user_config.parent.mkdir(parents=True, exist_ok=True)
+    user_config.write_text("task:\n  maxRuntimeMs: 300000\ntodo:\n  enabled: false\n", encoding="utf-8")
+    chat = start("live")
+    steps["launch"] = launch(chat)
+    steps["initial"] = {row["key"]: row for row in initial["settings"]}
+    steps["initial_ok"] = initial["ok"]
+    steps["agent_dir"] = initial["agentDir"]
+    steps["layer"] = initial["chudwareLayer"]
+    pinned = ["task.maxRuntimeMs", "todo.enabled", "todo.eager"]
+    # The conversation default is Encourage.
+    steps["pins"] = {"encourage": effective(chat, pinned)}
+    for preference in ("option", "off", "require"):
+        steps["pins"][preference] = effective(start(f"todo_{preference}", task_list_preference=preference), pinned)
+    keys = ["lsp.enabled", "lsp.diagnosticsOnWrite", "task.maxEffort", "memory.backend",
+            "retry.maxRetries", "task.maxConcurrency"]
+    steps["live_initial"] = effective(chat, keys)
+    steps["omp"] = [set_config({"key": "retry.maxRetries", "value": "5"}, lambda _: None),
+                    # RPC runtimes soft-pin this one to its default; a config write must still win.
+                    set_config({"key": "task.maxConcurrency", "value": "4"}, lambda _: None)]
+    steps["chudware"] = [set_config({"key": "lsp.enabled", "value": "true"}, lambda _: None),
+                         set_config({"key": "task.maxEffort", "value": "xhigh"}, lambda _: None)]
+    layer = Path(steps["layer"])
+    steps["files"] = {"user": user_config.read_text(encoding="utf-8"), "layer": layer.read_text(encoding="utf-8")}
+    steps["live_after"] = settle(chat, {
+        "lsp.enabled": ["true", "overlay"], "lsp.diagnosticsOnWrite": ["false", "overlay"],
+        "task.maxEffort": ["xhigh", "overlay"], "memory.backend": ["off", "overlay"],
+        "retry.maxRetries": ["5", "global"], "task.maxConcurrency": ["4", "global"]})
+    # LSP on adds the lsp tool to conversation processes started from now on.
+    steps["second"] = launch(start("second"))
+    steps["reset"] = [set_config({"key": key, "value": "default"}, lambda _: None)
+                      for key in ("retry.maxRetries", "task.maxConcurrency", "lsp.enabled", "task.maxEffort")]
+    steps["files_after_reset"] = {"user": user_config.read_text(encoding="utf-8"),
+                                  "layer": layer.read_text(encoding="utf-8")}
+    steps["live_reset"] = settle(chat, {
+        "lsp.enabled": ["false", "overlay"], "task.maxEffort": ["high", "overlay"],
+        "retry.maxRetries": ["10", "default"]})
+    refused = ("task.maxRuntimeMs", "memory.backend", "compaction.enabled", "theme.dark",
+               "providers.openai.apiKey", "mnemopi.llmApiKey", "no.such.setting")
+    steps["refused"] = {key: set_config({"key": key, "value": "0"}, lambda _: None)["ok"] for key in refused}
+    steps["invalid"] = [set_config(args, lambda _: None)["ok"] for args in (
+        {"key": "task.maxEffort", "value": "turbo"}, {"key": "lsp.enabled", "value": "sideways"})]
+    steps["untouched"] = {"user": user_config.read_text(encoding="utf-8"), "layer": layer.read_text(encoding="utf-8")}
+    print(json.dumps(steps))
+finally:
+    for session in sessions:
+        host._release_live_session(session)
+    host.shutdown()
+'''
+
+
+def test_official_omp_settings_round_trip_through_the_users_omp_config_and_chudwares_layer(tmp_path):
+    configured = os.environ.get("CHUDWARE_OMP_TEST_BIN")
+    if not configured:
+        pytest.skip("set CHUDWARE_OMP_TEST_BIN to the digest-pinned official OMP artifact")
+    pytest.importorskip("omp_rpc")
+    repo = Path(__file__).resolve().parents[2]
+    environment = {key: os.environ[key] for key in (
+        "PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "LANG", "LC_ALL",
+    ) if key in os.environ}
+    environment.update({
+        "HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
+        "APPDATA": str(tmp_path / "appdata"), "LOCALAPPDATA": str(tmp_path / "local"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"), "PYTHONPATH": str(repo),
+        "CHUDWARE_OMP_BIN": str(Path(configured).expanduser().resolve(strict=True)),
+        "CHUDWARE_PROJECT_DIR": str(tmp_path), "CHUDWARE_PROJECT_SAVE_DIR": str(tmp_path),
+        # The runtime refuses to start without a selectable model; no request is ever sent.
+        "ANTHROPIC_API_KEY": "placeholder",
+    })
+    completed = subprocess.run([sys.executable, "-c", _CONFIG_RUNNER], cwd=tmp_path,
+                               env=environment, capture_output=True, text=True,
+                               check=False, timeout=240)
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    steps = json.loads(completed.stdout.strip().splitlines()[-1])
+    rows = steps["initial"]
+
+    # Conversation processes: Chudware's layer, then the session's pins; LSP is a setting, not a flag.
+    layer, overlay = steps["launch"]["configs"]
+    assert Path(layer).name == "cad-settings.yml" and Path(layer).as_posix() == Path(steps["layer"]).as_posix()
+    assert Path(overlay).name.startswith("cad-session-")
+    assert not steps["launch"]["no_lsp"] and "lsp" not in steps["launch"]["tools"]
+    assert steps["live_initial"]["lsp.enabled"] == ["false", "overlay"]
+    assert steps["live_initial"]["lsp.diagnosticsOnWrite"] == ["false", "overlay"]
+    assert steps["live_initial"]["task.maxEffort"] == ["high", "overlay"]
+    assert steps["live_initial"]["memory.backend"] == ["off", "overlay"]
+    # The session overlay's nested pins outrank the user's own OMP values (maxRuntimeMs 300000,
+    # todos disabled: the todo tool in --tools would otherwise stop OMP from starting), and the
+    # task-list preference reaches OMP.
+    unset, runtime, on = ["default", "default"], ["0", "overlay"], ["true", "overlay"]
+    assert steps["pins"] == {
+        "encourage": {"task.maxRuntimeMs": runtime, "todo.enabled": on, "todo.eager": ["preferred", "overlay"]},
+        "option": {"task.maxRuntimeMs": runtime, "todo.enabled": on, "todo.eager": unset},
+        "off": {"task.maxRuntimeMs": runtime, "todo.enabled": ["false", "overlay"], "todo.eager": unset},
+        "require": {"task.maxRuntimeMs": runtime, "todo.enabled": on, "todo.eager": ["always", "overlay"]}}
+
+    # Rows come with OMP's own label, description, choices and provenance, under Chudware's tabs.
+    assert steps["initial_ok"] is True
+    assert {row["tab"] for row in rows.values()} <= {
+        "models", "context", "memory", "tools", "coding", "agents", "providers"}
+    for key, tab, scope in (("retry.maxRetries", "models", "omp"), ("compaction.thresholdPercent", "context", "omp"),
+                            ("todo.reminders", "tools", "omp"), ("edit.mode", "coding", "omp"),
+                            ("task.maxConcurrency", "agents", "omp"), ("providers.cacheRetention", "providers", "omp"),
+                            ("lsp.enabled", "coding", "chudware"), ("task.maxEffort", "agents", "chudware")):
+        assert rows[key]["tab"] == tab and rows[key]["scope"] == scope, key
+        assert rows[key]["label"] and rows[key]["description"], key
+    assert rows["lsp.enabled"]["type"] == "boolean" and rows["lsp.enabled"]["options"] == []
+    assert rows["lsp.enabled"]["current"] == "false" == rows["lsp.enabled"]["default"]
+    assert rows["lsp.enabled"]["source"] == "overlay" and rows["lsp.enabled"]["group"] == "LSP"
+    assert rows["task.maxEffort"]["current"] == "high" and "xhigh" in [o["value"] for o in rows["task.maxEffort"]["options"]]
+    assert rows["retry.maxRetries"]["type"] == "number" and rows["retry.maxRetries"]["source"] == "default"
+    assert rows["compaction.thresholdPercent"]["current"] == "default"
+    # Chudware owns, pins or never shows these; credentials are never listed.
+    for key in ("compaction.enabled", "compaction.methodOrder", "todo.eager", "task.maxRuntimeMs",
+                "memory.backend", "defaultThinkingLevel", "bash.enabled", "theme.dark",
+                "mnemopi.llmApiKey", "hindsight.apiToken"):
+        assert key not in rows, key
+
+    omp_set, concurrency_set = steps["omp"]
+    assert omp_set["ok"] and (omp_set["current"], omp_set["source"], omp_set["scope"]) == ("5", "global", "omp")
+    assert concurrency_set["current"] == "4"
+    lsp_set, effort_set = steps["chudware"]
+    assert (lsp_set["current"], lsp_set["source"], lsp_set["scope"]) == ("true", "overlay", "chudware")
+    assert effort_set["current"] == "xhigh"
+    # Each scope wrote its own file only.
+    assert "maxRetries: 5" in steps["files"]["user"] and "lsp" not in steps["files"]["user"]
+    assert "maxEffort" not in steps["files"]["user"]
+    assert "enabled: true" in steps["files"]["layer"] and "maxEffort: xhigh" in steps["files"]["layer"]
+    assert "maxRetries" not in steps["files"]["layer"]
+    # The running session applies both without a restart; a new process lists the lsp tool.
+    assert steps["live_after"] == {
+        "lsp.enabled": ["true", "overlay"], "lsp.diagnosticsOnWrite": ["false", "overlay"],
+        "task.maxEffort": ["xhigh", "overlay"], "memory.backend": ["off", "overlay"],
+        "retry.maxRetries": ["5", "global"], "task.maxConcurrency": ["4", "global"]}
+    assert "lsp" in steps["second"]["tools"] and not steps["second"]["no_lsp"]
+
+    # "default" drops an OMP key from the user's config and restores Chudware's value in the layer.
+    assert [reply["current"] for reply in steps["reset"]] == ["10", "32", "false", "high"]
+    assert "maxRetries" not in steps["files_after_reset"]["user"]
+    assert "maxConcurrency" not in steps["files_after_reset"]["user"]
+    assert "enabled: false" in steps["files_after_reset"]["layer"] and "maxEffort: high" in steps["files_after_reset"]["layer"]
+    assert steps["live_reset"] == {"lsp.enabled": ["false", "overlay"], "task.maxEffort": ["high", "overlay"],
+                                   "retry.maxRetries": ["10", "default"]}
+
+    assert not any(steps["refused"].values()) and not any(steps["invalid"])
+    assert steps["untouched"] == steps["files_after_reset"]
 
 
 def test_bridge_keeps_runtime_presentation_across_category_updates(tmp_path):

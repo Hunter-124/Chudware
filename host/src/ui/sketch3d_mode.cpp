@@ -451,6 +451,7 @@ bool Sketch3DMode::enterForFeature(AppState& st, const std::string& fid) {
         cancelRevision_ = cres.value("revision", -1L);
         if (cancelRevision_ != st.docMirror.revision()) cancelRevision_ = -1;
     }
+    entryContent_ = st.docMirror.featureContent(fid_);
     st.addLog("[sketch3d] editing " + fid_);
     return true;
 }
@@ -1321,16 +1322,6 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                  ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)))
                 commitSpline(st);
         }
-        // Esc: end the chain / drop the tool.
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            if (tool_ == Sk3Tool::Spline && toolPts_.size() >= 2) commitSpline(st);
-            if (!toolPts_.empty() || !chainPrevHandle_.empty()) {
-                toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
-                chainPrevHandle_.clear();
-            } else {
-                resetTool();
-            }
-        }
         // Right-click ends a line chain without dropping the tool.
         if (rightClickReleased()) {
             toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
@@ -1415,10 +1406,7 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
         if ((ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) &&
             !io.WantTextInput)
             deleteSelection(st);
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !dimPopupOpen_ && !planePopupOpen_) clearSel();
     }
-    if (modelVertexPicking_ && ImGui::IsKeyPressed(ImGuiKey_Escape))
-        setModelVertexPicking(st, false);
 
     // Tab cycles the working plane preset (documented in the contract appendix).
     if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Tab))
@@ -1477,6 +1465,31 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
             drawPlanePopup(st);
         }
         ImGui::End();
+    }
+
+    // Esc ladder — one step per press, mirroring the 2D sketcher; suppressed while a text field or
+    // a dimension/plane popup owns the keyboard:
+    //   1. a model-vertex pick or a tool is armed -> cancel it (and any chain in progress);
+    //   2. entities are selected                  -> clear the selection;
+    //   3. nothing armed or selected and this sketch's own content (params + refs) equals its
+    //      content at entry                       -> leave the sketch exactly like Finish Sketch.
+    // An edited sketch is never left by Esc; the user confirms with Finish Sketch.
+    if (!io.WantTextInput && !dimPopupOpen_ && !planePopupOpen_ &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        if (modelVertexPicking_) {
+            setModelVertexPicking(st, false);
+        } else if (tool_ != Sk3Tool::None) {
+            if (tool_ == Sk3Tool::Spline && toolPts_.size() >= 2) commitSpline(st);
+            resetTool();
+        } else if (!selEnts_.empty() || !selHandles_.empty()) {
+            clearSel();
+        } else if (!dragging_ && !dragArmed_ && !entryContent_.is_null() &&
+                   st.docMirror.docId() == docId_ &&
+                   st.docMirror.featureContent(fid_) == entryContent_ &&
+                   !st.contextPickActive && !ImGui::IsAnyItemActive() &&
+                   !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+            onRibbonCommand(st, "sketch3d_exit");
+        }
     }
 }
 

@@ -157,7 +157,7 @@ def test_viewer_file_open_does_not_grant_import_or_document_mutation(policy):
 
 
 @pytest.mark.parametrize("method", [
-    "agent_admin_turn", "agent_cancel", "agent_steer", "agent_answer",
+    "agent_admin_turn", "agent_cancel", "agent_steer", "agent_withdraw_steer", "agent_answer",
     "agent_handles_new",
     "omp_branch_session", "omp_close_session",
     "omp_session_stats", "memory_recall", "memory_remember", "dag_status",
@@ -185,7 +185,8 @@ def test_credential_management_and_url_probing_are_refused_in_cells(policy, meth
 
 @pytest.mark.parametrize("method", [
     "agent_cancel", "sim_cancel", "dag_abort", "subagent_terminate",
-    "agent_steer", "agent_answer", "omp_close_session", "omp_apply_compaction_policy",
+    "agent_steer", "agent_withdraw_steer", "agent_answer", "omp_close_session",
+    "omp_apply_compaction_policy",
 ])
 def test_control_policy_never_grants_workspace_wide_actor_access(policy, method):
     assert policy[method]["scope"] == "actor"

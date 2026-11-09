@@ -1,5 +1,5 @@
-// Chudware Settings modal (Appearance / General / AI / Providers / Benchmarks /
-// Prompts / Agent / Experimental tabs) and the About modal.
+// Chudware Settings modal (Appearance / General / AI pages; AI is a strip of tabs over Chudware's
+// sections and OMP's own settings) and the About modal.
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -57,6 +57,7 @@
 #include "anim.h"
 #include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
 #include "widgets/kit.h"  // ui::kit::sectionHeader — the one accent-caption treatment
+#include "widgets/kit_panel.h"  // ui::kit::formTabs — the AI tab strip
 #include "ai/rules_authoring.h"  // ui::drawRulesAuthoringPopup (Settings → AI → Rules → New rule…)
 #include "copilot/agent_text.h"  // ui::foldToAtlasGlyphs — Rules tab renders Python-authored text
 
@@ -692,7 +693,7 @@ static void settingsSectionHeader(const char* title, bool first = false) {
 // Rounded frosted glass card around a group of related fields, under a small accent section
 // header. Auto-height; id must be unique per page. Keeps label+widget pairs inside one child so
 // scrolling cannot detach a caption from its field. width=0 fills the row (the default); an
-// explicit width lets two sections sit side by side (Settings → Providers packs Sign-in and
+// explicit width lets two sections sit side by side (Settings → AI → Providers packs Sign-in and
 // Usage into two columns on wide panes). `first` drops the header's leading gap at a page top.
 static void settingsGlassSectionBegin(const char* id, const char* title, float width = 0.0f,
                                       bool first = false) {
@@ -748,20 +749,29 @@ static void settingsTabBodyEnd() {
     ImGui::PopStyleVar();  // WindowPadding
 }
 
-// AI sub-tabs whose bodies own their own scrolling (Skills / Context) must zero the PARENT
-// tab-body scroll exactly once — on the frame the sub-tab becomes active. Doing it every frame
-// (the old behavior) hard-pins the parent, so the wheel over those tabs was silently eaten.
-// Only the SELECTED sub-tab's body runs, so "previously-active index" plus a frame-gap test
-// covers both switching between two reporting sub-tabs and coming back from one that doesn't
-// report (Harness/Roles/…) or from a whole different Settings tab.
-static int s_aiSubTabPrev  = -1;     // sub-tab index whose body last drew
-static int s_aiSubTabFrame = -100;   // frame it drew on
-static bool aiSubTabJustEntered(int idx) {
-    const int frame = ImGui::GetFrameCount();
-    const bool entered = (s_aiSubTabPrev != idx) || (frame - s_aiSubTabFrame) > 1;
-    s_aiSubTabPrev  = idx;
-    s_aiSubTabFrame = frame;
-    return entered;
+// A jump to a section inside an AI tab (the SettingsRoute section values) leaves the section's
+// token here. The section calls aiAnchor() with its token just before it begins and the tab body
+// scrolls it to the top. Cards size themselves from the previous frame, so the layout above the
+// section is still settling for a few frames after a jump: the scroll is re-applied for
+// kAiAnchorFrames frames, then drawAiPage drops the token (also when the tab never drew that
+// section).
+static constexpr int kAiAnchorFrames = 10;
+static const char* s_aiAnchor = nullptr;
+static int         s_aiAnchorFrames = 0;
+static void aiAnchor(const char* section) {
+    if (!s_aiAnchor || std::strcmp(s_aiAnchor, section) != 0) return;
+    // At the cursor, one padding above it: SetScrollHereY would aim at the PREVIOUS item.
+    ImGui::SetScrollFromPosY(ImGui::GetCursorScreenPos().y - ImGui::GetWindowPos().y -
+                                 ImGui::GetStyle().WindowPadding.y,
+                             0.0f);
+}
+
+// Height for a full-height editor (Skills / Rules / Role prompts): one viewport of its tab body
+// below `reserved` px of its own heading, wherever it sits in the tab, and never shorter than a
+// usable editor. The tab scrolls when the editor is not the first thing in it.
+static float aiEditorHeight(float reserved) {
+    const float viewport = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y * 2.0f;
+    return ImMax(ui::metrics::px(360.0f), viewport - reserved);
 }
 
 
@@ -784,7 +794,7 @@ static void applyThemeNow(AppState& st, bool light) {
             ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
             ui::palette.viewportBottom[2]);
 }
-// ---- Subscription accounts (Settings → Providers → Accounts) ----------------
+// ---- Subscription accounts (Settings → AI → Providers → Accounts) ------------
 // Drives subscription_switch / subscription_login / subscription_logout. The model, the
 // parsing and the subscription_accounts/subscription_status/subscription_usage polls live in
 // ui/provider_usage.h: the Copilot composer draws the SAME windows as rings, and a second
@@ -1331,7 +1341,7 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     }
 }
 
-// ---- Omp provider manager (Settings → Providers) -------------------------------
+// ---- Omp provider manager (Settings → AI → Providers) ---------------------------
 // Two-pane sign-in manager driven by the persistent Omp worker service
 // (omp_provider_list / omp_auth_state / omp_set_key / omp_remove_key /
 // logout / omp_login). The UI holds no auth truth: it renders the latest sanitized
@@ -3086,7 +3096,7 @@ struct BenchCategoriesUi {
 };
 static BenchCategoriesUi s_cats;
 
-// ---- Model roles (Settings → AI → Roles) -------------------------------------
+// ---- Model roles (Settings → AI → Models) ------------------------------------
 // RPC: ai_roles_get/set. Degrade read-only when worker offline.
 // when the RPC is absent.
 //
@@ -4439,7 +4449,7 @@ static void drawModelRolesSection(AppState& st, float sc) {
 }
 
 // Copilot mode → tool policy + one-line description. Single source of truth for
-// Settings → AI → Harness organization (index matches CopilotMode).
+// Settings → AI → Behavior → Harness organization (index matches CopilotMode).
 struct HarnessModeInfo {
     const char* label;       // Agent | Plan | Ask
     const char* structure;   // what one turn in this mode is
@@ -4456,10 +4466,9 @@ static const HarnessModeInfo kHarnessModes[] = {
 static constexpr int kHarnessModeCount =
     (int)(sizeof(kHarnessModes) / sizeof(kHarnessModes[0]));
 
-// Settings → AI → Harness: mode grid + full quick-settings mirror (session knobs).
+// Settings → AI → Behavior: mode grid + full quick-settings mirror (session knobs).
 static void drawHarnessOrganizationSection(AppState& st, float sc);
 bool        drawHarnessSessionKnobs(AppState& st, float sc);
-static void drawMemoryLearningSection(AppState& st, float sc);
 
 
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
@@ -4499,8 +4508,8 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
     ImGui::PopStyleVar();  // CellPadding
 }
 
-// Settings → AI → Harness: full mirror of copilot Quick settings + extras that
-// only live in the modal (role adoption, privacy).
+// Settings → AI → Behavior: full mirror of copilot Quick settings, plus the Advanced run
+// preferences and chat display options that only live in the modal.
 // Laid out in a 2-column grid to save vertical space.
 bool drawHarnessSessionKnobs(AppState& st, float sc) {
     Settings& settings = st.settings;
@@ -4515,18 +4524,13 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     // in the modal.
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     static const char* kPrefLabels[] = {"Off", "Option", "Encourage", "Require"};
-    // The preference combos and the budget sliders form one two-column grid: each table
-    // column gets ONE label column sized to the widest caption stacked in it, so every combo
-    // and slider down a column starts at the same x.
-    const float harnessLeftColW =
-        ImMax(ImMax(settingsLabelLeadWidth("Plan preference", true),
-                    settingsLabelLeadWidth("Subagent preference", true)),
-              ImMax(settingsLabelLeadWidth("Subagent tool-call budget", true),
-                    settingsLabelLeadWidth("Project memory", true)));
-    const float harnessRightColW =
-        ImMax(ImMax(settingsLabelLeadWidth("Task list preference", true),
-                    settingsLabelLeadWidth("Advisor preference", true)),
-              settingsLabelLeadWidth("Max subagent nesting", true));
+    // The preference combos form one two-column grid: each table column gets ONE label column
+    // sized to the widest caption stacked in it, so every combo down a column starts at the
+    // same x.
+    const float harnessLeftColW = ImMax(settingsLabelLeadWidth("Plan preference", true),
+                                        settingsLabelLeadWidth("Subagent preference", true));
+    const float harnessRightColW = ImMax(settingsLabelLeadWidth("Task list preference", true),
+                                         settingsLabelLeadWidth("Advisor preference", true));
 
     auto prefCombo = [&](const char* label, const char* id, int* pref, const char* help,
                          float labelColW) {
@@ -4563,8 +4567,10 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                       &settings.taskListPreference,
                       "Whether the agent publishes a live task list (the Tasks panel "
                       "in the copilot). Off = never. Option = model's choice. "
-                      "Encourage = publish for any multi-step job. "
-                      "Require = always publish before starting work.",
+                      "Encourage = suggested on a chat's first message. "
+                      "Require = the first reply starts by publishing one. "
+                      "Applies when a chat's agent next starts. Drives OMP's todo.enabled "
+                      "and todo.eager settings.",
                       harnessRightColW);
             ImGui::TableNextColumn();
             prefCombo("Subagent preference", "##h_sub_pref", &settings.subagentPreference,
@@ -4627,7 +4633,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
             helpMarker("Scrubs dimensions, materials, part/drawing numbers, and project "
                        "ids from outbound cloud traffic and rehydrates replies; images "
                        "are blocked. Uses your local redaction-role model (Settings -> "
-                       "AI -> Roles -> redaction) for a residual pass. Compliance/IP "
+                       "AI -> Models -> redaction) for a residual pass. Compliance/IP "
                        "protection for cloud providers.");
         }
         if (adv) {
@@ -4731,17 +4737,18 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
         }
     }
 
-    // ---- Sliders / budgets — ADVANCED in full ----
-    // Subagent tool-call budget, nesting depth and memory token budget are all convergence
-    // and prompt-budget tuning. Each already self-tunes ("automatic" / shipped cap), and a
-    // wrong value here degrades runs in ways that are hard to attribute. This table is the
-    // last thing the function draws, so Basic mode simply stops here.
-    if (!adv) {
-        ImGui::PopStyleVar();  // CellPadding
-        return changed;
-    }
+    ImGui::PopStyleVar();  // CellPadding
+    return changed;
+}
 
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));
+// Subagent tool-call budget and nesting depth: convergence tuning. Each already self-tunes
+// ("automatic" / shipped cap), and a wrong value degrades runs in ways that are hard to
+// attribute, so callers show it in Advanced mode only (Settings → AI → Agents, AI workspace
+// Options). Persisted by their own savers, never through Settings.
+void drawSubagentLimitKnobs(float sc) {
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
+    const float harnessLeftColW = settingsLabelLeadWidth("Subagent tool-call budget", true);
+    const float harnessRightColW = settingsLabelLeadWidth("Max subagent nesting", true);
 
     if (ImGui::BeginTable("##harness_sliders", 2,
                           ImGuiTableFlags_SizingStretchSame |
@@ -4799,10 +4806,9 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     }
 
     ImGui::PopStyleVar();  // CellPadding
-    return changed;
 }
 
-// Settings -> AI -> Roles: the command-model / vision-model split (Seek-CAD style). Moved here
+// Settings -> AI -> Models: the command-model / vision-model split (Seek-CAD style). Moved here
 // from the retired Experimental tab — it IS a model-role assignment, so it belongs beside the
 // other per-role pickers rather than in a separate tab.
 static bool drawVisionRoutingSection(AppState& st, float sc) {
@@ -4815,7 +4821,7 @@ static bool drawVisionRoutingSection(AppState& st, float sc) {
     // (Moonshot / DeepSeek / ...) instead of the generic "OpenRouter / Cloud API" slot label.
     ImGui::TextUnformatted("Command model (sends & parses CAD ops)");
     helpMarker("The model that drives the agent loop: understands the request, plans, and "
-               "emits/parses the CAD operations. Pick it in Settings -> Providers or the "
+               "emits/parses the CAD operations. Pick it in Settings -> AI -> Providers or the "
                "composer's model chip. Shown here so you can see both routes side by side.");
     {
         const char* provLabel = settings.ompProvider.empty()
@@ -4916,7 +4922,7 @@ static bool drawVisionRoutingSection(AppState& st, float sc) {
         dimText("Local loopback endpoint — no API key required.");
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextWrapped("Cloud credentials are managed under Settings \xe2\x86\x92 Providers. "
+        ImGui::TextWrapped("Cloud credentials are managed under Settings -> AI -> Providers. "
                            "This override does not accept a key.");
         ImGui::PopStyleColor();
     }
@@ -4977,44 +4983,20 @@ static void saveAgentConfigNestedBool(const char* obj, const char* key, bool val
     });
 }
 
-// Memory & Learning + Workspace visibility knobs (Settings > AI > Harness).
-// 2-col grid like the session knobs above. Backend/learning/cache knobs persist to
-// config.json agent.* via the recipe above; visibility knobs persist via ui/ai/ai_prefs.
-static void drawMemoryLearningSection(AppState& st, float sc) {
-
+// Settings → AI → Context: the compaction method. Chudware owns the choice: it is persisted to
+// config.json agent.compaction_strategy and drives OMP's compaction.enabled and
+// compaction.methodOrder for every agent session (applied live through
+// omp_apply_compaction_policy).
+static void drawCompactionSection(AppState& st, float sc) {
     static bool loaded = false;
     static std::string strategy;
     static bool compactionApplying = false;
     static std::string compactionStatus;
     static std::string compactionEffective;
-    static bool s_autolearn = false;
-    static bool s_autoContinue = false;
     if (!loaded) {
         loaded = true;
         strategy = loadAgentConfigString("compaction_strategy", "auto");
-        s_autolearn = loadAgentConfigBool("autolearn_enabled", false);
-        s_autoContinue = loadAgentConfigBool("autolearn_auto_continue", false);
     }
-    static const char* backends[] = {"off", "sharpshooter", "mnemopi", "local", "hindsight"};
-    static const char* backendLabels[] = {"Off", "Decisions", "Full recall", "Local", "Hindsight"};
-    int backend = -1;
-    for (int i = 0; i < 5; ++i)
-        if (st.settings.memoryBackend == backends[i]) backend = i;
-    ImGui::TextUnformatted("Project memory");
-    settingsAuditLastText("Project memory");
-    const char* memoryPreview = backend >= 0 ? backendLabels[backend] : st.settings.memoryBackend.c_str();
-    if (settingsBeginPopupRowCombo("##memory_backend", memoryPreview, 220.0f * sc,
-                                   ImGuiComboFlags_HeightLarge)) {
-        for (int i = 0; i < 5; ++i) {
-            if (settingsPopupRowSelectable(backendLabels[i], backend == i)) {
-                st.settings.memoryBackend = backends[i];
-                st.settings.memoryEnabled = i != 0;
-                saveSettings(st.settings);
-            }
-        }
-        settingsEndPopupRowCombo();
-    }
-    dimText("Memory is scoped to the project. Backends may require additional setup.");
 
     static const char* modes[] = {"auto", "off", "snapcompact", "shake", "summary"};
     static const char* labels[] = {"Automatic", "Off", "Snapcompact", "Shake", "Summary"};
@@ -5022,6 +5004,9 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     for (int i = 0; i < 5; ++i) if (strategy == modes[i]) selected = i;
     ImGui::TextUnformatted("Compaction (next turn)");
     settingsAuditLastText("Compaction (next turn)");
+    helpMarker("Chudware's compaction method. It sets OMP's compaction.enabled and "
+               "compaction.methodOrder for every agent session, live and on new sessions. "
+               "The other compaction settings are OMP's own.");
     const std::string preview = selected < 0 ? strategy + " (unsupported)" : labels[selected];
     const bool compactionDisabled = compactionApplying;
     if (compactionDisabled) ImGui::BeginDisabled();
@@ -5123,7 +5108,45 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
         settingsAuditedDimText("No live agent session. Session controls are unavailable.");
     else
         settingsAuditedDimText("Current session compaction and retry state unavailable.");
+}
+
+// Settings → AI → Memory: the project memory backend and learning. Backend and learning knobs
+// persist to config.json agent.* via the recipe above; visibility knobs persist via ui/ai/ai_prefs.
+static void drawMemorySection(AppState& st, float sc) {
+    static bool loaded = false;
+    static bool s_autolearn = false;
+    static bool s_autoContinue = false;
+    if (!loaded) {
+        loaded = true;
+        s_autolearn = loadAgentConfigBool("autolearn_enabled", false);
+        s_autoContinue = loadAgentConfigBool("autolearn_auto_continue", false);
+    }
+    static const char* backends[] = {"off", "sharpshooter", "mnemopi", "local", "hindsight"};
+    static const char* backendLabels[] = {"Off", "Decisions", "Full recall", "Local", "Hindsight"};
+    int backend = -1;
+    for (int i = 0; i < 5; ++i)
+        if (st.settings.memoryBackend == backends[i]) backend = i;
+    ImGui::TextUnformatted("Project memory");
+    settingsAuditLastText("Project memory");
+    helpMarker("Chudware's project memory. It sets OMP's memory.backend (with "
+               "mnemopi.scoping per-project) when a chat's agent next starts. Off = none, "
+               "Decisions = sharpshooter, Full recall = mnemopi, Local = local, "
+               "Hindsight = hindsight.");
+    const char* memoryPreview = backend >= 0 ? backendLabels[backend] : st.settings.memoryBackend.c_str();
+    if (settingsBeginPopupRowCombo("##memory_backend", memoryPreview, 220.0f * sc,
+                                   ImGuiComboFlags_HeightLarge)) {
+        for (int i = 0; i < 5; ++i) {
+            if (settingsPopupRowSelectable(backendLabels[i], backend == i)) {
+                st.settings.memoryBackend = backends[i];
+                st.settings.memoryEnabled = i != 0;
+                saveSettings(st.settings);
+            }
+        }
+        settingsEndPopupRowCombo();
+    }
+    dimText("Memory is scoped to the project. Backends may require additional setup.");
     if (!st.settings.showAdvanced) return;
+    aiAnchor("autolearn");
 
     // ---- Auto-Learn (experimental) ----
     settingsSectionHeader("Auto-Learn (experimental)");
@@ -5185,11 +5208,244 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
     }
 }
 
+// ---- OMP-backed rows (Settings → AI tabs) -------------------------------------------------
+// Each AI tab lists its slice of OMP's own settings, read from omp_config_get once per Settings
+// open. Chudware keeps no copy of a value: a row reads and writes the OMP setting through
+// omp_config_set, either in the user's OMP config (scope "omp", shared with their other OMP
+// sessions) or in Chudware's own OMP config layer (scope "chudware": CAD-tuned defaults and the
+// user's Chudware-only choices). Every live OMP runtime watches both files, so a change applies
+// without a restart.
+struct OmpConfigUi {
+    nlohmann::json entries = nlohmann::json::array();
+    std::string agentDir, chudwareLayer, status;
+    bool requested = false;  // a read was sent since the window opened
+    bool loaded = false;     // entries hold a reply
+    bool saving = false;
+};
+static OmpConfigUi s_ompCfg;
+
+// The next AI tab that shows OMP rows reads them again.
+static void resetOmpConfig() { s_ompCfg = OmpConfigUi{}; }
+
+static bool ompConfigReplyOk(const core::RpcResult& r) {
+    return r.ok && r.result.is_object() && optionalJsonBool(r.result, "ok", false);
+}
+
+static std::string ompConfigFailure(const core::RpcResult& r) {
+    if (!r.ok) return r.err;
+    const std::string reason = r.result.is_object() ? optionalJsonString(r.result, "reason") : "";
+    return reason.empty() ? "no reply" : reason;
+}
+
+static void requestOmpConfig(AppState& st) {
+    s_ompCfg.requested = true;
+    st.rpc.call("omp_config_get", nlohmann::json::object(), [](const core::RpcResult& r) {
+        if (!ompConfigReplyOk(r)) {
+            s_ompCfg.status = "OMP settings are unavailable: " + ompConfigFailure(r);
+            return;
+        }
+        const auto* rows = optionalJsonArr(r.result, "settings");
+        s_ompCfg.entries = rows ? *rows : nlohmann::json::array();
+        s_ompCfg.agentDir = optionalJsonString(r.result, "agentDir");
+        s_ompCfg.chudwareLayer = optionalJsonString(r.result, "chudwareLayer");
+        s_ompCfg.loaded = true;
+        s_ompCfg.status.clear();
+    }, 30000);
+}
+
+// Writes one value, shows the reply's entry at once, then reads everything again: a value can
+// change what other rows show (their current value or provenance).
+static void saveOmpConfig(AppState& st, const std::string& key, const std::string& value) {
+    s_ompCfg.saving = true;
+    st.rpc.call("omp_config_set", nlohmann::json{{"key", key}, {"value", value}},
+                [key](const core::RpcResult& r) {
+        s_ompCfg.saving = false;
+        if (!ompConfigReplyOk(r)) {
+            s_ompCfg.status = "Could not save " + key + ": " + ompConfigFailure(r);
+            return;
+        }
+        for (auto& row : s_ompCfg.entries) {
+            if (!row.is_object() || optionalJsonString(row, "key") != key) continue;
+            for (auto it = r.result.begin(); it != r.result.end(); ++it)
+                if (it.key() != "ok") row[it.key()] = it.value();
+        }
+        s_ompCfg.status.clear();
+        s_ompCfg.requested = false;
+    }, 30000);
+}
+
+// One OMP setting: caption and help on the left, the control beside it, the scope at the right
+// edge. A boolean is a checkbox; any other type is an options combo. Returns the value picked
+// this frame, "" when nothing changed. A project / overlay / env value takes precedence over what
+// a write can set, so it is named under the row; "runtime" is only OMP's soft protocol-default
+// pin, which a write replaces, so it is never mentioned. A Chudware-scope row reads "overlay"
+// because the Chudware layer is itself a --config overlay: that is its own storage, not a pin.
+static std::string drawOmpRow(const nlohmann::json& entry, float labelColW, float scopeW,
+                              float controlMaxW, bool stacked) {
+    const float sc = ui::uiScale;
+    const std::string key = optionalJsonString(entry, "key");
+    const std::string label = optionalJsonString(entry, "label");
+    const std::string current = optionalJsonString(entry, "current");
+    const std::string description = optionalJsonString(entry, "description");
+    const std::string help =
+        (description.empty() ? std::string() : description + "\n\n") + "OMP setting: " + key;
+    const bool chudware = optionalJsonString(entry, "scope") == "chudware";
+    const char* scopeText = chudware ? "Chudware" : "OMP";
+    std::string picked;
+
+    ImGui::PushID(key.c_str());
+    const float rightX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    const auto scopeBadge = [&]() {
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();  // centre on the control's frame, like the caption
+        ImGui::SetCursorPosX(rightX - ImGui::CalcTextSize(scopeText).x);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::TextUnformatted(scopeText);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            const std::string& where = chudware ? s_ompCfg.chudwareLayer : s_ompCfg.agentDir;
+            ImGui::SetTooltip("%s%s%s",
+                              chudware ? "Chudware setting: stored in Chudware's own OMP config "
+                                         "layer, so your OMP config is unchanged."
+                                       : "OMP setting: stored in your OMP config and shared with "
+                                         "your other OMP sessions.",
+                              where.empty() ? "" : "\n", where.c_str());
+        }
+    };
+
+    if (optionalJsonString(entry, "type") == "boolean") {
+        bool on = current == "true";
+        if (ui::kit::checkbox("omp_value", label.c_str(), &on)) picked = on ? "true" : "false";
+        helpMarker(help.c_str());
+        scopeBadge();
+    } else if (const auto* options = optionalJsonArr(entry, "options")) {
+        std::string preview = current;
+        float widest = 0.0f;
+        for (const auto& option : *options) {
+            if (!option.is_object()) continue;
+            const std::string text = optionalJsonString(option, "label");
+            widest = ImMax(widest, ImGui::CalcTextSize(text.c_str()).x);
+            if (optionalJsonString(option, "value") == current) preview = text;
+        }
+        if (stacked) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(label.c_str());
+            settingsAuditLastText(label.c_str());
+            helpMarker(help.c_str());
+            scopeBadge();
+            ImGui::SetNextItemWidth(-1.0f);
+        } else {
+            settingsLabelLead(label.c_str(), help.c_str(), labelColW);
+            const float room = rightX - scopeW - ImGui::GetStyle().ItemSpacing.x -
+                               ImGui::GetCursorPosX();
+            ImGui::SetNextItemWidth(ImMax(ImGui::GetFrameHeight() * 3.0f,
+                                          ImMin(controlMaxW, room)));
+        }
+        if (settingsBeginPopupRowCombo("##omp_value", preview.c_str(),
+                                       widest + 24.0f * sc, ImGuiComboFlags_HeightLarge)) {
+            for (const auto& option : *options) {
+                if (!option.is_object()) continue;
+                const std::string value = optionalJsonString(option, "value");
+                ImGui::PushID(value.c_str());
+                if (settingsPopupRowSelectable(optionalJsonString(option, "label").c_str(),
+                                               value == current) &&
+                    value != current)
+                    picked = value;
+                const std::string optionHelp = optionalJsonString(option, "description");
+                if (!optionHelp.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", optionHelp.c_str());
+                ImGui::PopID();
+            }
+            settingsEndPopupRowCombo();
+        }
+        if (!stacked) scopeBadge();
+    }
+    const std::string source = optionalJsonString(entry, "source");
+    if (source == "project" || source == "env" || (source == "overlay" && !chudware))
+        dimText(("Currently set by the " + source + " layer, which takes precedence over this "
+                 "setting.").c_str());
+    ImGui::PopID();
+    return picked;
+}
+
+// The OMP rows of one AI tab, one glass card per OMP group (in OMP's order), under a single note
+// that says where the values are stored. Advanced mode only (the caller gates it).
+static void drawOmpTabRows(AppState& st, const char* tab) {
+    OmpConfigUi& c = s_ompCfg;
+    const float sc = ui::uiScale;
+    const bool serviceReady = st.workerStarted && !st.workerBootPending && st.startupPhase.empty();
+    if (!c.requested && serviceReady) requestOmpConfig(st);
+
+    std::vector<std::pair<std::string, std::vector<const nlohmann::json*>>> groups;
+    bool anyOmp = false, anyChudware = false;
+    for (const auto& entry : c.entries) {
+        if (!entry.is_object() || optionalJsonString(entry, "tab") != tab) continue;
+        const std::string group = optionalJsonString(entry, "group");
+        if (groups.empty() || groups.back().first != group) groups.push_back({group, {}});
+        groups.back().second.push_back(&entry);
+        (optionalJsonString(entry, "scope") == "chudware" ? anyChudware : anyOmp) = true;
+    }
+    if (!serviceReady && groups.empty()) {
+        dimText("OMP settings appear once the agent service is ready.");
+        return;
+    }
+    if (!c.status.empty()) {
+        ui::kit::inlineStatus(c.status.c_str(), ui::kit::Tone::Err);
+        if (ui::kit::secondaryButton("Retry##omp_config_retry")) {
+            c.requested = false;
+            c.status.clear();
+        }
+    } else if (!c.loaded) {
+        dimText("Loading OMP settings\xe2\x80\xa6");
+    }
+    if (groups.empty()) return;
+
+    // Where the values live, once per tab.
+    if (anyOmp && !c.agentDir.empty())
+        dimText(("OMP rows are stored in your OMP config under " + c.agentDir +
+                 " and shared with your other OMP sessions.").c_str());
+    if (anyChudware && !c.chudwareLayer.empty())
+        dimText(("Chudware rows are stored in Chudware's own OMP config layer, " +
+                 c.chudwareLayer + "; your OMP config is unchanged.").c_str());
+
+    std::string pickedKey, pickedValue;
+    for (size_t g = 0; g < groups.size(); ++g) {
+        const std::string cardId = "##omp_" + std::string(tab) + "_" + std::to_string(g);
+        const std::string& group = groups[g].first;
+        settingsGlassSectionBegin(cardId.c_str(), group.empty() ? "Settings" : group.c_str());
+        ImGui::BeginDisabled(c.saving);
+        // One shared caption column per card, so every control starts at the same x; narrow
+        // cards stack caption over control instead.
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float spacing = ImGui::GetStyle().ItemSpacing.x;
+        const bool stacked = avail < 460.0f * sc;
+        float scopeW = 0.0f, labelW = 0.0f;
+        for (const nlohmann::json* entry : groups[g].second) {
+            scopeW = ImMax(scopeW, ImGui::CalcTextSize(
+                optionalJsonString(*entry, "scope") == "chudware" ? "Chudware" : "OMP").x);
+            if (optionalJsonString(*entry, "type") != "boolean")
+                labelW = ImMax(labelW, settingsLabelLeadWidth(
+                    optionalJsonString(*entry, "label").c_str(), true));
+        }
+        const float controlMaxW = 320.0f * sc;
+        labelW = ImMin(labelW, ImMax(0.0f, avail - controlMaxW - scopeW - 2.0f * spacing));
+        for (const nlohmann::json* entry : groups[g].second) {
+            const std::string picked = drawOmpRow(*entry, labelW, scopeW, controlMaxW, stacked);
+            if (picked.empty()) continue;
+            pickedKey = optionalJsonString(*entry, "key");
+            pickedValue = picked;
+        }
+        ImGui::EndDisabled();
+        settingsGlassSectionEnd();
+    }
+    if (!pickedKey.empty()) saveOmpConfig(st, pickedKey, pickedValue);
+}
+
 }  // anonymous namespace
 
 namespace {
 
-// ---- Skills editor (Settings → Prompts → Skills; ported from dead overlay) ----
+// ---- Skills editor (Settings → AI → Agents → Skills; ported from dead overlay) ----
 struct OvSkillRow {
     std::string name;
     std::string description;
@@ -5818,10 +6074,10 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
         ImGui::PopStyleColor();
     }
 
-    // One scrollbar only: size columns to the remaining viewport minus the group title
-    // Interwebz paints above the child (title + underline). Parent ##tab_ai must not also scroll.
+    // Each column fills one viewport of the tab body below the group title that Interwebz
+    // paints above the child (title + underline).
     const float titleBudget = ImGui::GetTextLineHeight() + 10.0f * S;
-    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
+    const float colH = aiEditorHeight(titleBudget);
     ui::InterwebzTwoColumnBegin(12.0f);
     if (ui::InterwebzGroupBegin("##set_skill_list", "Skills", ImVec2(0, colH))) {
         int userSkills = 0;
@@ -6228,7 +6484,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
     const ImVec4 dimCol(ui::palette.textDim[0], ui::palette.textDim[1],
                         ui::palette.textDim[2], 1);
     const float titleBudget = ImGui::GetTextLineHeight() + 10.0f * S;
-    const float colH = ImMax(180.0f * S, ImGui::GetContentRegionAvail().y - titleBudget);
+    const float colH = aiEditorHeight(titleBudget);
     ui::InterwebzTwoColumnBegin(10.0f);
     if (ui::InterwebzGroupBegin("##set_trig_list", "Rules", ImVec2(0, colH))) {
         int enabledRules = 0;
@@ -6482,10 +6738,12 @@ static void drawSettingsContextTab(AppState& st, float S) {
 }  // namespace (skills/context editors)
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
-// Routes distinguish AI sections, so a search hit never inherits the last visited section.
-// One entry per prominent field/section; labels mirror the modal's visible text.
+// Each entry's SettingsRoute names the page, the AI tab, or the section inside a tab that a
+// search hit opens, so a hit never inherits the last visited tab. The dim `tab` text is also
+// searchable, so typing a tab name lists everything on it. One entry per prominent
+// field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
-    // Appearance (tab 0)
+    // Appearance (page 0)
     { "Theme",                    "Appearance",   0 },
     { "Light theme",              "Appearance",   0 },
     { "Dark theme",               "Appearance",   0 },
@@ -6497,7 +6755,7 @@ const SettingsEntry kSettingsEntries[] = {
     { "Corner rounding",          "Appearance",   0 },
     { "Text contrast",            "Appearance",   0 },
     { "Dynamic color",            "Appearance",   0 },
-    // General (tab 1)
+    // General (page 1)
     { "Units",                    "General",      1 },
     { "MMGS units",               "General",      1 },
     { "IPS units",                "General",      1 },
@@ -6511,152 +6769,121 @@ const SettingsEntry kSettingsEntries[] = {
     { "C++ core",                 "General",      1 },
     { "Performance profiler",     "General",      1 },
     { "Profiler",                 "General",      1 },
-    // AI (tab 2) — harness (session knobs), roles, tools+maintenance
-    { "Session knobs",            "AI", SettingsAiHarness },
-    { "Harness",                  "AI", SettingsAiHarness },
-    { "Tools",                    "AI", SettingsAiTools },
-    { "Dev Preview",              "AI", SettingsAiDevPreview },
-    { "Prompt assembly",          "AI", SettingsAiDevPreview },
-    { "Auto-Learn",               "AI", SettingsAiHarness },
-    { "Compaction",               "AI", SettingsAiHarness },
-    { "Tool families",            "AI", SettingsAiTools },
-    { "Bug reports",              "AI", SettingsAiTools },
-    { "Send bug reports",         "AI", SettingsAiTools },
-    { "Sketch 2D",                "AI", SettingsAiRoles },
-    { "Model 3D",                 "AI", SettingsAiRoles },
-    { "Model roles",              "AI", SettingsAiRoles },
-    { "Hidden models",            "Providers", SettingsProviders },
-    { "Harness organization",     "AI", SettingsAiHarness },
-    { "Copilot mode",             "AI", SettingsAiHarness },
-    { "Mode defaults",            "AI", SettingsAiHarness },
-    // Providers (tab 3) — provider/model, keys, Moonshot, accounts
-    { "AI provider",              "Providers",    3 },
-    { "Provider & Model",         "Providers",    3 },
-    { "Model",                    "Providers",    3 },
-    { "API key",                  "Providers",    3 },
-    { "Gemini key",               "Providers",    3 },
-    { "Anthropic key",            "Providers",    3 },
-    { "OpenAI key",               "Providers",    3 },
-    { "Cloud API key",            "Providers",    3 },
-    { "Moonshot",                 "Providers",    3 },
-    { "Kimi",                     "Providers",    3 },
-    { "Moonshot key",             "Providers",    3 },
-    { "Vision",                   "Providers",    3 },
-    { "Local endpoint",           "Providers",    3 },
-    { "Accounts",                 "Providers",    3 },
-    { "Subscription accounts",    "Providers",    3 },
-    { "Sign in",                  "Providers",    3 },
-    { "Add API key",              "Providers",    3 },
-    { "OAuth",                    "Providers",    3 },
-    { "Disconnect",               "Providers",    3 },
-    { "Usage & cost",             "Providers",    3 },
-    { "Session cost",             "Providers",    3 },
-    { "Model routing",            "Providers",    3 },
-    // Generation block — the ONE Settings-modal home for these three controls, rendered by
-    // drawAiSettingsSection(Generation) at the top of the Providers tab. "Reasoning effort"
-    // used to target the AI tab, which has no such control anywhere: the search hit landed
-    // the user on a page where the thing they searched for did not exist.
-    { "Generation",               "Providers",    3 },
-    { "Reasoning effort",         "Providers",    3 },
-    { "Thinking effort",          "Providers",    3 },
-    { "Max response tokens",      "Providers",    3 },
-    { "Model context window",     "Providers",    3 },
-    // AI: Benchmarks, Prompts, Skills, Rules
-    { "Benchmarks",               "AI", SettingsAiBenchmarks },
-    { "Agent benchmark",          "AI", SettingsAiBenchmarks },
-    { "Artifact validity",        "AI", SettingsAiBenchmarks },
-    { "Show legacy results",      "AI", SettingsAiBenchmarks },
-    { "Model leaderboard",        "AI", SettingsAiBenchmarks },
-    { "Run benchmark",            "AI", SettingsAiBenchmarks },
-    { "Benchmark",                "AI", SettingsAiBenchmarks },
-    { "Benchmark categories",     "AI", SettingsAiBenchmarks },
-    { "Category run",             "AI", SettingsAiBenchmarks },
-    { "Prompts",                  "AI", SettingsAiPrompts },
-    { "Role prompts",             "AI", SettingsAiPrompts },
-    { "Agent prompts",            "AI", SettingsAiPrompts },
-    { "Prompt editor",            "AI", SettingsAiPrompts },
-    { "System prompt",            "AI", SettingsAiPrompts },
-    { "System prompt override",   "AI", SettingsAiPrompts },
-    { "Skills",                   "AI", SettingsAiSkills },
-    { "Skill editor",             "AI", SettingsAiSkills },
-    { "Rules",                    "AI", SettingsAiRules },
-    { "Rule triggers",            "AI", SettingsAiRules },
-    { "Context injection",        "AI", SettingsAiRules },
-    { "Triggers",                 "AI", SettingsAiRules },
-    // Run behavior (lives on AI tab; was Agent tab 6)
-    { "Plan preference",          "AI", SettingsAiHarness },
-    { "Plan before building",     "AI", SettingsAiHarness },
-    { "Plan mode",                "AI", SettingsAiHarness },
-    { "Subagent preference",      "AI", SettingsAiHarness },
-    { "Task list preference",     "AI", SettingsAiHarness },
-    { "Role adoption",            "AI", SettingsAiHarness },
-    { "Advisor preference",       "AI", SettingsAiHarness },
-    { "Proactive advisor",        "AI", SettingsAiHarness },
-    { "Project memory",           "AI", SettingsAiHarness },
-    { "Memory budget",            "AI", SettingsAiHarness },
-    { "Subagent tool-call budget", "AI", SettingsAiHarness },
-    { "Tool call budget",         "AI", SettingsAiHarness },
-    { "Subagent convergence warning", "AI", SettingsAiHarness },
-    { "Run behavior",             "AI", SettingsAiHarness },
-    { "Maintenance",              "AI", SettingsAiTools },
-    { "Max subagent nesting",     "AI", SettingsAiHarness },
-    // Vision routing is in Roles; parametric sequence is in Harness.
-    { "Vision review model",      "AI", SettingsAiRoles },
-    { "Vision routing",           "AI", SettingsAiRoles },
-    { "Vision & spatial routing", "AI", SettingsAiRoles },
-    { "Spatial model",            "AI", SettingsAiRoles },
-    { "Seek-CAD split",           "AI", SettingsAiRoles },
-    { "Parametric sequence mode", "AI", SettingsAiHarness },
-    { "CAD sequence mode",        "AI", SettingsAiHarness },
-    { "Feature sequence",         "AI", SettingsAiHarness },
-    { "Monolithic solid",         "AI", SettingsAiHarness },
-    { "Experimental",             "AI", SettingsAiHarness },
+    // AI > Models
+    { "Models",                   "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Model roles",              "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Chat model",               "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Sketch 2D",                "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Model 3D",                 "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Thinking",                 "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Retry & fallback",         "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Service tier",             "AI \xc2\xb7 Models", SettingsAiModels },
+    { "Prompts",                  "AI \xc2\xb7 Models", SettingsAiRolePrompts },
+    { "Role prompts",             "AI \xc2\xb7 Models", SettingsAiRolePrompts },
+    { "Agent prompts",            "AI \xc2\xb7 Models", SettingsAiRolePrompts },
+    { "Prompt editor",            "AI \xc2\xb7 Models", SettingsAiRolePrompts },
+    { "System prompt",            "AI \xc2\xb7 Models", SettingsAiRolePrompts },
+    { "System prompt override",   "AI \xc2\xb7 Models", SettingsAiRolePrompts },
+    { "Vision review model",      "AI \xc2\xb7 Models", SettingsAiVisionRouting },
+    { "Vision routing",           "AI \xc2\xb7 Models", SettingsAiVisionRouting },
+    { "Vision & spatial routing", "AI \xc2\xb7 Models", SettingsAiVisionRouting },
+    { "Spatial model",            "AI \xc2\xb7 Models", SettingsAiVisionRouting },
+    { "Seek-CAD split",           "AI \xc2\xb7 Models", SettingsAiVisionRouting },
+    // AI > Behavior
+    { "Behavior",                 "AI \xc2\xb7 Behavior", SettingsAiBehavior },
+    { "Session knobs",            "AI \xc2\xb7 Behavior", SettingsAiBehavior },
+    { "Harness",                  "AI \xc2\xb7 Behavior", SettingsAiBehavior },
+    { "Run behavior",             "AI \xc2\xb7 Behavior", SettingsAiBehavior },
+    { "Plan preference",          "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Plan before building",     "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Plan mode",                "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Subagent preference",      "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Task list preference",     "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Advisor preference",       "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Proactive advisor",        "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Parametric sequence mode", "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "CAD sequence mode",        "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Feature sequence",         "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Monolithic solid",         "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Experimental",             "AI \xc2\xb7 Behavior", SettingsAiRunPreferences },
+    { "Harness organization",     "AI \xc2\xb7 Behavior", SettingsAiHarnessOrg },
+    { "Maintenance",              "AI \xc2\xb7 Behavior", SettingsAiMaintenance },
+    { "Repair runtime",           "AI \xc2\xb7 Behavior", SettingsAiMaintenance },
+    // AI > Context
+    { "Context",                  "AI \xc2\xb7 Context", SettingsAiContext },
+    { "Compaction",               "AI \xc2\xb7 Context", SettingsAiContext },
+    { "Rules",                    "AI \xc2\xb7 Context", SettingsAiRules },
+    { "Rule triggers",            "AI \xc2\xb7 Context", SettingsAiRules },
+    { "Context injection",        "AI \xc2\xb7 Context", SettingsAiRules },
+    { "Triggers",                 "AI \xc2\xb7 Context", SettingsAiRules },
+    // AI > Memory
+    { "Memory",                   "AI \xc2\xb7 Memory", SettingsAiMemory },
+    { "Project memory",           "AI \xc2\xb7 Memory", SettingsAiMemory },
+    { "Auto-Learn",               "AI \xc2\xb7 Memory", SettingsAiAutoLearn },
+    // AI > Tools
+    { "Tools",                    "AI \xc2\xb7 Tools", SettingsAiTools },
+    { "Tool families",            "AI \xc2\xb7 Tools", SettingsAiTools },
+    { "Tool limits",              "AI \xc2\xb7 Tools", SettingsAiTools },
+    { "Bug reports",              "AI \xc2\xb7 Tools", SettingsAiTools },
+    { "Send bug reports",         "AI \xc2\xb7 Tools", SettingsAiTools },
+    // AI > Coding
+    { "Coding",                   "AI \xc2\xb7 Coding", SettingsAiCoding },
+    { "LSP",                      "AI \xc2\xb7 Coding", SettingsAiCoding },
+    { "Language server",          "AI \xc2\xb7 Coding", SettingsAiCoding },
+    // AI > Agents
+    { "Agents",                   "AI \xc2\xb7 Agents", SettingsAiAgents },
+    { "Subagent tool-call budget", "AI \xc2\xb7 Agents", SettingsAiAgents },
+    { "Tool call budget",         "AI \xc2\xb7 Agents", SettingsAiAgents },
+    { "Subagent convergence warning", "AI \xc2\xb7 Agents", SettingsAiAgents },
+    { "Max subagent nesting",     "AI \xc2\xb7 Agents", SettingsAiAgents },
+    { "Skills",                   "AI \xc2\xb7 Agents", SettingsAiSkills },
+    { "Skill editor",             "AI \xc2\xb7 Agents", SettingsAiSkills },
+    // AI > Providers (page 3 is the Providers tab) — provider/model, keys, Moonshot, accounts
+    { "Hidden models",            "AI \xc2\xb7 Providers", SettingsProviders },
+    { "AI provider",              "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Provider & Model",         "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Model",                    "AI \xc2\xb7 Providers", SettingsProviders },
+    { "API key",                  "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Gemini key",               "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Anthropic key",            "AI \xc2\xb7 Providers", SettingsProviders },
+    { "OpenAI key",               "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Cloud API key",            "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Moonshot",                 "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Kimi",                     "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Moonshot key",             "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Vision",                   "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Local endpoint",           "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Accounts",                 "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Subscription accounts",    "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Sign in",                  "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Add API key",              "AI \xc2\xb7 Providers", SettingsProviders },
+    { "OAuth",                    "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Disconnect",               "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Usage & cost",             "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Session cost",             "AI \xc2\xb7 Providers", SettingsProviders },
+    { "Model routing",            "AI \xc2\xb7 Providers", SettingsProviders },
+    // AI > Developer
+    { "Developer",                "AI \xc2\xb7 Developer", SettingsAiDeveloper },
+    { "Dev Preview",              "AI \xc2\xb7 Developer", SettingsAiDevPreview },
+    { "Prompt assembly",          "AI \xc2\xb7 Developer", SettingsAiDevPreview },
+    { "Benchmarks",               "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Agent benchmark",          "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Artifact validity",        "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Show legacy results",      "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Model leaderboard",        "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Run benchmark",            "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Benchmark",                "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Benchmark categories",     "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
+    { "Category run",             "AI \xc2\xb7 Developer", SettingsAiBenchmarks },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
 
-// ---- AI hub sub-section disclosure ----
-// Which of the AI tab's 8 sub-sections are power surfaces.
-//
-// This split is measured, not guessed. A full inventory of the AI tab classified 155
-// interactive controls as 10 EVERYDAY / 145 ADVANCED / 0 auto-derivable. Per-section:
-//   Harness      9 everyday / 27 advanced
-//   Roles        0 everyday / 59 advanced   <- per-role model pinning; the resolver default
-//                                              is the normal path, and the everyday "which
-//                                              model do I use" choice lives in Providers
-//   Prompts      0 everyday /  8 advanced   <- authoring system/role instruction prose
-//   Skills       0 everyday /  6 advanced
-//   Rules        0 everyday / 16 advanced
-//   Benchmarks   0 everyday /  5 advanced
-//   Tools        1 everyday / 22 advanced   <- the 1 is "Repair / install runtime", which
-//                                              Basic mode re-homes onto Harness (see the
-//                                              Maintenance block in the Harness body) so
-//                                              hiding this section costs nothing
-//   Dev Preview  0 everyday /  2 advanced
-// So Basic mode showing Harness alone is what the data supports, and it is the difference
-// between ~10 controls and 155.
-//
-// Indices MUST stay aligned with kAiSubLabels in the AI tab; both are fixed 8-element
-// arrays and the static_assert below pins the length.
-const bool kAiSubAdvanced[8] = {
-    false,  // 0 Harness      — session behavior; the only page with everyday controls
-    true,   // 1 Roles        — per-role model/effort pinning
-    true,   // 2 Prompts      — system + role prompt authoring
-    true,   // 3 Skills       — skill catalog authoring
-    true,   // 4 Rules        — context-injection trigger authoring
-    true,   // 5 Benchmarks   — leaderboard + diagnostic runner
-    true,   // 6 Tools        — tool-family gating, per-tool overrides, bug reports
-    true,   // 7 Dev Preview  — dev-only prompt-assembly inspection
-};
-static_assert(sizeof(kAiSubAdvanced) / sizeof(kAiSubAdvanced[0]) == 8,
-              "kAiSubAdvanced must carry one flag per kAiSubLabels entry");
-
 // ---- Maintenance (runtime repair) ----
-// Extracted so Basic mode can re-home it. The AI-tab inventory found this is the ONLY
-// everyday control on the otherwise all-advanced Tools page, and a user whose runtime is
-// broken must be able to repair it without first discovering the Advanced switch. Rendered
-// on Tools when Advanced is on, on Harness when it is off — never both at once, so this is
-// placement, not duplication.
+// Extracted so Basic mode can re-home it. A user whose runtime is broken must be able to repair
+// it without first discovering the Advanced switch. Rendered on the Developer tab when Advanced
+// is on, on the Behavior tab when it is off — never both at once, so this is placement, not
+// duplication.
 static void drawRuntimeMaintenanceSection(AppState& st, float sc) {
     settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
     dimText("Repair the local CAD engine runtime.");
@@ -6675,6 +6902,2429 @@ static void drawRuntimeMaintenanceSection(AppState& st, float sc) {
     settingsGlassSectionEnd();
 }
 
+// ---- Settings page: Appearance ----
+// The canonical theme control lives here (moved from General; the View-menu item
+// stays a synced shortcut). The glass knobs edit Settings::glassCfg per group and
+// live-apply via ui::setGlassConfig + persist via saveSettings on every change —
+// so the persisted "appearance.glass" block is no longer a dead round-trip.
+static void drawAppearancePage(AppState& st) {
+    Settings& settings = st.settings;
+    const float sc = ui::uiScale;
+    settingsTabBodyBegin("##tab_appearance");
+    settingsGlassSectionBegin("##app_theme", "Theme", 0.0f, /*first=*/true);
+    bool isLight = (ui::activeTheme == ui::Theme::Light);
+    if (ui::kit::checkbox("app_light", "Light theme", &isLight))
+        applyThemeNow(st, isLight);
+    dimText("Switches the whole UI between the dark and light palettes. "
+            "Saved immediately.");
+    settingsGlassSectionEnd();
+
+    settingsGlassSectionBegin("##app_accent", "Accent colors");
+    dimText("Primary is the color a modeling operation's result is drawn in \xe2\x80\x94 "
+            "the same role the 3D ribbon icons bake their new geometry with. Secondary "
+            "is the direction cue: arrows, axes, annotation. The ribbon retints as you "
+            "drag. Saved immediately.");
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+    {
+        bool accentChanged = false;
+        // Same aligned label column as the glass rows below.
+        const float accLabelW = 150.0f * sc;
+        auto accentRow = [&](const char* label) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted(label);
+            ImGui::SameLine(accLabelW);
+        };
+        accentRow("Primary");
+        if (ImGui::ColorEdit3("##accentprimary", settings.accentPrimary,
+                              ImGuiColorEditFlags_NoInputs))
+            accentChanged = true;
+        ImGui::SameLine();
+        dimText("(extrudes, bosses \xe2\x80\x94 what the operation produced)");
+        accentRow("Secondary");
+        if (ImGui::ColorEdit3("##accentsecondary", settings.accentSecondary,
+                              ImGuiColorEditFlags_NoInputs))
+            accentChanged = true;
+        ImGui::SameLine();
+        dimText("(direction arrows, axes, dimensions)");
+        ImGui::Dummy(ImVec2(0, 4 * sc));
+        // "##accent" only disambiguates the ImGui id: the Liquid Glass section below
+        // has a button with the identical visible label, and two same-label buttons in
+        // one window share an id (the second one becomes unclickable).
+        if (ui::kit::secondaryButton("Reset to defaults##accent", true, nullptr, ImVec2(150.0f * sc, 28.0f * sc))) {
+            std::memcpy(settings.accentPrimary, ui::kDefaultAccentPrimary,
+                        sizeof(settings.accentPrimary));
+            std::memcpy(settings.accentSecondary, ui::kDefaultAccentSecondary,
+                        sizeof(settings.accentSecondary));
+            accentChanged = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Restore the shipped orange / blue pair");
+        if (accentChanged) {
+            // Live-apply then persist, matching the glass pair below: setAccentColors
+            // rewrites the palette, the accent-derived ImGuiCol slots and the baked
+            // icon atlas in one call, so the whole UI tracks the drag.
+            ui::setAccentColors(settings.accentPrimary, settings.accentSecondary);
+            saveSettings(settings);
+        }
+    }
+    settingsGlassSectionEnd();
+
+    settingsGlassSectionBegin("##app_brand", "Brand mark");
+    dimText("The copilot logo is a live 3D projection of a rotating tesseract "
+            "(a 4-cube) — this picks how it turns. Saved immediately.");
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+    {
+        // Each card is a hit box with the figure painted over it, so the preview is
+        // the SAME renderer the header uses — what you see here is what ships.
+        ImDrawList* bdl = ImGui::GetWindowDrawList();
+        const float capPad = 8.0f * sc;
+        const float lineH  = ImGui::GetTextLineHeight();
+        // Width comes from the WIDEST style name, not a round literal: at 96dp the
+        // captions ran past the card and had to be clipped mid-word.
+        float labelW = 0.0f;
+        for (int i = 0; i < (int)ui::TesseractAnim::Count; ++i)
+            labelW = std::max(labelW,
+                ImGui::CalcTextSize(ui::tesseractAnimName((ui::TesseractAnim)i)).x);
+        const float cardW = std::max(96.0f * sc, labelW + capPad * 2.0f);
+        const float cardH = 96.0f * sc;
+        const float capOff = cardH - lineH - 7.0f * sc;   // caption baseline, card-relative
+        const float figSz  = std::min(cardW, capOff) - 10.0f * sc;
+        const double now   = ImGui::GetTime();
+        for (int i = 0; i < (int)ui::TesseractAnim::Count; ++i) {
+            if (i) ImGui::SameLine(0.0f, 8.0f * sc);
+            char cid[24];
+            std::snprintf(cid, sizeof(cid), "##brandanim%d", i);
+            const ImVec2 mn = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton(cid, ImVec2(cardW, cardH));
+            if (ImGui::IsItemVisible()) ui::anim::requestFramesAt(30.0f);
+            const bool sel = (settings.brandAnim == i);
+            if (ImGui::IsItemClicked()) {
+                settings.brandAnim = i;
+                saveSettings(settings);   // matches the theme/glass immediate-save path
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                    ui::tesseractAnimBlurb((ui::TesseractAnim)i));
+            const ImVec2 mx(mn.x + cardW, mn.y + cardH);
+            const float* bg = sel ? ui::palette.accentSoft : ui::palette.button;
+            bdl->AddRectFilled(mn, mx, ui::Palette::toU32(bg),
+                               ui::metrics::rounding(8.0f));
+            if (sel)
+                bdl->AddRect(mn, mx, ui::Palette::toU32(ui::palette.accent),
+                             ui::metrics::rounding(8.0f), 0,
+                             ui::metrics::stroke(1.5f));
+            // Figure sits above the caption: centre it in the space left over the
+            // one text line so the mark never overlaps its own label.
+            const float capY = mn.y + capOff;
+            ui::drawTesseract(bdl,
+                              ImVec2((mn.x + mx.x) * 0.5f, (mn.y + capY) * 0.5f),
+                              figSz, now, (ui::TesseractAnim)i,
+                              ui::Palette::toU32(ui::palette.text));
+            const char* nm = ui::tesseractAnimName((ui::TesseractAnim)i);
+            const ImVec2 ts = ImGui::CalcTextSize(nm);
+            bdl->AddText(ImVec2((mn.x + mx.x) * 0.5f - ts.x * 0.5f, capY),
+                         ui::Palette::toU32(sel ? ui::palette.text
+                                                : ui::palette.textDim),
+                         nm);
+        }
+    }
+    settingsGlassSectionEnd();
+
+    settingsGlassSectionBegin("##app_glass", "Liquid Glass");
+    dimText("Per-surface styling for the glass panels floating over the viewport. "
+            "Dynamic color auto-tints each panel for max contrast against the live "
+            "model; pin a tint below to override it. Saved immediately.");
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+
+    // Group selector — segmented pills. Global is the inheritance base: the other
+    // groups fall back to it for any knob left at its default ("Reset" state).
+    static int s_glassGroup = 0;
+    static const char* kGroupLabel[(size_t)ui::GlassGroup::Count] = {
+        "Global", "Feature Manager", "Copilot", "Viewport HUD"};
+    ui::kit::segmented("##glass_group", kGroupLabel, (int)ui::GlassGroup::Count,
+                       &s_glassGroup);
+
+    const ui::GlassGroup grp = (ui::GlassGroup)s_glassGroup;
+    ui::GlassStyle& g = settings.glassCfg.group[(size_t)grp];
+    // Seed every widget from the group's EFFECTIVE (resolved) values so inherited
+    // knobs display what actually renders; an edit pins a concrete value.
+    const ui::GlassStyleResolved& res = ui::glassStyleResolved(grp);
+    bool glassChanged = false;
+
+    // Aligned label column (uiScale-correct).
+    const float labelW = 150.0f * sc;
+    const float fieldW = 230.0f * sc;
+    auto fieldRow = [&](const char* label) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(labelW);
+        ImGui::SetNextItemWidth(fieldW);
+    };
+
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    // Tint is hue+saturation only (brightness comes from the glass level/opacity),
+    // so edit it through an HSV swatch with the value channel pinned at 1.
+    fieldRow("Tint color");
+    {
+        float rgb[3];
+        ImGui::ColorConvertHSVtoRGB(res.tintHue / 360.0f, res.tintSat, 1.0f,
+                                    rgb[0], rgb[1], rgb[2]);
+        if (ImGui::ColorEdit3("##glasstint", rgb, ImGuiColorEditFlags_NoInputs)) {
+            float h, s2, v;
+            ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, s2, v);
+            g.tintHue = h * 360.0f;
+            g.tintSat = s2;
+            glassChanged = true;
+        }
+        ImGui::SameLine();
+        dimText("(hue + saturation; strength below mixes it in)");
+    }
+    // Slider VALUES render beside the track (not centered inside it) — the teal grab
+    // sat right on top of the in-track text and obscured it (visual-review fix).
+    auto sliderValueText = [&](const char* txt) {
+        ImGui::SameLine(0.0f, 8.0f * sc);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(txt);
+    };
+    fieldRow("Tint strength");
+    {
+        float v = res.tintStrength;
+        if (ImGui::SliderFloat("##glassstrength", &v, 0.0f, 1.0f, "")) {
+            g.tintStrength = v;
+            glassChanged = true;
+        }
+        char vb[32];
+        std::snprintf(vb, sizeof(vb), "%.2f", v);
+        sliderValueText(v <= 0.0f ? "off" : vb);
+    }
+    fieldRow("Glass level");
+    {
+        static const char* kLevels[] = {"Automatic", "Ultra thin", "Thin",
+                                        "Regular", "Thick"};
+        int lv = res.glassLevel + 1;  // -1 (auto) .. 3 -> 0 .. 4
+        if (lv < 0 || lv > 4) lv = 0;
+        if (settingsPopupRowCombo("##glasslevel", &lv, kLevels, 5)) {
+            g.glassLevel = lv - 1;
+            glassChanged = true;
+        }
+    }
+    fieldRow("Opacity");
+    {
+        float v = res.opacityMul;
+        if (ImGui::SliderFloat("##glassopacity", &v, 0.25f, 2.0f, "")) {
+            g.opacityMul = v;
+            glassChanged = true;
+        }
+        char vb[32];
+        std::snprintf(vb, sizeof(vb), "%.2fx", v);
+        sliderValueText(vb);
+    }
+    fieldRow("Corner rounding");
+    {
+        float v = res.rounding < 0.0f ? 12.0f : res.rounding;
+        if (ImGui::SliderFloat("##glassround", &v, 0.0f, 24.0f, "")) {
+            g.rounding = v;
+            glassChanged = true;
+        }
+        char vb[32];
+        std::snprintf(vb, sizeof(vb), "%.0f dp", v);
+        sliderValueText(res.rounding < 0.0f ? "automatic" : vb);
+    }
+    fieldRow("Text contrast boost");
+    {
+        float v = res.textContrastBoost;
+        if (ImGui::SliderFloat("##glassboost", &v, 0.0f, 1.0f, "")) {
+            g.textContrastBoost = v;
+            glassChanged = true;
+        }
+        char vb[32];
+        std::snprintf(vb, sizeof(vb), "%.2f", v);
+        sliderValueText(v <= 0.0f ? "off" : vb);
+    }
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    bool dyn = res.dynamicColor;
+    if (ui::kit::checkbox("glass_dynamic",
+                          "Dynamic color \xe2\x80\x94 auto max-contrast vs model", &dyn)) {
+        g.dynamicColor = dyn ? 1 : 0;
+        glassChanged = true;
+    }
+    dimText("On (default): each panel samples the live viewport and steers its tint "
+            "for legibility. Off: the pinned tint above is used as-is.");
+
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+    if (ui::kit::secondaryButton("Reset to defaults", true, nullptr, ImVec2(150.0f * sc, 28.0f * sc))) {
+        g = ui::GlassStyle();  // all sentinels -> inherit Global / built-in defaults
+        glassChanged = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Restore this group to inherited (Global / built-in) values");
+
+    if (glassChanged) {
+        ui::setGlassConfig(settings.glassCfg);  // live-apply (idempotent)
+        saveSettings(settings);                 // glass knobs persist immediately
+    }
+    settingsGlassSectionEnd();
+
+    // Live preview through the ACTUAL glass pipeline (adaptivePanel + glassPanel):
+    // over the viewport it frosts the real backdrop with this group's resolved style;
+    // over chrome it falls back to the layered glass. One stable id per group (the
+    // adaptive cache requires the same group every frame for a given id).
+    settingsGlassSectionBegin("##app_preview", "Preview");
+    {
+        static const char* kPreviewId[(size_t)ui::GlassGroup::Count] = {
+            "settings_glass_preview_global", "settings_glass_preview_fm",
+            "settings_glass_preview_copilot", "settings_glass_preview_hud"};
+        ImVec2 mn = ImGui::GetCursorScreenPos();
+        float pw = std::max(220.0f * sc, ImGui::GetContentRegionAvail().x);
+        float ph = 64.0f * sc;
+        ImRect pr(mn, ImVec2(mn.x + pw, mn.y + ph));
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId(kPreviewId[s_glassGroup]), pr, grp);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ui::glassPanel(dl, pr, ui::GlassLevel::Regular, 12.0f, surf);
+        ImFont* pf = st.fonts.medium ? st.fonts.medium : ImGui::GetFont();
+        float fs = ImGui::GetFontSize();
+        ui::glassText(dl, pf, fs, ImVec2(mn.x + 14.0f * sc, mn.y + 12.0f * sc),
+                      surf, kGroupLabel[s_glassGroup]);
+        dl->AddText(pf, fs * 0.88f,
+                    ImVec2(mn.x + 14.0f * sc, mn.y + 12.0f * sc + fs * 1.35f),
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                    "Adaptive text over this group's glass");
+        ImGui::Dummy(ImVec2(pw, ph));
+    }
+    settingsGlassSectionEnd();
+    settingsTabBodyEnd();
+}
+
+// ---- Settings page: General (document units, workspace folder, Box mirror, engine readout) ----
+// Workspace-folder edit buffer, reseeded from Settings on every open.
+static std::vector<char> s_wsBuf(512, 0);
+// Box.com mirror edit buffers, also reseeded on every open so Cancel-less immediate persistence
+// elsewhere can never leave stale secrets in the controls.
+static std::vector<char> s_boxFolderBuf(256, 0);
+static std::vector<char> s_boxDeveloperTokenBuf(1024, 0);
+static std::vector<char> s_boxClientIdBuf(512, 0);
+static std::vector<char> s_boxClientSecretBuf(1024, 0);
+static int s_boxAuthMethod = 0;
+// The text fields autosave when their edit ends (Enter / focus lost), when the page changes, or
+// when the modal closes. They count as dirty only after the user typed in them, so a stale
+// buffer can never overwrite a workspace folder changed elsewhere (opening a project).
+static bool s_wsDirty = false;
+static bool s_boxDirty = false;
+
+static void commitWorkspaceDir(AppState& st) {
+    s_wsDirty = false;
+    std::string chosen = s_wsBuf.data();
+#ifdef __EMSCRIPTEN__
+    // Never persist the literal '/workspace' stub — resolve the real root.
+    if (chosen == "/workspace") chosen.clear();
+#endif
+    st.settings.workspaceDir = chosen;
+    st.workspaceDir = chosen;  // empty: ensureWorkspaceDir re-resolves the default root
+    saveSettings(st.settings);
+    st.addLog("[ok] workspace folder set: " +
+              (chosen.empty() ? std::string("(default)") : chosen));
+}
+
+static void commitBoxSettings(AppState& st, bool refreshStatus) {
+    Settings& settings = st.settings;
+    s_boxDirty = false;
+    settings.boxFolderId =
+        s_boxFolderBuf[0] ? std::string(s_boxFolderBuf.data()) : std::string("0");
+    settings.boxAuthMethod = s_boxAuthMethod == 1 ? "oauth" : "developer_token";
+    settings.boxDeveloperToken = s_boxDeveloperTokenBuf.data();
+    settings.boxClientId = s_boxClientIdBuf.data();
+    settings.boxClientSecret = s_boxClientSecretBuf.data();
+    saveSettings(settings);
+    if (refreshStatus) {
+        s_boxMirrorUi.actionStatus = "Box settings saved";
+        requestBoxStatus(st);
+    }
+}
+
+// Runs every time the Settings window opens.
+static void seedGeneralPage(AppState& st) {
+    const Settings& settings = st.settings;
+    auto seed = [](std::vector<char>& dst, const std::string& src) {
+        std::fill(dst.begin(), dst.end(), 0);
+        std::strncpy(dst.data(), src.c_str(), dst.size() - 1);
+    };
+    seed(s_wsBuf, settings.workspaceDir);
+    seed(s_boxFolderBuf, settings.boxFolderId);
+    seed(s_boxDeveloperTokenBuf, settings.boxDeveloperToken);
+    seed(s_boxClientIdBuf, settings.boxClientId);
+    seed(s_boxClientSecretBuf, settings.boxClientSecret);
+    s_boxAuthMethod = settings.boxAuthMethod == "oauth" ? 1 : 0;
+    s_wsDirty = false;
+    s_boxDirty = false;
+    s_boxMirrorUi.actionStatus.clear();
+    requestBoxStatus(st);
+}
+
+// Typed fields commit when the page is left and when the window closes (their deactivation may
+// not have been drawn).
+static void commitGeneralPage(AppState& st) {
+    if (s_wsDirty) commitWorkspaceDir(st);
+    if (s_boxDirty) commitBoxSettings(st, /*refreshStatus=*/false);
+}
+
+static void drawGeneralPage(AppState& st) {
+    Settings& settings = st.settings;
+    const float sc = ui::uiScale;
+    settingsTabBodyBegin("##tab_general");
+    settingsGlassSectionBegin("##gen_document", "Document");
+    static const char* kUnitHelp =
+        "The unit system for dimension display and input. The model is always "
+        "stored in canonical millimeters; this only changes how lengths are "
+        "shown and how a bare typed number is read. Angles stay in degrees in "
+        "both systems. You can also click the MMGS/IPS badge in the status bar "
+        "to switch.";
+    static const char* kDisplayQualityHelp =
+        "How finely curved geometry is tessellated for DISPLAY. Fine (default) "
+        "keeps tubes, wheels and fillets smooth on large imported parts; Draft "
+        "trades smoothness for triangles on very heavy models. Geometry, mass "
+        "properties and exports are unaffected. Saved immediately and applied "
+        "to every open document.";
+    const float docLabelW =
+        ImMax(settingsLabelLeadWidth("Units", true),
+              settingsLabelLeadWidth("Display quality", true));
+    settingsLabelLead("Units", kUnitHelp, docLabelW);
+    static const char* kUnitLabels[] = {"MMGS", "IPS"};
+    static const char* kUnitTips[] = {"Millimeter, gram, second",
+                                      "Inch, pound, second"};
+    int unitSel = st.ips() ? 1 : 0;
+    if (ui::kit::segmented("##units", kUnitLabels, 2, &unitSel, 0.0f, kUnitTips)) {
+        settings.units = (unitSel == 1) ? Units::IPS : Units::MMGS;
+        // Saved immediately so the choice survives a Cancel (it is a display/document
+        // preference, like theme — and the status-bar toggle persists the same way).
+        saveSettings(settings);
+        st.addLog(std::string("[units] set to ") + (st.ips() ? "IPS" : "MMGS"));
+    }
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    dimText(st.ips() ? "inch, pound, second" : "millimeter, gram, second");
+
+    // Display tessellation quality (contracts/doc_ops.md §7). Saved immediately like
+    // Units above, then pushed to every open part/assembly doc so the viewport
+    // re-meshes at the new deflections without a reopen.
+    settingsLabelLead("Display quality", kDisplayQualityHelp, docLabelW);
+    static const char* kDisplayQualityLabels[] = {"Draft", "Standard", "Fine"};
+    static const char* kDisplayQualityValues[] = {"draft", "standard", "fine"};
+    int dqSel = 2;
+    for (int i = 0; i < 3; ++i)
+        if (settings.displayQuality == kDisplayQualityValues[i]) dqSel = i;
+    if (ui::kit::segmented("##display_quality", kDisplayQualityLabels, 3, &dqSel)) {
+        settings.displayQuality = kDisplayQualityValues[dqSel];
+        saveSettings(settings);
+        // AppState::syncDisplayQuality() pushes it to every open doc next frame; the
+        // same path restores the saved tier for docs opened after a restart.
+        st.addLog(std::string("[display] quality set to ") + settings.displayQuality);
+    }
+    dimText("Display-only mesh smoothness; lengths display/parse in the chosen units "
+            "everywhere. Both save immediately.");
+    settingsGlassSectionEnd();
+
+    // Configurations moved here from the left-pane strip (Graph took that slot).
+    // Both embedded bodies paint their own "Configurations (n)" heading, so the
+    // section gets only the section gap — a header here printed the title twice.
+    ui::kit::pushDensity(ui::kit::Density::Cozy);
+    ui::kit::gapSection();
+    ui::kit::popDensity();
+    if (st.configPanel) {
+        st.configPanel->drawEmbedded(st);
+    } else {
+        ui::drawConfigurationsBody(st);
+    }
+
+    // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
+    // users had to hand-edit config.json to re-root the File Explorer.
+    settingsGlassSectionBegin("##gen_workspace", "Workspace");
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Workspace folder");
+#ifdef __EMSCRIPTEN__
+    // Web: default is the server workspace abs root (fsBackend), not the
+    // literal "/workspace" stub from defaultWorkspaceDir().
+    {
+        static std::string s_wsDefaultWeb;
+        if (s_wsDefaultWeb.empty()) {
+            s_wsDefaultWeb = chudware::fsBackend().defaultRoot();
+            if (s_wsDefaultWeb.empty() || s_wsDefaultWeb == "/workspace")
+                s_wsDefaultWeb = chudware::fsBackend().defaultRoot();
+        }
+        static const std::string s_wsHelpWeb =
+            "The File Explorer's root folder on the server workspace. "
+            "Leave empty to use the server default. Browse picks a "
+            "subfolder under the workspace.";
+        static const std::string s_wsHintWeb =
+            s_wsDefaultWeb.empty() ? std::string("(server default)")
+                                   : ("(default: " + s_wsDefaultWeb + ")");
+        helpMarker(s_wsHelpWeb.c_str());
+        ImGui::SetNextItemWidth(-100.0f * sc);
+        if (ImGui::InputTextWithHint("##wsdir", s_wsHintWeb.c_str(),
+                                     s_wsBuf.data(), s_wsBuf.size()))
+            s_wsDirty = true;
+        if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir(st);
+        ImGui::SameLine();
+        if (ui::kit::secondaryButton("Browse\xe2\x80\xa6", true, nullptr, ImVec2(90.0f * sc, 0))) {
+            std::string chosen = openFolderDialog();
+            if (!chosen.empty() && chosen != "/workspace") {
+                std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
+                std::strncpy(s_wsBuf.data(), chosen.c_str(), s_wsBuf.size() - 1);
+                commitWorkspaceDir(st);  // picking a folder is the commit
+            }
+        }
+        dimText("Root of the File Explorer on the server workspace (saved automatically).");
+    }
+#else
+    // Truthful default label: defaultWorkspaceDir() applies the alias rule
+    // (existing Documents/Chudware wins, else Documents/Chudware).
+    static const std::string s_wsDefault = defaultWorkspaceDir();
+    static const std::string s_wsHelp =
+        "The File Explorer's root folder and the default save location. "
+        "Leave empty to use " + s_wsDefault + ". Saved automatically when you "
+        "press Enter or leave the field.";
+    static const std::string s_wsHint = "(default: " + s_wsDefault + ")";
+    helpMarker(s_wsHelp.c_str());
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##wsdir", s_wsHint.c_str(),
+                                 s_wsBuf.data(), s_wsBuf.size()))
+        s_wsDirty = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir(st);
+    dimText("Root of the File Explorer and default save location (saved automatically).");
+#endif
+    settingsGlassSectionEnd();
+
+    settingsGlassSectionBegin("##gen_box", "Box.com mirror");
+    if (ui::kit::checkbox("box_enabled", "Mirror saved projects to Box",
+                          &settings.boxEnabled)) {
+        saveSettings(settings);
+        requestBoxStatus(st);
+    }
+    dimText("Saved project files are queued in the background; saves never wait for Box.");
+
+    const float boxLabelW = ImMax(settingsLabelLeadWidth("Developer token", false),
+                                  settingsLabelLeadWidth("Client secret", false));
+    settingsLabelLead("Folder ID", nullptr, boxLabelW);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##box_folder_id", "Box folder id (0 = All Files)",
+                                 s_boxFolderBuf.data(), s_boxFolderBuf.size()))
+        s_boxDirty = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(st, true);
+
+    settingsLabelLead("Auth method", nullptr, boxLabelW);
+    static const char* kBoxAuthLabels[] = {"Developer token", "OAuth"};
+    if (ui::kit::segmented("##box_auth_method", kBoxAuthLabels, 2, &s_boxAuthMethod))
+        commitBoxSettings(st, true);  // the method gates "Connect Box account": apply at once
+
+    settingsLabelLead("Developer token", nullptr, boxLabelW);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##box_developer_token", "Box developer token",
+                                 s_boxDeveloperTokenBuf.data(),
+                                 s_boxDeveloperTokenBuf.size(),
+                                 ImGuiInputTextFlags_Password))
+        s_boxDirty = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(st, true);
+
+    settingsLabelLead("Client ID", nullptr, boxLabelW);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##box_client_id", "Box OAuth client ID",
+                                 s_boxClientIdBuf.data(), s_boxClientIdBuf.size()))
+        s_boxDirty = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(st, true);
+
+    settingsLabelLead("Client secret", nullptr, boxLabelW);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputTextWithHint("##box_client_secret", "Box OAuth client secret",
+                                 s_boxClientSecretBuf.data(),
+                                 s_boxClientSecretBuf.size(),
+                                 ImGuiInputTextFlags_Password))
+        s_boxDirty = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(st, true);
+
+
+    const bool oauthLoginDisabled =
+        settings.boxAuthMethod != "oauth" ||
+        s_boxMirrorUi.connectInFlight || !st.workerStarted;
+    ImGui::BeginDisabled(oauthLoginDisabled);
+    if (ui::kit::secondaryButton(s_boxMirrorUi.connectInFlight
+                          ? "Connecting Box account\xe2\x80\xa6"
+                          : "Connect Box account\xe2\x80\xa6"))
+        beginBoxOAuthLogin(st);
+    ImGui::EndDisabled();
+    if (settings.boxAuthMethod != "oauth" &&
+        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Select the OAuth auth method first");
+
+    ImGui::SameLine();
+    const bool syncDisabled =
+        s_boxMirrorUi.syncInFlight || !st.workerStarted || !settings.boxEnabled;
+    ImGui::BeginDisabled(syncDisabled);
+    if (ui::kit::secondaryButton(s_boxMirrorUi.syncInFlight ? "Syncing\xe2\x80\xa6" : "Sync now")) {
+        const std::string projectRoot = st.plmProjectPath();
+        if (projectRoot.empty())
+            s_boxMirrorUi.actionStatus =
+                "Box sync needs a current project or workspace folder";
+        else
+            beginBoxSync(st, projectRoot);
+    }
+    ImGui::EndDisabled();
+
+    std::string boxStatusLine = s_boxMirrorUi.accountStatus;
+    if (s_boxMirrorUi.statusInFlight) boxStatusLine = "Checking Box status\xe2\x80\xa6";
+    if (!s_boxMirrorUi.actionStatus.empty())
+        boxStatusLine = s_boxMirrorUi.actionStatus + "  |  " + boxStatusLine;
+    dimText(boxStatusLine.c_str());
+    settingsGlassSectionEnd();
+
+    // Theme moved to the Appearance page (the canonical control); engine routing +
+    // profiler are status/launchers, folded under one System section (audit P2).
+    settingsGlassSectionBegin("##gen_system", "System");
+    // Routing is unconditional — the C++ core IS the engine
+    // (the CHUDWARE_CPP_* escape hatches were removed with the Python oracle).
+    if (core::cpp_core().available()) {
+        ImGui::TextUnformatted("Active engine: C++ core (libchudware)");
+        helpMarker("The in-process C++ core is the only modeling engine — documents, "
+                   "sketching, FEA/CFD, CAM, ECAD, firmware and sourcing all run on "
+                   "it. Services-side Python handles orchestration surfaces (agent "
+                   "runs, parts catalog, reverse engineering, vendor sign-in, missions).");
+        dimText(("C++ core: libchudware loaded (ABI " +
+                 core::cpp_core().abiVersion() + ")").c_str());
+        ImGui::BulletText("Modeling / documents / sketch: C++ core");
+        ImGui::BulletText("Simulation (FEA + CFD) / CAM / ECAD / firmware: C++ core");
+    } else {
+        ImGui::TextUnformatted("Active engine: UNAVAILABLE (libchudware not loaded)");
+        // The path to name here is per-platform: the build tree carries the
+        // host's suffix (build.sh's PLATFORM_SUFFIX) and the engine takes that
+        // platform's shared-library extension. Naming the Linux pair on a Mac
+        // sends the user looking for a file that cannot exist.
+#if defined(_WIN32)
+        static constexpr const char* kBuiltEngine =
+            "build/windows-occt/bin/libchudware.dll";
+#elif defined(__APPLE__) && defined(__aarch64__)
+        static constexpr const char* kBuiltEngine =
+            "core/build-occt-macos-arm64/bin/libchudware.dylib";
+#elif defined(__APPLE__)
+        static constexpr const char* kBuiltEngine =
+            "core/build-occt-macos-x86_64/bin/libchudware.dylib";
+#else
+        static constexpr const char* kBuiltEngine =
+            "core/build-occt-linux/bin/libchudware.so";
+#endif
+        // Composed once, not per frame: this branch redraws every frame the
+        // engine is missing.
+        static const std::string kEngineHint =
+            std::string("The C++ core (libchudware) is NOT loaded, and it is the only "
+                        "engine (the Python oracle was removed). Set the "
+                        "CHUDWARE_LIBCHUDWARE environment variable to the built "
+                        "library (") + kBuiltEngine +
+            ") or stage it next to the executable, then restart.";
+        helpMarker(kEngineHint.c_str());
+        dimText("C++ core: not loaded");
+    }
+
+    ImGui::Dummy(ImVec2(0, 8 * sc));
+    dimText("Sampling profiler \xe2\x80\x94 see where modeling time goes (extrude / "
+            "fillet / boolean, into the kernel) as a live flame graph.");
+    if (ui::kit::secondaryButton("Open Profiler", true, nullptr, ImVec2(160.0f * sc, 30.0f * sc)))
+        st.showProfilerWindow = true;
+    settingsGlassSectionEnd();
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    dimText(("All settings here are stored in " + configPath() + ".").c_str());
+    settingsTabBodyEnd();
+}
+
+// Role prompts: the per-role prompt overrides and the system-prompt override (Models tab, Advanced).
+static void drawRolePromptsEditor(AppState& st, float sc) {
+    // Full-height role prompt editor for power users / dev refinement.
+    const bool canFetch = st.workerStarted;
+    if (!s_promptsLoaded && canFetch) loadPrompts(st);
+
+    settingsSectionHeader("Role prompts");
+    dimText("Edit mission/YAML and native/core role prompts independently. Overrides save to the "
+            "user data prompts directory.");
+    if (!canFetch || s_promptsLoading) ImGui::BeginDisabled();
+    if (ImGui::SmallButton("Refresh##prompts_refresh")) {
+        s_promptsLoaded = false;
+        loadPrompts(st);
+    }
+    if (!canFetch || s_promptsLoading) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(!canFetch
+            ? "Start the worker to load role prompts"
+            : "Prompt catalog is loading");
+    if (!s_promptsError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
+        ImGui::TextWrapped("%s", s_promptsError.c_str());
+        ImGui::PopStyleColor();
+    } else if (!s_promptsLoaded) {
+        ImGui::TextWrapped("%s", s_promptsLoading
+            ? "Loading\xe2\x80\xa6"
+            : "Worker not ready \xe2\x80\x94 start runtime to edit prompts.");
+    } else {
+        ImGui::SameLine();
+        dimText((std::to_string(s_promptRecs.size()) + " roles").c_str());
+    }
+
+    // Auto-select first role once the catalog lands.
+    if (s_promptsLoaded && !s_promptRecs.empty() &&
+        (s_selectedRole < 0 ||
+         (s_selectedRole > (int)s_promptRecs.size()))) {
+        s_selectedRole = 0;
+    }
+
+    const int sysIdx = (int)s_promptRecs.size();
+    const bool compactPrompts =
+        ImGui::GetContentRegionAvail().x < ui::metrics::px(450.0f);
+    if (compactPrompts) {
+        const char* preview = s_selectedRole < sysIdx && s_selectedRole >= 0
+            ? s_promptRecs[s_selectedRole].role.c_str() : "system (override)";
+        float widest = ImGui::CalcTextSize("system (override)").x;
+        for (const auto& pr : s_promptRecs)
+            widest = ImMax(widest, ImGui::CalcTextSize(pr.role.c_str()).x);
+        ImGui::SetNextItemWidth(-1);
+        if (settingsBeginPopupRowCombo("##prompt_role_pick", preview, widest)) {
+            for (int i = 0; i < sysIdx; ++i) {
+                ImGui::PushID(i);
+                if (settingsPopupRowSelectable(s_promptRecs[i].role.c_str(),
+                                              s_selectedRole == i)) {
+                    s_selectedRole = i;
+                    s_promptSystemSelected = false;
+                    s_pendingPromptSelection.clear();
+                }
+                ImGui::PopID();
+            }
+            if (settingsPopupRowSelectable("system (override)",
+                                           s_selectedRole == sysIdx)) {
+                s_selectedRole = sysIdx;
+                s_promptSystemSelected = true;
+                s_pendingPromptSelection.clear();
+            }
+            settingsEndPopupRowCombo();
+        }
+    }
+    // Fill remaining viewport — single scrollbar inside list/editor only.
+    const float promptsH = aiEditorHeight(ImGui::GetFrameHeightWithSpacing() * 3.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
+    if (!compactPrompts) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+               ui::palette.panelBg[2], 1));
+    ImGui::BeginChild("##rolelist", ImVec2(168.0f * sc, promptsH),
+                      ImGuiChildFlags_Borders);
+    if (s_promptRecs.empty() && s_promptsLoaded) {
+        dimText("No role prompts returned.");
+    }
+    for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+        bool sel = (i == s_selectedRole);
+        auto& pr = s_promptRecs[i];
+        std::string lbl = pr.role;
+        if (pr.overridden) lbl += " *";
+        if (settingsChildRowSelectable(lbl.c_str(), sel)) {
+            s_selectedRole = i;
+            s_promptSystemSelected = false;
+            s_pendingPromptSelection.clear();
+        }
+        if (sel) ImGui::SetItemDefaultFocus();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s%s", pr.role.c_str(),
+                              pr.overridden ? " (overridden)" : "");
+    }
+    ImGui::Separator();
+    {
+        std::string syslbl = "system (override)";
+        if (st.spBuf[0] != 0) syslbl += " *";
+        if (settingsChildRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx)) {
+            s_selectedRole = sysIdx;
+            s_promptSystemSelected = true;
+            s_pendingPromptSelection.clear();
+        }
+        if (s_selectedRole >= sysIdx) ImGui::SetItemDefaultFocus();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Override the agent system prompt (advanced)");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();  // ChildBg (list only — editor stays transparent)
+
+    ImGui::SameLine();
+    }
+
+    ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
+                      ImGuiChildFlags_Borders);
+    if (s_selectedRole >= sysIdx) {
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::TextUnformatted("System prompt override");
+        ImGui::PopFont();
+        dimText("Empty = built-in. Custom text fully replaces it \xe2\x80\x94 "
+                "keep the result/parts contract. Autosaves as you type.");
+        ImGui::PushFont(st.fonts.mono);
+        float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+        if (edH < 100.0f * sc) edH = 100.0f * sc;
+        if (ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
+                                  ImVec2(-1, edH))) {
+            s_spOverrideDirty = true;
+            s_spOverrideLastEdit = ImGui::GetTime();
+        }
+        ImGui::PopFont();
+        if (ui::kit::secondaryButton("Clear (use built-in)")) {
+            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+            commitSystemPromptOverride(st);  // empty = built-in, persist now
+        }
+    } else if (s_selectedRole >= 0 &&
+               s_selectedRole < (int)s_promptRecs.size()) {
+        auto& pr = s_promptRecs[s_selectedRole];
+        if (pr.overridden) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                       ui::palette.statusWarn[2], 1));
+            ImGui::TextUnformatted("[overridden]");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+        }
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::TextUnformatted(pr.role.c_str());
+        ImGui::PopFont();
+        int curLen = (int)std::strlen(pr.buf.data());
+        int delta  = curLen - pr.builtinLen;
+        if (delta != 0) {
+            ImGui::SameLine();
+            dimText(delta > 0 ? "(differs from built-in: longer)"
+                              : "(differs from built-in: shorter)");
+        }
+        dimText("Autosaves as you type.");
+        ImGui::PushFont(st.fonts.mono);
+        float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+        if (edH < 100.0f * sc) edH = 100.0f * sc;
+        if (ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
+                                      ImVec2(-1, edH))) {
+            pr.dirty = true;
+            pr.lastEdit = ImGui::GetTime();
+        }
+        ImGui::PopFont();
+        const char* noFetch = "Prompts are unavailable until the engine is connected.";
+        // No Save button: the edit above autosaves (flushPromptEdits).
+        if (ui::kit::secondaryButton("Reset to built-in", canFetch, noFetch,
+                                     ImVec2(140.0f * sc, 28.0f * sc))) {
+            resetPromptOverride(pr, st);
+            st.addLog("[ok] prompt reset: " + pr.role);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Delete override and restore shipped prompt");
+        if (!s_promptSaveError.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(settingsErrInk(), "%s", s_promptSaveError.c_str());
+        }
+    } else {
+        dimText("Select a role on the left to edit its prompt.");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();  // WindowPadding shared by both panes
+}
+
+// Agent benchmark card and the folded legacy results (Developer tab).
+static void drawBenchmarksSection(AppState& st, float sc) {
+    // Shared leaderboard board (refreshed by runner / refresh button).
+    static ui::leaderboard::Board s_lb;
+    static bool s_lbLoaded = false;
+    static double s_lbLast = -1e9;
+    const double now = ImGui::GetTime();
+    if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
+        s_lb = ui::leaderboard::load();
+        s_lbLoaded = true;
+        s_lbLast = now;
+    }
+
+    // The agent benchmark is the artifact_validity suite (benchmarks/
+    // artifact_validity): a CLI runner that grades the saved deliverable file of
+    // each trial. It has no in-app runner, so this card names the suite and hands
+    // over the exact command instead of an empty table.
+    settingsGlassSectionBegin("##bench_artifact", "Agent benchmark", 0.0f,
+                              /*first=*/true);
+    static const char* kArtifactRunCmd =
+        "python -m benchmarks.artifact_validity.runner run --tag demo "
+        "--tasks F1,F2,F3,F4,C1,C2,C3,S1,S2,S3 --model <provider:model>";
+    if (ui::kit::emptyState(
+            nullptr, "Artifact validity suite",
+            "Each trial gives the agent one headless turn in a fresh workspace, "
+            "then reopens the one file the task asks for and grades it. Tasks: "
+            "facilities F1-F4, core C1-C3, solids S1-S3. Run it from the "
+            "repository root with "
+            "python -m benchmarks.artifact_validity.runner run, then "
+            "report --tag <tag> for the scored table.",
+            "Copy run command"))
+        ImGui::SetClipboardText(kArtifactRunCmd);
+    settingsGlassSectionEnd();
+
+    // Legacy gym leaderboard, per-tool-family categories and quick runner: kept
+    // reachable but folded away — the board is retired (often MOCK smoke data)
+    // and must not read as the current score. A legacy run in flight forces it
+    // open so its progress is never hidden.
+    static bool s_showLegacyBench = false;
+    ui::kit::checkbox("bench_show_legacy", "Show legacy results", &s_showLegacyBench,
+                      "The retired gym leaderboard, its tool-family categories and "
+                      "the legacy quick runner.");
+    // Keep status polling alive while this tab is open.
+    pollBenchStatus(st, s_bench.running, &s_lb);
+    if (s_showLegacyBench || s_bench.running) {
+        pollBenchCategories(st, /*force=*/false);
+        if (!s_cats.cats.empty()) {
+            settingsGlassSectionBegin("##bench_categories", "Legacy categories");
+            drawBenchCategories(st, sc);
+            settingsGlassSectionEnd();
+        }
+
+        settingsGlassSectionBegin("##bench_leaderboard", "Legacy gym leaderboard");
+        dimText("Pass rates from the retired gym suite "
+                "(benchmarks/leaderboard/leaderboard.json). Superseded by the "
+                "artifact validity suite above.");
+        if (ui::kit::secondaryButton("Refresh##settings_lb")) {
+            s_lb = ui::leaderboard::load();
+            s_lbLast = ImGui::GetTime();
+            s_cats.lastPoll = -1e9;
+            s_cats.loaded = false;
+        }
+        ImGui::Dummy(ImVec2(0, 2 * sc));
+        ui::leaderboard::drawCompactTable(s_lb, sc);
+        drawBenchRunner(st, sc, s_lb, s_lbLast);
+        settingsGlassSectionEnd();
+    }
+}
+
+// Global tool limits, default tools by role, per-tool options and bug reports (Tools tab).
+static void drawToolsSections(AppState& st, float sc) {
+    settingsGlassSectionBegin("##ai_tools_global", "Global tool limits", 0.0f, /*first=*/true);
+    dimText("Defaults applied to every tool call. A per-tool Options override "
+            "(nonzero) always wins. Autosaved under config.json agent.*.");
+    static int s_globalTimeout = 0;
+    static int s_globalMaxCalls = 0;
+    static int s_globalSupervision = 4;
+    static bool s_loopGuardEnabled = true;
+    static int s_loopGuardThreshold = 3;
+    static bool s_globalLoaded = false;
+    static double s_globalLast = -1e9;
+    static bool s_globalDirty = false;
+    static std::string s_globalErr;
+    {
+        const double nowGl = ImGui::GetTime();
+        // Never reload over unsaved edits (it clobbered them every 2 s).
+        if (!s_globalLoaded ||
+            (!s_globalDirty && (nowGl - s_globalLast) > 2.0)) {
+            s_globalLast = nowGl;
+            s_globalLoaded = true;
+            try {
+                const nlohmann::json j = readConfigJson();
+                auto ag = j.value("agent", nlohmann::json::object());
+                s_globalTimeout = ag.value("tool_timeout_s_default", 0);
+                s_globalMaxCalls = ag.value("tool_max_calls_default", 0);
+                s_globalSupervision = ag.value("supervision_interval_calls", 4);
+                s_loopGuardEnabled = ag.value("tool_loop_guard_enabled", true);
+                s_loopGuardThreshold = ag.value("tool_loop_guard_threshold", 3);
+            } catch (...) {
+                s_globalTimeout = 0;
+                s_globalMaxCalls = 0;
+                s_globalSupervision = 4;
+                s_loopGuardEnabled = true;
+                s_loopGuardThreshold = 3;
+            }
+            if (s_globalTimeout < 0) s_globalTimeout = 0;
+            if (s_globalMaxCalls < 0) s_globalMaxCalls = 0;
+            if (s_globalSupervision < 0) s_globalSupervision = 4;
+            if (s_loopGuardThreshold < 1) s_loopGuardThreshold = 1;
+        }
+    }
+    // 0 means "off / unlimited" for these limits: shown as an empty field
+    // with that word as the hint, never as a bare zero.
+    auto optionalLimit = [&](const char* id, const char* label, int* v,
+                             const char* offHint, const char* unit,
+                             const char* tip) {
+        bool on = *v > 0;
+        int shown = on ? *v : 1;
+        ui::kit::FieldOpts o;
+        o.withPresent(&on).withHint(offHint).withMin(1).withTip(tip);
+        if (unit) o.withUnit(unit);
+        if (ui::kit::fieldInt(id, label, &shown, o)) {
+            *v = on ? shown : 0;
+            s_globalDirty = true;
+        }
+    };
+    {
+        ui::kit::FieldGroup limits("global_limits", "Supervision interval");
+        optionalLimit("global_timeout_s", "Tool timeout", &s_globalTimeout,
+                      "No timeout", ui::kit::unitText(ui::kit::Unit::s),
+                      "Seconds before a tool call is abandoned. Empty = "
+                      "no timeout. A per-tool override wins.");
+        optionalLimit("global_max_calls", "Max calls per turn",
+                      &s_globalMaxCalls, "Unlimited", nullptr,
+                      "Calls of one tool allowed per turn. Empty = "
+                      "unlimited. A per-tool override wins.");
+        optionalLimit("global_supervision", "Supervision interval",
+                      &s_globalSupervision, "Never", nullptr,
+                      "Force an advisor verification pass every N tool "
+                      "calls. Empty = never.");
+        if (ui::kit::fieldCheckbox(
+                "loop_guard_enabled", "Loop guard", &s_loopGuardEnabled,
+                ui::kit::FieldOpts().withTip(
+                    "Refuse a tool call that repeats the exact same tool + "
+                    "arguments too many times in a row instead of "
+                    "dispatching it again (a real stuck loop, not just "
+                    "\"used this tool a lot\").")))
+            s_globalDirty = true;
+        if (s_loopGuardEnabled &&
+            ui::kit::fieldInt("loop_guard_threshold", "Repeats before refusal",
+                              &s_loopGuardThreshold,
+                              ui::kit::FieldOpts().withMin(1).withTip(
+                                  "Consecutive identical calls before "
+                                  "refusal (default 3).")))
+            s_globalDirty = true;
+    }
+    if (s_globalDirty) {
+        // Autosave: commit the edit on the frame it happened (the writer
+        // coalesces keystrokes). A rejected patch stays dirty and retries.
+        if (updateConfigJson([&](nlohmann::json& j) {
+                if (!j.contains("agent") || !j["agent"].is_object())
+                    j["agent"] = nlohmann::json::object();
+                j["agent"]["tool_timeout_s_default"] =
+                    std::max(0, s_globalTimeout);
+                j["agent"]["tool_max_calls_default"] =
+                    std::max(0, s_globalMaxCalls);
+                j["agent"]["supervision_interval_calls"] =
+                    std::max(0, s_globalSupervision);
+                j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
+                j["agent"]["tool_loop_guard_threshold"] =
+                    std::max(1, s_loopGuardThreshold);
+            })) {
+            s_globalDirty = false;
+            s_globalErr.clear();
+        } else {
+            s_globalErr = "Failed to save global tool limits.";
+        }
+    }
+    if (!s_globalErr.empty())
+        ImGui::TextColored(settingsErrInk(), "%s", s_globalErr.c_str());
+    settingsGlassSectionEnd();
+
+    settingsGlassSectionBegin("##ai_tools_roles", "Default tools by role");
+    dimText("Pick a role, then assign which MCP tool families it gets by "
+            "default. Replaces global on/off family toggles. Saved under "
+            "config.json agent.role_tools. Per-tool Options below still apply.");
+
+    // ---- role_tools state (mirrors services/agent/config.py DEFAULT_ROLE_TOOLS)
+    static std::map<std::string, std::set<std::string>> s_roleTools;
+    static int s_roleToolsSel = 4;  // "default"
+    static bool s_roleToolsDirty = false;
+    static bool s_toolOptDirty = false;
+    static double s_roleToolsLast = -1e9;
+    static std::map<std::string, bool> s_toolEnabled;
+    static std::map<std::string, int> s_toolTimeout;
+    static std::map<std::string, int> s_toolMaxCalls;
+    static std::map<std::string, std::string> s_toolDefaults;
+    static std::map<std::string, std::string> s_toolNote;
+    // Included tool context (description_override) + per-tool schema_trim
+    // ( -1 inherit tier, 0 full paragraph, 1 first-sentence trim ).
+    static std::map<std::string, std::string> s_toolDescOverride;
+    static std::map<std::string, int> s_toolSchemaTrim;
+    static std::string s_toolOptErr;
+
+    static const char* kToolFamilies[] = {
+        "cad", "ecad", "cam", "em", "reveng", "plm", "parts",
+        "advisor", "ledger", "intake", "recon", "gsl",
+        "workspace", "research", "sim", "mission",
+        "office", "files", "shell"
+    };
+    static constexpr int kToolFamilyCount =
+        (int)(sizeof(kToolFamilies) / sizeof(kToolFamilies[0]));
+
+    // Sensible defaults — keep in sync with services/agent/config.py
+    // DEFAULT_ROLE_TOOLS.
+    auto seedDefaultRoleTools = [&]() {
+        s_roleTools.clear();
+        auto put = [&](const char* role, std::initializer_list<const char*> fams) {
+            std::set<std::string> s;
+            for (const char* f : fams) s.insert(f);
+            s_roleTools[role] = std::move(s);
+        };
+        put("advisor", {"advisor", "research", "ledger", "gsl"});
+        put("task", {"cad", "sim", "cam", "parts", "gsl", "files", "shell", "office"});
+        put("planning", {"mission", "advisor", "ledger", "research", "gsl", "workspace"});
+        put("vision", {"gsl", "cad"});
+        put("default", {"cad", "files", "shell", "office", "plm", "research",
+                        "parts", "gsl", "advisor", "workspace", "ledger",
+                        "sim", "cam", "ecad", "reveng", "mission"});
+        put("plm", {"plm", "files", "office", "ledger"});
+        put("redaction", {});
+        put("sketch2d", {"cad", "gsl", "ecad"});
+        put("model3d", {"cad", "sim", "parts", "gsl"});
+        put("memory", {"ledger", "plm", "files"});
+        put("cam", {"cam", "cad", "parts"});
+        put("sim", {"sim", "cad", "gsl"});
+        put("ecad", {"ecad", "parts", "research", "em"});
+        put("drawing", {"cad", "office", "gsl"});
+        put("reveng", {"reveng", "research", "cad", "parts"});
+    };
+
+    // Offline fallback catalog — generated tables
+    // (tools/gen_tool_panel_tables.py). Whenever the
+    // runtime is up, the LIVE catalog from the worker
+    // ai_tool_catalog RPC replaces them (below).
+    using FamTools = tool_panel_tables::FamTools;
+    static const auto& kFamToolMap = tool_panel_tables::kFamToolMap;
+    static constexpr int kFamToolMapN = tool_panel_tables::kFamToolMapN;
+    static const auto& kToolDescs = tool_panel_tables::kToolDescs;
+    static constexpr int kToolDescsN = tool_panel_tables::kToolDescsN;
+    static const auto& kToolGuidance = tool_panel_tables::kToolGuidance;
+    static constexpr int kToolGuidanceN = tool_panel_tables::kToolGuidanceN;
+
+    // Live tool catalog (worker ai_tool_catalog RPC) — the
+    // panel shows every registered tool with its real
+    // family + live description, and the curated
+    // tool_guidance defaults in the per-tool Options popup.
+    static bool s_liveCatTried = false;
+    static bool s_liveCatOk = false;
+    static bool s_liveCatLoading = false;
+    static double s_liveCatAt = -1e9;
+    static std::vector<std::string> s_liveFamilies;
+    static std::map<std::string, std::vector<std::string>> s_liveFamTools;
+    static std::map<std::string, std::string> s_liveDescs;
+    static nlohmann::json s_liveGuidance = nlohmann::json::object();
+
+
+    auto toolTooltip = [&](const char* tn) -> const char* {
+        if (!tn || !tn[0]) return "MCP tool.";
+        // Live catalog description (worker ai_tool_catalog) first.
+        if (s_liveCatOk) {
+            auto it = s_liveDescs.find(tn);
+            if (it != s_liveDescs.end() && !it->second.empty())
+                return it->second.c_str();
+        }
+        // kToolDescs (generated fallback) is sorted by name — linear
+        // scan is fine at this size.
+        for (int i = 0; i < kToolDescsN; ++i) {
+            if (!std::strcmp(tn, kToolDescs[i].name))
+                return kToolDescs[i].desc;
+        }
+        // Family-aware fallbacks — never the useless generic alone.
+        if (std::strncmp(tn, "reveng_", 7) == 0 ||
+            std::strncmp(tn, "get_reveng_", 11) == 0 ||
+            std::strncmp(tn, "list_reveng_", 12) == 0)
+            return "Reverse-engineering session / reconstruct tool.";
+        if (std::strncmp(tn, "plm_", 4) == 0)
+            return "Product lifecycle management tool.";
+        if (std::strncmp(tn, "office_", 7) == 0)
+            return "Office document read/edit tool.";
+        if (std::strncmp(tn, "cam_", 4) == 0)
+            return "CAM / machining tool.";
+        if (std::strncmp(tn, "ecad_", 5) == 0)
+            return "Electronics CAD tool.";
+        if (std::strncmp(tn, "fs_", 3) == 0)
+            return "Project filesystem tool.";
+        if (std::strncmp(tn, "research_", 9) == 0)
+            return "Research / lookup tool.";
+        if (std::strncmp(tn, "em_", 3) == 0)
+            return "Electromagnetics simulation tool.";
+        if (std::strncmp(tn, "dag_", 4) == 0 ||
+            std::strncmp(tn, "mission_", 8) == 0)
+            return "Mission / DAG orchestration tool.";
+        return "Agent tool — see Options for AI usage parameters.";
+    };
+
+    // Built-in curated guidance (generated kToolGuidance table)
+    // as a json object shaped like the live catalog's guidance
+    // entries — used when the worker ai_tool_catalog RPC has
+    // no entry for this tool. Linear scan, same as toolTooltip.
+    auto builtinGuidance = [&](const char* tn) -> nlohmann::json {
+        nlohmann::json g = nlohmann::json::object();
+        if (!tn || !tn[0]) return g;
+        for (int i = 0; i < kToolGuidanceN; ++i) {
+            if (!std::strcmp(tn, kToolGuidance[i].name)) {
+                if (kToolGuidance[i].note && kToolGuidance[i].note[0])
+                    g["prompt_note"] = kToolGuidance[i].note;
+                if (kToolGuidance[i].timeout_s > 0)
+                    g["timeout_s"] = kToolGuidance[i].timeout_s;
+                if (kToolGuidance[i].max_calls > 0)
+                    g["max_calls_per_turn"] = kToolGuidance[i].max_calls;
+                if (kToolGuidance[i].param_defaults_json &&
+                    kToolGuidance[i].param_defaults_json[0]) {
+                    nlohmann::json pd = nlohmann::json::parse(
+                        kToolGuidance[i].param_defaults_json,
+                        nullptr, false);
+                    if (pd.is_object() && !pd.empty())
+                        g["param_defaults"] = pd;
+                }
+                break;
+            }
+        }
+        return g;
+    };
+
+    auto famHelp = [](const char* fam) -> const char* {
+        if (!std::strcmp(fam, "cad")) return "Parametric modeling, drawings, measure, mates.";
+        if (!std::strcmp(fam, "sim")) return "FEA, CFD, and motion simulation.";
+        if (!std::strcmp(fam, "cam")) return "CAM jobs, stock, toolpaths, post.";
+        if (!std::strcmp(fam, "ecad")) return "Schematic + PCB tools.";
+        if (!std::strcmp(fam, "em")) return "Electromagnetics simulation.";
+        if (!std::strcmp(fam, "parts")) return "Catalog parts, BOM, quotes.";
+        if (!std::strcmp(fam, "reveng")) return "Reverse engineering from scans/photos.";
+        if (!std::strcmp(fam, "plm")) return "Project history, checkpoints, releases.";
+        if (!std::strcmp(fam, "research")) return "Web search, materials, eng calc.";
+        if (!std::strcmp(fam, "mission")) return "DAG / mission orchestration.";
+        if (!std::strcmp(fam, "gsl")) return "Geometry narrative describers + sketch health.";
+        if (!std::strcmp(fam, "advisor")) return "Steering advisor tools.";
+        if (!std::strcmp(fam, "office")) return "Read/edit Office + PDF (office_oxide extract).";
+        if (!std::strcmp(fam, "files")) return "Project filesystem read/write/glob/grep.";
+        if (!std::strcmp(fam, "shell")) return "Shell commands inside the project jail.";
+        if (!std::strcmp(fam, "ledger")) return "Mission ledger read/write.";
+        if (!std::strcmp(fam, "intake")) return "Requirements / intake confirmations.";
+        if (!std::strcmp(fam, "recon")) return "Mesh reconstruction helpers.";
+        if (!std::strcmp(fam, "workspace")) return "Workspace status, enable_tools, delegate.";
+        return "Tool family.";
+    };
+
+    // Pull the live tool catalog once the worker is up
+    // (retry every 15 s until it succeeds). The generated catalog remains
+    // usable while the queued request waits behind an active agent run.
+    if (st.workerStarted && !s_liveCatLoading &&
+        (!s_liveCatTried ||
+         (!s_liveCatOk && ImGui::GetTime() - s_liveCatAt > 15.0))) {
+        s_liveCatTried = true;
+        s_liveCatLoading = true;
+        s_liveCatAt = ImGui::GetTime();
+        st.rpc.call("ai_tool_catalog", nlohmann::json::object(),
+                    [](const core::RpcResult& r) {
+            s_liveCatLoading = false;
+            if (!r.ok || !r.result.value("ok", false)) {
+                s_liveCatAt = ImGui::GetTime();
+                return;
+            }
+            s_liveFamTools.clear();
+            s_liveDescs.clear();
+            s_liveGuidance = nlohmann::json::object();
+            for (const auto& row :
+                 r.result.value("tools", nlohmann::json::array())) {
+                const std::string name = row.value("name", "");
+                const std::string fam = row.value("family", "?");
+                if (name.empty()) continue;
+                s_liveFamTools[fam].push_back(name);
+                s_liveDescs[name] = row.value("description", "");
+                if (row.contains("guidance") &&
+                    row["guidance"].is_object() &&
+                    !row["guidance"].empty())
+                    s_liveGuidance[name] = row["guidance"];
+            }
+            // Canonical family order (kToolFamilies), then any
+            // families the config list does not know yet.
+            s_liveFamilies.clear();
+            for (int i = 0; i < kToolFamilyCount; ++i)
+                if (s_liveFamTools.count(kToolFamilies[i]))
+                    s_liveFamilies.push_back(kToolFamilies[i]);
+            for (const auto& kv : s_liveFamTools)
+                if (std::find(s_liveFamilies.begin(),
+                              s_liveFamilies.end(),
+                              kv.first) == s_liveFamilies.end())
+                    s_liveFamilies.push_back(kv.first);
+            s_liveCatOk = true;
+        }, 20000);
+    }
+
+    const double nowTf = ImGui::GetTime();
+    // Never re-seed/reload while the user has unsaved edits: the 2 s
+    // poll used to wipe a freshly ticked family (e.g. intake for the
+    // default role) back to the on-disk state before Save was hit.
+    if (s_roleTools.empty() ||
+        (!s_roleToolsDirty && !s_toolOptDirty &&
+         (nowTf - s_roleToolsLast) > 2.0)) {
+        s_roleToolsLast = nowTf;
+        seedDefaultRoleTools();
+        try {
+            const nlohmann::json j = readConfigJson();
+            auto ag = j.value("agent", nlohmann::json::object());
+            auto rt = ag.value("role_tools", nlohmann::json::object());
+            if (rt.is_object()) {
+                for (auto it = rt.begin(); it != rt.end(); ++it) {
+                    if (!it.value().is_array()) continue;
+                    std::set<std::string> fams;
+                    for (const auto& v : it.value()) {
+                        if (v.is_string()) fams.insert(v.get<std::string>());
+                    }
+                    s_roleTools[it.key()] = std::move(fams);
+                }
+            }
+            auto to = ag.value("tool_options", nlohmann::json::object());
+            if (to.is_object()) {
+                for (auto it = to.begin(); it != to.end(); ++it) {
+                    const std::string tn = it.key();
+                    const auto& e = it.value();
+                    if (!e.is_object()) continue;
+                    if (e.contains("enabled") && e["enabled"].is_boolean())
+                        s_toolEnabled[tn] = e["enabled"].get<bool>();
+                    else
+                        s_toolEnabled[tn] = true;
+                    if (e.contains("timeout_s") && e["timeout_s"].is_number_integer())
+                        s_toolTimeout[tn] = e["timeout_s"].get<int>();
+                    if (e.contains("max_calls_per_turn") &&
+                        e["max_calls_per_turn"].is_number_integer())
+                        s_toolMaxCalls[tn] = e["max_calls_per_turn"].get<int>();
+                    if (e.contains("param_defaults"))
+                        s_toolDefaults[tn] = e["param_defaults"].dump(2);
+                    if (e.contains("prompt_note") && e["prompt_note"].is_string())
+                        s_toolNote[tn] = e["prompt_note"].get<std::string>();
+                    if (e.contains("description_override") &&
+                        e["description_override"].is_string())
+                        s_toolDescOverride[tn] =
+                            e["description_override"].get<std::string>();
+                    if (e.contains("schema_trim")) {
+                        if (e["schema_trim"].is_null())
+                            s_toolSchemaTrim[tn] = -1;
+                        else if (e["schema_trim"].is_boolean())
+                            s_toolSchemaTrim[tn] =
+                                e["schema_trim"].get<bool>() ? 1 : 0;
+                    }
+                }
+            }
+        } catch (...) {
+            seedDefaultRoleTools();
+        }
+    }
+
+    // Role badge picker row
+    if (s_roleToolsSel < 0 || s_roleToolsSel >= kRoleCount) s_roleToolsSel = 4;
+    ImGui::BeginGroup();
+    for (int i = 0; i < kRoleCount; ++i) {
+        ImGui::PushID(i + 9100);
+        const bool sel = (i == s_roleToolsSel);
+        if (sel) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(kRoleColors[i].x, kRoleColors[i].y,
+                       kRoleColors[i].z, 0.35f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(kRoleColors[i].x, kRoleColors[i].y,
+                       kRoleColors[i].z, 0.50f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                ImVec4(kRoleColors[i].x, kRoleColors[i].y,
+                       kRoleColors[i].z, 0.65f));
+        }
+        drawRoleBadge(i, sc);
+        ImGui::SameLine(0.0f, 2.0f * sc);
+        char btn[64];
+        std::snprintf(btn, sizeof(btn), "%s##rolepick%d", kRoleLabels[i], i);
+        if (ImGui::SmallButton(btn)) s_roleToolsSel = i;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Edit default tool families for %s",
+                              kRoleLabels[i]);
+        if (sel) ImGui::PopStyleColor(3);
+        if ((i + 1) % 5 != 0)
+            ImGui::SameLine(0.0f, 8.0f * sc);
+        ImGui::PopID();
+    }
+    ImGui::EndGroup();
+
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    {
+        const char* rk = kRoleKeys[s_roleToolsSel];
+        ImGui::AlignTextToFramePadding();
+        drawRoleBadge(s_roleToolsSel, sc);
+        ImGui::SameLine(0.0f, 6.0f * sc);
+        ImGui::Text("Families for %s", kRoleLabels[s_roleToolsSel]);
+        helpMarker("Checked families become this role's default tool "
+                   "surface (unioned onto the role card allowlist).");
+
+        std::set<std::string>& assigned = s_roleTools[rk];
+        if (ImGui::BeginTable("##role_fam_assign", 3,
+                              ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_NoPadOuterX)) {
+            for (int fi = 0; fi < kToolFamilyCount; ++fi) {
+                const char* fam = kToolFamilies[fi];
+                ImGui::TableNextColumn();
+                bool on = assigned.count(fam) > 0;
+                ImGui::PushID(fam);
+                if (ui::kit::checkbox("fam", fam, &on)) {
+                    if (on) assigned.insert(fam);
+                    else assigned.erase(fam);
+                    s_roleToolsDirty = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", famHelp(fam));
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    settingsSectionHeader("Agent service built-ins");
+    {
+        static std::vector<ui::OmpToolRow> tools;
+        static std::string forSession;
+        static bool loaded = false, inFlight = false, failed = false;
+        static double lastPoll = -1e9;
+        const std::string conv = st.activeConvId();
+        const auto* link = ui::ompSessionLink(conv);
+        const bool live = link && link->runtimeLive;
+        if (forSession != conv) {
+            forSession = conv;
+            loaded = false;
+            failed = false;
+            lastPoll = -1e9;
+            tools.clear();
+        }
+        const double now = ImGui::GetTime();
+        if (live && !inFlight && now - lastPoll > (loaded ? 60.0 : 15.0)) {
+            lastPoll = now;
+            inFlight = true;
+#ifdef __EMSCRIPTEN__
+            const std::string session = cellAgentSessionHandle(conv);
+#else
+            const std::string session = conv;
+#endif
+            st.rpc.call("omp_tool_state", nlohmann::json{{"session_id", session}},
+                [conv](const core::RpcResult& r) {
+                    inFlight = false;
+                    if (forSession != conv) return;
+                    std::vector<ui::OmpToolRow> rows;
+                    failed = !r.ok || !ui::parseOmpToolState(r.result, rows);
+                    if (!failed) {
+                        tools = std::move(rows);
+                        loaded = true;
+                    }
+                }, 15000);
+        }
+        if (!live) dimText("No live agent session.");
+        else if (failed) dimText("Built-in tool state could not be refreshed.");
+        else if (!loaded) dimText("Reading built-in tool state...");
+        else if (tools.empty()) dimText("The runtime reported no tools.");
+        else for (const auto& tool : tools) {
+            ImGui::PushID(tool.name.c_str());
+            ompStatusDotText(tool.name.c_str(),
+                tool.availabilityKnown && tool.available ? ui::palette.statusOk
+                                                        : ui::palette.textDim,
+                tool.availabilityKnown && tool.available);
+            if (!tool.availabilityKnown) {
+                ImGui::SameLine();
+                dimText("availability unknown");
+            } else if (!tool.available) {
+                ImGui::SameLine();
+                dimText("unavailable");
+            }
+            if (!tool.description.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tool.description.c_str());
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 8.0f * sc));
+    dimText("Per-tool rows: checkbox enables a tool globally (dimmed = off); "
+            "Options overrides limits, included tool context, and AI usage "
+            "guidance. Hover a name for what it does.");
+    if (s_liveCatLoading)
+        dimText("Loading live tool catalog; showing built-in catalog meanwhile.");
+    static char s_toolFilterBuf[64] = "";
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##tool_filter", "Filter tools...",
+                             s_toolFilterBuf, sizeof(s_toolFilterBuf));
+    const std::string toolNeedle = toLowerAscii(s_toolFilterBuf);
+
+    // Only expand families assigned to the selected role (plus always
+    // show all when filtering so users can find disabled tools).
+    const std::set<std::string>& selFams =
+        s_roleTools[kRoleKeys[s_roleToolsSel]];
+    // Unified family→tools view: the LIVE catalog when the
+    // worker answered, else the generated fallback tables.
+    std::vector<std::pair<std::string, std::vector<std::string>>> famView;
+    if (s_liveCatOk) {
+        for (const auto& fam : s_liveFamilies)
+            famView.emplace_back(fam, s_liveFamTools[fam]);
+    } else {
+        for (int fi = 0; fi < kFamToolMapN; ++fi) {
+            const FamTools& ft = kFamToolMap[fi];
+            famView.emplace_back(
+                ft.fam,
+                std::vector<std::string>(ft.tools, ft.tools + ft.n));
+        }
+    }
+    for (const auto& famEntry : famView) {
+        const std::string& famName = famEntry.first;
+        const std::vector<std::string>& famToolList = famEntry.second;
+        const bool famAssigned = selFams.count(famName) > 0;
+        if (!toolNeedle.empty()) {
+            int famMatches = 0;
+            for (const auto& toolName : famToolList)
+                if (toLowerAscii(toolName).find(toolNeedle)
+                    != std::string::npos)
+                    ++famMatches;
+            if (famMatches == 0) continue;
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        } else if (!famAssigned) {
+            // Still list unassigned families collapsed so users can
+            // enable individual tools / browse Options.
+        }
+        char famLabel[96];
+        std::snprintf(famLabel, sizeof(famLabel), "%s%s",
+                      famName.c_str(), famAssigned ? "" : "  (not assigned)");
+        if (!ImGui::TreeNode(famLabel)) continue;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", famHelp(famName.c_str()));
+        for (const auto& toolName : famToolList) {
+            const char* tn = toolName.c_str();
+            if (!toolNeedle.empty() &&
+                toLowerAscii(tn).find(toolNeedle) == std::string::npos)
+                continue;
+            ImGui::PushID(tn);
+            bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
+            if (ui::kit::checkbox("en", "", &en)) {
+                s_toolEnabled[tn] = en;
+                s_toolOptDirty = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Enable/disable this tool globally.");
+            ImGui::SameLine();
+            if (!en)
+                ImGui::PushStyleColor(
+                    ImGuiCol_Text,
+                    ui::Palette::toU32(ui::palette.textDim));
+            ImGui::TextUnformatted(tn);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", toolTooltip(tn));
+            if (!en) ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Options"))
+                ImGui::OpenPopup("tool_opts");
+            if (ImGui::BeginPopup("tool_opts")) {
+                ImGui::TextUnformatted(tn);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 360.0f * sc);
+                ImGui::TextDisabled("%s", toolTooltip(tn));
+                ImGui::PopTextWrapPos();
+                ImGui::Separator();
+                ImGui::TextDisabled("Empty = use the built-in or global "
+                                    "default shown in the field.");
+                const float boxW = 360.0f * sc;
+                int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
+                int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                // Built-in curated defaults (tool_guidance,
+                // live catalog) — dimmed placeholders; an
+                // empty user field inherits them. Falls back
+                // to the generated kToolGuidance table when
+                // the live catalog has no entry for this
+                // tool (worker down / RPC not answered yet).
+                const nlohmann::json curated =
+                    (s_liveCatOk && s_liveGuidance.contains(tn))
+                        ? s_liveGuidance[tn]
+                        : builtinGuidance(tn);
+                // An unset override (0) is an empty field whose hint names
+                // the value it inherits, never a bare zero.
+                const int curT = curated.value("timeout_s", 0);
+                const int curM = curated.value("max_calls_per_turn", 0);
+                const std::string toHint =
+                    curT > 0 ? "Default " + std::to_string(curT) + " s"
+                    : s_globalTimeout > 0
+                        ? "Global " + std::to_string(s_globalTimeout) + " s"
+                        : std::string("No timeout");
+                const std::string mcHint =
+                    curM > 0 ? "Default " + std::to_string(curM)
+                    : s_globalMaxCalls > 0
+                        ? "Global " + std::to_string(s_globalMaxCalls)
+                        : std::string("Unlimited");
+                {
+                    ui::kit::FieldGroup limits("tool_limits",
+                                               "Max calls per turn");
+                    bool toSet = to > 0;
+                    int toShown = toSet ? to : 1;
+                    if (ui::kit::fieldInt(
+                            "timeout_s", "Timeout", &toShown,
+                            ui::kit::FieldOpts()
+                                .withPresent(&toSet)
+                                .withHint(toHint.c_str())
+                                .withMin(1)
+                                .withUnit(ui::kit::Unit::s))) {
+                        s_toolTimeout[tn] = toSet ? toShown : 0;
+                        s_toolOptDirty = true;
+                    }
+                    bool mcSet = mc > 0;
+                    int mcShown = mcSet ? mc : 1;
+                    if (ui::kit::fieldInt(
+                            "max_calls_per_turn", "Max calls per turn",
+                            &mcShown,
+                            ui::kit::FieldOpts()
+                                .withPresent(&mcSet)
+                                .withHint(mcHint.c_str())
+                                .withMin(1))) {
+                        s_toolMaxCalls[tn] = mcSet ? mcShown : 0;
+                        s_toolOptDirty = true;
+                    }
+                }
+
+                // AI usage parameters / included tool context
+                // (agent.tool_options.<name> — same shape as Python
+                // get_tool_options).
+                ImGui::Dummy(ImVec2(0, 4.0f * sc));
+                ImGui::TextUnformatted("AI usage parameters");
+                ImGui::Separator();
+
+                int trimMode = s_toolSchemaTrim.count(tn)
+                                   ? s_toolSchemaTrim[tn] : -1;
+                if (trimMode < -1 || trimMode > 1) trimMode = -1;
+                const char* trimLabels[] = {
+                    "Inherit tier", "Full paragraph", "First sentence"
+                };
+                // Map stored -1/0/1 -> items 0/1/2
+                int trimSel = (trimMode < 0) ? 0 : (trimMode == 0 ? 1 : 2);
+                if (ui::kit::fieldEnum(
+                        "schema_trim", "Description length", &trimSel,
+                        trimLabels, 3,
+                        ui::kit::FieldOpts()
+                            .withEnumStyle(ui::kit::EnumStyle::Combo)
+                            .withTip("How much of the tool description is "
+                                     "included in the AI tools prompt. "
+                                     "Inherit = tier default."))) {
+                    s_toolSchemaTrim[tn] =
+                        (trimSel == 0) ? -1 : (trimSel == 1 ? 0 : 1);
+                    s_toolOptDirty = true;
+                }
+
+                static char descBuf[2048];
+                static char defBuf[2048];
+                static char noteBuf[1024];
+                std::snprintf(descBuf, sizeof(descBuf), "%s",
+                    s_toolDescOverride.count(tn)
+                        ? s_toolDescOverride[tn].c_str() : "");
+                std::snprintf(defBuf, sizeof(defBuf), "%s",
+                    s_toolDefaults.count(tn)
+                        ? s_toolDefaults[tn].c_str() : "{}");
+                std::snprintf(noteBuf, sizeof(noteBuf), "%s",
+                    s_toolNote.count(tn) ? s_toolNote[tn].c_str() : "");
+
+                // Live docstring (what the model gets when override empty).
+                const char* liveDesc = toolTooltip(tn);
+                ImGui::Dummy(ImVec2(0, 2.0f * sc));
+                ImGui::TextUnformatted("Included tool context");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "description_override — replaces the MCP docstring "
+                        "in the AI tools prompt. Leave empty to use the "
+                        "live tool description shown below.");
+                if (descBuf[0] == '\0' && liveDesc && liveDesc[0]) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ui::Palette::toU32(ui::palette.textDim));
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                    ImGui::TextWrapped(
+                        s_liveCatOk ? "Live (no override): %s"
+                                    : "Built-in (offline snapshot): %s",
+                        liveDesc);
+                    ImGui::PopTextWrapPos();
+                    ImGui::PopStyleColor();
+                }
+                if (ImGui::InputTextMultiline("##description_override",
+                        descBuf, sizeof(descBuf),
+                        ImVec2(boxW, 56 * sc))) {
+                    s_toolDescOverride[tn] = descBuf;
+                    s_toolOptDirty = true;
+                }
+
+                ImGui::TextUnformatted("AI usage guidance");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "prompt_note — appended as \"Note: ...\" under this "
+                        "tool in the AI tools prompt. Leave empty to "
+                        "inherit the built-in default (when one exists).");
+                const std::string curNote = curated.value("prompt_note", "");
+                if (noteBuf[0] == '\0') {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ui::Palette::toU32(ui::palette.textDim));
+                    if (!curNote.empty()) {
+                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                        ImGui::TextWrapped("(default): %s", curNote.c_str());
+                        ImGui::PopTextWrapPos();
+                    } else {
+                        ImGui::TextUnformatted(
+                            "(empty — no Note: line in the tools prompt)");
+                    }
+                    ImGui::PopStyleColor();
+                }
+                if (ImGui::InputTextMultiline("##prompt_note",
+                        noteBuf, sizeof(noteBuf),
+                        ImVec2(boxW, 40 * sc))) {
+                    s_toolNote[tn] = noteBuf;
+                    s_toolOptDirty = true;
+                }
+
+                ImGui::TextUnformatted("Default arguments (JSON)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "param_defaults — kwargs merged under the model's "
+                        "call (model-supplied values win).");
+                if (defBuf[0] == '\0' || !std::strcmp(defBuf, "{}")) {
+                    if (curated.contains("param_defaults") &&
+                        curated["param_defaults"].is_object() &&
+                        !curated["param_defaults"].empty()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ui::Palette::toU32(ui::palette.textDim));
+                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                        ImGui::TextWrapped("(default): %s",
+                            curated["param_defaults"].dump().c_str());
+                        ImGui::PopTextWrapPos();
+                        ImGui::PopStyleColor();
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ui::Palette::toU32(ui::palette.textDim));
+                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
+                        ImGui::TextWrapped(
+                            "(none — the tool's own signature defaults "
+                            "apply; see \"Model receives\" below)");
+                        ImGui::PopTextWrapPos();
+                        ImGui::PopStyleColor();
+                    }
+                }
+                if (ImGui::InputTextMultiline("##param_defaults",
+                        defBuf, sizeof(defBuf),
+                        ImVec2(boxW, 60 * sc))) {
+                    s_toolDefaults[tn] = defBuf;
+                    s_toolOptDirty = true;
+                }
+
+                // ---- Model receives: real assembled tools-slot entry ----
+                ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                ImGui::TextUnformatted("Model receives (preview)");
+                ImGui::SameLine();
+                helpMarker("Exact tools-slot block assembled the same way "
+                           "as tool_schemas.render_tools_block (signature + "
+                           "description + optional Note). Refresh pulls from "
+                           "the worker; offline falls back to the live "
+                           "docstring + your overrides.");
+                static std::string s_previewTool;
+                static std::string s_previewText;
+                static std::string s_previewErr;
+                static double s_previewAt = -1e9;
+                static bool s_previewFetching = false;
+                const bool canPrev = st.workerStarted;
+                auto makeLocalPreview = [&]() {
+                    std::string sig = std::string("- ") + tn + "(…)";
+                    std::string body;
+                    if (s_toolDescOverride.count(tn) &&
+                        !s_toolDescOverride[tn].empty())
+                        body = s_toolDescOverride[tn];
+                    else if (liveDesc)
+                        body = liveDesc;
+                    std::string entry = sig;
+                    if (!body.empty())
+                        entry += "\n    " + body;
+                    if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
+                        entry += "\n    Note: " + s_toolNote[tn];
+                    else if (!curNote.empty())
+                        entry += "\n    Note: " + curNote;
+                    return "[TOOLS] Call tools with EXACTLY these kwargs:\n" +
+                           entry;
+                };
+                auto buildLocalPreview = [&]() {
+                    s_previewText = makeLocalPreview();
+                    s_previewErr.clear();
+                };
+                auto fetchPreview = [&](bool force) {
+                    const double now = ImGui::GetTime();
+                    if (s_previewFetching ||
+                        (!force && s_previewTool == tn &&
+                         (now - s_previewAt) < 1.5))
+                        return;
+                    s_previewTool = tn;
+                    s_previewAt = now;
+                    if (!canPrev) {
+                        buildLocalPreview();
+                        s_previewErr = "Worker offline — local approximation";
+                        return;
+                    }
+                    nlohmann::json p;
+                    p["tool"] = tn;
+                    // Pass explicit trim when not inheriting.
+                    if (s_toolSchemaTrim.count(tn) &&
+                        s_toolSchemaTrim[tn] >= 0)
+                        p["trim"] = (s_toolSchemaTrim[tn] != 0);
+                    const std::string localPreview = makeLocalPreview();
+                    s_previewFetching = true;
+                    flushConfigWrites();
+                    st.rpc.call("ai_tool_preview", std::move(p),
+                                [localPreview](const core::RpcResult& r) {
+                        s_previewFetching = false;
+                        if (!r.ok || !r.result.value("ok", false)) {
+                            s_previewText = localPreview;
+                            s_previewErr = r.err.empty()
+                                ? r.result.value(
+                                    "error", std::string("preview failed"))
+                                : r.err;
+                            return;
+                        }
+                        s_previewText = r.result.value("text", "");
+                        if (s_previewText.empty())
+                            s_previewText = r.result.value("entry", "");
+                        s_previewErr.clear();
+                    }, 8000);
+                };
+                // Refresh when popup opens / tool changes. Edits rebuild
+                // a local approximation until Refresh is clicked.
+                if (s_previewTool != tn) {
+                    fetchPreview(/*force=*/true);
+                } else if (s_toolOptDirty && s_previewErr.find("offline") ==
+                           std::string::npos &&
+                           s_previewErr.find("Worker") == std::string::npos) {
+                    // Keep showing last worker text; user can Refresh.
+                }
+                ImGui::SameLine();
+                if (!canPrev || s_previewFetching) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("Refresh##tool_preview"))
+                    fetchPreview(/*force=*/true);
+                if (!canPrev || s_previewFetching) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(s_previewFetching
+                        ? "Loading tool preview"
+                        : "Start the worker to refresh the preview");
+                // Always refresh local approx when worker unavailable.
+                if (!canPrev && (s_previewTool != tn || s_toolOptDirty))
+                    buildLocalPreview();
+                if (s_previewFetching) {
+                    ImGui::SameLine();
+                    dimText("Loading\xe2\x80\xa6");
+                }
+                if (!s_previewErr.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ui::Palette::toU32(ui::palette.statusWarn));
+                    ImGui::TextWrapped("%s", s_previewErr.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                    ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+                           ui::palette.panelBg[2], 1));
+                ImGui::BeginChild("##tool_recv_preview",
+                                  ImVec2(boxW, 110 * sc), true);
+                ImGui::PushFont(st.fonts.mono);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW - 12 * sc);
+                ImGui::TextUnformatted(
+                    s_previewText.empty() ? "(empty)" : s_previewText.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::PopFont();
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+
+    // Autosave. Every edit above flags its half (role families / per-tool
+    // options) dirty; the commit happens on that same frame so a sub-tab
+    // switch or close cannot strand it. Each half writes only its own keys:
+    // a tool-option edit must not also materialise role_tools /
+    // tool_families from the in-memory defaults.
+    if (s_roleToolsDirty || s_toolOptDirty) {
+        bool saveRoles = s_roleToolsDirty;
+        bool saveOpts = s_toolOptDirty;
+        nlohmann::json rt = nlohmann::json::object();
+        nlohmann::json tf = nlohmann::json::object();
+        nlohmann::json to = nlohmann::json::object();
+        if (saveRoles) {
+            for (const auto& kv : s_roleTools) {
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& fam : kv.second) arr.push_back(fam);
+                rt[kv.first] = std::move(arr);
+            }
+
+            // Derive tool_families as the union of all role assignments
+            // so legacy kill-switches / MCP external clients stay coherent.
+            std::set<std::string> unionFams;
+            for (const auto& kv : s_roleTools)
+                for (const auto& fam : kv.second) unionFams.insert(fam);
+            for (int i = 0; i < kToolFamilyCount; ++i)
+                tf[kToolFamilies[i]] = unionFams.count(kToolFamilies[i]) > 0;
+        }
+        s_toolOptErr.clear();
+        if (saveOpts) {
+            std::set<std::string> names;
+            for (const auto& kv : s_toolEnabled) names.insert(kv.first);
+            for (const auto& kv : s_toolTimeout) names.insert(kv.first);
+            for (const auto& kv : s_toolMaxCalls) names.insert(kv.first);
+            for (const auto& kv : s_toolDefaults) names.insert(kv.first);
+            for (const auto& kv : s_toolNote) names.insert(kv.first);
+            for (const auto& kv : s_toolDescOverride) names.insert(kv.first);
+            for (const auto& kv : s_toolSchemaTrim) names.insert(kv.first);
+            for (const auto& tn : names) {
+                nlohmann::json e = nlohmann::json::object();
+                bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
+                if (!en) e["enabled"] = false;
+                int tmo = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
+                if (tmo > 0) e["timeout_s"] = tmo;
+                int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
+                if (mc > 0) e["max_calls_per_turn"] = mc;
+                if (s_toolDefaults.count(tn) && !s_toolDefaults[tn].empty()) {
+                    try {
+                        auto parsed = nlohmann::json::parse(s_toolDefaults[tn]);
+                        if (parsed.is_object() && !parsed.empty())
+                            e["param_defaults"] = parsed;
+                    } catch (...) {
+                        s_toolOptErr = "Invalid JSON in param_defaults for " + tn +
+                                       " \xe2\x80\x94 tool options are not saved until it is fixed.";
+                        break;
+                    }
+                }
+                if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
+                    e["prompt_note"] = s_toolNote[tn];
+                if (s_toolDescOverride.count(tn) &&
+                    !s_toolDescOverride[tn].empty())
+                    e["description_override"] = s_toolDescOverride[tn];
+                if (s_toolSchemaTrim.count(tn) &&
+                    s_toolSchemaTrim[tn] >= 0)
+                    e["schema_trim"] = (s_toolSchemaTrim[tn] != 0);
+                if (!e.empty()) to[tn] = e;
+            }
+            // Half-typed JSON must not wipe the stored options: they wait
+            // (still dirty) until it parses; the role half saves regardless.
+            if (!s_toolOptErr.empty()) saveOpts = false;
+        }
+        if (saveRoles || saveOpts) {
+            const bool ok = updateConfigJson([&](nlohmann::json& j) {
+                if (!j.contains("agent") || !j["agent"].is_object())
+                    j["agent"] = nlohmann::json::object();
+                if (saveRoles) {
+                    j["agent"]["role_tools"] = rt;
+                    // Merge, never replace: tool_families also carries keys
+                    // this page has no control for (e.g. manufacture, org).
+                    auto& fams = j["agent"]["tool_families"];
+                    if (!fams.is_object()) fams = nlohmann::json::object();
+                    for (auto it = tf.begin(); it != tf.end(); ++it)
+                        fams[it.key()] = it.value();
+                }
+                if (saveOpts) j["agent"]["tool_options"] = to;
+            });
+            if (ok) {
+                if (saveRoles) s_roleToolsDirty = false;
+                if (saveOpts) s_toolOptDirty = false;
+            } else {
+                s_toolOptErr = "Failed to save tool settings; retrying.";
+            }
+        }
+    }
+    ImGui::Dummy(ImVec2(0, 6.0f * sc));
+    if (!s_toolOptErr.empty())
+        ImGui::TextColored(settingsErrInk(), "%s", s_toolOptErr.c_str());
+    if (ui::kit::secondaryButton("Reset role defaults", true, nullptr, ImVec2(160.0f * sc, 0))) {
+        seedDefaultRoleTools();
+        s_roleToolsDirty = true;  // autosaved next frame
+    }
+    ImGui::SameLine();
+    if (ui::kit::secondaryButton("Reset tool options", true, nullptr, ImVec2(150.0f * sc, 0))) {
+        s_toolEnabled.clear();
+        s_toolTimeout.clear();
+        s_toolMaxCalls.clear();
+        s_toolDefaults.clear();
+        s_toolNote.clear();
+        s_toolDescOverride.clear();
+        s_toolSchemaTrim.clear();
+        s_toolOptDirty = true;  // autosaved next frame
+    }
+    settingsGlassSectionEnd();
+
+    ImGui::Dummy(ImVec2(0, 10.0f * sc));
+    settingsGlassSectionBegin("##ai_bugreports", "Bug reports");
+    dimText("Give the agent a submit_bug_report tool so it can file a "
+            "report when it hits tool errors or broken behavior. Reports "
+            "are markdown files in Documents/Chudware/Bug-Reports/ \xe2\x80\x94 "
+            "nothing leaves this machine.");
+    {
+        static bool s_bugReports = loadAgentConfigBool("bug_reports", true);
+        if (ui::kit::checkbox("bug_reports", "Send bug reports", &s_bugReports))
+            saveAgentConfigValue("bug_reports", s_bugReports);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Saved immediately to config.json "
+                              "agent.bug_reports.");
+    }
+    settingsGlassSectionEnd();
+}
+
+// The assembled system prompt a main-chat turn would send (Developer tab).
+static void drawDevPreviewSection(AppState& st, float sc) {
+    settingsGlassSectionBegin("##ai_dev_preview", "Prompt assembly preview");
+    dimText("Shows the system prompt a typical main-chat / general_agent "
+            "turn would send (effective role/global override + capability "
+            "SOFT block + harness base + catalogs + tools slot + Auto-Learn "
+            "guidance when enabled), followed by an example user message "
+            "that marks where the request goes. Nothing here is sent to a "
+            "model.");
+
+    static std::string s_devSys;
+    static std::string s_devUser;
+    static std::string s_devErr;
+    static std::string s_devMeta;
+    static bool s_devLoaded = false;
+    static bool s_devFetching = false;
+    static bool s_includeTools = true;
+
+    const bool canDev = st.workerStarted;
+    auto fetchDevPreview = [&]() {
+        if (s_devFetching) return;
+        s_devFetching = true;
+        s_devErr.clear();
+        if (!canDev) {
+            s_devSys.clear();
+            s_devUser.clear();
+            s_devMeta.clear();
+            s_devErr = "Worker not ready — start the runtime to load the "
+                       "assembled prompt.";
+            s_devLoaded = true;
+            s_devFetching = false;
+            return;
+        }
+        const bool includeTools = s_includeTools;
+        flushConfigWrites();
+        st.rpc.call("ai_prompt_preview",
+                    nlohmann::json{{"include_tools", includeTools}},
+                    [includeTools](const core::RpcResult& r) {
+            s_devFetching = false;
+            if (s_includeTools != includeTools) {
+                s_devLoaded = false;
+                return;
+            }
+            if (!r.ok || !r.result.value("ok", false)) {
+                s_devSys.clear();
+                s_devUser.clear();
+                s_devMeta.clear();
+                s_devErr = r.err.empty()
+                    ? r.result.value(
+                        "error", std::string("ai_prompt_preview failed"))
+                    : r.err;
+                s_devLoaded = true;
+                return;
+            }
+            // Fold once here, not per frame: the prompt is long and may
+            // carry glyphs the UI font lacks.
+            s_devSys = ui::foldToAtlasGlyphs(r.result.value("system", ""));
+            // The worker brackets its sample request with a color-span
+            // marker ("[[USER REQUEST - sample]] ", math brackets); the
+            // preview shows the example request itself under its own
+            // caption instead. Marker bytes are matched, never rendered.
+            std::string user = r.result.value("user_placeholder", "");
+            static const char* kMarkClose = "\xe2\x9f\xa7";  // gui-lint: allow
+            const size_t close = user.find(kMarkClose);
+            if (user.rfind("\xe2\x9f\xa6", 0) == 0 &&  // gui-lint: allow
+                close != std::string::npos) {
+                user.erase(0, close + std::strlen(kMarkClose));
+                user.erase(0, user.find_first_not_of(' '));
+            }
+            s_devUser = ui::foldToAtlasGlyphs(user);
+            auto meta = r.result.value("meta", nlohmann::json::object());
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "%s  \xc2\xb7  %d tools  \xc2\xb7  %d chars  \xc2\xb7  "
+                "~%d tokens  \xc2\xb7  Auto-Learn %s",
+                meta.value("role", "general_agent").c_str(),
+                meta.value("allowed_tool_count", 0),
+                meta.value("system_chars", 0),
+                meta.value("system_tokens_est", 0),
+                meta.value("autolearn", false) ? "on" : "off");
+            s_devMeta = buf;
+            s_devErr.clear();
+            s_devLoaded = true;
+        }, 30000);
+    };
+
+    if (!s_devLoaded && canDev && !s_devFetching)
+        fetchDevPreview();
+
+    if (s_devFetching) ImGui::BeginDisabled();
+    if (ui::kit::checkbox("dev_tools_slot", "Include tools slot", &s_includeTools)) {
+        s_devLoaded = false;
+    }
+    if (s_devFetching) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!canDev || s_devFetching) ImGui::BeginDisabled();
+    if (ui::kit::secondaryButton("Refresh##dev_preview", true, nullptr, ImVec2(100.0f * sc, 0)))
+        fetchDevPreview();
+    if (!canDev || s_devFetching) ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(s_devFetching
+            ? "Assembling prompt preview"
+            : "Start the worker to load the prompt preview");
+    if (s_devFetching) {
+        ImGui::SameLine();
+        dimText("Loading\xe2\x80\xa6");
+    }
+    if (!s_devMeta.empty()) {
+        ImGui::SameLine();
+        dimText(s_devMeta.c_str());
+    }
+    if (!s_devErr.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("%s", s_devErr.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    // System prompt (normal ink) then the example user message (accent).
+    const float prevH = ImMax(280.0f * sc,
+        ImGui::GetContentRegionAvail().y - 8.0f * sc);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+               ui::palette.panelBg[2], 1));
+    ImGui::BeginChild("##dev_prompt_body", ImVec2(-1, prevH),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar);
+    ImGui::PushFont(st.fonts.mono);
+    const float wrapX = ImGui::GetCursorPosX() +
+        ImGui::GetContentRegionAvail().x - 4.0f * sc;
+    ImGui::PushTextWrapPos(wrapX);
+    // Section captions in the UI font, not mono rule lines.
+    auto caption = [&](const char* text) {
+        ImGui::PopFont();
+        dimText(text);
+        ImGui::PushFont(st.fonts.mono);
+    };
+    if (!s_devSys.empty()) {
+        caption("System prompt");
+        ImGui::TextUnformatted(s_devSys.c_str());
+        if (!s_devUser.empty()) {
+            ImGui::Dummy(ImVec2(0, 10.0f * sc));
+            caption("Example user message (not sent)");
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ui::Palette::toU32(ui::palette.accent));
+            ImGui::TextWrapped("%s", s_devUser.c_str());
+            ImGui::PopStyleColor();
+        }
+    } else if (s_devFetching || (!s_devLoaded && canDev)) {
+        caption("Assembling the prompt\xe2\x80\xa6");
+    } else {
+        ImGui::PopFont();
+        ui::kit::emptyState(
+            nullptr, "No preview yet",
+            canDev ? "Refresh to assemble the prompt a main-chat turn "
+                     "would send."
+                   : "Start the engine to assemble the prompt a main-chat "
+                     "turn would send.");
+        ImGui::PushFont(st.fonts.mono);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::PopFont();
+    settingsPillScrollbar();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    settingsGlassSectionEnd();
+}
+
+
+// ---- Settings → AI: Chudware's tabs, laid out like OMP's settings tabs ------------------------
+// Each tab shows its Chudware-owned sections (`draw`). In Advanced mode its OMP rows follow
+// (drawOmpTabRows, keyed by `id`, which is also the backend's `tab`) and then `drawEditors`:
+// full-height editors sit last so they never push the settings off-screen.
+
+static void drawAiModelsTab(AppState& st, float sc) {
+    settingsGlassSectionBegin("##ai_basic_models", "Models", 0.0f, /*first=*/true);
+    drawModelRolesSection(st, sc);
+    settingsGlassSectionEnd();
+    // Vision and spatial routing are advanced overrides; the model assignments above remain
+    // available in Basic.
+    if (st.settings.showAdvanced) {
+        aiAnchor("vision_routing");
+        settingsGlassSectionBegin("##ai_vision_routing", "Vision & spatial routing");
+        if (drawVisionRoutingSection(st, sc)) saveSettings(st.settings);
+        settingsGlassSectionEnd();
+    }
+}
+
+static void drawAiModelsEditors(AppState& st, float sc) {
+    aiAnchor("role_prompts");
+    drawRolePromptsEditor(st, sc);
+}
+
+static void drawAiBehaviorTab(AppState& st, float sc) {
+    aiAnchor("run_preferences");
+    settingsGlassSectionBegin("##ai_harness_session", "Session knobs", 0.0f, /*first=*/true);
+    dimText("Same knobs as Copilot -> Quick settings. Advanced adds the run preferences and "
+            "the chat display options.");
+    ImGui::Dummy(ImVec2(0, 4.0f * sc));
+    if (drawHarnessSessionKnobs(st, sc)) saveSettings(st.settings);
+    settingsGlassSectionEnd();
+
+    if (st.settings.showAdvanced) {
+        // Harness organization is a structural/diagnostic surface — the shipped arrangement is
+        // correct for normal use.
+        aiAnchor("harness_org");
+        settingsGlassSectionBegin("##ai_harness_org", "Harness organization");
+        drawHarnessOrganizationSection(st, sc);
+        settingsGlassSectionEnd();
+    } else {
+        // Basic mode hides the Developer tab, where runtime repair lives. Re-home it here so a
+        // broken runtime is always fixable.
+        aiAnchor("maintenance");
+        ImGui::Dummy(ImVec2(0, 10.0f * sc));
+        drawRuntimeMaintenanceSection(st, sc);
+    }
+}
+
+static void drawAiContextTab(AppState& st, float sc) {
+    settingsGlassSectionBegin("##ai_compaction", "Compaction method", 0.0f, /*first=*/true);
+    drawCompactionSection(st, sc);
+    settingsGlassSectionEnd();
+}
+
+static void drawAiContextEditors(AppState& st, float sc) {
+    aiAnchor("rules");
+    drawSettingsContextTab(st, sc);
+}
+
+static void drawAiMemoryTab(AppState& st, float sc) {
+    settingsGlassSectionBegin("##ai_memory", "Memory & Learning", 0.0f, /*first=*/true);
+    drawMemorySection(st, sc);
+    settingsGlassSectionEnd();
+}
+
+static void drawAiAgentsTab(AppState&, float sc) {
+    settingsGlassSectionBegin("##ai_subagent_limits", "Subagent limits", 0.0f, /*first=*/true);
+    drawSubagentLimitKnobs(sc);
+    settingsGlassSectionEnd();
+}
+
+static void drawAiAgentsEditors(AppState& st, float sc) {
+    aiAnchor("skills");
+    drawSettingsSkillsTab(st, sc);
+}
+
+// The Providers body also decides whether the provider poll keeps running (see
+// drawSettingsModal): it only does while this tab is drawn.
+static bool s_providerTabDrawn = false;
+static void drawAiProvidersTab(AppState& st, float) {
+    s_providerTabDrawn = true;
+    dimText("New credentials are stored by the runtime; availability does not verify provider "
+            "access.");
+    // Online model limits and thinking are derived from OMP capabilities.
+    drawOmpProviderManager(st);
+}
+
+static void drawAiDeveloperTab(AppState& st, float sc) {
+    aiAnchor("benchmarks");
+    drawBenchmarksSection(st, sc);
+    aiAnchor("dev_preview");
+    ImGui::Dummy(ImVec2(0, 10.0f * sc));
+    drawDevPreviewSection(st, sc);
+    aiAnchor("maintenance");
+    ImGui::Dummy(ImVec2(0, 10.0f * sc));
+    drawRuntimeMaintenanceSection(st, sc);
+}
+
+struct AiTab {
+    const char* id;     // stable: the backend's omp_config_get `tab`, and the body window ##tab_<id>
+    const char* label;
+    const char* lead;   // one line under the strip
+    bool        basic;  // listed in Basic mode; the other tabs need Advanced
+    void      (*draw)(AppState& st, float sc);         // Chudware-owned sections, or nullptr
+    void      (*drawEditors)(AppState& st, float sc);  // full-height editors (Advanced), or nullptr
+    bool        ompRows;                               // shows the tab's OMP rows (Advanced)
+};
+
+// Strip order. Basic mode lists a tab only when it has an everyday control: OMP rows and the
+// authoring editors are Advanced, so Tools, Coding, Agents and Developer need it entirely.
+// Behavior and Developer have no OMP source (OMP's Interaction settings are terminal-only).
+static const AiTab kAiTabs[] = {
+    {"models",    "Models",
+     "Which model each role uses, and how it thinks, retries and falls back.",
+     true,  drawAiModelsTab,    drawAiModelsEditors,  true},
+    {"behavior",  "Behavior",
+     "How the agent plans, delegates and shows its work in the chat.",
+     true,  drawAiBehaviorTab,  nullptr,              false},
+    {"context",   "Context",
+     "How a long conversation is compacted, and the rules that inject guidance.",
+     true,  drawAiContextTab,   drawAiContextEditors, true},
+    {"memory",    "Memory",
+     "What the agent remembers about your project between chats.",
+     true,  drawAiMemoryTab,    nullptr,              true},
+    {"tools",     "Tools",
+     "Which tools the agent may call, with their limits and defaults.",
+     false, drawToolsSections,  nullptr,              true},
+    {"coding",    "Coding",
+     "Editing, reading, language server and shell behavior when the agent works on code.",
+     false, nullptr,            nullptr,              true},
+    {"agents",    "Agents",
+     "Subagent limits and the skills subagents can use.",
+     false, drawAiAgentsTab,    drawAiAgentsEditors,  true},
+    {"providers", "Providers",
+     "Provider sign-in, model availability and connection behavior.",
+     true,  drawAiProvidersTab, nullptr,              true},
+    {"developer", "Developer",
+     "Benchmarks, the assembled prompt preview and runtime maintenance.",
+     false, drawAiDeveloperTab, nullptr,              false},
+};
+static constexpr int kAiTabCount = (int)(sizeof(kAiTabs) / sizeof(kAiTabs[0]));
+
+static int aiTabIndex(const char* id) {
+    for (int i = 0; i < kAiTabCount; ++i)
+        if (std::strcmp(kAiTabs[i].id, id) == 0) return i;
+    return 0;
+}
+
+static int aiHiddenTabCount() {
+    int n = 0;
+    for (const AiTab& tab : kAiTabs)
+        if (!tab.basic) ++n;
+    return n;
+}
+
+static int s_aiTabSel = 0;  // index into kAiTabs; persists across opens
+
+static void drawAiPage(AppState& st) {
+    const float sc = ui::uiScale;
+    const bool adv = st.settings.showAdvanced;
+    // visIdx maps a strip position back to its kAiTabs index.
+    const char* labels[kAiTabCount];
+    int visIdx[kAiTabCount];
+    int visN = 0;
+    for (int i = 0; i < kAiTabCount; ++i) {
+        if (!adv && !kAiTabs[i].basic) continue;
+        labels[visN] = kAiTabs[i].label;
+        visIdx[visN++] = i;
+    }
+    // Turning Advanced off while parked on an Advanced-only tab would leave a body with no tab.
+    if (!adv && !kAiTabs[s_aiTabSel].basic) s_aiTabSel = 0;
+
+    settingsTabBodyBegin("##tab_ai", /*scroll=*/false, /*padX=*/0.0f, /*padY=*/0.0f);
+    // The strip wraps onto more rows when the dialog is narrow, so this child sizes to it.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(ui::metrics::px(10.0f), ui::metrics::px(6.0f)));
+    ImGui::BeginChild("##ai_tabs", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    int sel = 0;
+    for (int k = 0; k < visN; ++k)
+        if (visIdx[k] == s_aiTabSel) sel = k;
+    if (ui::kit::formTabs("ai_tabs", labels, nullptr, visN, &sel, nullptr, /*fitLabels=*/true))
+        s_aiTabSel = visIdx[sel];
+    const AiTab& tab = kAiTabs[s_aiTabSel];
+    ImGui::Dummy(ImVec2(0.0f, ui::metrics::px(2.0f)));
+    dimText(tab.lead);
+    if (!adv) {
+        // Basic mode lists fewer tabs: say which ones appear with Advanced, so none looks lost.
+        std::string hidden;
+        int k = 0;
+        const int total = aiHiddenTabCount();
+        for (const AiTab& t : kAiTabs) {
+            if (t.basic) continue;
+            if (k > 0) hidden += (k == total - 1) ? " and " : ", ";
+            hidden += t.label;
+            ++k;
+        }
+        dimText((hidden + (total == 1 ? " appears" : " appear") +
+                 " when Advanced is turned on.").c_str());
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();  // WindowPadding
+
+    static int s_drawnTab = -1;
+    const std::string body = std::string("##tab_") + tab.id;
+    settingsTabBodyBegin(body.c_str());
+    // A new tab starts at the top; a jump to a section then scrolls to it (aiAnchor).
+    if (s_drawnTab != s_aiTabSel) {
+        ImGui::SetScrollY(0.0f);
+        s_drawnTab = s_aiTabSel;
+    }
+    if (tab.draw) tab.draw(st, sc);
+    if (adv && tab.ompRows) drawOmpTabRows(st, tab.id);
+    if (adv && tab.drawEditors) tab.drawEditors(st, sc);
+    settingsTabBodyEnd();
+    if (s_aiAnchor && --s_aiAnchorFrames <= 0) s_aiAnchor = nullptr;
+    settingsTabBodyEnd();
+}
+
+// ---- Settings window: pages ------------------------------------------------------------------
+// The window draws its navigation (rail, or a segmented row on phone widths) from this table and
+// dispatches the selected page, so a new category (Drawings, Units, Simulation, Modeling, ...) is
+// one row here plus its draw function. The row index is the SettingsRoute page number: keep the
+// order (openSettingsTab and CHUDWARE_SHOT_SETTINGS_TAB address pages by it) and append new rows.
+struct SettingsNavNote {  // small annotation on a rail row
+    const char* meta;
+    const char* tooltip;
+};
+struct SettingsCategory {
+    const char* id;          // rail row id
+    const char* label;       // rail label and phone-width tooltip
+    const char* shortLabel;  // phone-width segmented label
+    const char* icon;        // icon atlas name
+    void      (*draw)(AppState& st);           // page body; owns its scroll body
+    void      (*commitPending)(AppState& st);  // optional: commit typed fields when the page is left
+    SettingsNavNote (*navNote)();              // optional: annotation while something needs attention
+};
+
+static SettingsNavNote aiNavNote() {
+    if (!s_omp.oauth.active) return {nullptr, nullptr};
+    return {"sign-in", "A provider sign-in is in progress"};
+}
+
+static const SettingsCategory kSettingsCategories[] = {
+    {"nav_appearance", "Appearance", "Look",    "ws_appearance", drawAppearancePage, nullptr,           nullptr},
+    {"nav_general",    "General",    "General", "settings",      drawGeneralPage,    commitGeneralPage, nullptr},
+    {"nav_ai",         "AI",         "AI",      "ai_panel",      drawAiPage,         nullptr,           aiNavNote},
+};
+static constexpr int kSettingsCategoryCount =
+    (int)(sizeof(kSettingsCategories) / sizeof(kSettingsCategories[0]));
+static_assert(SettingsAppearance == 0 && SettingsGeneral == 1 && SettingsAI == 2 &&
+              SettingsAI < kSettingsCategoryCount,
+              "SettingsRoute page numbers index kSettingsCategories");
+
+static int s_settingsPage = 0;  // index into kSettingsCategories; persists across opens
+
+// A SettingsRoute that lands inside the AI page: its tab, and the section to scroll to.
+struct AiRoute {
+    int         route;
+    const char* tab;       // kAiTabs id
+    const char* section;   // aiAnchor() token, or nullptr for the top of the tab
+    bool        advanced;  // the target needs Advanced although its tab does not
+};
+static const AiRoute kAiRoutes[] = {
+    {SettingsProviders,        "providers", nullptr,           false},
+    // Retired pages (4..7): kept for callers that still send them.
+    {4,                        "developer", "benchmarks",      true},
+    {5,                        "models",    "role_prompts",    true},
+    {6,                        "context",   "rules",           true},
+    {7,                        "models",    "vision_routing",  true},
+    {SettingsAiModels,         "models",    nullptr,           false},
+    {SettingsAiBehavior,       "behavior",  nullptr,           false},
+    {SettingsAiContext,        "context",   nullptr,           false},
+    {SettingsAiMemory,         "memory",    nullptr,           false},
+    {SettingsAiTools,          "tools",     nullptr,           false},
+    {SettingsAiCoding,         "coding",    nullptr,           false},
+    {SettingsAiAgents,         "agents",    nullptr,           false},
+    {SettingsAiDeveloper,      "developer", nullptr,           false},
+    {SettingsAiRolePrompts,    "models",    "role_prompts",    true},
+    {SettingsAiVisionRouting,  "models",    "vision_routing",  true},
+    {SettingsAiRunPreferences, "behavior",  "run_preferences", true},
+    {SettingsAiHarnessOrg,     "behavior",  "harness_org",     true},
+    {SettingsAiRules,          "context",   "rules",           true},
+    {SettingsAiAutoLearn,      "memory",    "autolearn",       true},
+    {SettingsAiSkills,         "agents",    "skills",          false},
+    {SettingsAiBenchmarks,     "developer", "benchmarks",      false},
+    {SettingsAiDevPreview,     "developer", "dev_preview",     false},
+    {SettingsAiMaintenance,    "developer", "maintenance",     false},
+};
+
+// Opens `route` (a SettingsRoute value): selects the page, and for the AI page its tab and the
+// section to scroll to. Unknown values are ignored.
+static void openSettingsRoute(AppState& st, int route) {
+    if (route >= SettingsAppearance && route <= SettingsAI) {
+        s_settingsPage = route;
+        return;
+    }
+    for (const AiRoute& r : kAiRoutes) {
+        if (r.route != route) continue;
+        const bool adv = st.settings.showAdvanced;
+        // Runtime repair lives on the Developer tab; Basic mode has no such tab, so it sits on
+        // Behavior there (drawAiBehaviorTab).
+        const int tab = aiTabIndex(route == SettingsAiMaintenance && !adv ? "behavior" : r.tab);
+        s_settingsPage = SettingsAI;
+        s_aiTabSel = tab;
+        s_aiAnchor = r.section;
+        s_aiAnchorFrames = kAiAnchorFrames;
+        // Reachability guarantee: a jump may target something Basic mode hides — Settings
+        // search indexes every entry, and the composer's /rule jumps straight at Rules. Rather
+        // than dropping the user on a tab that is not in the strip, reveal Advanced and persist
+        // it. Hiding a control can therefore never hide a capability: every programmatic route
+        // into one turns disclosure on.
+        if (!adv && (r.advanced || !kAiTabs[tab].basic)) {
+            st.settings.showAdvanced = true;
+            saveSettings(st.settings);
+        }
+        return;
+    }
+}
 
 namespace ui {
 
@@ -6684,6 +9334,12 @@ namespace ui {
 // Forward to it. (:: is required: unqualified here would resolve to this wrapper.)
 bool drawHarnessSessionKnobs(AppState& st, float sc) {
     return ::drawHarnessSessionKnobs(st, sc);
+}
+
+// Subagent tool-call budget and max nesting (Settings → AI → Agents). The AI workspace Options
+// view shows them in Advanced mode, beside the session knobs.
+void drawSubagentLimitKnobs(float sc) {
+    ::drawSubagentLimitKnobs(sc);
 }
 
 void flushSettingsModalEdits(AppState& st) {
@@ -6763,64 +9419,10 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         s_settingsEnabledKeyboardNav = true;
     }
-    // Workspace-folder edit buffer (General tab), reseeded from Settings on every open.
-    static std::vector<char> s_wsBuf(512, 0);
-    // Box.com mirror edit buffers (General tab), also reseeded on every open so Cancel-less
-    // immediate persistence elsewhere can never leave stale secrets in the controls.
-    static std::vector<char> s_boxFolderBuf(256, 0);
-    static std::vector<char> s_boxDeveloperTokenBuf(1024, 0);
-    static std::vector<char> s_boxClientIdBuf(512, 0);
-    static std::vector<char> s_boxClientSecretBuf(1024, 0);
-    static int s_boxAuthMethod = 0;
-    // General-page text fields autosave when their edit ends (Enter / focus lost), when the page
-    // changes, or when the modal closes. They count as dirty only after the user typed in them,
-    // so a stale buffer can never overwrite a workspace folder changed elsewhere (opening a project).
-    static bool s_wsDirty = false;
-    static bool s_boxDirty = false;
-    auto commitWorkspaceDir = [&]() {
-        s_wsDirty = false;
-        std::string chosen = s_wsBuf.data();
-#ifdef __EMSCRIPTEN__
-        // Never persist the literal '/workspace' stub — resolve the real root.
-        if (chosen == "/workspace") chosen.clear();
-#endif
-        settings.workspaceDir = chosen;
-        st.workspaceDir = chosen;  // empty: ensureWorkspaceDir re-resolves the default root
-        saveSettings(settings);
-        st.addLog("[ok] workspace folder set: " +
-                  (chosen.empty() ? std::string("(default)") : chosen));
-    };
-    auto commitBoxSettings = [&](bool refreshStatus) {
-        s_boxDirty = false;
-        settings.boxFolderId =
-            s_boxFolderBuf[0] ? std::string(s_boxFolderBuf.data()) : std::string("0");
-        settings.boxAuthMethod = s_boxAuthMethod == 1 ? "oauth" : "developer_token";
-        settings.boxDeveloperToken = s_boxDeveloperTokenBuf.data();
-        settings.boxClientId = s_boxClientIdBuf.data();
-        settings.boxClientSecret = s_boxClientSecretBuf.data();
-        saveSettings(settings);
-        if (refreshStatus) {
-            s_boxMirrorUi.actionStatus = "Box settings saved";
-            requestBoxStatus(st);
-        }
-    };
     if (opening) {
         openOmpProviderModal();
-        std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
-        std::strncpy(s_wsBuf.data(), settings.workspaceDir.c_str(), s_wsBuf.size() - 1);
-        auto seedBoxBuffer = [](std::vector<char>& dst, const std::string& src) {
-            std::fill(dst.begin(), dst.end(), 0);
-            std::strncpy(dst.data(), src.c_str(), dst.size() - 1);
-        };
-        seedBoxBuffer(s_boxFolderBuf, settings.boxFolderId);
-        seedBoxBuffer(s_boxDeveloperTokenBuf, settings.boxDeveloperToken);
-        seedBoxBuffer(s_boxClientIdBuf, settings.boxClientId);
-        seedBoxBuffer(s_boxClientSecretBuf, settings.boxClientSecret);
-        s_boxAuthMethod = settings.boxAuthMethod == "oauth" ? 1 : 0;
-        s_wsDirty = false;
-        s_boxDirty = false;
-        s_boxMirrorUi.actionStatus.clear();
-        requestBoxStatus(st);
+        seedGeneralPage(st);
+        resetOmpConfig();
         // Make sure the glass engine reflects the persisted config before the Appearance
         // preview draws (idempotent — app startup wiring may already have pushed it).
         ui::setGlassConfig(settings.glassCfg);
@@ -6907,104 +9509,34 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::PopStyleColor(4);  // Border / TitleBg / TitleBgActive / TitleBgCollapsed
         // All placement is resolved above, before Begin paints the window decorations.
         if (settingsBegun) {
-        // Keep a role deep link until its asynchronous catalog has arrived.
-        bool jumpToPrompts = false;
-        if (!st.pendingPromptRole.empty()) {
-            s_pendingPromptSelection = std::move(st.pendingPromptRole);
-            st.pendingPromptRole.clear();
-            selectPendingPrompt();
-            if (!s_promptsLoaded && st.workerStarted) loadPrompts(st);
-            jumpToPrompts = true;
-        }
-        // Which AI sub-tab a jump should land on (-1 = leave the last one selected). Declared
-        // out here because the legacy-index remap below runs BEFORE the tab bar is built.
-        static int s_aiSubJump = -1;
-        // Which AI sub-section the left nav rail has selected (persists across opens).
-        static int s_aiSubSel = 0;
-        // openSettingsTab: jump to a specific tab requested by the command search widget.
+        // openSettingsTab: a SettingsRoute from the command search, a deep link or a scenario.
         int jumpToTab = -1;
         if (st.openSettingsTab >= 0) {
             jumpToTab          = st.openSettingsTab;
             st.openSettingsTab = -1;
         }
-        // Tabs are 0=Appearance 1=General 2=AI 3=Providers. Every retired tab index folds onto
-        // AI and selects the sub-tab that absorbed it: Benchmarks(4), Prompts(5), Agent(6),
-        // Experimental(7 — its two knobs now live on Roles and Harness). This MUST run before
-        // the tab bar: when it sat after, a legacy index selected nothing on the frame it
-        // arrived and the jump was silently dropped.
-        const bool explicitAiSection =
-            jumpToTab >= SettingsAiHarness && jumpToTab <= SettingsAiDevPreview;
-        if (explicitAiSection) {
-            s_aiSubJump = jumpToTab - SettingsAiHarness;
-            jumpToTab = SettingsAI;
-        } else if (jumpToTab >= 4 && jumpToTab <= 7) {
-            if (jumpToTab == 4) s_aiSubJump = 5;       // Benchmarks
-            else if (jumpToTab == 5) s_aiSubJump = 2;  // Prompts
-            else if (jumpToTab == 6) s_aiSubJump = 4;  // Rules (/rule in the composer)
-            else if (jumpToTab == 7) s_aiSubJump = 1;  // Experimental -> Roles
-            jumpToTab = SettingsAI;
+        // A role deep link wins, and is kept until its asynchronous catalog has arrived.
+        if (!st.pendingPromptRole.empty()) {
+            s_pendingPromptSelection = std::move(st.pendingPromptRole);
+            st.pendingPromptRole.clear();
+            selectPendingPrompt();
+            if (!s_promptsLoaded && st.workerStarted) loadPrompts(st);
+            jumpToTab = SettingsAiRolePrompts;
         }
-        if (jumpToPrompts) {
-            s_aiSubJump = 2;
-            jumpToTab = 2;
-        }
-        // A resolved jump drives the rail selection directly, so it lands the same frame.
-        //
-        // Reachability guarantee: a jump may target a section Basic mode hides — Settings
-        // search indexes every entry, and the composer's /rule jumps straight at Rules,
-        // which is an advanced section. Rather than dropping the user on a page that is not
-        // in the rail, reveal advanced and persist it. This is why hiding a section can
-        // never hide a capability: every programmatic route into one turns disclosure on.
-        if (s_aiSubJump >= 0) {
-            s_aiSubSel = s_aiSubJump;
-            if (!st.settings.showAdvanced &&
-                (explicitAiSection || (s_aiSubJump < 8 && kAiSubAdvanced[s_aiSubJump]))) {
-                st.settings.showAdvanced = true;
-                saveSettings(st.settings);
-            }
-        }
-        // wantSettings (screenshot/automation shot) opens the AI tab.
+        // wantSettings (screenshot/automation shot) opens the AI page.
         static bool s_wantSettingsTabDone = false;
         if (st.wantSettings && !s_wantSettingsTabDone) {
             s_wantSettingsTabDone = true;
-            if (jumpToTab < 0) jumpToTab = 2;
+            if (jumpToTab < 0) jumpToTab = SettingsAI;
         }
-
-        // Pages: 0=Appearance 1=General 2=AI 3=Providers (indices are the openSettingsTab /
-        // CHUDWARE_SHOT_SETTINGS_TAB contract — never reorder). The selection persists across
-        // opens; a resolved jump drives it directly so it lands the same frame.
-        static int s_settingsPage = 0;
-        if (jumpToTab >= 0 && jumpToTab <= 3) s_settingsPage = jumpToTab;
-        // Leaving General commits its typed fields (their deactivation may not have been drawn).
-        if (s_settingsPage != SettingsGeneral) {
-            if (s_wsDirty) commitWorkspaceDir();
-            if (s_boxDirty) commitBoxSettings(/*refreshStatus=*/false);
-        }
-
-        // AI sub-section visibility, resolved BEFORE the nav rail: on wide dialogs the AI
-        // sections are listed in the rail under "AI" (one navigation column, not a rail
-        // inside a rail), and the AI page body below dispatches on the same stable indices.
-        static const char* kAiSubLabels[8] = {
-            "Harness", "Roles", "Prompts", "Skills",
-            "Rules", "Benchmarks", "Tools", "Dev Preview"};
-        // Basic mode paints only the everyday sections (kAiSubAdvanced, file scope). visIdx
-        // maps a rail/combo row back to its REAL section index.
-        const char* visLabels[8];
-        int visIdx[8];
-        int visN = 0;
-        for (int i = 0; i < 8; ++i) {
-            if (!st.settings.showAdvanced && kAiSubAdvanced[i]) continue;
-            visLabels[visN] = kAiSubLabels[i];
-            visIdx[visN] = i;
-            ++visN;
-        }
-        // Turning Advanced off while parked on an advanced section would otherwise render a
-        // body with no corresponding nav row. Fall back to Harness.
-        if (!st.settings.showAdvanced && s_aiSubSel >= 0 && s_aiSubSel < 8 &&
-            kAiSubAdvanced[s_aiSubSel])
-            s_aiSubSel = 0;
-        // With one visible section there is nothing to navigate (the Basic-mode shape).
-        const bool aiNav = visN > 1;
+        // A resolved jump drives the page and tab selection directly, so it lands the same
+        // frame. It MUST run before the navigation is built: after it, a jump selected nothing
+        // on the frame it arrived and was silently dropped.
+        if (jumpToTab >= 0) openSettingsRoute(st, jumpToTab);
+        // Leaving a page commits its typed fields (their deactivation may not have been drawn).
+        for (int i = 0; i < kSettingsCategoryCount; ++i)
+            if (i != s_settingsPage && kSettingsCategories[i].commitPending)
+                kSettingsCategories[i].commitPending(st);
 
         // Fixed navigation + scrolling page body. The outer container is non-scrolling and
         // TRANSPARENT — a glass frame around the whole region read as a nested border box; the
@@ -7014,14 +9546,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                           ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         // Phone-width dialogs cannot afford a sidebar: the pages become one segmented row with
-        // short labels instead, and the AI page keeps its own section picker.
+        // short labels instead, and the AI page's tab strip wraps onto more rows.
         const bool compactTabs = ImGui::GetContentRegionAvail().x < 520.0f * sc;
         const bool navRail = !compactTabs;
-        static const char* kPageLabel[4] = {"Appearance", "General", "AI", "Providers"};
-        static const char* kPageShort[4] = {"Look", "General", "AI", "Keys"};
-        static const char* kPageIcon[4]  = {"ws_appearance", "settings", "ai_panel", "eng_firm"};
-        static const char* kPageId[4]    = {"nav_appearance", "nav_general", "nav_ai",
-                                            "nav_providers"};
         const char* kAdvancedTip =
             "Advanced settings\n"
             "Off: only the controls most users need.\n"
@@ -7031,7 +9558,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             "turns this on for you.";
         // Basic / Advanced disclosure. Lives in the navigation (visible from every page) so it
         // reads as a property of the whole dialog rather than of one page. Why it exists: ~130
-        // indexed entries plus an 8-section AI hub with no triage — Basic hides power controls
+        // indexed entries plus OMP's own settings, with no triage — Basic hides power controls
         // and disables nothing.
         auto advancedToggle = [&]() {
             bool adv = st.settings.showAdvanced;
@@ -7054,29 +9581,19 @@ void drawSettingsModal(AppState& st, bool busy) {
             // Rounded kit rows: frosted selection pill, animated hover wash, icon in accent
             // while selected — the same row every selected list in the app uses.
             ui::kit::pushDensity(ui::kit::Density::Compact);
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < kSettingsCategoryCount; ++i) {
+                const SettingsCategory& cat = kSettingsCategories[i];
                 ui::kit::RowStyle rs;
-                rs.icon     = kPageIcon[i];
+                rs.icon     = cat.icon;
                 rs.iconTone = (s_settingsPage == i) ? ui::kit::Tone::Accent
                                                     : ui::kit::Tone::Neutral;
                 rs.selected = (s_settingsPage == i);
-                if (i == 3 && s_omp.oauth.active) {
-                    rs.meta    = "sign-in";
-                    rs.tooltip = "A provider sign-in is in progress";
+                if (cat.navNote) {
+                    const SettingsNavNote note = cat.navNote();
+                    rs.meta    = note.meta;
+                    rs.tooltip = note.tooltip;
                 }
-                if (ui::kit::row(kPageId[i], kPageLabel[i], rs)) s_settingsPage = i;
-                // AI sections nest under their page while it is open.
-                if (i == 2 && s_settingsPage == 2 && aiNav) {
-                    ImGui::Indent(ui::metrics::px(22.0f));
-                    for (int k = 0; k < visN; ++k) {
-                        ImGui::PushID(visIdx[k]);
-                        ui::kit::RowStyle sr;
-                        sr.selected = (visIdx[k] == s_aiSubSel);
-                        if (ui::kit::row("nav_ai_sub", visLabels[k], sr)) s_aiSubSel = visIdx[k];
-                        ImGui::PopID();
-                    }
-                    ImGui::Unindent(ui::metrics::px(22.0f));
-                }
+                if (ui::kit::row(cat.id, cat.label, rs)) s_settingsPage = i;
             }
             ui::kit::popDensity();
             // Advanced switch pinned to the rail's foot (or right after the rows when the rail
@@ -7088,9 +9605,9 @@ void drawSettingsModal(AppState& st, bool busy) {
             const float footY = ImGui::GetWindowHeight() - ImGui::GetStyle().WindowPadding.y -
                                 footH;
             if (footY > ImGui::GetCursorPosY()) ImGui::SetCursorPosY(footY);
-            if (!st.settings.showAdvanced && visN < 8) {
+            if (!st.settings.showAdvanced) {
                 char more[32];
-                std::snprintf(more, sizeof(more), "+%d in Advanced", 8 - visN);
+                std::snprintf(more, sizeof(more), "+%d in Advanced", aiHiddenTabCount());
                 dimText(more);
             }
             advancedToggle();
@@ -7107,2180 +9624,21 @@ void drawSettingsModal(AppState& st, bool busy) {
             ImGui::SameLine(0, ui::metrics::px(8.0f));
         } else {
             ImGui::Indent(ui::metrics::px(10.0f));
-            ui::kit::segmented("##set_pages", kPageShort, 4, &s_settingsPage,
+            const char* pageShort[kSettingsCategoryCount];
+            const char* pageLabel[kSettingsCategoryCount];
+            for (int i = 0; i < kSettingsCategoryCount; ++i) {
+                pageShort[i] = kSettingsCategories[i].shortLabel;
+                pageLabel[i] = kSettingsCategories[i].label;
+            }
+            ui::kit::segmented("##set_pages", pageShort, kSettingsCategoryCount, &s_settingsPage,
                                ImGui::GetContentRegionAvail().x - ui::metrics::px(10.0f),
-                               kPageLabel);
+                               pageLabel);
             advancedToggle();
             ImGui::Unindent(ui::metrics::px(10.0f));
         }
-        bool providerTabDrawn = false;
-        {
-            // ---- Appearance page (FIRST): theme + colored liquid glass (v2.1) ----
-            // The canonical theme control lives here (moved from General; the View-menu item
-            // stays a synced shortcut). The glass knobs edit Settings::glassCfg per group and
-            // live-apply via ui::setGlassConfig + persist via saveSettings on every change —
-            // so the persisted "appearance.glass" block is no longer a dead round-trip.
-            if (s_settingsPage == 0) {
-                settingsTabBodyBegin("##tab_appearance");
-                settingsGlassSectionBegin("##app_theme", "Theme", 0.0f, /*first=*/true);
-                bool isLight = (ui::activeTheme == ui::Theme::Light);
-                if (ui::kit::checkbox("app_light", "Light theme", &isLight))
-                    applyThemeNow(st, isLight);
-                dimText("Switches the whole UI between the dark and light palettes. "
-                        "Saved immediately.");
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##app_accent", "Accent colors");
-                dimText("Primary is the color a modeling operation's result is drawn in \xe2\x80\x94 "
-                        "the same role the 3D ribbon icons bake their new geometry with. Secondary "
-                        "is the direction cue: arrows, axes, annotation. The ribbon retints as you "
-                        "drag. Saved immediately.");
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                {
-                    bool accentChanged = false;
-                    // Same aligned label column as the glass rows below.
-                    const float accLabelW = 150.0f * sc;
-                    auto accentRow = [&](const char* label) {
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::TextUnformatted(label);
-                        ImGui::SameLine(accLabelW);
-                    };
-                    accentRow("Primary");
-                    if (ImGui::ColorEdit3("##accentprimary", settings.accentPrimary,
-                                          ImGuiColorEditFlags_NoInputs))
-                        accentChanged = true;
-                    ImGui::SameLine();
-                    dimText("(extrudes, bosses \xe2\x80\x94 what the operation produced)");
-                    accentRow("Secondary");
-                    if (ImGui::ColorEdit3("##accentsecondary", settings.accentSecondary,
-                                          ImGuiColorEditFlags_NoInputs))
-                        accentChanged = true;
-                    ImGui::SameLine();
-                    dimText("(direction arrows, axes, dimensions)");
-                    ImGui::Dummy(ImVec2(0, 4 * sc));
-                    // "##accent" only disambiguates the ImGui id: the Liquid Glass section below
-                    // has a button with the identical visible label, and two same-label buttons in
-                    // one window share an id (the second one becomes unclickable).
-                    if (ui::kit::secondaryButton("Reset to defaults##accent", true, nullptr, ImVec2(150.0f * sc, 28.0f * sc))) {
-                        std::memcpy(settings.accentPrimary, ui::kDefaultAccentPrimary,
-                                    sizeof(settings.accentPrimary));
-                        std::memcpy(settings.accentSecondary, ui::kDefaultAccentSecondary,
-                                    sizeof(settings.accentSecondary));
-                        accentChanged = true;
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Restore the shipped orange / blue pair");
-                    if (accentChanged) {
-                        // Live-apply then persist, matching the glass pair below: setAccentColors
-                        // rewrites the palette, the accent-derived ImGuiCol slots and the baked
-                        // icon atlas in one call, so the whole UI tracks the drag.
-                        ui::setAccentColors(settings.accentPrimary, settings.accentSecondary);
-                        saveSettings(settings);
-                    }
-                }
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##app_brand", "Brand mark");
-                dimText("The copilot logo is a live 3D projection of a rotating tesseract "
-                        "(a 4-cube) — this picks how it turns. Saved immediately.");
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                {
-                    // Each card is a hit box with the figure painted over it, so the preview is
-                    // the SAME renderer the header uses — what you see here is what ships.
-                    ImDrawList* bdl = ImGui::GetWindowDrawList();
-                    const float capPad = 8.0f * sc;
-                    const float lineH  = ImGui::GetTextLineHeight();
-                    // Width comes from the WIDEST style name, not a round literal: at 96dp the
-                    // captions ran past the card and had to be clipped mid-word.
-                    float labelW = 0.0f;
-                    for (int i = 0; i < (int)ui::TesseractAnim::Count; ++i)
-                        labelW = std::max(labelW,
-                            ImGui::CalcTextSize(ui::tesseractAnimName((ui::TesseractAnim)i)).x);
-                    const float cardW = std::max(96.0f * sc, labelW + capPad * 2.0f);
-                    const float cardH = 96.0f * sc;
-                    const float capOff = cardH - lineH - 7.0f * sc;   // caption baseline, card-relative
-                    const float figSz  = std::min(cardW, capOff) - 10.0f * sc;
-                    const double now   = ImGui::GetTime();
-                    for (int i = 0; i < (int)ui::TesseractAnim::Count; ++i) {
-                        if (i) ImGui::SameLine(0.0f, 8.0f * sc);
-                        char cid[24];
-                        std::snprintf(cid, sizeof(cid), "##brandanim%d", i);
-                        const ImVec2 mn = ImGui::GetCursorScreenPos();
-                        ImGui::InvisibleButton(cid, ImVec2(cardW, cardH));
-                        if (ImGui::IsItemVisible()) ui::anim::requestFramesAt(30.0f);
-                        const bool sel = (settings.brandAnim == i);
-                        if (ImGui::IsItemClicked()) {
-                            settings.brandAnim = i;
-                            saveSettings(settings);   // matches the theme/glass immediate-save path
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("%s",
-                                ui::tesseractAnimBlurb((ui::TesseractAnim)i));
-                        const ImVec2 mx(mn.x + cardW, mn.y + cardH);
-                        const float* bg = sel ? ui::palette.accentSoft : ui::palette.button;
-                        bdl->AddRectFilled(mn, mx, ui::Palette::toU32(bg),
-                                           ui::metrics::rounding(8.0f));
-                        if (sel)
-                            bdl->AddRect(mn, mx, ui::Palette::toU32(ui::palette.accent),
-                                         ui::metrics::rounding(8.0f), 0,
-                                         ui::metrics::stroke(1.5f));
-                        // Figure sits above the caption: centre it in the space left over the
-                        // one text line so the mark never overlaps its own label.
-                        const float capY = mn.y + capOff;
-                        ui::drawTesseract(bdl,
-                                          ImVec2((mn.x + mx.x) * 0.5f, (mn.y + capY) * 0.5f),
-                                          figSz, now, (ui::TesseractAnim)i,
-                                          ui::Palette::toU32(ui::palette.text));
-                        const char* nm = ui::tesseractAnimName((ui::TesseractAnim)i);
-                        const ImVec2 ts = ImGui::CalcTextSize(nm);
-                        bdl->AddText(ImVec2((mn.x + mx.x) * 0.5f - ts.x * 0.5f, capY),
-                                     ui::Palette::toU32(sel ? ui::palette.text
-                                                            : ui::palette.textDim),
-                                     nm);
-                    }
-                }
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##app_glass", "Liquid Glass");
-                dimText("Per-surface styling for the glass panels floating over the viewport. "
-                        "Dynamic color auto-tints each panel for max contrast against the live "
-                        "model; pin a tint below to override it. Saved immediately.");
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-
-                // Group selector — segmented pills. Global is the inheritance base: the other
-                // groups fall back to it for any knob left at its default ("Reset" state).
-                static int s_glassGroup = 0;
-                static const char* kGroupLabel[(size_t)ui::GlassGroup::Count] = {
-                    "Global", "Feature Manager", "Copilot", "Viewport HUD"};
-                ui::kit::segmented("##glass_group", kGroupLabel, (int)ui::GlassGroup::Count,
-                                   &s_glassGroup);
-
-                const ui::GlassGroup grp = (ui::GlassGroup)s_glassGroup;
-                ui::GlassStyle& g = settings.glassCfg.group[(size_t)grp];
-                // Seed every widget from the group's EFFECTIVE (resolved) values so inherited
-                // knobs display what actually renders; an edit pins a concrete value.
-                const ui::GlassStyleResolved& res = ui::glassStyleResolved(grp);
-                bool glassChanged = false;
-
-                // Aligned label column (uiScale-correct).
-                const float labelW = 150.0f * sc;
-                const float fieldW = 230.0f * sc;
-                auto fieldRow = [&](const char* label) {
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted(label);
-                    ImGui::SameLine(labelW);
-                    ImGui::SetNextItemWidth(fieldW);
-                };
-
-                ImGui::Dummy(ImVec2(0, 6 * sc));
-                // Tint is hue+saturation only (brightness comes from the glass level/opacity),
-                // so edit it through an HSV swatch with the value channel pinned at 1.
-                fieldRow("Tint color");
-                {
-                    float rgb[3];
-                    ImGui::ColorConvertHSVtoRGB(res.tintHue / 360.0f, res.tintSat, 1.0f,
-                                                rgb[0], rgb[1], rgb[2]);
-                    if (ImGui::ColorEdit3("##glasstint", rgb, ImGuiColorEditFlags_NoInputs)) {
-                        float h, s2, v;
-                        ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, s2, v);
-                        g.tintHue = h * 360.0f;
-                        g.tintSat = s2;
-                        glassChanged = true;
-                    }
-                    ImGui::SameLine();
-                    dimText("(hue + saturation; strength below mixes it in)");
-                }
-                // Slider VALUES render beside the track (not centered inside it) — the teal grab
-                // sat right on top of the in-track text and obscured it (visual-review fix).
-                auto sliderValueText = [&](const char* txt) {
-                    ImGui::SameLine(0.0f, 8.0f * sc);
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted(txt);
-                };
-                fieldRow("Tint strength");
-                {
-                    float v = res.tintStrength;
-                    if (ImGui::SliderFloat("##glassstrength", &v, 0.0f, 1.0f, "")) {
-                        g.tintStrength = v;
-                        glassChanged = true;
-                    }
-                    char vb[32];
-                    std::snprintf(vb, sizeof(vb), "%.2f", v);
-                    sliderValueText(v <= 0.0f ? "off" : vb);
-                }
-                fieldRow("Glass level");
-                {
-                    static const char* kLevels[] = {"Automatic", "Ultra thin", "Thin",
-                                                    "Regular", "Thick"};
-                    int lv = res.glassLevel + 1;  // -1 (auto) .. 3 -> 0 .. 4
-                    if (lv < 0 || lv > 4) lv = 0;
-                    if (settingsPopupRowCombo("##glasslevel", &lv, kLevels, 5)) {
-                        g.glassLevel = lv - 1;
-                        glassChanged = true;
-                    }
-                }
-                fieldRow("Opacity");
-                {
-                    float v = res.opacityMul;
-                    if (ImGui::SliderFloat("##glassopacity", &v, 0.25f, 2.0f, "")) {
-                        g.opacityMul = v;
-                        glassChanged = true;
-                    }
-                    char vb[32];
-                    std::snprintf(vb, sizeof(vb), "%.2fx", v);
-                    sliderValueText(vb);
-                }
-                fieldRow("Corner rounding");
-                {
-                    float v = res.rounding < 0.0f ? 12.0f : res.rounding;
-                    if (ImGui::SliderFloat("##glassround", &v, 0.0f, 24.0f, "")) {
-                        g.rounding = v;
-                        glassChanged = true;
-                    }
-                    char vb[32];
-                    std::snprintf(vb, sizeof(vb), "%.0f dp", v);
-                    sliderValueText(res.rounding < 0.0f ? "automatic" : vb);
-                }
-                fieldRow("Text contrast boost");
-                {
-                    float v = res.textContrastBoost;
-                    if (ImGui::SliderFloat("##glassboost", &v, 0.0f, 1.0f, "")) {
-                        g.textContrastBoost = v;
-                        glassChanged = true;
-                    }
-                    char vb[32];
-                    std::snprintf(vb, sizeof(vb), "%.2f", v);
-                    sliderValueText(v <= 0.0f ? "off" : vb);
-                }
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                bool dyn = res.dynamicColor;
-                if (ui::kit::checkbox("glass_dynamic",
-                                      "Dynamic color \xe2\x80\x94 auto max-contrast vs model", &dyn)) {
-                    g.dynamicColor = dyn ? 1 : 0;
-                    glassChanged = true;
-                }
-                dimText("On (default): each panel samples the live viewport and steers its tint "
-                        "for legibility. Off: the pinned tint above is used as-is.");
-
-                ImGui::Dummy(ImVec2(0, 4 * sc));
-                if (ui::kit::secondaryButton("Reset to defaults", true, nullptr, ImVec2(150.0f * sc, 28.0f * sc))) {
-                    g = ui::GlassStyle();  // all sentinels -> inherit Global / built-in defaults
-                    glassChanged = true;
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Restore this group to inherited (Global / built-in) values");
-
-                if (glassChanged) {
-                    ui::setGlassConfig(settings.glassCfg);  // live-apply (idempotent)
-                    saveSettings(settings);                 // glass knobs persist immediately
-                }
-                settingsGlassSectionEnd();
-
-                // Live preview through the ACTUAL glass pipeline (adaptivePanel + glassPanel):
-                // over the viewport it frosts the real backdrop with this group's resolved style;
-                // over chrome it falls back to the layered glass. One stable id per group (the
-                // adaptive cache requires the same group every frame for a given id).
-                settingsGlassSectionBegin("##app_preview", "Preview");
-                {
-                    static const char* kPreviewId[(size_t)ui::GlassGroup::Count] = {
-                        "settings_glass_preview_global", "settings_glass_preview_fm",
-                        "settings_glass_preview_copilot", "settings_glass_preview_hud"};
-                    ImVec2 mn = ImGui::GetCursorScreenPos();
-                    float pw = std::max(220.0f * sc, ImGui::GetContentRegionAvail().x);
-                    float ph = 64.0f * sc;
-                    ImRect pr(mn, ImVec2(mn.x + pw, mn.y + ph));
-                    const ui::AdaptiveSurface& surf =
-                        ui::adaptivePanel(ui::panelId(kPreviewId[s_glassGroup]), pr, grp);
-                    ImDrawList* dl = ImGui::GetWindowDrawList();
-                    ui::glassPanel(dl, pr, ui::GlassLevel::Regular, 12.0f, surf);
-                    ImFont* pf = st.fonts.medium ? st.fonts.medium : ImGui::GetFont();
-                    float fs = ImGui::GetFontSize();
-                    ui::glassText(dl, pf, fs, ImVec2(mn.x + 14.0f * sc, mn.y + 12.0f * sc),
-                                  surf, kGroupLabel[s_glassGroup]);
-                    dl->AddText(pf, fs * 0.88f,
-                                ImVec2(mn.x + 14.0f * sc, mn.y + 12.0f * sc + fs * 1.35f),
-                                ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
-                                "Adaptive text over this group's glass");
-                    ImGui::Dummy(ImVec2(pw, ph));
-                }
-                settingsGlassSectionEnd();
-                settingsTabBodyEnd();
-            }
-
-            // ---- General page: Document (units) + System (engine readout, profiler) ----
-            if (s_settingsPage == 1) {
-                settingsTabBodyBegin("##tab_general");
-                settingsGlassSectionBegin("##gen_document", "Document");
-                static const char* kUnitHelp =
-                    "The unit system for dimension display and input. The model is always "
-                    "stored in canonical millimeters; this only changes how lengths are "
-                    "shown and how a bare typed number is read. Angles stay in degrees in "
-                    "both systems. You can also click the MMGS/IPS badge in the status bar "
-                    "to switch.";
-                static const char* kDisplayQualityHelp =
-                    "How finely curved geometry is tessellated for DISPLAY. Fine (default) "
-                    "keeps tubes, wheels and fillets smooth on large imported parts; Draft "
-                    "trades smoothness for triangles on very heavy models. Geometry, mass "
-                    "properties and exports are unaffected. Saved immediately and applied "
-                    "to every open document.";
-                const float docLabelW =
-                    ImMax(settingsLabelLeadWidth("Units", true),
-                          settingsLabelLeadWidth("Display quality", true));
-                settingsLabelLead("Units", kUnitHelp, docLabelW);
-                static const char* kUnitLabels[] = {"MMGS", "IPS"};
-                static const char* kUnitTips[] = {"Millimeter, gram, second",
-                                                  "Inch, pound, second"};
-                int unitSel = st.ips() ? 1 : 0;
-                if (ui::kit::segmented("##units", kUnitLabels, 2, &unitSel, 0.0f, kUnitTips)) {
-                    settings.units = (unitSel == 1) ? Units::IPS : Units::MMGS;
-                    // Saved immediately so the choice survives a Cancel (it is a display/document
-                    // preference, like theme — and the status-bar toggle persists the same way).
-                    saveSettings(settings);
-                    st.addLog(std::string("[units] set to ") + (st.ips() ? "IPS" : "MMGS"));
-                }
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                dimText(st.ips() ? "inch, pound, second" : "millimeter, gram, second");
-
-                // Display tessellation quality (contracts/doc_ops.md §7). Saved immediately like
-                // Units above, then pushed to every open part/assembly doc so the viewport
-                // re-meshes at the new deflections without a reopen.
-                settingsLabelLead("Display quality", kDisplayQualityHelp, docLabelW);
-                static const char* kDisplayQualityLabels[] = {"Draft", "Standard", "Fine"};
-                static const char* kDisplayQualityValues[] = {"draft", "standard", "fine"};
-                int dqSel = 2;
-                for (int i = 0; i < 3; ++i)
-                    if (settings.displayQuality == kDisplayQualityValues[i]) dqSel = i;
-                if (ui::kit::segmented("##display_quality", kDisplayQualityLabels, 3, &dqSel)) {
-                    settings.displayQuality = kDisplayQualityValues[dqSel];
-                    saveSettings(settings);
-                    // AppState::syncDisplayQuality() pushes it to every open doc next frame; the
-                    // same path restores the saved tier for docs opened after a restart.
-                    st.addLog(std::string("[display] quality set to ") + settings.displayQuality);
-                }
-                dimText("Display-only mesh smoothness; lengths display/parse in the chosen units "
-                        "everywhere. Both save immediately.");
-                settingsGlassSectionEnd();
-
-                // Configurations moved here from the left-pane strip (Graph took that slot).
-                // Both embedded bodies paint their own "Configurations (n)" heading, so the
-                // section gets only the section gap — a header here printed the title twice.
-                ui::kit::pushDensity(ui::kit::Density::Cozy);
-                ui::kit::gapSection();
-                ui::kit::popDensity();
-                if (st.configPanel) {
-                    st.configPanel->drawEmbedded(st);
-                } else {
-                    ui::drawConfigurationsBody(st);
-                }
-
-                // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
-                // users had to hand-edit config.json to re-root the File Explorer.
-                settingsGlassSectionBegin("##gen_workspace", "Workspace");
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted("Workspace folder");
-#ifdef __EMSCRIPTEN__
-                // Web: default is the server workspace abs root (fsBackend), not the
-                // literal "/workspace" stub from defaultWorkspaceDir().
-                {
-                    static std::string s_wsDefaultWeb;
-                    if (s_wsDefaultWeb.empty()) {
-                        s_wsDefaultWeb = chudware::fsBackend().defaultRoot();
-                        if (s_wsDefaultWeb.empty() || s_wsDefaultWeb == "/workspace")
-                            s_wsDefaultWeb = chudware::fsBackend().defaultRoot();
-                    }
-                    static const std::string s_wsHelpWeb =
-                        "The File Explorer's root folder on the server workspace. "
-                        "Leave empty to use the server default. Browse picks a "
-                        "subfolder under the workspace.";
-                    static const std::string s_wsHintWeb =
-                        s_wsDefaultWeb.empty() ? std::string("(server default)")
-                                               : ("(default: " + s_wsDefaultWeb + ")");
-                    helpMarker(s_wsHelpWeb.c_str());
-                    ImGui::SetNextItemWidth(-100.0f * sc);
-                    if (ImGui::InputTextWithHint("##wsdir", s_wsHintWeb.c_str(),
-                                                 s_wsBuf.data(), s_wsBuf.size()))
-                        s_wsDirty = true;
-                    if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir();
-                    ImGui::SameLine();
-                    if (ui::kit::secondaryButton("Browse\xe2\x80\xa6", true, nullptr, ImVec2(90.0f * sc, 0))) {
-                        std::string chosen = openFolderDialog();
-                        if (!chosen.empty() && chosen != "/workspace") {
-                            std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
-                            std::strncpy(s_wsBuf.data(), chosen.c_str(), s_wsBuf.size() - 1);
-                            commitWorkspaceDir();  // picking a folder is the commit
-                        }
-                    }
-                    dimText("Root of the File Explorer on the server workspace (saved automatically).");
-                }
-#else
-                // Truthful default label: defaultWorkspaceDir() applies the alias rule
-                // (existing Documents/Chudware wins, else Documents/Chudware).
-                static const std::string s_wsDefault = defaultWorkspaceDir();
-                static const std::string s_wsHelp =
-                    "The File Explorer's root folder and the default save location. "
-                    "Leave empty to use " + s_wsDefault + ". Saved automatically when you "
-                    "press Enter or leave the field.";
-                static const std::string s_wsHint = "(default: " + s_wsDefault + ")";
-                helpMarker(s_wsHelp.c_str());
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputTextWithHint("##wsdir", s_wsHint.c_str(),
-                                             s_wsBuf.data(), s_wsBuf.size()))
-                    s_wsDirty = true;
-                if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir();
-                dimText("Root of the File Explorer and default save location (saved automatically).");
-#endif
-                settingsGlassSectionEnd();
-
-                settingsGlassSectionBegin("##gen_box", "Box.com mirror");
-                if (ui::kit::checkbox("box_enabled", "Mirror saved projects to Box",
-                                      &settings.boxEnabled)) {
-                    saveSettings(settings);
-                    requestBoxStatus(st);
-                }
-                dimText("Saved project files are queued in the background; saves never wait for Box.");
-
-                const float boxLabelW = ImMax(settingsLabelLeadWidth("Developer token", false),
-                                              settingsLabelLeadWidth("Client secret", false));
-                settingsLabelLead("Folder ID", nullptr, boxLabelW);
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputTextWithHint("##box_folder_id", "Box folder id (0 = All Files)",
-                                             s_boxFolderBuf.data(), s_boxFolderBuf.size()))
-                    s_boxDirty = true;
-                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
-
-                settingsLabelLead("Auth method", nullptr, boxLabelW);
-                static const char* kBoxAuthLabels[] = {"Developer token", "OAuth"};
-                if (ui::kit::segmented("##box_auth_method", kBoxAuthLabels, 2, &s_boxAuthMethod))
-                    commitBoxSettings(true);  // the method gates "Connect Box account": apply at once
-
-                settingsLabelLead("Developer token", nullptr, boxLabelW);
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputTextWithHint("##box_developer_token", "Box developer token",
-                                             s_boxDeveloperTokenBuf.data(),
-                                             s_boxDeveloperTokenBuf.size(),
-                                             ImGuiInputTextFlags_Password))
-                    s_boxDirty = true;
-                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
-
-                settingsLabelLead("Client ID", nullptr, boxLabelW);
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputTextWithHint("##box_client_id", "Box OAuth client ID",
-                                             s_boxClientIdBuf.data(), s_boxClientIdBuf.size()))
-                    s_boxDirty = true;
-                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
-
-                settingsLabelLead("Client secret", nullptr, boxLabelW);
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputTextWithHint("##box_client_secret", "Box OAuth client secret",
-                                             s_boxClientSecretBuf.data(),
-                                             s_boxClientSecretBuf.size(),
-                                             ImGuiInputTextFlags_Password))
-                    s_boxDirty = true;
-                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
-
-
-                const bool oauthLoginDisabled =
-                    settings.boxAuthMethod != "oauth" ||
-                    s_boxMirrorUi.connectInFlight || !st.workerStarted;
-                ImGui::BeginDisabled(oauthLoginDisabled);
-                if (ui::kit::secondaryButton(s_boxMirrorUi.connectInFlight
-                                      ? "Connecting Box account\xe2\x80\xa6"
-                                      : "Connect Box account\xe2\x80\xa6"))
-                    beginBoxOAuthLogin(st);
-                ImGui::EndDisabled();
-                if (settings.boxAuthMethod != "oauth" &&
-                    ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Select the OAuth auth method first");
-
-                ImGui::SameLine();
-                const bool syncDisabled =
-                    s_boxMirrorUi.syncInFlight || !st.workerStarted || !settings.boxEnabled;
-                ImGui::BeginDisabled(syncDisabled);
-                if (ui::kit::secondaryButton(s_boxMirrorUi.syncInFlight ? "Syncing\xe2\x80\xa6" : "Sync now")) {
-                    const std::string projectRoot = st.plmProjectPath();
-                    if (projectRoot.empty())
-                        s_boxMirrorUi.actionStatus =
-                            "Box sync needs a current project or workspace folder";
-                    else
-                        beginBoxSync(st, projectRoot);
-                }
-                ImGui::EndDisabled();
-
-                std::string boxStatusLine = s_boxMirrorUi.accountStatus;
-                if (s_boxMirrorUi.statusInFlight) boxStatusLine = "Checking Box status\xe2\x80\xa6";
-                if (!s_boxMirrorUi.actionStatus.empty())
-                    boxStatusLine = s_boxMirrorUi.actionStatus + "  |  " + boxStatusLine;
-                dimText(boxStatusLine.c_str());
-                settingsGlassSectionEnd();
-
-                // Theme moved to the Appearance page (the canonical control); engine routing +
-                // profiler are status/launchers, folded under one System section (audit P2).
-                settingsGlassSectionBegin("##gen_system", "System");
-                // Routing is unconditional — the C++ core IS the engine
-                // (the CHUDWARE_CPP_* escape hatches were removed with the Python oracle).
-                if (core::cpp_core().available()) {
-                    ImGui::TextUnformatted("Active engine: C++ core (libchudware)");
-                    helpMarker("The in-process C++ core is the only modeling engine — documents, "
-                               "sketching, FEA/CFD, CAM, ECAD, firmware and sourcing all run on "
-                               "it. Services-side Python handles orchestration surfaces (agent "
-                               "runs, parts catalog, reverse engineering, vendor sign-in, missions).");
-                    dimText(("C++ core: libchudware loaded (ABI " +
-                             core::cpp_core().abiVersion() + ")").c_str());
-                    ImGui::BulletText("Modeling / documents / sketch: C++ core");
-                    ImGui::BulletText("Simulation (FEA + CFD) / CAM / ECAD / firmware: C++ core");
-                } else {
-                    ImGui::TextUnformatted("Active engine: UNAVAILABLE (libchudware not loaded)");
-                    // The path to name here is per-platform: the build tree carries the
-                    // host's suffix (build.sh's PLATFORM_SUFFIX) and the engine takes that
-                    // platform's shared-library extension. Naming the Linux pair on a Mac
-                    // sends the user looking for a file that cannot exist.
-#if defined(_WIN32)
-                    static constexpr const char* kBuiltEngine =
-                        "build/windows-occt/bin/libchudware.dll";
-#elif defined(__APPLE__) && defined(__aarch64__)
-                    static constexpr const char* kBuiltEngine =
-                        "core/build-occt-macos-arm64/bin/libchudware.dylib";
-#elif defined(__APPLE__)
-                    static constexpr const char* kBuiltEngine =
-                        "core/build-occt-macos-x86_64/bin/libchudware.dylib";
-#else
-                    static constexpr const char* kBuiltEngine =
-                        "core/build-occt-linux/bin/libchudware.so";
-#endif
-                    // Composed once, not per frame: this branch redraws every frame the
-                    // engine is missing.
-                    static const std::string kEngineHint =
-                        std::string("The C++ core (libchudware) is NOT loaded, and it is the only "
-                                    "engine (the Python oracle was removed). Set the "
-                                    "CHUDWARE_LIBCHUDWARE environment variable to the built "
-                                    "library (") + kBuiltEngine +
-                        ") or stage it next to the executable, then restart.";
-                    helpMarker(kEngineHint.c_str());
-                    dimText("C++ core: not loaded");
-                }
-
-                ImGui::Dummy(ImVec2(0, 8 * sc));
-                dimText("Sampling profiler \xe2\x80\x94 see where modeling time goes (extrude / "
-                        "fillet / boolean, into the kernel) as a live flame graph.");
-                if (ui::kit::secondaryButton("Open Profiler", true, nullptr, ImVec2(160.0f * sc, 30.0f * sc)))
-                    st.showProfilerWindow = true;
-                settingsGlassSectionEnd();
-                ImGui::Dummy(ImVec2(0, 6 * sc));
-                dimText(("All settings here are stored in " + configPath() + ".").c_str());
-                settingsTabBodyEnd();
-            }
-            // ---- AI page: unified hub (absorbed Benchmarks / Prompts / Agent / Experimental) ----
-            // s_aiSubJump is resolved above, before the navigation, so a jump lands on the right
-            // section the same frame.
-            if (s_settingsPage == 2) {
-                settingsTabBodyBegin("##tab_ai", /*scroll=*/false,
-                                     /*padX=*/0.0f, /*padY=*/0.0f);
-
-                // AI sub-navigation: wide dialogs list the sections in the settings rail under
-                // "AI" (above); phone-width dialogs have no rail, so a section picker leads the
-                // page. Only the SELECTED section's body runs each frame — Benchmarks' status
-                // polling relies on that.
-                if (aiNav && !navRail) {
-                    int visSel = 0;
-                    for (int k = 0; k < visN; ++k)
-                        if (visIdx[k] == s_aiSubSel) {
-                            visSel = k;
-                            break;
-                        }
-                    ImGui::SetNextItemWidth(-1);
-                    if (settingsPopupRowCombo("##ai_sub_pick", &visSel, visLabels, visN))
-                        s_aiSubSel = visIdx[visSel];
-                }
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                    ImVec2(10.0f * sc, 6.0f * sc));
-                ImGui::BeginChild("##ai_sub_body", ImVec2(0, 0),
-                                  ImGuiChildFlags_AlwaysUseWindowPadding,
-                                  ImGuiWindowFlags_NoScrollbar);
-                {
-                    // Selection changed: start the new section at the top.
-                    static int s_aiSubDrawnPrev = -1;
-                    if (s_aiSubDrawnPrev != s_aiSubSel) {
-                        ImGui::SetScrollY(0.0f);
-                        s_aiSubDrawnPrev = s_aiSubSel;
-                    }
-
-                    // Basic mode draws no rail (one visible section), so the "more exists"
-                    // cue has to live in the body or the tab silently looks like it lost
-                    // seven pages. Names them explicitly rather than just counting.
-                    if (!aiNav && !st.settings.showAdvanced) {
-                        dimText("Roles, Prompts, Skills, Rules, Benchmarks, Tools and Dev "
-                                "Preview appear when Advanced is turned on.");
-                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                    }
-
-                    // Harness is first: full quick-settings mirror + mode grid.
-                    // (Behavior was absorbed here so knobs aren't duplicated.)
-                    if (s_aiSubSel == 0) {
-                        settingsGlassSectionBegin("##ai_basic_models", "Models");
-                        drawModelRolesSection(st, sc);
-                        settingsGlassSectionEnd();
-                        // Session knobs lead (most-used); the mode grid sits at the bottom
-                        // of the page — it is a read-mostly orientation card.
-                        settingsGlassSectionBegin("##ai_harness_session", "Session knobs");
-                        dimText("Same knobs as Copilot -> Quick settings, plus modal-only "
-                                "options such as role adoption.");
-                        ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                        if (drawHarnessSessionKnobs(st, sc))
-                            saveSettings(st.settings);
-                        settingsGlassSectionEnd();
-
-                        settingsGlassSectionBegin("##ai_memory", "Memory & Learning");
-                        drawMemoryLearningSection(st, sc);
-                        settingsGlassSectionEnd();
-
-                        // Harness organization is a structural/diagnostic surface — the
-                        // shipped arrangement is correct for normal use.
-                        if (st.settings.showAdvanced) {
-                            settingsGlassSectionBegin("##ai_harness_org",
-                                                      "Harness organization");
-                            drawHarnessOrganizationSection(st, sc);
-                            settingsGlassSectionEnd();
-                        }
-                        // Basic mode hides the Tools page, whose only everyday control is
-                        // runtime repair. Re-home it here so a broken runtime is always
-                        // fixable; Advanced keeps it on Tools where it has always lived.
-                        if (!st.settings.showAdvanced) {
-                            ImGui::Dummy(ImVec2(0, 10.0f * sc));
-                            drawRuntimeMaintenanceSection(st, sc);
-                        }
-                    }
-
-
-
-                    if (s_aiSubSel == 1) {
-                        // Model pickers first (compact table).
-                        settingsGlassSectionBegin("##ai_model_roles", "Model roles");
-                        drawModelRolesSection(st, sc);
-                        settingsGlassSectionEnd();
-
-                        // Vision and spatial routing are advanced overrides; the shared model
-                        // roles above remain available in Basic.
-                        if (st.settings.showAdvanced) {
-                            settingsGlassSectionBegin("##ai_vision_routing",
-                                                      "Vision & spatial routing");
-                            if (drawVisionRoutingSection(st, sc)) saveSettings(st.settings);
-                            settingsGlassSectionEnd();
-                        }
-                    }
-
-                    if (s_aiSubSel == 2) {
-                        // Full-height role prompt editor for power users / dev refinement.
-                        const bool canFetch = st.workerStarted;
-                        if (!s_promptsLoaded && canFetch) loadPrompts(st);
-
-                        ImGui::AlignTextToFramePadding();
-                        ImGui::TextUnformatted("Role prompts");
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip(
-                                "Edit mission/YAML and native/core role prompts independently. "
-                                "Overrides save to the user data prompts directory.");
-                        ImGui::SameLine();
-                        if (!canFetch || s_promptsLoading) ImGui::BeginDisabled();
-                        if (ImGui::SmallButton("Refresh##prompts_refresh")) {
-                            s_promptsLoaded = false;
-                            loadPrompts(st);
-                        }
-                        if (!canFetch || s_promptsLoading) ImGui::EndDisabled();
-                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                            ImGui::SetTooltip(!canFetch
-                                ? "Start the worker to load role prompts"
-                                : "Prompt catalog is loading");
-                        if (!s_promptsError.empty()) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
-                            ImGui::TextWrapped("%s", s_promptsError.c_str());
-                            ImGui::PopStyleColor();
-                        } else if (!s_promptsLoaded) {
-                            ImGui::TextWrapped("%s", s_promptsLoading
-                                ? "Loading\xe2\x80\xa6"
-                                : "Worker not ready \xe2\x80\x94 start runtime to edit prompts.");
-                        } else {
-                            ImGui::SameLine();
-                            dimText((std::to_string(s_promptRecs.size()) + " roles").c_str());
-                        }
-
-                        // Auto-select first role once the catalog lands.
-                        if (s_promptsLoaded && !s_promptRecs.empty() &&
-                            (s_selectedRole < 0 ||
-                             (s_selectedRole > (int)s_promptRecs.size()))) {
-                            s_selectedRole = 0;
-                        }
-
-                        const int sysIdx = (int)s_promptRecs.size();
-                        const bool compactPrompts =
-                            ImGui::GetContentRegionAvail().x < ui::metrics::px(450.0f);
-                        if (compactPrompts) {
-                            const char* preview = s_selectedRole < sysIdx && s_selectedRole >= 0
-                                ? s_promptRecs[s_selectedRole].role.c_str() : "system (override)";
-                            float widest = ImGui::CalcTextSize("system (override)").x;
-                            for (const auto& pr : s_promptRecs)
-                                widest = ImMax(widest, ImGui::CalcTextSize(pr.role.c_str()).x);
-                            ImGui::SetNextItemWidth(-1);
-                            if (settingsBeginPopupRowCombo("##prompt_role_pick", preview, widest)) {
-                                for (int i = 0; i < sysIdx; ++i) {
-                                    ImGui::PushID(i);
-                                    if (settingsPopupRowSelectable(s_promptRecs[i].role.c_str(),
-                                                                  s_selectedRole == i)) {
-                                        s_selectedRole = i;
-                                        s_promptSystemSelected = false;
-                                        s_pendingPromptSelection.clear();
-                                    }
-                                    ImGui::PopID();
-                                }
-                                if (settingsPopupRowSelectable("system (override)",
-                                                               s_selectedRole == sysIdx)) {
-                                    s_selectedRole = sysIdx;
-                                    s_promptSystemSelected = true;
-                                    s_pendingPromptSelection.clear();
-                                }
-                                settingsEndPopupRowCombo();
-                            }
-                        }
-                        // Fill remaining viewport — single scrollbar inside list/editor only.
-                        const float promptsH = ImMax(220.0f * sc,
-                            ImGui::GetContentRegionAvail().y - 4.0f * sc);
-                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
-                        if (!compactPrompts) {
-                        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                            ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
-                                   ui::palette.panelBg[2], 1));
-                        ImGui::BeginChild("##rolelist", ImVec2(168.0f * sc, promptsH),
-                                          ImGuiChildFlags_Borders);
-                        if (s_promptRecs.empty() && s_promptsLoaded) {
-                            dimText("No role prompts returned.");
-                        }
-                        for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
-                            bool sel = (i == s_selectedRole);
-                            auto& pr = s_promptRecs[i];
-                            std::string lbl = pr.role;
-                            if (pr.overridden) lbl += " *";
-                            if (settingsChildRowSelectable(lbl.c_str(), sel)) {
-                                s_selectedRole = i;
-                                s_promptSystemSelected = false;
-                                s_pendingPromptSelection.clear();
-                            }
-                            if (sel) ImGui::SetItemDefaultFocus();
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s%s", pr.role.c_str(),
-                                                  pr.overridden ? " (overridden)" : "");
-                        }
-                        ImGui::Separator();
-                        {
-                            std::string syslbl = "system (override)";
-                            if (st.spBuf[0] != 0) syslbl += " *";
-                            if (settingsChildRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx)) {
-                                s_selectedRole = sysIdx;
-                                s_promptSystemSelected = true;
-                                s_pendingPromptSelection.clear();
-                            }
-                            if (s_selectedRole >= sysIdx) ImGui::SetItemDefaultFocus();
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Override the agent system prompt (advanced)");
-                        }
-                        ImGui::EndChild();
-                        ImGui::PopStyleColor();  // ChildBg (list only — editor stays transparent)
-
-                        ImGui::SameLine();
-                        }
-
-                        ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
-                                          ImGuiChildFlags_Borders);
-                        if (s_selectedRole >= sysIdx) {
-                            ImGui::PushFont(st.fonts.medium);
-                            ImGui::TextUnformatted("System prompt override");
-                            ImGui::PopFont();
-                            dimText("Empty = built-in. Custom text fully replaces it \xe2\x80\x94 "
-                                    "keep the result/parts contract. Autosaves as you type.");
-                            ImGui::PushFont(st.fonts.mono);
-                            float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
-                            if (edH < 100.0f * sc) edH = 100.0f * sc;
-                            if (ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
-                                                      ImVec2(-1, edH))) {
-                                s_spOverrideDirty = true;
-                                s_spOverrideLastEdit = ImGui::GetTime();
-                            }
-                            ImGui::PopFont();
-                            if (ui::kit::secondaryButton("Clear (use built-in)")) {
-                                std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
-                                commitSystemPromptOverride(st);  // empty = built-in, persist now
-                            }
-                        } else if (s_selectedRole >= 0 &&
-                                   s_selectedRole < (int)s_promptRecs.size()) {
-                            auto& pr = s_promptRecs[s_selectedRole];
-                            if (pr.overridden) {
-                                ImGui::PushStyleColor(ImGuiCol_Text,
-                                    ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
-                                           ui::palette.statusWarn[2], 1));
-                                ImGui::TextUnformatted("[overridden]");
-                                ImGui::PopStyleColor();
-                                ImGui::SameLine();
-                            }
-                            ImGui::PushFont(st.fonts.medium);
-                            ImGui::TextUnformatted(pr.role.c_str());
-                            ImGui::PopFont();
-                            int curLen = (int)std::strlen(pr.buf.data());
-                            int delta  = curLen - pr.builtinLen;
-                            if (delta != 0) {
-                                ImGui::SameLine();
-                                dimText(delta > 0 ? "(differs from built-in: longer)"
-                                                  : "(differs from built-in: shorter)");
-                            }
-                            dimText("Autosaves as you type.");
-                            ImGui::PushFont(st.fonts.mono);
-                            float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
-                            if (edH < 100.0f * sc) edH = 100.0f * sc;
-                            if (ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
-                                                          ImVec2(-1, edH))) {
-                                pr.dirty = true;
-                                pr.lastEdit = ImGui::GetTime();
-                            }
-                            ImGui::PopFont();
-                            const char* noFetch = "Prompts are unavailable until the engine is connected.";
-                            // No Save button: the edit above autosaves (flushPromptEdits).
-                            if (ui::kit::secondaryButton("Reset to built-in", canFetch, noFetch,
-                                                         ImVec2(140.0f * sc, 28.0f * sc))) {
-                                resetPromptOverride(pr, st);
-                                st.addLog("[ok] prompt reset: " + pr.role);
-                            }
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Delete override and restore shipped prompt");
-                            if (!s_promptSaveError.empty()) {
-                                ImGui::SameLine();
-                                ImGui::TextColored(settingsErrInk(), "%s", s_promptSaveError.c_str());
-                            }
-                        } else {
-                            dimText("Select a role on the left to edit its prompt.");
-                        }
-                        ImGui::EndChild();
-                        ImGui::PopStyleVar();  // WindowPadding shared by both panes
-                    }
-
-
-                    if (s_aiSubSel == 3) {
-                        // Fill-height editors own their scrolling: zero the parent ONCE on
-                        // entry, never every frame (that ate the wheel on this tab).
-                        if (aiSubTabJustEntered(3)) ImGui::SetScrollY(0.0f);
-                        drawSettingsSkillsTab(st, sc);
-                    }
-
-                    if (s_aiSubSel == 4) {
-                        if (aiSubTabJustEntered(4)) ImGui::SetScrollY(0.0f);
-                        drawSettingsContextTab(st, sc);
-                    }
-
-                    if (s_aiSubSel == 5) {
-                // Shared leaderboard board (refreshed by runner / refresh button).
-                static ui::leaderboard::Board s_lb;
-                static bool s_lbLoaded = false;
-                static double s_lbLast = -1e9;
-                const double now = ImGui::GetTime();
-                if (!s_lbLoaded || (now - s_lbLast) > 5.0) {
-                    s_lb = ui::leaderboard::load();
-                    s_lbLoaded = true;
-                    s_lbLast = now;
-                }
-
-                // The agent benchmark is the artifact_validity suite (benchmarks/
-                // artifact_validity): a CLI runner that grades the saved deliverable file of
-                // each trial. It has no in-app runner, so this card names the suite and hands
-                // over the exact command instead of an empty table.
-                settingsGlassSectionBegin("##bench_artifact", "Agent benchmark", 0.0f,
-                                          /*first=*/true);
-                static const char* kArtifactRunCmd =
-                    "python -m benchmarks.artifact_validity.runner run --tag demo "
-                    "--tasks F1,F2,F3,F4,C1,C2,C3,S1,S2,S3 --model <provider:model>";
-                if (ui::kit::emptyState(
-                        nullptr, "Artifact validity suite",
-                        "Each trial gives the agent one headless turn in a fresh workspace, "
-                        "then reopens the one file the task asks for and grades it. Tasks: "
-                        "facilities F1-F4, core C1-C3, solids S1-S3. Run it from the "
-                        "repository root with "
-                        "python -m benchmarks.artifact_validity.runner run, then "
-                        "report --tag <tag> for the scored table.",
-                        "Copy run command"))
-                    ImGui::SetClipboardText(kArtifactRunCmd);
-                settingsGlassSectionEnd();
-
-                // Legacy gym leaderboard, per-tool-family categories and quick runner: kept
-                // reachable but folded away — the board is retired (often MOCK smoke data)
-                // and must not read as the current score. A legacy run in flight forces it
-                // open so its progress is never hidden.
-                static bool s_showLegacyBench = false;
-                ui::kit::checkbox("bench_show_legacy", "Show legacy results", &s_showLegacyBench,
-                                  "The retired gym leaderboard, its tool-family categories and "
-                                  "the legacy quick runner.");
-                // Keep status polling alive while this tab is open.
-                pollBenchStatus(st, s_bench.running, &s_lb);
-                if (s_showLegacyBench || s_bench.running) {
-                    pollBenchCategories(st, /*force=*/false);
-                    if (!s_cats.cats.empty()) {
-                        settingsGlassSectionBegin("##bench_categories", "Legacy categories");
-                        drawBenchCategories(st, sc);
-                        settingsGlassSectionEnd();
-                    }
-
-                    settingsGlassSectionBegin("##bench_leaderboard", "Legacy gym leaderboard");
-                    dimText("Pass rates from the retired gym suite "
-                            "(benchmarks/leaderboard/leaderboard.json). Superseded by the "
-                            "artifact validity suite above.");
-                    if (ui::kit::secondaryButton("Refresh##settings_lb")) {
-                        s_lb = ui::leaderboard::load();
-                        s_lbLast = ImGui::GetTime();
-                        s_cats.lastPoll = -1e9;
-                        s_cats.loaded = false;
-                    }
-                    ImGui::Dummy(ImVec2(0, 2 * sc));
-                    ui::leaderboard::drawCompactTable(s_lb, sc);
-                    drawBenchRunner(st, sc, s_lb, s_lbLast);
-                    settingsGlassSectionEnd();
-                }
-
-                    }
-
-                    if (s_aiSubSel == 6) {
-
-                        settingsGlassSectionBegin("##ai_tools_global", "Global tool limits");
-                        dimText("Defaults applied to every tool call. A per-tool Options override "
-                                "(nonzero) always wins. Autosaved under config.json agent.*.");
-                        static int s_globalTimeout = 0;
-                        static int s_globalMaxCalls = 0;
-                        static int s_globalSupervision = 4;
-                        static bool s_loopGuardEnabled = true;
-                        static int s_loopGuardThreshold = 3;
-                        static bool s_globalLoaded = false;
-                        static double s_globalLast = -1e9;
-                        static bool s_globalDirty = false;
-                        static std::string s_globalErr;
-                        {
-                            const double nowGl = ImGui::GetTime();
-                            // Never reload over unsaved edits (it clobbered them every 2 s).
-                            if (!s_globalLoaded ||
-                                (!s_globalDirty && (nowGl - s_globalLast) > 2.0)) {
-                                s_globalLast = nowGl;
-                                s_globalLoaded = true;
-                                try {
-                                    const nlohmann::json j = readConfigJson();
-                                    auto ag = j.value("agent", nlohmann::json::object());
-                                    s_globalTimeout = ag.value("tool_timeout_s_default", 0);
-                                    s_globalMaxCalls = ag.value("tool_max_calls_default", 0);
-                                    s_globalSupervision = ag.value("supervision_interval_calls", 4);
-                                    s_loopGuardEnabled = ag.value("tool_loop_guard_enabled", true);
-                                    s_loopGuardThreshold = ag.value("tool_loop_guard_threshold", 3);
-                                } catch (...) {
-                                    s_globalTimeout = 0;
-                                    s_globalMaxCalls = 0;
-                                    s_globalSupervision = 4;
-                                    s_loopGuardEnabled = true;
-                                    s_loopGuardThreshold = 3;
-                                }
-                                if (s_globalTimeout < 0) s_globalTimeout = 0;
-                                if (s_globalMaxCalls < 0) s_globalMaxCalls = 0;
-                                if (s_globalSupervision < 0) s_globalSupervision = 4;
-                                if (s_loopGuardThreshold < 1) s_loopGuardThreshold = 1;
-                            }
-                        }
-                        // 0 means "off / unlimited" for these limits: shown as an empty field
-                        // with that word as the hint, never as a bare zero.
-                        auto optionalLimit = [&](const char* id, const char* label, int* v,
-                                                 const char* offHint, const char* unit,
-                                                 const char* tip) {
-                            bool on = *v > 0;
-                            int shown = on ? *v : 1;
-                            ui::kit::FieldOpts o;
-                            o.withPresent(&on).withHint(offHint).withMin(1).withTip(tip);
-                            if (unit) o.withUnit(unit);
-                            if (ui::kit::fieldInt(id, label, &shown, o)) {
-                                *v = on ? shown : 0;
-                                s_globalDirty = true;
-                            }
-                        };
-                        {
-                            ui::kit::FieldGroup limits("global_limits", "Supervision interval");
-                            optionalLimit("global_timeout_s", "Tool timeout", &s_globalTimeout,
-                                          "No timeout", ui::kit::unitText(ui::kit::Unit::s),
-                                          "Seconds before a tool call is abandoned. Empty = "
-                                          "no timeout. A per-tool override wins.");
-                            optionalLimit("global_max_calls", "Max calls per turn",
-                                          &s_globalMaxCalls, "Unlimited", nullptr,
-                                          "Calls of one tool allowed per turn. Empty = "
-                                          "unlimited. A per-tool override wins.");
-                            optionalLimit("global_supervision", "Supervision interval",
-                                          &s_globalSupervision, "Never", nullptr,
-                                          "Force an advisor verification pass every N tool "
-                                          "calls. Empty = never.");
-                            if (ui::kit::fieldCheckbox(
-                                    "loop_guard_enabled", "Loop guard", &s_loopGuardEnabled,
-                                    ui::kit::FieldOpts().withTip(
-                                        "Refuse a tool call that repeats the exact same tool + "
-                                        "arguments too many times in a row instead of "
-                                        "dispatching it again (a real stuck loop, not just "
-                                        "\"used this tool a lot\").")))
-                                s_globalDirty = true;
-                            if (s_loopGuardEnabled &&
-                                ui::kit::fieldInt("loop_guard_threshold", "Repeats before refusal",
-                                                  &s_loopGuardThreshold,
-                                                  ui::kit::FieldOpts().withMin(1).withTip(
-                                                      "Consecutive identical calls before "
-                                                      "refusal (default 3).")))
-                                s_globalDirty = true;
-                        }
-                        if (s_globalDirty) {
-                            // Autosave: commit the edit on the frame it happened (the writer
-                            // coalesces keystrokes). A rejected patch stays dirty and retries.
-                            if (updateConfigJson([&](nlohmann::json& j) {
-                                    if (!j.contains("agent") || !j["agent"].is_object())
-                                        j["agent"] = nlohmann::json::object();
-                                    j["agent"]["tool_timeout_s_default"] =
-                                        std::max(0, s_globalTimeout);
-                                    j["agent"]["tool_max_calls_default"] =
-                                        std::max(0, s_globalMaxCalls);
-                                    j["agent"]["supervision_interval_calls"] =
-                                        std::max(0, s_globalSupervision);
-                                    j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
-                                    j["agent"]["tool_loop_guard_threshold"] =
-                                        std::max(1, s_loopGuardThreshold);
-                                })) {
-                                s_globalDirty = false;
-                                s_globalErr.clear();
-                            } else {
-                                s_globalErr = "Failed to save global tool limits.";
-                            }
-                        }
-                        if (!s_globalErr.empty())
-                            ImGui::TextColored(settingsErrInk(), "%s", s_globalErr.c_str());
-                        settingsGlassSectionEnd();
-
-                        settingsGlassSectionBegin("##ai_tools_roles", "Default tools by role");
-                        dimText("Pick a role, then assign which MCP tool families it gets by "
-                                "default. Replaces global on/off family toggles. Saved under "
-                                "config.json agent.role_tools. Per-tool Options below still apply.");
-
-                        // ---- role_tools state (mirrors services/agent/config.py DEFAULT_ROLE_TOOLS)
-                        static std::map<std::string, std::set<std::string>> s_roleTools;
-                        static int s_roleToolsSel = 4;  // "default"
-                        static bool s_roleToolsDirty = false;
-                        static bool s_toolOptDirty = false;
-                        static double s_roleToolsLast = -1e9;
-                        static std::map<std::string, bool> s_toolEnabled;
-                        static std::map<std::string, int> s_toolTimeout;
-                        static std::map<std::string, int> s_toolMaxCalls;
-                        static std::map<std::string, std::string> s_toolDefaults;
-                        static std::map<std::string, std::string> s_toolNote;
-                        // Included tool context (description_override) + per-tool schema_trim
-                        // ( -1 inherit tier, 0 full paragraph, 1 first-sentence trim ).
-                        static std::map<std::string, std::string> s_toolDescOverride;
-                        static std::map<std::string, int> s_toolSchemaTrim;
-                        static std::string s_toolOptErr;
-
-                        static const char* kToolFamilies[] = {
-                            "cad", "ecad", "cam", "em", "reveng", "plm", "parts",
-                            "advisor", "ledger", "intake", "recon", "gsl",
-                            "workspace", "research", "sim", "mission",
-                            "office", "files", "shell"
-                        };
-                        static constexpr int kToolFamilyCount =
-                            (int)(sizeof(kToolFamilies) / sizeof(kToolFamilies[0]));
-
-                        // Sensible defaults — keep in sync with services/agent/config.py
-                        // DEFAULT_ROLE_TOOLS.
-                        auto seedDefaultRoleTools = [&]() {
-                            s_roleTools.clear();
-                            auto put = [&](const char* role, std::initializer_list<const char*> fams) {
-                                std::set<std::string> s;
-                                for (const char* f : fams) s.insert(f);
-                                s_roleTools[role] = std::move(s);
-                            };
-                            put("advisor", {"advisor", "research", "ledger", "gsl"});
-                            put("task", {"cad", "sim", "cam", "parts", "gsl", "files", "shell", "office"});
-                            put("planning", {"mission", "advisor", "ledger", "research", "gsl", "workspace"});
-                            put("vision", {"gsl", "cad"});
-                            put("default", {"cad", "files", "shell", "office", "plm", "research",
-                                            "parts", "gsl", "advisor", "workspace", "ledger",
-                                            "sim", "cam", "ecad", "reveng", "mission"});
-                            put("plm", {"plm", "files", "office", "ledger"});
-                            put("redaction", {});
-                            put("sketch2d", {"cad", "gsl", "ecad"});
-                            put("model3d", {"cad", "sim", "parts", "gsl"});
-                            put("memory", {"ledger", "plm", "files"});
-                            put("cam", {"cam", "cad", "parts"});
-                            put("sim", {"sim", "cad", "gsl"});
-                            put("ecad", {"ecad", "parts", "research", "em"});
-                            put("drawing", {"cad", "office", "gsl"});
-                            put("reveng", {"reveng", "research", "cad", "parts"});
-                        };
-
-                        // Offline fallback catalog — generated tables
-                        // (tools/gen_tool_panel_tables.py). Whenever the
-                        // runtime is up, the LIVE catalog from the worker
-                        // ai_tool_catalog RPC replaces them (below).
-                        using FamTools = tool_panel_tables::FamTools;
-                        static const auto& kFamToolMap = tool_panel_tables::kFamToolMap;
-                        static constexpr int kFamToolMapN = tool_panel_tables::kFamToolMapN;
-                        static const auto& kToolDescs = tool_panel_tables::kToolDescs;
-                        static constexpr int kToolDescsN = tool_panel_tables::kToolDescsN;
-                        static const auto& kToolGuidance = tool_panel_tables::kToolGuidance;
-                        static constexpr int kToolGuidanceN = tool_panel_tables::kToolGuidanceN;
-
-                        // Live tool catalog (worker ai_tool_catalog RPC) — the
-                        // panel shows every registered tool with its real
-                        // family + live description, and the curated
-                        // tool_guidance defaults in the per-tool Options popup.
-                        static bool s_liveCatTried = false;
-                        static bool s_liveCatOk = false;
-                        static bool s_liveCatLoading = false;
-                        static double s_liveCatAt = -1e9;
-                        static std::vector<std::string> s_liveFamilies;
-                        static std::map<std::string, std::vector<std::string>> s_liveFamTools;
-                        static std::map<std::string, std::string> s_liveDescs;
-                        static nlohmann::json s_liveGuidance = nlohmann::json::object();
-
-
-                        auto toolTooltip = [&](const char* tn) -> const char* {
-                            if (!tn || !tn[0]) return "MCP tool.";
-                            // Live catalog description (worker ai_tool_catalog) first.
-                            if (s_liveCatOk) {
-                                auto it = s_liveDescs.find(tn);
-                                if (it != s_liveDescs.end() && !it->second.empty())
-                                    return it->second.c_str();
-                            }
-                            // kToolDescs (generated fallback) is sorted by name — linear
-                            // scan is fine at this size.
-                            for (int i = 0; i < kToolDescsN; ++i) {
-                                if (!std::strcmp(tn, kToolDescs[i].name))
-                                    return kToolDescs[i].desc;
-                            }
-                            // Family-aware fallbacks — never the useless generic alone.
-                            if (std::strncmp(tn, "reveng_", 7) == 0 ||
-                                std::strncmp(tn, "get_reveng_", 11) == 0 ||
-                                std::strncmp(tn, "list_reveng_", 12) == 0)
-                                return "Reverse-engineering session / reconstruct tool.";
-                            if (std::strncmp(tn, "plm_", 4) == 0)
-                                return "Product lifecycle management tool.";
-                            if (std::strncmp(tn, "office_", 7) == 0)
-                                return "Office document read/edit tool.";
-                            if (std::strncmp(tn, "cam_", 4) == 0)
-                                return "CAM / machining tool.";
-                            if (std::strncmp(tn, "ecad_", 5) == 0)
-                                return "Electronics CAD tool.";
-                            if (std::strncmp(tn, "fs_", 3) == 0)
-                                return "Project filesystem tool.";
-                            if (std::strncmp(tn, "research_", 9) == 0)
-                                return "Research / lookup tool.";
-                            if (std::strncmp(tn, "em_", 3) == 0)
-                                return "Electromagnetics simulation tool.";
-                            if (std::strncmp(tn, "dag_", 4) == 0 ||
-                                std::strncmp(tn, "mission_", 8) == 0)
-                                return "Mission / DAG orchestration tool.";
-                            return "Agent tool — see Options for AI usage parameters.";
-                        };
-
-                        // Built-in curated guidance (generated kToolGuidance table)
-                        // as a json object shaped like the live catalog's guidance
-                        // entries — used when the worker ai_tool_catalog RPC has
-                        // no entry for this tool. Linear scan, same as toolTooltip.
-                        auto builtinGuidance = [&](const char* tn) -> nlohmann::json {
-                            nlohmann::json g = nlohmann::json::object();
-                            if (!tn || !tn[0]) return g;
-                            for (int i = 0; i < kToolGuidanceN; ++i) {
-                                if (!std::strcmp(tn, kToolGuidance[i].name)) {
-                                    if (kToolGuidance[i].note && kToolGuidance[i].note[0])
-                                        g["prompt_note"] = kToolGuidance[i].note;
-                                    if (kToolGuidance[i].timeout_s > 0)
-                                        g["timeout_s"] = kToolGuidance[i].timeout_s;
-                                    if (kToolGuidance[i].max_calls > 0)
-                                        g["max_calls_per_turn"] = kToolGuidance[i].max_calls;
-                                    if (kToolGuidance[i].param_defaults_json &&
-                                        kToolGuidance[i].param_defaults_json[0]) {
-                                        nlohmann::json pd = nlohmann::json::parse(
-                                            kToolGuidance[i].param_defaults_json,
-                                            nullptr, false);
-                                        if (pd.is_object() && !pd.empty())
-                                            g["param_defaults"] = pd;
-                                    }
-                                    break;
-                                }
-                            }
-                            return g;
-                        };
-
-                        auto famHelp = [](const char* fam) -> const char* {
-                            if (!std::strcmp(fam, "cad")) return "Parametric modeling, drawings, measure, mates.";
-                            if (!std::strcmp(fam, "sim")) return "FEA, CFD, and motion simulation.";
-                            if (!std::strcmp(fam, "cam")) return "CAM jobs, stock, toolpaths, post.";
-                            if (!std::strcmp(fam, "ecad")) return "Schematic + PCB tools.";
-                            if (!std::strcmp(fam, "em")) return "Electromagnetics simulation.";
-                            if (!std::strcmp(fam, "parts")) return "Catalog parts, BOM, quotes.";
-                            if (!std::strcmp(fam, "reveng")) return "Reverse engineering from scans/photos.";
-                            if (!std::strcmp(fam, "plm")) return "Project history, checkpoints, releases.";
-                            if (!std::strcmp(fam, "research")) return "Web search, materials, eng calc.";
-                            if (!std::strcmp(fam, "mission")) return "DAG / mission orchestration.";
-                            if (!std::strcmp(fam, "gsl")) return "Geometry narrative describers + sketch health.";
-                            if (!std::strcmp(fam, "advisor")) return "Steering advisor tools.";
-                            if (!std::strcmp(fam, "office")) return "Read/edit Office + PDF (office_oxide extract).";
-                            if (!std::strcmp(fam, "files")) return "Project filesystem read/write/glob/grep.";
-                            if (!std::strcmp(fam, "shell")) return "Shell commands inside the project jail.";
-                            if (!std::strcmp(fam, "ledger")) return "Mission ledger read/write.";
-                            if (!std::strcmp(fam, "intake")) return "Requirements / intake confirmations.";
-                            if (!std::strcmp(fam, "recon")) return "Mesh reconstruction helpers.";
-                            if (!std::strcmp(fam, "workspace")) return "Workspace status, enable_tools, delegate.";
-                            return "Tool family.";
-                        };
-
-                        // Pull the live tool catalog once the worker is up
-                        // (retry every 15 s until it succeeds). The generated catalog remains
-                        // usable while the queued request waits behind an active agent run.
-                        if (st.workerStarted && !s_liveCatLoading &&
-                            (!s_liveCatTried ||
-                             (!s_liveCatOk && ImGui::GetTime() - s_liveCatAt > 15.0))) {
-                            s_liveCatTried = true;
-                            s_liveCatLoading = true;
-                            s_liveCatAt = ImGui::GetTime();
-                            st.rpc.call("ai_tool_catalog", nlohmann::json::object(),
-                                        [](const core::RpcResult& r) {
-                                s_liveCatLoading = false;
-                                if (!r.ok || !r.result.value("ok", false)) {
-                                    s_liveCatAt = ImGui::GetTime();
-                                    return;
-                                }
-                                s_liveFamTools.clear();
-                                s_liveDescs.clear();
-                                s_liveGuidance = nlohmann::json::object();
-                                for (const auto& row :
-                                     r.result.value("tools", nlohmann::json::array())) {
-                                    const std::string name = row.value("name", "");
-                                    const std::string fam = row.value("family", "?");
-                                    if (name.empty()) continue;
-                                    s_liveFamTools[fam].push_back(name);
-                                    s_liveDescs[name] = row.value("description", "");
-                                    if (row.contains("guidance") &&
-                                        row["guidance"].is_object() &&
-                                        !row["guidance"].empty())
-                                        s_liveGuidance[name] = row["guidance"];
-                                }
-                                // Canonical family order (kToolFamilies), then any
-                                // families the config list does not know yet.
-                                s_liveFamilies.clear();
-                                for (int i = 0; i < kToolFamilyCount; ++i)
-                                    if (s_liveFamTools.count(kToolFamilies[i]))
-                                        s_liveFamilies.push_back(kToolFamilies[i]);
-                                for (const auto& kv : s_liveFamTools)
-                                    if (std::find(s_liveFamilies.begin(),
-                                                  s_liveFamilies.end(),
-                                                  kv.first) == s_liveFamilies.end())
-                                        s_liveFamilies.push_back(kv.first);
-                                s_liveCatOk = true;
-                            }, 20000);
-                        }
-
-                        const double nowTf = ImGui::GetTime();
-                        // Never re-seed/reload while the user has unsaved edits: the 2 s
-                        // poll used to wipe a freshly ticked family (e.g. intake for the
-                        // default role) back to the on-disk state before Save was hit.
-                        if (s_roleTools.empty() ||
-                            (!s_roleToolsDirty && !s_toolOptDirty &&
-                             (nowTf - s_roleToolsLast) > 2.0)) {
-                            s_roleToolsLast = nowTf;
-                            seedDefaultRoleTools();
-                            try {
-                                const nlohmann::json j = readConfigJson();
-                                auto ag = j.value("agent", nlohmann::json::object());
-                                auto rt = ag.value("role_tools", nlohmann::json::object());
-                                if (rt.is_object()) {
-                                    for (auto it = rt.begin(); it != rt.end(); ++it) {
-                                        if (!it.value().is_array()) continue;
-                                        std::set<std::string> fams;
-                                        for (const auto& v : it.value()) {
-                                            if (v.is_string()) fams.insert(v.get<std::string>());
-                                        }
-                                        s_roleTools[it.key()] = std::move(fams);
-                                    }
-                                }
-                                auto to = ag.value("tool_options", nlohmann::json::object());
-                                if (to.is_object()) {
-                                    for (auto it = to.begin(); it != to.end(); ++it) {
-                                        const std::string tn = it.key();
-                                        const auto& e = it.value();
-                                        if (!e.is_object()) continue;
-                                        if (e.contains("enabled") && e["enabled"].is_boolean())
-                                            s_toolEnabled[tn] = e["enabled"].get<bool>();
-                                        else
-                                            s_toolEnabled[tn] = true;
-                                        if (e.contains("timeout_s") && e["timeout_s"].is_number_integer())
-                                            s_toolTimeout[tn] = e["timeout_s"].get<int>();
-                                        if (e.contains("max_calls_per_turn") &&
-                                            e["max_calls_per_turn"].is_number_integer())
-                                            s_toolMaxCalls[tn] = e["max_calls_per_turn"].get<int>();
-                                        if (e.contains("param_defaults"))
-                                            s_toolDefaults[tn] = e["param_defaults"].dump(2);
-                                        if (e.contains("prompt_note") && e["prompt_note"].is_string())
-                                            s_toolNote[tn] = e["prompt_note"].get<std::string>();
-                                        if (e.contains("description_override") &&
-                                            e["description_override"].is_string())
-                                            s_toolDescOverride[tn] =
-                                                e["description_override"].get<std::string>();
-                                        if (e.contains("schema_trim")) {
-                                            if (e["schema_trim"].is_null())
-                                                s_toolSchemaTrim[tn] = -1;
-                                            else if (e["schema_trim"].is_boolean())
-                                                s_toolSchemaTrim[tn] =
-                                                    e["schema_trim"].get<bool>() ? 1 : 0;
-                                        }
-                                    }
-                                }
-                            } catch (...) {
-                                seedDefaultRoleTools();
-                            }
-                        }
-
-                        // Role badge picker row
-                        if (s_roleToolsSel < 0 || s_roleToolsSel >= kRoleCount) s_roleToolsSel = 4;
-                        ImGui::BeginGroup();
-                        for (int i = 0; i < kRoleCount; ++i) {
-                            ImGui::PushID(i + 9100);
-                            const bool sel = (i == s_roleToolsSel);
-                            if (sel) {
-                                ImGui::PushStyleColor(ImGuiCol_Button,
-                                    ImVec4(kRoleColors[i].x, kRoleColors[i].y,
-                                           kRoleColors[i].z, 0.35f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                    ImVec4(kRoleColors[i].x, kRoleColors[i].y,
-                                           kRoleColors[i].z, 0.50f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                                    ImVec4(kRoleColors[i].x, kRoleColors[i].y,
-                                           kRoleColors[i].z, 0.65f));
-                            }
-                            drawRoleBadge(i, sc);
-                            ImGui::SameLine(0.0f, 2.0f * sc);
-                            char btn[64];
-                            std::snprintf(btn, sizeof(btn), "%s##rolepick%d", kRoleLabels[i], i);
-                            if (ImGui::SmallButton(btn)) s_roleToolsSel = i;
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Edit default tool families for %s",
-                                                  kRoleLabels[i]);
-                            if (sel) ImGui::PopStyleColor(3);
-                            if ((i + 1) % 5 != 0)
-                                ImGui::SameLine(0.0f, 8.0f * sc);
-                            ImGui::PopID();
-                        }
-                        ImGui::EndGroup();
-
-                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                        {
-                            const char* rk = kRoleKeys[s_roleToolsSel];
-                            ImGui::AlignTextToFramePadding();
-                            drawRoleBadge(s_roleToolsSel, sc);
-                            ImGui::SameLine(0.0f, 6.0f * sc);
-                            ImGui::Text("Families for %s", kRoleLabels[s_roleToolsSel]);
-                            helpMarker("Checked families become this role's default tool "
-                                       "surface (unioned onto the role card allowlist).");
-
-                            std::set<std::string>& assigned = s_roleTools[rk];
-                            if (ImGui::BeginTable("##role_fam_assign", 3,
-                                                  ImGuiTableFlags_SizingStretchSame |
-                                                  ImGuiTableFlags_NoPadOuterX)) {
-                                for (int fi = 0; fi < kToolFamilyCount; ++fi) {
-                                    const char* fam = kToolFamilies[fi];
-                                    ImGui::TableNextColumn();
-                                    bool on = assigned.count(fam) > 0;
-                                    ImGui::PushID(fam);
-                                    if (ui::kit::checkbox("fam", fam, &on)) {
-                                        if (on) assigned.insert(fam);
-                                        else assigned.erase(fam);
-                                        s_roleToolsDirty = true;
-                                    }
-                                    if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("%s", famHelp(fam));
-                                    ImGui::PopID();
-                                }
-                                ImGui::EndTable();
-                            }
-                        }
-
-                        settingsSectionHeader("Agent service built-ins");
-                        {
-                            static std::vector<ui::OmpToolRow> tools;
-                            static std::string forSession;
-                            static bool loaded = false, inFlight = false, failed = false;
-                            static double lastPoll = -1e9;
-                            const std::string conv = st.activeConvId();
-                            const auto* link = ui::ompSessionLink(conv);
-                            const bool live = link && link->runtimeLive;
-                            if (forSession != conv) {
-                                forSession = conv;
-                                loaded = false;
-                                failed = false;
-                                lastPoll = -1e9;
-                                tools.clear();
-                            }
-                            const double now = ImGui::GetTime();
-                            if (live && !inFlight && now - lastPoll > (loaded ? 60.0 : 15.0)) {
-                                lastPoll = now;
-                                inFlight = true;
-#ifdef __EMSCRIPTEN__
-                                const std::string session = cellAgentSessionHandle(conv);
-#else
-                                const std::string session = conv;
-#endif
-                                st.rpc.call("omp_tool_state", nlohmann::json{{"session_id", session}},
-                                    [conv](const core::RpcResult& r) {
-                                        inFlight = false;
-                                        if (forSession != conv) return;
-                                        std::vector<ui::OmpToolRow> rows;
-                                        failed = !r.ok || !ui::parseOmpToolState(r.result, rows);
-                                        if (!failed) {
-                                            tools = std::move(rows);
-                                            loaded = true;
-                                        }
-                                    }, 15000);
-                            }
-                            if (!live) dimText("No live agent session.");
-                            else if (failed) dimText("Built-in tool state could not be refreshed.");
-                            else if (!loaded) dimText("Reading built-in tool state...");
-                            else if (tools.empty()) dimText("The runtime reported no tools.");
-                            else for (const auto& tool : tools) {
-                                ImGui::PushID(tool.name.c_str());
-                                ompStatusDotText(tool.name.c_str(),
-                                    tool.availabilityKnown && tool.available ? ui::palette.statusOk
-                                                                            : ui::palette.textDim,
-                                    tool.availabilityKnown && tool.available);
-                                if (!tool.availabilityKnown) {
-                                    ImGui::SameLine();
-                                    dimText("availability unknown");
-                                } else if (!tool.available) {
-                                    ImGui::SameLine();
-                                    dimText("unavailable");
-                                }
-                                if (!tool.description.empty() && ImGui::IsItemHovered())
-                                    ImGui::SetTooltip("%s", tool.description.c_str());
-                                ImGui::PopID();
-                            }
-                        }
-
-                        ImGui::Dummy(ImVec2(0, 8.0f * sc));
-                        dimText("Per-tool rows: checkbox enables a tool globally (dimmed = off); "
-                                "Options overrides limits, included tool context, and AI usage "
-                                "guidance. Hover a name for what it does.");
-                        if (s_liveCatLoading)
-                            dimText("Loading live tool catalog; showing built-in catalog meanwhile.");
-                        static char s_toolFilterBuf[64] = "";
-                        ImGui::SetNextItemWidth(-1);
-                        ImGui::InputTextWithHint("##tool_filter", "Filter tools...",
-                                                 s_toolFilterBuf, sizeof(s_toolFilterBuf));
-                        const std::string toolNeedle = toLowerAscii(s_toolFilterBuf);
-
-                        // Only expand families assigned to the selected role (plus always
-                        // show all when filtering so users can find disabled tools).
-                        const std::set<std::string>& selFams =
-                            s_roleTools[kRoleKeys[s_roleToolsSel]];
-                        // Unified family→tools view: the LIVE catalog when the
-                        // worker answered, else the generated fallback tables.
-                        std::vector<std::pair<std::string, std::vector<std::string>>> famView;
-                        if (s_liveCatOk) {
-                            for (const auto& fam : s_liveFamilies)
-                                famView.emplace_back(fam, s_liveFamTools[fam]);
-                        } else {
-                            for (int fi = 0; fi < kFamToolMapN; ++fi) {
-                                const FamTools& ft = kFamToolMap[fi];
-                                famView.emplace_back(
-                                    ft.fam,
-                                    std::vector<std::string>(ft.tools, ft.tools + ft.n));
-                            }
-                        }
-                        for (const auto& famEntry : famView) {
-                            const std::string& famName = famEntry.first;
-                            const std::vector<std::string>& famToolList = famEntry.second;
-                            const bool famAssigned = selFams.count(famName) > 0;
-                            if (!toolNeedle.empty()) {
-                                int famMatches = 0;
-                                for (const auto& toolName : famToolList)
-                                    if (toLowerAscii(toolName).find(toolNeedle)
-                                        != std::string::npos)
-                                        ++famMatches;
-                                if (famMatches == 0) continue;
-                                ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-                            } else if (!famAssigned) {
-                                // Still list unassigned families collapsed so users can
-                                // enable individual tools / browse Options.
-                            }
-                            char famLabel[96];
-                            std::snprintf(famLabel, sizeof(famLabel), "%s%s",
-                                          famName.c_str(), famAssigned ? "" : "  (not assigned)");
-                            if (!ImGui::TreeNode(famLabel)) continue;
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", famHelp(famName.c_str()));
-                            for (const auto& toolName : famToolList) {
-                                const char* tn = toolName.c_str();
-                                if (!toolNeedle.empty() &&
-                                    toLowerAscii(tn).find(toolNeedle) == std::string::npos)
-                                    continue;
-                                ImGui::PushID(tn);
-                                bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
-                                if (ui::kit::checkbox("en", "", &en)) {
-                                    s_toolEnabled[tn] = en;
-                                    s_toolOptDirty = true;
-                                }
-                                if (ImGui::IsItemHovered())
-                                    ImGui::SetTooltip("Enable/disable this tool globally.");
-                                ImGui::SameLine();
-                                if (!en)
-                                    ImGui::PushStyleColor(
-                                        ImGuiCol_Text,
-                                        ui::Palette::toU32(ui::palette.textDim));
-                                ImGui::TextUnformatted(tn);
-                                if (ImGui::IsItemHovered())
-                                    ImGui::SetTooltip("%s", toolTooltip(tn));
-                                if (!en) ImGui::PopStyleColor();
-                                ImGui::SameLine();
-                                if (ImGui::SmallButton("Options"))
-                                    ImGui::OpenPopup("tool_opts");
-                                if (ImGui::BeginPopup("tool_opts")) {
-                                    ImGui::TextUnformatted(tn);
-                                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 360.0f * sc);
-                                    ImGui::TextDisabled("%s", toolTooltip(tn));
-                                    ImGui::PopTextWrapPos();
-                                    ImGui::Separator();
-                                    ImGui::TextDisabled("Empty = use the built-in or global "
-                                                        "default shown in the field.");
-                                    const float boxW = 360.0f * sc;
-                                    int to = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
-                                    int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
-                                    // Built-in curated defaults (tool_guidance,
-                                    // live catalog) — dimmed placeholders; an
-                                    // empty user field inherits them. Falls back
-                                    // to the generated kToolGuidance table when
-                                    // the live catalog has no entry for this
-                                    // tool (worker down / RPC not answered yet).
-                                    const nlohmann::json curated =
-                                        (s_liveCatOk && s_liveGuidance.contains(tn))
-                                            ? s_liveGuidance[tn]
-                                            : builtinGuidance(tn);
-                                    // An unset override (0) is an empty field whose hint names
-                                    // the value it inherits, never a bare zero.
-                                    const int curT = curated.value("timeout_s", 0);
-                                    const int curM = curated.value("max_calls_per_turn", 0);
-                                    const std::string toHint =
-                                        curT > 0 ? "Default " + std::to_string(curT) + " s"
-                                        : s_globalTimeout > 0
-                                            ? "Global " + std::to_string(s_globalTimeout) + " s"
-                                            : std::string("No timeout");
-                                    const std::string mcHint =
-                                        curM > 0 ? "Default " + std::to_string(curM)
-                                        : s_globalMaxCalls > 0
-                                            ? "Global " + std::to_string(s_globalMaxCalls)
-                                            : std::string("Unlimited");
-                                    {
-                                        ui::kit::FieldGroup limits("tool_limits",
-                                                                   "Max calls per turn");
-                                        bool toSet = to > 0;
-                                        int toShown = toSet ? to : 1;
-                                        if (ui::kit::fieldInt(
-                                                "timeout_s", "Timeout", &toShown,
-                                                ui::kit::FieldOpts()
-                                                    .withPresent(&toSet)
-                                                    .withHint(toHint.c_str())
-                                                    .withMin(1)
-                                                    .withUnit(ui::kit::Unit::s))) {
-                                            s_toolTimeout[tn] = toSet ? toShown : 0;
-                                            s_toolOptDirty = true;
-                                        }
-                                        bool mcSet = mc > 0;
-                                        int mcShown = mcSet ? mc : 1;
-                                        if (ui::kit::fieldInt(
-                                                "max_calls_per_turn", "Max calls per turn",
-                                                &mcShown,
-                                                ui::kit::FieldOpts()
-                                                    .withPresent(&mcSet)
-                                                    .withHint(mcHint.c_str())
-                                                    .withMin(1))) {
-                                            s_toolMaxCalls[tn] = mcSet ? mcShown : 0;
-                                            s_toolOptDirty = true;
-                                        }
-                                    }
-
-                                    // AI usage parameters / included tool context
-                                    // (agent.tool_options.<name> — same shape as Python
-                                    // get_tool_options).
-                                    ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                                    ImGui::TextUnformatted("AI usage parameters");
-                                    ImGui::Separator();
-
-                                    int trimMode = s_toolSchemaTrim.count(tn)
-                                                       ? s_toolSchemaTrim[tn] : -1;
-                                    if (trimMode < -1 || trimMode > 1) trimMode = -1;
-                                    const char* trimLabels[] = {
-                                        "Inherit tier", "Full paragraph", "First sentence"
-                                    };
-                                    // Map stored -1/0/1 -> items 0/1/2
-                                    int trimSel = (trimMode < 0) ? 0 : (trimMode == 0 ? 1 : 2);
-                                    if (ui::kit::fieldEnum(
-                                            "schema_trim", "Description length", &trimSel,
-                                            trimLabels, 3,
-                                            ui::kit::FieldOpts()
-                                                .withEnumStyle(ui::kit::EnumStyle::Combo)
-                                                .withTip("How much of the tool description is "
-                                                         "included in the AI tools prompt. "
-                                                         "Inherit = tier default."))) {
-                                        s_toolSchemaTrim[tn] =
-                                            (trimSel == 0) ? -1 : (trimSel == 1 ? 0 : 1);
-                                        s_toolOptDirty = true;
-                                    }
-
-                                    static char descBuf[2048];
-                                    static char defBuf[2048];
-                                    static char noteBuf[1024];
-                                    std::snprintf(descBuf, sizeof(descBuf), "%s",
-                                        s_toolDescOverride.count(tn)
-                                            ? s_toolDescOverride[tn].c_str() : "");
-                                    std::snprintf(defBuf, sizeof(defBuf), "%s",
-                                        s_toolDefaults.count(tn)
-                                            ? s_toolDefaults[tn].c_str() : "{}");
-                                    std::snprintf(noteBuf, sizeof(noteBuf), "%s",
-                                        s_toolNote.count(tn) ? s_toolNote[tn].c_str() : "");
-
-                                    // Live docstring (what the model gets when override empty).
-                                    const char* liveDesc = toolTooltip(tn);
-                                    ImGui::Dummy(ImVec2(0, 2.0f * sc));
-                                    ImGui::TextUnformatted("Included tool context");
-                                    if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip(
-                                            "description_override — replaces the MCP docstring "
-                                            "in the AI tools prompt. Leave empty to use the "
-                                            "live tool description shown below.");
-                                    if (descBuf[0] == '\0' && liveDesc && liveDesc[0]) {
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                            ui::Palette::toU32(ui::palette.textDim));
-                                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
-                                        ImGui::TextWrapped(
-                                            s_liveCatOk ? "Live (no override): %s"
-                                                        : "Built-in (offline snapshot): %s",
-                                            liveDesc);
-                                        ImGui::PopTextWrapPos();
-                                        ImGui::PopStyleColor();
-                                    }
-                                    if (ImGui::InputTextMultiline("##description_override",
-                                            descBuf, sizeof(descBuf),
-                                            ImVec2(boxW, 56 * sc))) {
-                                        s_toolDescOverride[tn] = descBuf;
-                                        s_toolOptDirty = true;
-                                    }
-
-                                    ImGui::TextUnformatted("AI usage guidance");
-                                    if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip(
-                                            "prompt_note — appended as \"Note: ...\" under this "
-                                            "tool in the AI tools prompt. Leave empty to "
-                                            "inherit the built-in default (when one exists).");
-                                    const std::string curNote = curated.value("prompt_note", "");
-                                    if (noteBuf[0] == '\0') {
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                            ui::Palette::toU32(ui::palette.textDim));
-                                        if (!curNote.empty()) {
-                                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
-                                            ImGui::TextWrapped("(default): %s", curNote.c_str());
-                                            ImGui::PopTextWrapPos();
-                                        } else {
-                                            ImGui::TextUnformatted(
-                                                "(empty — no Note: line in the tools prompt)");
-                                        }
-                                        ImGui::PopStyleColor();
-                                    }
-                                    if (ImGui::InputTextMultiline("##prompt_note",
-                                            noteBuf, sizeof(noteBuf),
-                                            ImVec2(boxW, 40 * sc))) {
-                                        s_toolNote[tn] = noteBuf;
-                                        s_toolOptDirty = true;
-                                    }
-
-                                    ImGui::TextUnformatted("Default arguments (JSON)");
-                                    if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip(
-                                            "param_defaults — kwargs merged under the model's "
-                                            "call (model-supplied values win).");
-                                    if (defBuf[0] == '\0' || !std::strcmp(defBuf, "{}")) {
-                                        if (curated.contains("param_defaults") &&
-                                            curated["param_defaults"].is_object() &&
-                                            !curated["param_defaults"].empty()) {
-                                            ImGui::PushStyleColor(ImGuiCol_Text,
-                                                ui::Palette::toU32(ui::palette.textDim));
-                                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
-                                            ImGui::TextWrapped("(default): %s",
-                                                curated["param_defaults"].dump().c_str());
-                                            ImGui::PopTextWrapPos();
-                                            ImGui::PopStyleColor();
-                                        } else {
-                                            ImGui::PushStyleColor(ImGuiCol_Text,
-                                                ui::Palette::toU32(ui::palette.textDim));
-                                            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW);
-                                            ImGui::TextWrapped(
-                                                "(none — the tool's own signature defaults "
-                                                "apply; see \"Model receives\" below)");
-                                            ImGui::PopTextWrapPos();
-                                            ImGui::PopStyleColor();
-                                        }
-                                    }
-                                    if (ImGui::InputTextMultiline("##param_defaults",
-                                            defBuf, sizeof(defBuf),
-                                            ImVec2(boxW, 60 * sc))) {
-                                        s_toolDefaults[tn] = defBuf;
-                                        s_toolOptDirty = true;
-                                    }
-
-                                    // ---- Model receives: real assembled tools-slot entry ----
-                                    ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                                    ImGui::TextUnformatted("Model receives (preview)");
-                                    ImGui::SameLine();
-                                    helpMarker("Exact tools-slot block assembled the same way "
-                                               "as tool_schemas.render_tools_block (signature + "
-                                               "description + optional Note). Refresh pulls from "
-                                               "the worker; offline falls back to the live "
-                                               "docstring + your overrides.");
-                                    static std::string s_previewTool;
-                                    static std::string s_previewText;
-                                    static std::string s_previewErr;
-                                    static double s_previewAt = -1e9;
-                                    static bool s_previewFetching = false;
-                                    const bool canPrev = st.workerStarted;
-                                    auto makeLocalPreview = [&]() {
-                                        std::string sig = std::string("- ") + tn + "(…)";
-                                        std::string body;
-                                        if (s_toolDescOverride.count(tn) &&
-                                            !s_toolDescOverride[tn].empty())
-                                            body = s_toolDescOverride[tn];
-                                        else if (liveDesc)
-                                            body = liveDesc;
-                                        std::string entry = sig;
-                                        if (!body.empty())
-                                            entry += "\n    " + body;
-                                        if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
-                                            entry += "\n    Note: " + s_toolNote[tn];
-                                        else if (!curNote.empty())
-                                            entry += "\n    Note: " + curNote;
-                                        return "[TOOLS] Call tools with EXACTLY these kwargs:\n" +
-                                               entry;
-                                    };
-                                    auto buildLocalPreview = [&]() {
-                                        s_previewText = makeLocalPreview();
-                                        s_previewErr.clear();
-                                    };
-                                    auto fetchPreview = [&](bool force) {
-                                        const double now = ImGui::GetTime();
-                                        if (s_previewFetching ||
-                                            (!force && s_previewTool == tn &&
-                                             (now - s_previewAt) < 1.5))
-                                            return;
-                                        s_previewTool = tn;
-                                        s_previewAt = now;
-                                        if (!canPrev) {
-                                            buildLocalPreview();
-                                            s_previewErr = "Worker offline — local approximation";
-                                            return;
-                                        }
-                                        nlohmann::json p;
-                                        p["tool"] = tn;
-                                        // Pass explicit trim when not inheriting.
-                                        if (s_toolSchemaTrim.count(tn) &&
-                                            s_toolSchemaTrim[tn] >= 0)
-                                            p["trim"] = (s_toolSchemaTrim[tn] != 0);
-                                        const std::string localPreview = makeLocalPreview();
-                                        s_previewFetching = true;
-                                        flushConfigWrites();
-                                        st.rpc.call("ai_tool_preview", std::move(p),
-                                                    [localPreview](const core::RpcResult& r) {
-                                            s_previewFetching = false;
-                                            if (!r.ok || !r.result.value("ok", false)) {
-                                                s_previewText = localPreview;
-                                                s_previewErr = r.err.empty()
-                                                    ? r.result.value(
-                                                        "error", std::string("preview failed"))
-                                                    : r.err;
-                                                return;
-                                            }
-                                            s_previewText = r.result.value("text", "");
-                                            if (s_previewText.empty())
-                                                s_previewText = r.result.value("entry", "");
-                                            s_previewErr.clear();
-                                        }, 8000);
-                                    };
-                                    // Refresh when popup opens / tool changes. Edits rebuild
-                                    // a local approximation until Refresh is clicked.
-                                    if (s_previewTool != tn) {
-                                        fetchPreview(/*force=*/true);
-                                    } else if (s_toolOptDirty && s_previewErr.find("offline") ==
-                                               std::string::npos &&
-                                               s_previewErr.find("Worker") == std::string::npos) {
-                                        // Keep showing last worker text; user can Refresh.
-                                    }
-                                    ImGui::SameLine();
-                                    if (!canPrev || s_previewFetching) ImGui::BeginDisabled();
-                                    if (ImGui::SmallButton("Refresh##tool_preview"))
-                                        fetchPreview(/*force=*/true);
-                                    if (!canPrev || s_previewFetching) ImGui::EndDisabled();
-                                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                                        ImGui::SetTooltip(s_previewFetching
-                                            ? "Loading tool preview"
-                                            : "Start the worker to refresh the preview");
-                                    // Always refresh local approx when worker unavailable.
-                                    if (!canPrev && (s_previewTool != tn || s_toolOptDirty))
-                                        buildLocalPreview();
-                                    if (s_previewFetching) {
-                                        ImGui::SameLine();
-                                        dimText("Loading\xe2\x80\xa6");
-                                    }
-                                    if (!s_previewErr.empty()) {
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                            ui::Palette::toU32(ui::palette.statusWarn));
-                                        ImGui::TextWrapped("%s", s_previewErr.c_str());
-                                        ImGui::PopStyleColor();
-                                    }
-                                    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                                        ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
-                                               ui::palette.panelBg[2], 1));
-                                    ImGui::BeginChild("##tool_recv_preview",
-                                                      ImVec2(boxW, 110 * sc), true);
-                                    ImGui::PushFont(st.fonts.mono);
-                                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + boxW - 12 * sc);
-                                    ImGui::TextUnformatted(
-                                        s_previewText.empty() ? "(empty)" : s_previewText.c_str());
-                                    ImGui::PopTextWrapPos();
-                                    ImGui::PopFont();
-                                    ImGui::EndChild();
-                                    ImGui::PopStyleColor();
-
-                                    ImGui::EndPopup();
-                                }
-                                ImGui::PopID();
-                            }
-                            ImGui::TreePop();
-                        }
-
-                        // Autosave. Every edit above flags its half (role families / per-tool
-                        // options) dirty; the commit happens on that same frame so a sub-tab
-                        // switch or close cannot strand it. Each half writes only its own keys:
-                        // a tool-option edit must not also materialise role_tools /
-                        // tool_families from the in-memory defaults.
-                        if (s_roleToolsDirty || s_toolOptDirty) {
-                            bool saveRoles = s_roleToolsDirty;
-                            bool saveOpts = s_toolOptDirty;
-                            nlohmann::json rt = nlohmann::json::object();
-                            nlohmann::json tf = nlohmann::json::object();
-                            nlohmann::json to = nlohmann::json::object();
-                            if (saveRoles) {
-                                for (const auto& kv : s_roleTools) {
-                                    nlohmann::json arr = nlohmann::json::array();
-                                    for (const auto& fam : kv.second) arr.push_back(fam);
-                                    rt[kv.first] = std::move(arr);
-                                }
-
-                                // Derive tool_families as the union of all role assignments
-                                // so legacy kill-switches / MCP external clients stay coherent.
-                                std::set<std::string> unionFams;
-                                for (const auto& kv : s_roleTools)
-                                    for (const auto& fam : kv.second) unionFams.insert(fam);
-                                for (int i = 0; i < kToolFamilyCount; ++i)
-                                    tf[kToolFamilies[i]] = unionFams.count(kToolFamilies[i]) > 0;
-                            }
-                            s_toolOptErr.clear();
-                            if (saveOpts) {
-                                std::set<std::string> names;
-                                for (const auto& kv : s_toolEnabled) names.insert(kv.first);
-                                for (const auto& kv : s_toolTimeout) names.insert(kv.first);
-                                for (const auto& kv : s_toolMaxCalls) names.insert(kv.first);
-                                for (const auto& kv : s_toolDefaults) names.insert(kv.first);
-                                for (const auto& kv : s_toolNote) names.insert(kv.first);
-                                for (const auto& kv : s_toolDescOverride) names.insert(kv.first);
-                                for (const auto& kv : s_toolSchemaTrim) names.insert(kv.first);
-                                for (const auto& tn : names) {
-                                    nlohmann::json e = nlohmann::json::object();
-                                    bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
-                                    if (!en) e["enabled"] = false;
-                                    int tmo = s_toolTimeout.count(tn) ? s_toolTimeout[tn] : 0;
-                                    if (tmo > 0) e["timeout_s"] = tmo;
-                                    int mc = s_toolMaxCalls.count(tn) ? s_toolMaxCalls[tn] : 0;
-                                    if (mc > 0) e["max_calls_per_turn"] = mc;
-                                    if (s_toolDefaults.count(tn) && !s_toolDefaults[tn].empty()) {
-                                        try {
-                                            auto parsed = nlohmann::json::parse(s_toolDefaults[tn]);
-                                            if (parsed.is_object() && !parsed.empty())
-                                                e["param_defaults"] = parsed;
-                                        } catch (...) {
-                                            s_toolOptErr = "Invalid JSON in param_defaults for " + tn +
-                                                           " \xe2\x80\x94 tool options are not saved until it is fixed.";
-                                            break;
-                                        }
-                                    }
-                                    if (s_toolNote.count(tn) && !s_toolNote[tn].empty())
-                                        e["prompt_note"] = s_toolNote[tn];
-                                    if (s_toolDescOverride.count(tn) &&
-                                        !s_toolDescOverride[tn].empty())
-                                        e["description_override"] = s_toolDescOverride[tn];
-                                    if (s_toolSchemaTrim.count(tn) &&
-                                        s_toolSchemaTrim[tn] >= 0)
-                                        e["schema_trim"] = (s_toolSchemaTrim[tn] != 0);
-                                    if (!e.empty()) to[tn] = e;
-                                }
-                                // Half-typed JSON must not wipe the stored options: they wait
-                                // (still dirty) until it parses; the role half saves regardless.
-                                if (!s_toolOptErr.empty()) saveOpts = false;
-                            }
-                            if (saveRoles || saveOpts) {
-                                const bool ok = updateConfigJson([&](nlohmann::json& j) {
-                                    if (!j.contains("agent") || !j["agent"].is_object())
-                                        j["agent"] = nlohmann::json::object();
-                                    if (saveRoles) {
-                                        j["agent"]["role_tools"] = rt;
-                                        // Merge, never replace: tool_families also carries keys
-                                        // this page has no control for (e.g. manufacture, org).
-                                        auto& fams = j["agent"]["tool_families"];
-                                        if (!fams.is_object()) fams = nlohmann::json::object();
-                                        for (auto it = tf.begin(); it != tf.end(); ++it)
-                                            fams[it.key()] = it.value();
-                                    }
-                                    if (saveOpts) j["agent"]["tool_options"] = to;
-                                });
-                                if (ok) {
-                                    if (saveRoles) s_roleToolsDirty = false;
-                                    if (saveOpts) s_toolOptDirty = false;
-                                } else {
-                                    s_toolOptErr = "Failed to save tool settings; retrying.";
-                                }
-                            }
-                        }
-                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                        if (!s_toolOptErr.empty())
-                            ImGui::TextColored(settingsErrInk(), "%s", s_toolOptErr.c_str());
-                        if (ui::kit::secondaryButton("Reset role defaults", true, nullptr, ImVec2(160.0f * sc, 0))) {
-                            seedDefaultRoleTools();
-                            s_roleToolsDirty = true;  // autosaved next frame
-                        }
-                        ImGui::SameLine();
-                        if (ui::kit::secondaryButton("Reset tool options", true, nullptr, ImVec2(150.0f * sc, 0))) {
-                            s_toolEnabled.clear();
-                            s_toolTimeout.clear();
-                            s_toolMaxCalls.clear();
-                            s_toolDefaults.clear();
-                            s_toolNote.clear();
-                            s_toolDescOverride.clear();
-                            s_toolSchemaTrim.clear();
-                            s_toolOptDirty = true;  // autosaved next frame
-                        }
-                        settingsGlassSectionEnd();
-
-                        ImGui::Dummy(ImVec2(0, 10.0f * sc));
-                        settingsGlassSectionBegin("##ai_bugreports", "Bug reports");
-                        dimText("Give the agent a submit_bug_report tool so it can file a "
-                                "report when it hits tool errors or broken behavior. Reports "
-                                "are markdown files in Documents/Chudware/Bug-Reports/ \xe2\x80\x94 "
-                                "nothing leaves this machine.");
-                        {
-                            static bool s_bugReports = loadAgentConfigBool("bug_reports", true);
-                            if (ui::kit::checkbox("bug_reports", "Send bug reports", &s_bugReports))
-                                saveAgentConfigValue("bug_reports", s_bugReports);
-                            if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Saved immediately to config.json "
-                                                  "agent.bug_reports.");
-                        }
-                        settingsGlassSectionEnd();
-
-                        ImGui::Dummy(ImVec2(0, 10.0f * sc));
-                        drawRuntimeMaintenanceSection(st, sc);
-                    }
-
-                    // ---- Dev Preview: assembled general_agent system prompt ----
-                    if (s_aiSubSel == 7) {
-                        if (aiSubTabJustEntered(7)) ImGui::SetScrollY(0.0f);
-                        settingsGlassSectionBegin("##ai_dev_preview", "Prompt assembly preview");
-                        dimText("Shows the system prompt a typical main-chat / general_agent "
-                                "turn would send (effective role/global override + capability "
-                                "SOFT block + harness base + catalogs + tools slot + Auto-Learn "
-                                "guidance when enabled), followed by an example user message "
-                                "that marks where the request goes. Nothing here is sent to a "
-                                "model.");
-
-                        static std::string s_devSys;
-                        static std::string s_devUser;
-                        static std::string s_devErr;
-                        static std::string s_devMeta;
-                        static bool s_devLoaded = false;
-                        static bool s_devFetching = false;
-                        static bool s_includeTools = true;
-
-                        const bool canDev = st.workerStarted;
-                        auto fetchDevPreview = [&]() {
-                            if (s_devFetching) return;
-                            s_devFetching = true;
-                            s_devErr.clear();
-                            if (!canDev) {
-                                s_devSys.clear();
-                                s_devUser.clear();
-                                s_devMeta.clear();
-                                s_devErr = "Worker not ready — start the runtime to load the "
-                                           "assembled prompt.";
-                                s_devLoaded = true;
-                                s_devFetching = false;
-                                return;
-                            }
-                            const bool includeTools = s_includeTools;
-                            flushConfigWrites();
-                            st.rpc.call("ai_prompt_preview",
-                                        nlohmann::json{{"include_tools", includeTools}},
-                                        [includeTools](const core::RpcResult& r) {
-                                s_devFetching = false;
-                                if (s_includeTools != includeTools) {
-                                    s_devLoaded = false;
-                                    return;
-                                }
-                                if (!r.ok || !r.result.value("ok", false)) {
-                                    s_devSys.clear();
-                                    s_devUser.clear();
-                                    s_devMeta.clear();
-                                    s_devErr = r.err.empty()
-                                        ? r.result.value(
-                                            "error", std::string("ai_prompt_preview failed"))
-                                        : r.err;
-                                    s_devLoaded = true;
-                                    return;
-                                }
-                                // Fold once here, not per frame: the prompt is long and may
-                                // carry glyphs the UI font lacks.
-                                s_devSys = ui::foldToAtlasGlyphs(r.result.value("system", ""));
-                                // The worker brackets its sample request with a color-span
-                                // marker ("[[USER REQUEST - sample]] ", math brackets); the
-                                // preview shows the example request itself under its own
-                                // caption instead. Marker bytes are matched, never rendered.
-                                std::string user = r.result.value("user_placeholder", "");
-                                static const char* kMarkClose = "\xe2\x9f\xa7";  // gui-lint: allow
-                                const size_t close = user.find(kMarkClose);
-                                if (user.rfind("\xe2\x9f\xa6", 0) == 0 &&  // gui-lint: allow
-                                    close != std::string::npos) {
-                                    user.erase(0, close + std::strlen(kMarkClose));
-                                    user.erase(0, user.find_first_not_of(' '));
-                                }
-                                s_devUser = ui::foldToAtlasGlyphs(user);
-                                auto meta = r.result.value("meta", nlohmann::json::object());
-                                char buf[256];
-                                std::snprintf(buf, sizeof(buf),
-                                    "%s  \xc2\xb7  %d tools  \xc2\xb7  %d chars  \xc2\xb7  "
-                                    "~%d tokens  \xc2\xb7  Auto-Learn %s",
-                                    meta.value("role", "general_agent").c_str(),
-                                    meta.value("allowed_tool_count", 0),
-                                    meta.value("system_chars", 0),
-                                    meta.value("system_tokens_est", 0),
-                                    meta.value("autolearn", false) ? "on" : "off");
-                                s_devMeta = buf;
-                                s_devErr.clear();
-                                s_devLoaded = true;
-                            }, 30000);
-                        };
-
-                        if (!s_devLoaded && canDev && !s_devFetching)
-                            fetchDevPreview();
-
-                        if (s_devFetching) ImGui::BeginDisabled();
-                        if (ui::kit::checkbox("dev_tools_slot", "Include tools slot", &s_includeTools)) {
-                            s_devLoaded = false;
-                        }
-                        if (s_devFetching) ImGui::EndDisabled();
-                        ImGui::SameLine();
-                        if (!canDev || s_devFetching) ImGui::BeginDisabled();
-                        if (ui::kit::secondaryButton("Refresh##dev_preview", true, nullptr, ImVec2(100.0f * sc, 0)))
-                            fetchDevPreview();
-                        if (!canDev || s_devFetching) ImGui::EndDisabled();
-                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                            ImGui::SetTooltip(s_devFetching
-                                ? "Assembling prompt preview"
-                                : "Start the worker to load the prompt preview");
-                        if (s_devFetching) {
-                            ImGui::SameLine();
-                            dimText("Loading\xe2\x80\xa6");
-                        }
-                        if (!s_devMeta.empty()) {
-                            ImGui::SameLine();
-                            dimText(s_devMeta.c_str());
-                        }
-                        if (!s_devErr.empty()) {
-                            ImGui::PushStyleColor(ImGuiCol_Text,
-                                ui::Palette::toU32(ui::palette.statusWarn));
-                            ImGui::TextWrapped("%s", s_devErr.c_str());
-                            ImGui::PopStyleColor();
-                        }
-
-                        // System prompt (normal ink) then the example user message (accent).
-                        const float prevH = ImMax(280.0f * sc,
-                            ImGui::GetContentRegionAvail().y - 8.0f * sc);
-                        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                            ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
-                                   ui::palette.panelBg[2], 1));
-                        ImGui::BeginChild("##dev_prompt_body", ImVec2(-1, prevH),
-                                          ImGuiChildFlags_Borders,
-                                          ImGuiWindowFlags_NoScrollbar);
-                        ImGui::PushFont(st.fonts.mono);
-                        const float wrapX = ImGui::GetCursorPosX() +
-                            ImGui::GetContentRegionAvail().x - 4.0f * sc;
-                        ImGui::PushTextWrapPos(wrapX);
-                        // Section captions in the UI font, not mono rule lines.
-                        auto caption = [&](const char* text) {
-                            ImGui::PopFont();
-                            dimText(text);
-                            ImGui::PushFont(st.fonts.mono);
-                        };
-                        if (!s_devSys.empty()) {
-                            caption("System prompt");
-                            ImGui::TextUnformatted(s_devSys.c_str());
-                            if (!s_devUser.empty()) {
-                                ImGui::Dummy(ImVec2(0, 10.0f * sc));
-                                caption("Example user message (not sent)");
-                                ImGui::PushStyleColor(ImGuiCol_Text,
-                                    ui::Palette::toU32(ui::palette.accent));
-                                ImGui::TextWrapped("%s", s_devUser.c_str());
-                                ImGui::PopStyleColor();
-                            }
-                        } else if (s_devFetching || (!s_devLoaded && canDev)) {
-                            caption("Assembling the prompt\xe2\x80\xa6");
-                        } else {
-                            ImGui::PopFont();
-                            ui::kit::emptyState(
-                                nullptr, "No preview yet",
-                                canDev ? "Refresh to assemble the prompt a main-chat turn "
-                                         "would send."
-                                       : "Start the engine to assemble the prompt a main-chat "
-                                         "turn would send.");
-                            ImGui::PushFont(st.fonts.mono);
-                        }
-                        ImGui::PopTextWrapPos();
-                        ImGui::PopFont();
-                        settingsPillScrollbar();
-                        ImGui::EndChild();
-                        ImGui::PopStyleColor();
-                        settingsGlassSectionEnd();
-                    }
-
-                }
-                settingsPillScrollbar();
-                ImGui::EndChild();  // ##ai_sub_body
-                ImGui::PopStyleVar();  // WindowPadding (content pane)
-                s_aiSubJump = -1;
-                settingsTabBodyEnd();
-            }
-
-            // ---- Providers page: two-pane provider manager ----
-            if (s_settingsPage == 3) {
-                providerTabDrawn = true;
-                settingsTabBodyBegin("##tab_providers");
-                dimText("Provider sign-in and model availability. New credentials are stored "
-                        "by the runtime; availability does not verify provider access.");
-                // Online model limits and thinking are derived from OMP capabilities.
-                drawOmpProviderManager(st);
-
-                settingsTabBodyEnd();
-            }
-        }
-        if (!providerTabDrawn) leaveOmpProviderView();
+        s_providerTabDrawn = false;
+        kSettingsCategories[s_settingsPage].draw(st);
+        if (!s_providerTabDrawn) leaveOmpProviderView();
         ImGui::EndChild();
         // Nested modal: must be submitted every frame inside the Settings window scope or
         // ImGui's modal stack makes it non-interactive. It clears the flag itself on close.
@@ -9298,8 +9656,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         }
         flushPromptEditors(st, /*force=*/true);
         flushSkillRuleEdits(st, /*force=*/true);
-        if (s_wsDirty) commitWorkspaceDir();
-        if (s_boxDirty) commitBoxSettings(/*refreshStatus=*/false);
+        for (const SettingsCategory& cat : kSettingsCategories)
+            if (cat.commitPending) cat.commitPending(st);
         if (s_omp.modalOpen) closeOmpProviderModal(st);
     }
 

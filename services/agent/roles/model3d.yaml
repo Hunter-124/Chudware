@@ -104,7 +104,8 @@ system_prompt: |
      apply only eligible, understood changes and preserve editable history.
      Never automatically rewrite topology or use refine without an explicit need.
      Equal volume or no surviving owned faces does not prove a feature unused.
-     On rebuild failure, read the add_features reply's regen_diagnosis first.
+     On rebuild failure, read the add_features reply's error, failed_features and
+     structural_findings first; call regen_diagnose only if you want a proposed fix.
      If rollback is needed, enable_tools(categories=["plm"]) then plm_rollback;
      replan when the approach is wrong.
 

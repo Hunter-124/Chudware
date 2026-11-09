@@ -660,7 +660,8 @@ TRUE-ASSEMBLY WORKFLOW
   6. VALIDATE: describe_assembly() (world bboxes + solve status), check_interference()
      (clashes + tightest clearances; min_clearance_mm flags too-tight fits), interface_check
      (do hole patterns/axes actually line up), measure_between (spot dimensions).
-     check_interference members= (also components=) accepts component IDs or member names.
+     check_interference members= (also components=) accepts component IDs or member names;
+     a suppressed or unknown component ID is refused by name, never narrowed away.
      describe_assembly ok reports narration success; inspect fit and warnings for completeness.
      interface_check separates differing hole diameters from positional error; pass fastener
      for nominal clearance (not grommet/head fit). Contact is unverified without a planar
@@ -742,9 +743,9 @@ WORKFLOW
                                             auto_define=False to both when leaving sketches free.
                                             An invalid fillet/chamfer solid is rejected even if
                                             OCCT reports construction success. Atomic failure keeps
-                                            the prior live tree/revision; regen_diagnosis uses the
-                                            rejected candidate and native feature error. Provider
-                                            unavailability does not erase that native evidence.
+                                            the prior live tree/revision; structural_findings uses the
+                                            rejected candidate and native feature error. No model is
+                                            called on failure; regen_diagnose proposes a fix on request.
   3. render_part()                          SEE it — ONE call returns a 2x2 grid of the four
                                             most useful complementary shots (the planner
                                             measures ~200 cameras in the engine and picks the
@@ -1304,12 +1305,19 @@ _ADD_FEATURES_GUIDE = """Apply a list of document ops to build/edit the part (th
         use cad_guide("fillet") for its mode rules.
         Positive requests passing input/topology checks are tried unchanged first. If that
         build fails, or a finite requested radius is nonpositive, a bounded search can adjust
-        radii, but only a fully validated blend covering every selected edge is accepted.
+        radii, but only a fully validated blend covering every selected edge is accepted,
+        and a constant-radius reduction never goes below min(0.05 mm, 0.1% of the body's
+        thinnest extent, a tenth of the request).
+        An inside-corner constant fillet wider than the planar face it rolls on (a boss near a
+        plate edge) is built at the requested radius and ends flush with that face's open
+        perpendicular edge, before any radius reduction is tried.
         Variable endpoints are refined in deterministic order, not as a global optimum.
-        A timeout stops the search without becoming a radius bound; a previously fully
-        validated all-edge candidate can still be returned. Invalid or dangling selectors,
-        zero matches, nonfinite radii, unsupported topology, crashes, and failure to find a
-        valid all-edge blend are explicit errors.
+        A budget stop is not a radius bound; a previously fully validated all-edge candidate
+        can still be returned. Failures name the failing edge or corner with a location; when
+        the requested and smallest radii fail at the same place, fix the construction there
+        (cad_guide("fillet")), not the radius. Invalid or dangling selectors, zero matches,
+        nonfinite radii, unsupported topology, crashes, and failure to find a valid all-edge
+        blend are explicit errors.
 
         ARGUMENT SHAPES — the canonical call is `ops=[…]`; these are accepted too, and every
         rewrite comes back in `interpreted` (prefer the canonical spelling once you know it):
@@ -1528,8 +1536,9 @@ _ADD_FEATURES_GUIDE = """Apply a list of document ops to build/edit the part (th
         or a warning warrants it, and review the finished artifact as needed. Before
         declaring done run verify_battery(doc_id=doc_id). On a validation error
         the whole batch is rejected — read `error`, fix the ops, call again. A rebuild-failure
-        response may also carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis +
-        editable fix_ops + verifier verdict) — record your verdict with regen_resolve(card, action).
+        response carries the native per-feature reasons in `error`/`failed_features` plus
+        model-free `structural_findings`; add_features never calls a model. Call regen_diagnose
+        only when you want a proposed repair (it calls a model and returns a fix-preview card).
 
         SKETCH MUTATIONS: any batch that includes sketch_add_entity / sketch_add_constraint /
         sketch_set_dim / sketch_fillet / … auto-appends one readback per touched sketch under
@@ -1910,6 +1919,23 @@ def cad_guide_text(topic: str = "") -> str:
             "geometry for bus analysis. Supply the cable datasheet bend radius before "
             "routing or checking. Add a clamp by splitting an interior routed segment with "
             "harness_edit(action='add_clamp', segment_id=..., distance_mm=...) or point=.... "
+            "A route failure names the wire, endpoints and obstacle (error fields wire, "
+            "start, end and detail with endpoint, obstacle, distance_mm, required_mm, "
+            "free_mm): fix the connector frame or exit_dir with "
+            "harness_edit(action='edit_connector', connector_id=..., frame=..., exit_dir=...) "
+            "instead of creating new harnesses or probing with extra routes. A join that "
+            "enlarges a bundle re-paths every route for the bundle it finally carries "
+            "(repathed_segments, route_passes); a bundle with no room fails naming "
+            "bundle_wires and the bend radius it needs, and no_join_point means no bundle "
+            "offers a junction clear of connector exit stubs. Routes persist: "
+            "after geometry, keepout or connector changes use "
+            "harness_route(reroute=True, wire_ids=[...]); a segment shared with other wires "
+            "is refused and lists them. harness_edit also removes wires, segments and "
+            "connectors (remove_wire, remove_segment, remove_connector) and deletes a "
+            "scratch harness (delete_harness). "
+            "harness_route keepouts are {aabb: [[xmin,ymin,zmin],[xmax,ymax,zmax]], name?, "
+            "clearance_mm?} boxes or {body: id|name|component, clearance_mm?} overrides; "
+            "max_nodes is at most 200000, so an exhausted search at that cap needs a larger grid_mm. "
             "Inspect connectivity, bend and clearance findings, then electrical and bus "
             "assumptions and results. Bus links represent "
             "series sections of one signal path. Missing evidence is unknown, not a pass "
@@ -2757,10 +2783,12 @@ def cad_guide_text(topic: str = "") -> str:
             "Tool: regen_diagnose(doc_id=...) or regen_diagnose(document_json=...)\n\n"
             "  Supply reference_json with a known-good revision for a geometry comparison.\n"
             "  A fixture scan or rebuild without a reference is unverified, not a pass.\n"
-            "WHEN TO USE: call after add_features returns any feature with ok=false, or when\n"
-            "  close_part / export_part / run_fea_* fail with a regen error.\n"
-            "WORKFLOW: add_features → check feature ok flags → if any false, regen_diagnose\n"
-            "  → apply the proposed fix-ops → re-run add_features → verify_battery."
+            "WHEN TO USE: only when you want a proposed repair. A failed add_features reply already\n"
+            "  carries the native per-feature reasons (error/failed_features) and model-free\n"
+            "  structural_findings; add_features never calls a model. regen_diagnose calls one.\n"
+            "WORKFLOW: add_features fails → read error/failed_features/structural_findings → fix the\n"
+            "  ops yourself; if stuck, regen_diagnose → apply the proposed fix-ops → re-run\n"
+            "  add_features → verify_battery."
         )
     if topic in ("code_compliance", "code_check", "building_code", "compliance",
                  "ibc", "asce", "nfpa"):
@@ -3245,6 +3273,14 @@ def cad_guide_text(topic: str = "") -> str:
             "     fuzzy_tolerance_mm: its overlap classification/volume are approximate.\n"
             "     fallback_extrema_disjoint marks positive-distance evidence for a\n"
             "     constituent after Boolean failures; it can coexist with fuzzy fallback.\n"
+            "     clipped_common marks an exact (not approximate) Common recovered after\n"
+            "     the direct one failed, by clipping one body to the other's bounds.\n"
+            "     For ok=false, summary names the first failed pair and its\n"
+            "     pair_failures[].detail lists the OCCT alert, operand (first=a,\n"
+            "     second=b), world location and sub-shape tolerance; query_geometry\n"
+            "     near=<that point> finds the face/feature. Sub-shapes closer together\n"
+            "     than the other body's coarse fillet tolerance (e.g. a 0.01 mm step)\n"
+            "     make OCCT merge them: remove the step rather than retrying.\n"
             "     A clash returns ok=true, clear=false; ok=false means incomplete.\n"
             "     clearance_status and clearance_tolerance_mm distinguish below, above and\n"
             "     within_tolerance; ±0.000001 mm is uncertain, not a definite pass/violation.\n"

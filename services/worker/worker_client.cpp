@@ -102,10 +102,7 @@ json liveParticipant(const json &params) {
   if (id.empty() && display.empty())
     return nullptr;
 
-  json value = {{"id", id}, {"display", display}, {"account_id", nullptr}};
-  const auto account = params.find("account_id");
-  if (account != params.end() && !account->is_null())
-    value["account_id"] = *account;
+  json value = {{"id", id}, {"display", display}};
   return value;
 }
 
@@ -470,7 +467,7 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
   // (daemon) or locally (in-process) when no worker run matched; it never needs
   // the engine DLL.
   if (method == "agent_cancel" || method == "agent_steer" ||
-      method == "agent_answer")
+      method == "agent_withdraw_steer" || method == "agent_answer")
     return true;
   // Model-availability probe is doc-independent and provider-diagnostic; route
   // it to the C++ core whenever the DLL loads (the host picker falls back to a
@@ -1769,6 +1766,20 @@ bool WorkerClient::callAgentSteer(const std::string &runId,
   return call("agent_steer", params, result, err, 5000);
 }
 
+bool WorkerClient::callAgentWithdrawSteer(const std::string &runId,
+                                          const std::string &steerId,
+                                          json &result, std::string &err,
+                                          const std::string &provider) {
+  json params{{"run_id", runId}, {"steer_id", steerId}};
+  if (!provider.empty()) params["provider"] = provider;
+  bool matched = false;
+  if (callWorkerControl("withdraw_steer", runId, params, matched, result, err))
+    return true;
+  if (matched)
+    return false;
+  return call("agent_withdraw_steer", params, result, err, 5000);
+}
+
 bool WorkerClient::callAgentAnswer(const std::string &runId,
                                    const std::string &batchId,
                                    const json &answers, bool declined,
@@ -1857,7 +1868,7 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   // cannot safely carry concurrent requests.
   const bool isAgentControl =
       (method == "agent_cancel" || method == "agent_steer" ||
-       method == "agent_answer");
+       method == "agent_withdraw_steer" || method == "agent_answer");
 #ifdef __EMSCRIPTEN__
   // Browser controls must share the cell admission guard, not native side sockets.
   if (isAgentControl)
@@ -2005,6 +2016,11 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       } else if (method == "agent_steer") {
         cppResult = json{{"ok", true},
                          {"steered", false},
+                         {"reason", "no active agent run"}};
+        ok = true;
+      } else if (method == "agent_withdraw_steer") {
+        cppResult = json{{"ok", true},
+                         {"withdrawn", false},
                          {"reason", "no active agent run"}};
         ok = true;
       } else {

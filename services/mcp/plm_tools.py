@@ -574,12 +574,11 @@ def register_plm_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @_with_project_path
     def plm_add_remote(path: str = "", kind: str = "folder", name: str = "origin",
-                       url: str = "", display_name: str = "",
-                       account_id: str = "") -> str:
-        """Register a team-sync profile with optional account identity.
+                       url: str = "", display_name: str = "") -> str:
+        """Register a team-sync profile for a shared project location.
 
-        ``kind`` is ``folder`` | ``ssh`` | ``https`` | ``plm-server`` |
-        ``chudware-cloud``. Tokens for live servers are supplied only at join.
+        ``kind`` is ``folder`` | ``ssh`` | ``https`` | ``plm-server``. Tokens for
+        live servers are supplied only at join.
         """
         try:
             from services.plm import remote as remote_mod
@@ -592,7 +591,6 @@ def register_plm_tools(mcp: FastMCP) -> None:
             kind=kind,
             url=url or None,
             display_name=display_name or None,
-            account_id=account_id or None,
         )
         if not out.get("ok"):
             return _err(str(out.get("reason") or "internal"),
@@ -654,7 +652,7 @@ def register_plm_tools(mcp: FastMCP) -> None:
                    **{k: v for k, v in out.items() if k != "ok"})
 
     # ------------------------------------------------------------------
-    # Authoritative live co-editing (aicad.plm-live/1)
+    # Authoritative live co-editing (aicad.plm-live/2)
     # ------------------------------------------------------------------
 
     def _live_worker(method: str, payload: dict[str, Any]) -> str:
@@ -675,7 +673,7 @@ def register_plm_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Join an authoritative live item session.
 
-        ``participant`` is ``{id, display, account_id}``. ``token`` is used for
+        ``participant`` is ``{id, display}``. ``token`` is used for
         this connection only and is never saved in the project profile. An
         optional ``local_doc_id`` attaches the already-open editor document.
         Returns the session id, authoritative sequence, and attached/replacement

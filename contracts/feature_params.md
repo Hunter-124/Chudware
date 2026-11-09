@@ -882,3 +882,66 @@ shell is sewn face by face, and sewing is super-linear in triangle count, so:
   `warnings` entry. A NEW document that fails to take the reference is discarded.
 - glTF and GLB have no mesh-reference format and fail with `mesh_too_large`.
 - Closed single-shell meshes keep the direct solid lane at any size.
+
+## Fillet run-off (append-only, 2026-11-07)
+
+Amends §Fillet parameters and correction v2. A constant-radius fillet whose selected edges
+are all inside (concave) corners is retried at the SAME radius, before any radius correction,
+when the unchanged request fails and the blend is too wide for an end of its support:
+
+- **ring**: a planar support the blend overruns (a rib standing nearer a plate edge than the
+  radius) is extended past its open rim, blended, and cut back flush with the rim;
+- **cap**: the planar face ending a prism-shaped support (a boss or rib shorter than the
+  radius, an inside corner beside a wall that is too short) is extruded outward, blended, and
+  cut back flush with that face;
+- **separate**: blends that only collide with each other (two bosses closer than a radius)
+  are built one contour at a time and the material each adds is united.
+
+An open rim is a convex edge meeting its neighbour at a right angle, within two radii of a
+selected edge's interior. Slanted, rounded or tangent rims, outside-edge fillets, variable
+radii, contact joins, several solids, and a radius larger than the body do not run off; they
+keep the correction search. A successful run-off reports `effective == requested` and
+`adjustment: "none"`. A failed run-off never ends the search: the correction proceeds, and
+the failure at the requested radius carries the run-off reason.
+
+The result is built from booleans of the original body, so it is validated like any other
+fillet result (closed solid, BRepCheck, document-solid policy) and its face provenance chains
+through the recorded boolean histories.
+
+## Swept blends (append-only, 2026-11-08)
+
+Amends §Fillet parameters and correction v2, §Fillet run-off, and the chamfer edge-dropping
+behaviour. The kernel blend builder closes each end of a blend together with the faces that
+meet there, and fails where an end vertex joins more than one face besides the two supports
+(a hook's rounded tip meeting a wall where a second curved face of the hook also ends): it
+refuses the edge at every size, or reports success with a vertex tolerance as wide as the gap.
+
+- A kernel fillet or chamfer result with a vertex or edge tolerance above
+  max(10 × the source body's largest tolerance, 5% of the blend size, 0.001 mm) is rejected.
+  A fillet names the corner it could not close; a chamfer treats it as a failed build.
+- A **prismatic edge** is straight, borders two faces that are not tangent along it, and each
+  face is a plane containing its direction, a cylinder whose axis is parallel to it, or a
+  linear extrusion along it. Its blend has one exact cross-section along its whole length.
+- When the unchanged constant-radius request fails (after run-off), the fillet is retried at
+  the SAME radius as a **swept blend**, before any radius correction: first the prismatic
+  selected edges that share no vertex with another selected edge, then every prismatic
+  selected edge. Each is built as the cross-section (the region between the two faces and the
+  rolling-ball arc) swept along the edge, trimmed where the surfaces of the faces ending the
+  edge cross it, and cut from (outside edge) or fused to (inside edge) the body, one edge at a
+  time; the kernel builder then blends the remaining selected edges on that body. Like the
+  kernel's contour, a swept blend runs on along sharp edges continuing its edge in a straight
+  line between faces of the same cross-section (a long edge split by an imprint), and covers
+  selected edges on that run. New end faces lying on a face's surface are merged into it.
+- A chamfer whose kernel build fails tries the same two swept attempts (symmetric,
+  two-distance and distance-angle profiles) before dropping edges.
+- A swept blend refuses, with a reason, when the blend is wider than a face it rests on,
+  another face or pocket lies inside its region (the exchanged volume differs from the blend's),
+  an edge continues in a straight line into a sharp edge whose faces have another
+  cross-section, no face ends the edge, or the faces
+  ending it turn both ways around it. A refusal never ends the search; the failure at the
+  requested radius carries the swept-blend reason.
+
+A successful swept fillet reports `effective == requested` and `adjustment: "none"`, and is
+validated like any other fillet result. Its face provenance chains through the recorded
+boolean and face-merge histories. [`blend_sweep.cpp`](../core/geom/blend_sweep.cpp) owns the
+construction.

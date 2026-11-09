@@ -53,7 +53,7 @@ inline constexpr const char* kPreviewsHelp  =
     "placeholder only.";
 }  // namespace aiPrefCopy
 
-// ---- chat transcript display (Settings -> AI -> Harness "Chat display") ---------------------
+// ---- chat transcript display (Settings -> AI -> Behavior "Chat display") -------------------
 // Read from per-frame draw code for EVERY activity row — the cached accessors make that cheap.
 
 // How much of a tool call the transcript shows.

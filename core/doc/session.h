@@ -113,9 +113,18 @@ nlohmann::json doc_new(const std::string& kind, const std::string& name,
 // scad_convert (to_code/to_native) uses this same transaction and returns successful
 // conversion reports in scad_conversions; unsupported/changed projections throw OpError.
 // `reject_unknown` is enabled for agent mutations; GUI/import paths preserve legacy keys.
+// `sketch_session` (the session_id of doc_sketch_enter) opts the reply into interactive sketch
+// editing: while it owns the active sketch and the batch only edits that sketch, the history
+// is compiled only up to the sketch. The reply reports every later feature rolled_back
+// (rebuild.doc_status.rolled_back_to names the sketch, `exact` is omitted) and the document and
+// its undo history are unchanged; doc_sketch_exit rebuilds the rest. Any other batch rebuilds
+// the complete history. `with_exact=false` omits the `exact` statistics from the reply.
+// `preview_through` (a feature id) does the same for a property-manager preview: a batch that
+// only edits that feature compiles the history up to it, and the final edit rebuilds the rest.
 nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
                              const nlohmann::json& ops, bool coalesce, bool with_tess = true,
-                             bool reject_unknown = true);
+                             bool reject_unknown = true, std::uint64_t sketch_session = 0,
+                             bool with_exact = true, const std::string& preview_through = {});
 
 // Non-solid, embedded reference meshes. Mutations are document transactions but do
 // not compile features; the mesh payload is content-addressed in the native container.
@@ -141,8 +150,10 @@ nlohmann::json doc_mesh_ref_mesh(const std::string& doc_id, const nlohmann::json
 nlohmann::json doc_dry_run_ops(const std::string& doc_id, const nlohmann::json& ops,
                                 int budget_ms = 0);
 
-nlohmann::json doc_undo(const std::string& doc_id);     // bumps revision +1
-nlohmann::json doc_redo(const std::string& doc_id);     // bumps revision +1
+// `sketch_session` as for doc_apply_ops: undo/redo inside an interactive sketch session
+// compile only up to its sketch.
+nlohmann::json doc_undo(const std::string& doc_id, std::uint64_t sketch_session = 0);  // bumps revision +1
+nlohmann::json doc_redo(const std::string& doc_id, std::uint64_t sketch_session = 0);  // bumps revision +1
 // Clear undo_stack + redo_stack (+ disk journal) for a doc without bumping
 // revision. Used after a human (gui) doc_save so interactive undo resets at the
 // saved baseline. Returns {"ok": true, "doc_id": ...}.
@@ -280,6 +291,15 @@ nlohmann::json doc_resolve_pick(const std::string& doc_id, int body_id,
 
 // The edge topo_ids bordering a face (for "fillet a whole face"). Returns {edges:[...]}.
 nlohmann::json doc_face_edges(const std::string& doc_id, int body_id, int face_topo_id);
+
+// The edges a fillet/chamfer's `refs.edges` select, resolved against the body the feature
+// received (the state just before it ran — the feature itself has consumed them from the
+// displayed result). Returns {feature, revision, body, refs:[{index, error, edges:[{selector,
+// points, closed}]}]}: one row per element of the slot, each with the unique edges it names as
+// canonical pick selectors plus a world-space polyline to draw. A nonnegative `revision` that
+// is no longer the document's raises OpError("stale_revision"). Part documents only.
+nlohmann::json doc_feature_edges(const std::string& doc_id, const std::string& feature_id,
+                                 long revision);
 
 // Instant3D push-pull: drag face (1-based body_id, 1-based topo_id) by `distance` mm
 // along its outward normal. Plans the drivable feature param (plan_push_pull), and on
@@ -481,7 +501,7 @@ nlohmann::json doc_eval_edge_analysis(const std::string& doc_id, const nlohmann:
 // seam_edges, degenerate_edges, orientation:{checked,consistent,…}, brep_valid, volume_mm3,
 // volume_positive, area_mm2, self_intersection:{checked,self_intersecting,
 // interference_count,kinds,elapsed_ms}}], body_count, all_watertight, all_sound}.
-// Free-edge counting is seam/degenerate-aware (same rule as dress_is_closed_solid), so a
+// Free-edge counting is seam/degenerate-aware (same rule as geom::is_watertight), so a
 // cylinder's seam is NOT reported as a hole. Self-intersection is a real BOPAlgo_CheckerSI
 // run at level 9 under a 20 s per-body wall-clock budget; a body it flags is NOT sound.
 // A check that could not run (timeout, OCCT failure) reports checked:false with a reason
@@ -739,11 +759,15 @@ nlohmann::json doc_save(const std::string& doc_id, const std::string& path,
 // re-uniqued against the open docs (recovered duplicates would otherwise all be "Part1").
 // `recovered` marks a crash survivor dirty. Its optional original path is bound
 // instead of the snapshot path; its base stamp is accepted only if still current.
+// `display_quality` ("draft"|"standard"|"fine"; empty = engine default) opens the session
+// at that display tier, so a cache saved at the caller's tier hits instead of being
+// re-tiered (a full re-solve) right after the open. The response echoes "display_quality".
 nlohmann::json doc_open(const std::string& path, bool as_solid = false,
                         bool detach_path = false, bool recovered = false,
                         bool reuse_open = false,
                         const std::string& recovery_original_path = {},
-                        const nlohmann::json& recovery_base_stamp = nullptr);
+                        const nlohmann::json& recovery_base_stamp = nullptr,
+                        const std::string& display_quality = {});
 // Replace the bound document in place from disk, advancing its revision. Optional
 // revision guards protect a snapshot followed by system-initiated reload.
 nlohmann::json doc_reload(const std::string& doc_id, long expected_revision = -1,

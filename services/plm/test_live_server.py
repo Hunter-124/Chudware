@@ -1,4 +1,4 @@
-"""Focused protocol proof for the authoritative ``aicad.plm-live/1`` relay."""
+"""Focused protocol proof for the authoritative ``aicad.plm-live/2`` relay."""
 from __future__ import annotations
 
 import asyncio
@@ -111,7 +111,7 @@ class _Factory:
 
 
 def _participant(participant_id: str) -> dict[str, Any]:
-    return {"id": participant_id, "display": participant_id.upper(), "account_id": None}
+    return {"id": participant_id, "display": participant_id.upper()}
 
 
 def _wire(**fields: Any) -> str:
@@ -206,10 +206,17 @@ def test_schema_identity_scope_and_message_limits_are_plain_refusals(tmp_path: P
 
             websocket = await _connect(server.url)
             await websocket.send(_wire(type="join", project_id=project_id, item_id=item_id,
-                                       participant={"id": "u1", "display": "", "account_id": None}))
+                                       participant={"id": "u1", "display": ""}))
             error = json.loads(await websocket.recv())
             assert error["reason"] == "invalid_identity"
             assert "Traceback" not in error["hint"]
+            await websocket.wait_closed()
+
+            websocket = await _connect(server.url)
+            await websocket.send(_wire(type="join", project_id=project_id, item_id=item_id,
+                                       participant={"id": "u1", "display": "U1", "role": "admin"}))
+            error = json.loads(await websocket.recv())
+            assert error["reason"] == "invalid_identity"
             await websocket.wait_closed()
 
             websocket = await _connect(server.url)

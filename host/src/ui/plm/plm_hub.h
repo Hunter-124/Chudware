@@ -61,9 +61,8 @@ struct PlmWhereUsedRow {
 // optional identity is how THIS machine appears to the team on that location;
 // capabilities say what the service can actually do against it.
 struct PlmRemoteRow {
-    std::string id, kind, url, name;   // kind: folder | ssh | https | plm-server | chudware-cloud
-    bool reserved = false;             // chudware-cloud config-only seam (§6.1)
-    std::string identityUserId, identityDisplay, identityAccountId;
+    std::string id, kind, url, name;   // kind: folder | ssh | https | plm-server
+    std::string identityUserId, identityDisplay;
     bool canSync = false;              // capabilities: "snapshot_sync"
     bool canLock = false;              // capabilities: "advisory_locks"
     bool canLive = false;              // capabilities: "live_coedit" (kind "plm-server") —
@@ -72,7 +71,7 @@ struct PlmRemoteRow {
 
 // One advisory lock (§6.2) — a courtesy presence signal, never a hard block.
 struct PlmLockRow {
-    std::string itemId, userId, display, accountId, acquiredAt, expiresAt;
+    std::string itemId, userId, display, acquiredAt, expiresAt;
 };
 
 // ---- live co-editing session (plm-server profiles — contracts/plm_live.md) -----
@@ -292,7 +291,7 @@ struct PlmHubState {
     char        shareLocation[512] = {};  // Share-this-project dialog buffers
     char        shareName[128] = {};
     char        shareDisplay[128] = {};
-    int         shareKind = 0;            // 0 folder | 1 ssh | 2 https (cloud disabled)
+    int         shareKind = 0;            // 0 folder | 1 ssh | 2 https
 
     // live co-editing session (plm-server profiles — see PlmLiveState above)
     PlmLiveState live;
@@ -358,7 +357,7 @@ void        plmEnsureSettings(AppState& st);
 void        plmEnsureGit(AppState& st, bool details = true);
 void        plmEnsureTeam(AppState& st);     // remotes + advisory locks (plm_status)
 // The shared location that lock/presence actions run against: the first
-// non-reserved remote advertising advisory locks (nullptr = none configured).
+// remote advertising advisory locks (nullptr = none configured).
 const PlmRemoteRow* plmTeamLockRemote();
 long long   plmIsoToUnix(const std::string& iso);  // "…T…Z" -> unix seconds (0 = unparsable)
 bool        plmLockLive(const PlmLockRow& l);      // not yet soft-expired (§6.2)

@@ -85,7 +85,7 @@ NON_READ_EXACT = {
     "cam_apply_ops", "cam_undo", "cam_redo", "cam_generate", "cam_post", "cam_save",
     "drawing_export", "drawing_save_standalone", "ecad_export", "ecad_save",
     "export_file", "export_drawing", "export2d_drawing", "export_flat_dxf",
-    "agent_cancel", "agent_steer",
+    "agent_cancel", "agent_steer", "agent_withdraw_steer",
     "agent_answer", "agent_admin_turn",
     "agent_handles_new",
     "agent_ask_v2", "agent_answer_question",

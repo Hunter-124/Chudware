@@ -12,6 +12,7 @@
 #include "ui/copilot/inline_image_refs.h"
 #include "ui/copilot/video_attachment.h"
 #include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
+#include "ui/settings_modal.h"           // SettingsRoute deep links (/rule opens Rules)
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
 #include "ui/copilot/context_chips.h"      // context-picker chips: add / reconcile / draw / focus
@@ -21,6 +22,8 @@
 #include "ui/file_explorer.h"             // ui::ensureWorkspaceDir — the fs_* jail every turn rides
 #include "ui/ai/plan_board.h"             // planBoardTakeEditsForTurn — idle plan edits ride the turn
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
+#include <unordered_map>
+#include <unordered_set>
 #include "core/jobs.h"
 
 // ---- auto-growing, wrapping chat input -------------------------------------------------------
@@ -137,6 +140,19 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
                 data->BufDirty = true;
         }
         return 0;
+    }
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways && cb->wrap &&
+        ImGui::IsKeyPressed(ImGuiKey_Home) && !ImGui::GetIO().KeyCtrl) {
+        // The widget just moved the caret to the start of its row, but rows end at our soft
+        // wraps as well as at the user's breaks. Home goes to the LOGICAL line start: back past
+        // soft wraps to the last Shift/Alt+Enter break. Shift+Home keeps its anchor
+        // (SelectionStart) and extends to the same spot.
+        const int to = ui::copilot::logicalLineStart(cb->wrap->hard, data->CursorPos);
+        if (to != data->CursorPos) {
+            const bool extend = ImGui::GetIO().KeyShift;
+            data->CursorPos = data->SelectionEnd = to;
+            if (!extend) data->SelectionStart = to;
+        }
     }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways && cb->composer) {
         const bool draftChanged = !g_imageRemovals.empty() || !g_composerInsert.empty();
@@ -2051,10 +2067,10 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             const std::string id = r.result.value("id", std::string());
             const std::string kw = r.result.value("keyword", std::string());
             pushSessionNotice(st, "Rule \"" + id + "\" created \xe2\x80\x94 fires when \"" + kw +
-                                      "\" appears. Edit it in Settings \xc2\xb7 AI \xc2\xb7 Rules.");
+                                      "\" appears. Edit it in Settings \xc2\xb7 AI \xc2\xb7 Context.");
             st.addLog("[..] /rule: created rule '" + id + "'");
             st.openSettings = true;
-            st.openSettingsTab = 6;  // AI tab, Rules sub-tab
+            st.openSettingsTab = SettingsAiRules;  // AI tab, Context -> Rules editor
         }, 20000);
         st.toast(ui::ToastLevel::Info, "Creating rule\xe2\x80\xa6");
         return true;
@@ -3747,7 +3763,8 @@ bool aiTurnActive(AppState& st) {
 // queue into AppState::addLog() from the GL thread once per composer frame.
 struct AgentControlChannel {
     // empty steer = cancel; attachments ride only with a steer. `answer` jobs carry an ask_user
-    // batch resolution (answers, or declined) instead.
+    // batch resolution (answers, or declined) instead; `withdraw` jobs take back the steer
+    // `steerId` unread (`edit` says what the user wants to do with it next).
     struct Job {
         std::string runId;
         std::string provider;
@@ -3755,6 +3772,8 @@ struct AgentControlChannel {
         std::string steerId;        // the steer's user bubble (empty = no bubble to update)
         nlohmann::json attachments;
         bool answer = false;
+        bool withdraw = false;
+        bool edit = false;
         std::string convId, batchId;
         nlohmann::json answers;
         bool declined = false;
@@ -3775,12 +3794,21 @@ struct AgentControlChannel {
         std::string transportErr;   // the call itself failed (retryable)
         std::string reason;         // the worker refused it (no longer pending)
     };
+    // A withdraw call's outcome, applied by applySteerWithdrawal on the GL thread.
+    struct WithdrawResult {
+        std::string convId, steerId;
+        bool edit = false;
+        bool withdrawn = false;
+        std::string error;    // the call failed or was refused
+        std::string reason;   // why a reachable run kept it (e.g. "ambiguous")
+    };
     std::mutex mtx;
     std::condition_variable cv;
     std::deque<Job> q;
     std::deque<std::string> pendingLogs;   // GL-thread-only drain via agentControlDrainLogs()
     std::deque<AnswerResult> pendingAnswers;   // likewise
     std::deque<SteerResult> pendingSteers;     // likewise
+    std::deque<WithdrawResult> pendingWithdrawals;   // likewise
     std::atomic<AppState*> st{nullptr};
     bool stopping = false; // guarded by mtx; shutdown runs on the UI thread
     std::thread thread;
@@ -3821,6 +3849,34 @@ struct AgentControlChannel {
         pendingAnswers.push_back(std::move(res));
     }
 
+    void runWithdraw(AppState& s, const Job& job) {
+        WithdrawResult res;
+        res.convId = job.convId;
+        res.steerId = job.steerId;
+        res.edit = job.edit;
+        nlohmann::json r;
+        std::string e;
+        try {
+            s.worker.callAgentWithdrawSteer(job.runId, job.steerId, r, e, job.provider);
+        } catch (const std::exception& ex) {
+            e = ex.what();
+        } catch (...) {
+            e = "agent_withdraw_steer exception";
+        }
+        if (e.empty() && !jbool(r, "ok")) {
+            e = jstr(r, "reason");
+            if (e.empty()) e = "refused";
+        }
+        res.withdrawn = e.empty() && jbool(r, "withdrawn");
+        res.error = e;
+        res.reason = jstr(r, "reason");
+        std::lock_guard<std::mutex> lk(mtx);
+        pendingLogs.push_back("[..] agent_withdraw_steer " + job.steerId + ": " +
+                              (res.withdrawn ? std::string("withdrawn")
+                               : !e.empty() ? e : "kept (" + res.reason + ")"));
+        pendingWithdrawals.push_back(std::move(res));
+    }
+
     AgentControlChannel() : thread([this] {
             for (;;) {
                 Job job;
@@ -3835,6 +3891,10 @@ struct AgentControlChannel {
                 if (!s) continue;
                 if (job.answer) {
                     runAnswer(*s, job);
+                    continue;
+                }
+                if (job.withdraw) {
+                    runWithdraw(*s, job);
                     continue;
                 }
                 nlohmann::json r;
@@ -4012,6 +4072,19 @@ static void agentControlDrainLogs(AppState& st) {
         applyAnswerResult(st, res);
     }
     for (;;) {
+        AgentControlChannel::WithdrawResult res;
+        {
+            std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
+            if (g_agentCtl.pendingWithdrawals.empty()) break;
+            res = std::move(g_agentCtl.pendingWithdrawals.front());
+            g_agentCtl.pendingWithdrawals.pop_front();
+        }
+        std::string why = res.error;
+        if (why.empty() && res.reason == "ambiguous")
+            why = "another unread message has the same text";
+        applySteerWithdrawal(st, res.convId, res.steerId, res.withdrawn, res.edit, why);
+    }
+    for (;;) {
         AgentControlChannel::SteerResult res;
         {
             std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
@@ -4106,6 +4179,8 @@ static void finalizeStoppedTurnActivity(ChatMsg& m, const char* compactionOutcom
             if (!ui::settleUnfinishedCompaction(a, compactionOutcome))
                 a.status = "cancelled";
             a.reason = compactionOutcome;
+        } else if (a.rowKind == 3 && a.status == "running") {
+            ui::settleUnfinishedTool(a, compactionOutcome);   // an Eval whose final call never came
         } else if (a.streaming || a.status == "running" || a.status.empty()) {
             a.status = "done";
             a.streaming = false;
@@ -4194,10 +4269,46 @@ static bool activeRunAcceptsSteer(AppState& st, std::string* runIdOut = nullptr)
     return true;
 }
 
+// The exact composer draft each pending steer was sent from (text, attachments, inline images,
+// context chips), so taking one back restores what the user wrote rather than its transformed
+// bubble. GL thread only; entries for steers no longer pending are dropped on the next send.
+struct SteerDraft {
+    std::string convId, text;
+    nlohmann::json draft;
+};
+static std::unordered_map<std::string, SteerDraft> s_steerDrafts;
+static std::unordered_set<std::string> s_withdrawing;   // steer ids with a withdraw in flight
+
+static const ChatMsg* findPendingSteer(const std::vector<ChatMsg>& msgs,
+                                       const std::string& steerId) {
+    for (size_t i = pendingSteerTail(msgs); i < msgs.size(); ++i)
+        if (msgs[i].steerId == steerId) return &msgs[i];
+    return nullptr;
+}
+
+static void rememberSteerDraft(AppState& st, const std::string& steerId, const std::string& text) {
+    for (auto it = s_steerDrafts.begin(); it != s_steerDrafts.end();) {
+        const std::vector<ChatMsg>* msgs = conversationMsgs(st, it->second.convId);
+        if (msgs && findPendingSteer(*msgs, it->first)) ++it;
+        else it = s_steerDrafts.erase(it);
+    }
+    s_steerDrafts[steerId] = {st.activeConvId(), text,
+                              {{"attachments", st.pendingAttachments},
+                               {"inline_images", st.pendingInlineImagePaths},
+                               {"context_refs", core::contextRefsToJson(st.pendingContextRefs)}}};
+}
+
 // Hand the staged payload (`text` + pendingAttachments / pendingContextRefs) to the live run as
 // a steer. The caller has checked activeRunAcceptsSteer; attachments ride with it, so a picture
 // alone is a valid follow-up.
 static void sendSteer(AppState& st, const std::string& text, const std::string& runId) {
+    // Names this bubble on the control lane and in agent.steer events, so its "queued" / "read"
+    // state follows the message.
+    static unsigned s_steerSeq = 0;
+    const std::string steerId =
+        "steer-" + std::to_string((long long)(chatNowEpoch() * 1000.0)) + "-" +
+        std::to_string(++s_steerSeq);
+    rememberSteerDraft(st, steerId, text);
     std::string sendText = text;
     std::string bubbleText;
     nlohmann::json attachments = consumeComposerAttachments(st, sendText, &bubbleText);
@@ -4205,15 +4316,88 @@ static void sendSteer(AppState& st, const std::string& text, const std::string& 
     // The control lane carries text + images only: the chips ride inline.
     if (const std::string ctx = core::contextRefsPromptText(contextRefs); !ctx.empty())
         sendText += "\n\n" + ctx;
-    // Names this bubble on the control lane and in agent.steer events, so its "queued" / "read"
-    // state follows the message.
-    static unsigned s_steerSeq = 0;
-    const std::string steerId =
-        "steer-" + std::to_string((long long)(chatNowEpoch() * 1000.0)) + "-" +
-        std::to_string(++s_steerSeq);
     appendSteerToTranscript(st, userBubbleText(bubbleText, attachments), attachments,
                             std::move(contextRefs), steerId);
     agentControlDispatch(st, runId, sendText, std::move(attachments), steerId);
+}
+
+bool steerWithdrawPending(const std::string& steerId) { return s_withdrawing.count(steerId) != 0; }
+
+void withdrawPendingSteer(AppState& st, const std::string& steerId, bool edit) {
+    if (steerId.empty() || s_withdrawing.count(steerId) || !findPendingSteer(st.chat, steerId))
+        return;
+    std::string runId;
+    {
+        auto run = st.activeRun();
+        std::lock_guard<std::mutex> lk(run->mtx);
+        runId = run->runId;
+    }
+    if (runId.empty()) return;
+    s_withdrawing.insert(steerId);
+    g_agentCtl.st.store(&st, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(g_agentCtl.mtx);
+        AgentControlChannel::Job job;
+        job.runId = runId;
+#ifdef __EMSCRIPTEN__
+        job.provider = launchedRunProvider(st, runId);
+#endif
+        job.withdraw = true;
+        job.edit = edit;
+        job.steerId = steerId;
+        job.convId = st.activeConvId();
+        g_agentCtl.q.push_back(std::move(job));
+    }
+    g_agentCtl.cv.notify_one();
+}
+
+void applySteerWithdrawal(AppState& st, const std::string& convId, const std::string& steerId,
+                          bool withdrawn, bool edit, const std::string& error) {
+    s_withdrawing.erase(steerId);
+    std::vector<ChatMsg>* msgs = conversationMsgs(st, convId);
+    if (!msgs) return;
+    if (!withdrawn) {
+        // Its delivery event (or the run's end) settles the bubble; it stays where it is.
+        if (!error.empty())
+            st.toast(ui::ToastLevel::Warn, "Couldn't take the message back: " + error + ".");
+        else
+            st.toast(ui::ToastLevel::Info, "Too late to take it back: the agent already read it.");
+        return;
+    }
+    size_t at = msgs->size();
+    for (size_t i = msgs->size(); i-- > 0;)
+        if ((*msgs)[i].fromUser && (*msgs)[i].steerId == steerId) { at = i; break; }
+    if (at == msgs->size()) return;
+    std::string text;
+    nlohmann::json draft;
+    if (auto it = s_steerDrafts.find(steerId); it != s_steerDrafts.end()) {
+        text = std::move(it->second.text);
+        draft = std::move(it->second.draft);
+        s_steerDrafts.erase(it);
+    } else {
+        const ChatMsg& m = (*msgs)[at];
+        text = m.text;
+        draft = {{"attachments", m.imagePaths}, {"inline_images", nlohmann::json::array()},
+                 {"context_refs", core::contextRefsToJson(m.contextRefs)}};
+    }
+    msgs->erase(msgs->begin() + (std::ptrdiff_t)at);
+    // It heads this chat's queue: it was written before anything queued after it.
+    const bool active = convId == st.activeConvId();
+    std::vector<std::string>* prompts = active ? &st.queuedPrompts : nullptr;
+    std::vector<nlohmann::json>* drafts = active ? &st.queuedPromptDrafts : nullptr;
+    for (auto& c : st.conversations)
+        if (!active && c.id == convId) {
+            prompts = &c.queuedPrompts;
+            drafts = &c.queuedPromptDrafts;
+        }
+    if (!prompts) return;
+    drafts->resize(prompts->size(), nlohmann::json::object());
+    prompts->insert(prompts->begin(), std::move(text));
+    drafts->insert(drafts->begin(), std::move(draft));
+    markChatHistoryDirty();
+    if (!active) return;
+    if (edit) beginQueuedPromptEdit(st, 0);
+    else cancelQueuedPromptToComposer(st, 0);
 }
 
 static void removeQueuedPrompt(AppState& st, size_t index) {

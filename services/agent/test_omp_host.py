@@ -2189,6 +2189,85 @@ def test_nonconversation_client_does_not_use_cad_template(monkeypatch):
         client._omp_bridge_dir.cleanup()
 
 
+@pytest.mark.parametrize(("preference", "todo", "has_todo"), [
+    ("off", {"enabled": False}, False),
+    ("option", {"enabled": True}, True),
+    ("encourage", {"enabled": True, "eager": "preferred"}, True),
+    ("require", {"enabled": True, "eager": "always"}, True),
+])
+def test_task_list_preference_is_the_conversation_todo_policy(
+        monkeypatch, tmp_path, preference, todo, has_todo):
+    import yaml
+    from services import paths
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    factory = FakeFactory()
+    host = OmpSessionHost(client_factory=factory)
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/omp")
+    monkeypatch.setattr(omp_host_module, "_binary_supports_flag", lambda *args: True)
+    client = host._make_client({"task_list_preference": preference}, no_session=False)
+    try:
+        args = client.kwargs["extra_args"]
+        # Chudware's settings layer first, the session's pins last: a later file wins.
+        layer, pins = [args[index + 1] for index, arg in enumerate(args) if arg == "--config"]
+        assert Path(layer) == tmp_path / "omp" / "cad-settings.yml"
+        assert yaml.safe_load(Path(pins).read_text(encoding="utf-8")).get("todo") == todo
+        assert ("todo" in client.kwargs["tools"]) is has_todo
+    finally:
+        client._omp_bridge.stop()
+        client._omp_bridge_dir.cleanup()
+
+
+@pytest.mark.parametrize("cell", [False, True])
+@pytest.mark.parametrize("todo", sorted(omp_host_module._CAD_TODO_SETTINGS))
+@pytest.mark.parametrize("memory", sorted(omp_host_module._CAD_MEMORY_SETTINGS))
+def test_session_overlay_is_nested_yaml_that_pins_the_session_settings(monkeypatch, tmp_path, memory, todo, cell):
+    import yaml
+    from services import paths
+    from services.agent import request_context
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    if cell:
+        monkeypatch.setattr(request_context, "in_cell", lambda: True)
+        monkeypatch.setattr(request_context, "actor_state_root", lambda: tmp_path / "actor")
+    path = omp_host_module._cad_session_overlay(memory, {"enabled": True}, todo=todo)
+    tree = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    # OMP reads nested YAML only: a dotted top-level key would be silently ignored.
+    assert not [key for key in tree if "." in key]
+    assert tree["task"] == {"maxRuntimeMs": 0}
+    assert tree["memory"]["backend"] == memory
+    assert tree["compaction"] == {"enabled": True}
+    assert ("browser" in tree and "computer" in tree) is cell and "async" not in tree
+    if cell:
+        assert tree["browser"] == {"enabled": False} and tree["computer"] == {"enabled": False}
+    assert Path(path).parent == (tmp_path / "actor" if cell else tmp_path) / "omp"
+
+
+def test_lsp_is_off_for_a_conversation_until_chudwares_layer_turns_it_on(monkeypatch, tmp_path):
+    from services import paths
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    host = OmpSessionHost(client_factory=FakeFactory())
+    monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/omp")
+    monkeypatch.setattr(omp_host_module, "_binary_supports_flag", lambda *args: True)
+
+    def launch():
+        client = host._make_client({}, no_session=False)
+        try:
+            return client.kwargs["extra_args"], client.kwargs["tools"]
+        finally:
+            client._omp_bridge.stop()
+            client._omp_bridge_dir.cleanup()
+
+    args, tools = launch()
+    assert "--no-lsp" not in args and "lsp" not in tools
+    layer = tmp_path / "omp" / "cad-settings.yml"
+    assert "enabled: false" in layer.read_text(encoding="utf-8")
+    layer.write_text("lsp:\n  enabled: true\n", encoding="utf-8")
+    args, tools = launch()
+    assert "--no-lsp" not in args and "lsp" in tools
+
+
 def test_forwards_events_attachments_callbacks_and_all_turn_settings(tmp_path):
     image = tmp_path / "pixel.png"
     image.write_bytes(_PNG_1PX)
@@ -2365,7 +2444,7 @@ def test_set_model_refusal_names_the_signed_out_provider_or_the_catalog():
     signed_out, _ = run(host, "signed-out", provider="openai", model="gpt-5")
     assert signed_out["ok"] is False
     assert "openai is not signed in" in signed_out["reason"]
-    assert "Settings -> Providers" in signed_out["reason"]
+    assert "Settings -> AI -> Providers" in signed_out["reason"]
     assert "anthropic" in signed_out["reason"]  # what IS signed in
 
     factory = RejectingFactory()
@@ -3726,7 +3805,10 @@ def test_helper_empty_response_is_not_a_success(helper_runtime, reply):
     assert factory.clients[0].stop_count == 1
 
 
-def test_helper_applies_selected_compaction_overlay(helper_runtime, monkeypatch):
+def test_helper_applies_selected_compaction_overlay(helper_runtime, monkeypatch, tmp_path):
+    from services import paths
+
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
     host, factory = helper_runtime
     policies = []
     monkeypatch.setattr(host, "_resolve_binary", lambda *, required: "/fake/omp")
@@ -3741,7 +3823,8 @@ def test_helper_applies_selected_compaction_overlay(helper_runtime, monkeypatch)
     assert host.complete_text("", "repair", compaction_settings=chosen) == "helper answer"
     assert policies == [("off", chosen)]
     args = factory.clients[0].kwargs["extra_args"]
-    assert args[:4] == ("--no-lsp", "--config", "/fake/overlay.yml", "--no-mcp")
+    layer = str(tmp_path / "omp" / "cad-settings.yml")
+    assert args[:6] == ("--no-lsp", "--config", layer, "--config", "/fake/overlay.yml", "--no-mcp")
     assert "--no-extensions" in args and "--trusted-extension" in args
 
 
@@ -3821,6 +3904,14 @@ class QueueingClient(FakeClient):
         super().steer(message, images=images)
         self.queue.append({"text": message, "images": list(images or [])})
 
+    def remove_queued_message(self, message, queue):
+        self.calls.append(("remove_queued_message", {"message": message, "queue": queue}))
+        for index, item in enumerate(self.queue if queue == "steering" else []):
+            if item["text"] == message:
+                del self.queue[index]
+                return {"removed": True}
+        return {"removed": False}
+
     def abort_and_restore_queue(self):
         self.calls.append(("abort_and_restore_queue", {}))
         restored = self.queue[:]
@@ -3860,6 +3951,14 @@ def _start(host, factory, session_id, run_id, **extra):
         time.sleep(0.001)
     client = factory.clients[-1]
     assert client.prompted.wait(1.0)
+    # `prompted` fires inside the prompt RPC; the run counts as submitted (and a Stop aborts
+    # through OMP instead of force-stopping) only once that call has returned.
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with host._lock:
+            if any(r.run_id == run_id and r.started and not r.submitting for r in host._runs.values()):
+                break
+        time.sleep(0.001)
     return thread, out, client
 
 
@@ -4005,6 +4104,49 @@ def test_unrelated_user_frame_never_acknowledges_tracked_steers():
     assert cancel["carried_steer_ids"] == ["s-roof", "s-material"]
     assert not [f for f in emitted if f.get("type") == "agent_steer"
                 and f.get("status") == "delivered"]
+
+
+def test_withdrawn_steer_never_reaches_the_model_and_its_text_can_be_sent_again():
+    host, factory = _queueing_host()
+    thread, out, client = _start(host, factory, "w", "r-withdraw")
+    host.steer("r-withdraw", "add a roof", steer_id="s-roof")
+    host.steer("r-withdraw", "make it PETG", steer_id="s-material")
+
+    taken = host.withdraw_steer("r-withdraw", "s-roof")
+    assert taken["withdrawn"] is True and taken["active"] is True
+    assert [item["text"] for item in client.queue] == ["make it PETG"]
+    # The edited message goes back in: not refused as a duplicate of the withdrawn one.
+    again = host.steer("r-withdraw", "add a roof", steer_id="s-roof-2")
+    assert again["steered"] is True and "duplicate" not in again
+
+    client.boundary()
+    late = host.withdraw_steer("r-withdraw", "s-material")
+    assert late["ok"] is True and late["withdrawn"] is False
+    cancel = host.cancel("r-withdraw")
+    thread.join(1.0)
+    _, emitted = out["value"]
+    assert cancel["carried_steer_ids"] == []
+    assert [(f["steer_id"], f["status"]) for f in emitted if f.get("type") == "agent_steer"] == [
+        ("s-material", "delivered"), ("s-roof-2", "delivered")]
+    assert host.withdraw_steer("r-withdraw", "s-roof-2") == {
+        "ok": True, "run_id": "r-withdraw", "steer_id": "s-roof-2", "withdrawn": False,
+        "active": False}
+
+
+def test_withdraw_refuses_when_omp_cannot_tell_same_text_steers_apart():
+    host, factory = _queueing_host()
+    thread, _, client = _start(host, factory, "w", "r-same-text")
+    host.steer("r-same-text", "use this", [{"data": "Zmlyc3Q=", "mime": "image/png"}],
+               steer_id="s-first")
+    host.steer("r-same-text", "use this", [{"data": "c2Vjb25k", "mime": "image/png"}],
+               steer_id="s-second")
+
+    refused = host.withdraw_steer("r-same-text", "s-second")
+    assert refused["withdrawn"] is False and refused["reason"] == "ambiguous"
+    assert len(client.queue) == 2
+    assert "remove_queued_message" not in call_names(client)
+    host.cancel("r-same-text")
+    thread.join(1.0)
 
 
 def test_same_text_with_distinct_images_is_not_a_duplicate():

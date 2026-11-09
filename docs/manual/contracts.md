@@ -37,7 +37,7 @@
 - `parts.md` — Contract: Unified Parts Library — `aicad.parts/1`
 - `piping_schema.md` — Contract: `aicad.piping/1` document schema
 - `plm.md` — Contract: PLM / Version Control — `aicad.plm/1`
-- `plm_live.md` — PLM live-session protocol — `aicad.plm-live/1`
+- `plm_live.md` — PLM live-session protocol — `aicad.plm-live/2`
 - `plm_planning.md` — Contract: PLM Planning — `aicad.planning/1`
 - `providers.md` — Contract: Providers & Session Layer — v1
 - `requirements.md` — Contract: Requirements layer — `aicad.req/1`

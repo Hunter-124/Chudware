@@ -15,7 +15,7 @@ bool blocksInteraction(std::string_view method, const nlohmann::json& params) {
     static constexpr std::string_view metadata[] = {
         "fw_projects", "agent_list_models", "subscription_accounts",
         "subscription_status", "subscription_usage", "omp_auth_state",
-        "omp_models_list", "ai_prompt_baseline", "skills_list",
+        "omp_models_list", "omp_config_get", "ai_prompt_baseline", "skills_list",
         "em_status", "sim_caps", "fw_status",
         "topology_capabilities", "omp_provider_list", "plm_timeline",
         "bench_status", "bench_categories", "doc_mesh_ref_list", "doc_mesh_ref_mesh",

@@ -1218,6 +1218,32 @@ TEST_CASE("persisted build state: a saved part reopens warm and its first op exe
     REQUIRE(doc_close(nid));
 }
 
+TEST_CASE("persisted build state: a part saved at a non-default display tier reopens warm at it") {
+    using namespace chudware::doc;
+    const std::string id = make_three_box_part();
+    AppearanceFiles files(id);
+    const auto path = files.dir / "draft.step+";
+    doc_set_display_quality(id, "draft");
+    REQUIRE(doc_save(id, path.string()).at("cache").at("written") == true);
+    REQUIRE(doc_close(id));
+
+    const json before = compile_cache_stats();
+    const json opened = doc_open(path.string(), false, false, false, false, {}, nullptr, "draft");
+    INFO(opened.at("cache").dump());
+    CHECK(opened.at("cache_hit") == true);
+    CHECK(opened.at("warm") == true);
+    CHECK(opened.at("display_quality") == "draft");
+    const std::string nid = opened.at("doc_id").get<std::string>();
+    // The GUI re-applies its persisted tier to every tab; the current tier keeps the build.
+    const json reapplied = doc_set_display_quality(nid, "draft");
+    CHECK(reapplied.at("rebuild").at("doc_status").at("features_executed") == 0);
+    CHECK(executed_since(before) == 0);
+    CHECK(reapplied.at("volume").get<double>() == Approx(kThreeBoxVolume));
+    REQUIRE(doc_close(nid));
+
+    CHECK_THROWS_AS(doc_open(path.string(), false, false, false, false, {}, nullptr, "ultra"), OpError);
+}
+
 TEST_CASE("persisted build state: editing the last feature after reopen executes only the tail") {
     using namespace chudware::doc;
     const std::string id = make_three_box_part();

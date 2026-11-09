@@ -30,7 +30,7 @@ ITEM_KINDS = {
     "part", "assembly", "drawing", "ecad", "cam", "requirements", "deliverable",
 }
 AI_MODES = {"manual", "assisted", "managed"}
-REMOTE_KINDS = {"folder", "ssh", "https", "plm-server", "chudware-cloud"}
+REMOTE_KINDS = {"folder", "ssh", "https", "plm-server"}
 REMOTE_CAPABILITIES = ("snapshot_sync", "advisory_locks")
 LIVE_REMOTE_CAPABILITIES = ("snapshot_sync", "live_coedit", "presence")
 

@@ -417,7 +417,12 @@ def _edge_faces(doc_id: str, metrics: dict, *, mesh=None) -> Optional[list]:
     edge discretisation with both faces it bounds, so the faces an edge touches are the faces
     owning a vertex at EVERY point of its polyline (endpoints alone also touch the faces
     meeting at the corner; intersecting over the whole polyline leaves the two neighbours).
-    None when the tessellation is unreadable."""
+    None when the tessellation is unreadable.
+
+    Pure array work, no per-vertex Python objects: this runs on the worker process that also
+    serves the OMP bridge, and a multi-million-vertex assembly spent 7-10 s inside one
+    GIL-holding numpy call (``np.unique(axis=0)``) plus seconds in ``.tolist()``, long enough
+    to starve the bridge's own tool polls (``bridge timeout``)."""
     mesh = cc._doc_mesh(doc_id) if mesh is None else mesh
     if mesh is None:
         return None
@@ -441,23 +446,60 @@ def _edge_faces(doc_id: str, metrics: dict, *, mesh=None) -> Optional[list]:
     vid = mesh["idx"][ok].reshape(-1)
     fid = mf[np.repeat(tri_face[ok], 3)]
     keep = fid >= 0
-    pairs = np.unique(np.stack([vid[keep], fid[keep]], axis=1), axis=0)
-    vkeys = [tuple(r) for r in np.round(mesh["pos"], 4).tolist()]
-    at: dict = {}
-    for v, f in pairs.tolist():
-        at.setdefault(vkeys[v], set()).add(int(f))
+    vid, fid = vid[keep], fid[keep]
+
     out: list = [[] for _ in edges]
+    owner_edge: list = []        # engine edge index of each polyline that has one
+    polylines: list = []
     for me in mesh["edges"]:
         ei = edge_key.get((body_of.get(int(me["body"]), int(me["body"])), int(me["edge_id"])))
-        if ei is None:
-            continue
-        common: Optional[set] = None
-        for p in np.round(np.asarray(me["pts"], dtype=np.float64), 4).tolist():
-            here = at.get(tuple(p), set())
-            common = set(here) if common is None else (common & here)
-            if not common:
-                break
-        out[ei] = sorted(common or ())
+        if ei is not None:
+            owner_edge.append(ei)
+            polylines.append(np.asarray(me["pts"], dtype=np.float64).reshape(-1, 3))
+    if not polylines:
+        return out
+    sizes = np.fromiter((len(p) for p in polylines), dtype=np.int64, count=len(polylines))
+    if not sizes.any():
+        return out
+    n_faces = max(len(faces), 1)
+
+    # One id per distinct position on the 1e-4 grid that both tables are matched on (the
+    # same equivalence as comparing np.round(p, 4)): lexsort the mesh vertices and the edge
+    # points together, then number the runs.
+    n_verts = len(mesh["pos"])
+    grid = np.rint(np.concatenate([mesh["pos"], *polylines]) * 1e4)
+    order = np.lexsort((grid[:, 2], grid[:, 1], grid[:, 0]))
+    sorted_grid = grid[order]
+    run_start = np.empty(len(order), dtype=bool)
+    run_start[0] = True
+    np.any(sorted_grid[1:] != sorted_grid[:-1], axis=1, out=run_start[1:])
+    point = np.empty(len(order), dtype=np.int64)
+    point[order] = np.cumsum(run_start) - 1
+    vert_point, edge_point = point[:n_verts], point[n_verts:]
+
+    # (position, face) incidences, only at positions some edge polyline visits.
+    visited = np.zeros(int(point.max()) + 1, dtype=bool)
+    visited[edge_point] = True
+    at_point = vert_point[vid]
+    chosen = visited[at_point]
+    incidence = np.unique(at_point[chosen] * n_faces + fid[chosen])
+    inc_point, inc_face = incidence // n_faces, incidence % n_faces
+
+    # Every polyline point expands to the faces owning its position; an edge touches a face
+    # iff all of the edge's points do, i.e. the face is counted once per point.
+    first = np.searchsorted(inc_point, edge_point, side="left")
+    count = np.searchsorted(inc_point, edge_point, side="right") - first
+    total = int(count.sum())
+    polyline_of_point = np.repeat(np.arange(len(polylines), dtype=np.int64), sizes)
+    slot = np.repeat(first - (np.cumsum(count) - count), count) + np.arange(total)
+    pairs, seen = np.unique(np.repeat(polyline_of_point, count) * n_faces + inc_face[slot],
+                            return_counts=True)
+    touching = pairs[seen == sizes[pairs // n_faces]]
+    by_polyline: dict = {}
+    for k in touching.tolist():
+        by_polyline.setdefault(k // n_faces, []).append(k % n_faces)
+    for j, ei in enumerate(owner_edge):
+        out[ei] = by_polyline.get(j, [])
     return out
 
 

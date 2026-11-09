@@ -128,6 +128,7 @@ bool PropertyManager::openForCommand(AppState& st, const std::string& cmdId) {
     formSourceRevision_ = st.docMirror.revision();
     freshEditRequired_ = false;
     previewInFlight_ = false;
+    previewRolledBack_ = false;
     lastEditTime_ = ImGui::GetTime();
     previewError_.clear();
     focusedOnOpen_ = false;
@@ -355,6 +356,7 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
     formSourceRevision_ = st.docMirror.revision();
     freshEditRequired_ = false;
     previewInFlight_ = false;
+    previewRolledBack_ = false;
     lastEditTime_ = ImGui::GetTime();
     previewError_.clear();
     focusedOnOpen_ = false;
@@ -374,12 +376,14 @@ bool PropertyManager::openForEdit(AppState& st, const std::string& featureId) {
 
     loadFromTree(*target);
     hydrateFilletFromMirror(st);
+    requestEdgeRefGeometry(st);
 
     // A fillet/chamfer is shown LIVE and APPLIED while editing — the session already has it applied,
-    // so the rounded result is on screen the moment the PM opens. The original edges in the feature
-    // are drawn as dashed 3D overlay lines (viewport_panel + collectActiveWellEdgeSegments), built
-    // from each selector's geometry, so the user can see and click-to-deselect edges that have been
-    // rounded away. No suppressed-base preview is needed.
+    // so the rounded result is on screen the moment the PM opens, and the edges it rounded are gone
+    // from that body. The engine resolves the stored refs on the feature's INPUT body
+    // (requestEdgeRefGeometry); the viewport draws each as a dashed 3D overlay line
+    // (viewport_panel + collectActiveWellEdgeSegments) the user can click to deselect, and the
+    // Edges list shows them. No suppressed-base preview is needed.
 
     st.addLog("[pm] edit " + featureId + " (" + type + ")");
     return true;
@@ -480,6 +484,35 @@ void PropertyManager::hydrateFilletFromMirror(AppState& st) {
         if (fillet != status["data"].end()) hydrateFilletEvidence(*fillet);
         break;
     }
+}
+
+void PropertyManager::requestEdgeRefGeometry(AppState& st) {
+    const PMField* well = blendEdgeWell();
+    if (!well || targetId_.empty() || well->picks.empty() ||
+        !st.docMirror.hasDoc() || !st.workerStarted) return;
+    // Ask only while some pick has no engine answer yet: a reopened ref, or an edge picked in
+    // this session (which has only its own selector until the feature holding it exists). The
+    // answer is the edge's dashed overlay AND the anchor/direction of the size handle, so it must
+    // not be re-asked on every preview of a drag that changes neither.
+    if (!pmBlendEdgesUnanswered(*well)) return;
+    std::vector<nlohmann::json> requested;
+    requested.reserve(well->picks.size());
+    for (const auto& pick : well->picks) requested.push_back(pick.selector);
+    const uint64_t generation = editSessionGeneration_;
+    const std::weak_ptr<int> lifetime = rpcLifetime_;
+    const std::string docId = sessionDocId_;
+    st.rpc.call("doc_feature_edges", {{"doc_id", docId}, {"feature_id", targetId_}},
+        [this, &st, generation, lifetime, docId, requested = std::move(requested)]
+        (const core::RpcResult& r) {
+            if (lifetime.expired() || generation != editSessionGeneration_ || !active_ ||
+                sessionDocId_ != docId) return;
+            if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                st.addLog("[pm] stored edges not resolved" + (r.ok ? std::string() : ": " + r.err));
+                return;
+            }
+            if (!applyEdgeRefGeometry(r.result, requested))
+                st.addLog("[pm] stored edges changed before the engine resolved them");
+        });
 }
 
 // ---- in-viewport callouts (C27-A) -----------------------------------------
@@ -589,6 +622,8 @@ void PropertyManager::close() {
     aiBusy_ = false;
     aiMessage_.clear();
     aiHighlights_.clear();
+    suppressWellAutoArm_ = false;   // a dismissed well belongs to the form that just closed
+    hoverPick_ = hoverShape_ = -1;
     ++aiRequestSeq_;
 }
 
@@ -639,6 +674,13 @@ bool PropertyManager::routePick(const nlohmann::json& selector, int pickKind,
     // whatever element was clicked — accept it regardless of the underlying pick kind.
     if (!allowed && ak.body && selector.value("kind", std::string()) == "body") allowed = true;
     if (!allowed) return false;
+
+    // An edge the well already holds as a stored ref (the engine resolved it on the feature's
+    // input body) toggles off here, whatever form the stored ref took.
+    if (k == render::PickKind::Edge && pmToggleStoredEdge(*well, selector)) {
+        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+        return true;
+    }
 
     // De-dup by hint_index + centroid (same element picked twice toggles off — SolidWorks).
     auto same = [&](const nlohmann::json& a, const nlohmann::json& b) {
@@ -733,90 +775,6 @@ void PropertyManager::collectActiveWellHighlights(std::vector<std::array<uint32_
                 out.push_back({p.pickBody, p.pickTopo, (uint32_t)p.pickKind});
         return;  // a single well is active at a time
     }
-}
-
-void PropertyManager::collectActiveWellEdgeSegments(std::vector<EdgeSeg>& out) const {
-    if (!active_ || !form_) return;
-    const std::string ftype = form_->type ? form_->type : "";
-    if (ftype != "fillet" && ftype != "chamfer") return;  // dashed old-edge overlay is blend-only
-    for (const auto& f : fields_) {
-        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
-            !fieldVisible(*f.def, fields_) || !f.def->selKinds.edge)
-            continue;
-        for (int i = 0; i < (int)f.picks.size(); ++i) {
-            const nlohmann::json& sel = f.picks[i].selector;
-            if (!sel.is_object() || !sel.contains("centroid") || !sel["centroid"].is_array() ||
-                sel["centroid"].size() < 3)
-                continue;
-            EdgeSeg seg;
-            seg.pickIndex = i;
-            const auto& c = sel["centroid"];
-            float cx = c[0].get<float>(), cy = c[1].get<float>(), cz = c[2].get<float>();
-            const std::string surf = sel.value("surf", std::string());
-            const bool hasAxis = sel.contains("axis") && sel["axis"].is_array() &&
-                                 sel["axis"].size() == 3;
-            const bool hasLen = !sel.value("area_or_len", nlohmann::json()).is_null();
-            if (surf == "line" && hasAxis && hasLen) {
-                // Straight edge: reconstruct the segment from centroid ± half-length along its axis.
-                float ax = sel["axis"][0].get<float>(), ay = sel["axis"][1].get<float>(),
-                      az = sel["axis"][2].get<float>();
-                float half = 0.5f * sel["area_or_len"].get<float>();
-                seg.pts.push_back({cx - ax * half, cy - ay * half, cz - az * half});
-                seg.pts.push_back({cx + ax * half, cy + ay * half, cz + az * half});
-                seg.closed = false;
-            } else if (surf == "circle" && hasAxis && hasLen) {
-                // Circular edge (the revolve case): centroid is the center, area_or_len is the
-                // circumference (=2πr), axis is the circle normal. Sample a closed loop in the plane
-                // perpendicular to the axis so the dashed overlay traces the real edge.
-                float nx = sel["axis"][0].get<float>(), ny = sel["axis"][1].get<float>(),
-                      nz = sel["axis"][2].get<float>();
-                float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
-                float r = sel["area_or_len"].get<float>() / (2.0f * 3.14159265358979f);
-                if (nl > 1e-6f && r > 1e-6f) {
-                    nx /= nl; ny /= nl; nz /= nl;
-                    // Two basis vectors spanning the circle plane (u ⟂ n, v = n × u).
-                    float rx = (std::fabs(nx) < 0.9f) ? 1.0f : 0.0f;
-                    float ry = (std::fabs(nx) < 0.9f) ? 0.0f : 1.0f;
-                    float ux = ny * 0.0f - nz * ry, uy = nz * rx - nx * 0.0f, uz = nx * ry - ny * rx;
-                    float ul = std::sqrt(ux * ux + uy * uy + uz * uz);
-                    if (ul > 1e-6f) {
-                        ux /= ul; uy /= ul; uz /= ul;
-                        float vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;
-                        const int N = 48;
-                        seg.pts.reserve(N);
-                        for (int k = 0; k < N; ++k) {
-                            float t = (float)k / (float)N * 2.0f * 3.14159265358979f;
-                            float ct = std::cos(t) * r, stt = std::sin(t) * r;
-                            seg.pts.push_back({cx + ux * ct + vx * stt, cy + uy * ct + vy * stt,
-                                               cz + uz * ct + vz * stt});
-                        }
-                        seg.closed = true;
-                    }
-                }
-                if (seg.pts.empty()) { seg.pts.push_back({cx, cy, cz}); seg.closed = false; }
-            } else {
-                // Arc/spline/ellipse we can't reconstruct from the selector: mark the centroid so the
-                // viewport still draws a small ring there as a deselect target.
-                seg.pts.push_back({cx, cy, cz});
-                seg.closed = false;
-            }
-            out.push_back(seg);
-        }
-        return;  // a single well is active at a time
-    }
-}
-
-bool PropertyManager::removeActiveWellPick(int pickIndex) {
-    for (auto& f : fields_) {
-        if (f.def->kind != PMFieldKind::SelectorWell || !f.wellActive ||
-            !fieldVisible(*f.def, fields_) || !f.def->selKinds.edge)
-            continue;
-        if (pickIndex < 0 || pickIndex >= (int)f.picks.size()) return false;
-        f.picks.erase(f.picks.begin() + pickIndex);
-        dirty_ = true; lastEditTime_ = ImGui::GetTime();
-        return true;
-    }
-    return false;
 }
 
 bool PropertyManager::activeWellWantsBody() const {
@@ -1526,6 +1484,7 @@ bool PropertyManager::formSourceCurrent(AppState& st) {
         initField(fields_[i], form_->fields[i], ips_);
     loadFromTree(*target);
     hydrateFilletFromMirror(st);
+    requestEdgeRefGeometry(st);
     formSourceRevision_ = st.docMirror.revision();
     dirty_ = false;
     freshEditRequired_ = true;
@@ -1577,7 +1536,7 @@ bool PropertyManager::applyPreview(AppState& st) {
     }
 
     nlohmann::json feature;
-    buildOpFeature(feature);
+    buildOpFeature(feature, st.docMirror.tree());
 
     // Fillet/chamfer preview is LIVE and APPLIED (SolidWorks style): the feature stays un-suppressed
     // so the viewport shows the actual rounded result as the user edits. The original (pre-round)
@@ -1629,15 +1588,38 @@ bool PropertyManager::applyPreview(AppState& st) {
     const bool blendCap = blend;
     // Disposable live preview -> short timeout; a genuine commit -> patient default (never abort).
     const int timeoutMs = committing_ ? 120000 : kPreviewTimeoutMs;
+    // A preview of an existing feature that later features follow asks the engine to rebuild only
+    // the history up to it; the final edit (committing_) rebuilds the rest, so OK must not close
+    // on a preview that was shown rolled back.
+    std::string previewThrough;
+    if (!committing_ && !targetId_.empty() && ops.size() == 1 &&
+        ops[0].value("op", std::string()) == "edit_feature") {
+        const auto& tree = st.docMirror.tree();
+        const auto features = tree.find("features");
+        if (features != tree.end() && features->is_array() && !features->empty() &&
+            features->back().value("id", std::string()) != targetId_)
+            previewThrough = targetId_;
+    }
+    const bool deferred = !previewThrough.empty();
+    const bool addOp = !firstPreviewDone_ && targetId_.empty();
     st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
-        [this, &st, blendCap, baseRevision, coalesce, generation, lifetime, docId, finalQuality]
+        [this, &st, blendCap, baseRevision, coalesce, generation, lifetime, docId, finalQuality, deferred, addOp]
         (const core::OpsResponse& resp, bool current) {
             --st.rebuildsInFlight;
             if (lifetime.expired() || generation != editSessionGeneration_) return;
             previewInFlight_ = false;
             if (!active_ || sessionDocId_ != docId) return;
             if (!current || st.docMirror.docId() != docId) {
-                // Obsolete responses carry no presentable diagnostics or accepted payload.
+                // Obsolete responses carry no presentable diagnostics or accepted payload — except
+                // that an accepted add_feature already exists in the document. Keep its id so the
+                // next edit modifies it; forgetting it would add a second copy of the feature.
+                if (addOp && resp.ok && targetId_.empty() && resp.id_map.is_object()) {
+                    const auto it = resp.id_map.find("$0");
+                    if (it != resp.id_map.end() && it->is_string()) {
+                        targetId_ = it->get<std::string>();
+                        firstPreviewDone_ = true;
+                    }
+                }
                 cancelSafe_ = false;
                 acceptPending_ = false;
                 freshEditRequired_ = true;
@@ -1673,6 +1655,7 @@ bool PropertyManager::applyPreview(AppState& st) {
                 formSourceRevision_ = resp.revision;
             cancelRevision_ = resp.revision;
             previewError_.clear();
+            previewRolledBack_ = deferred;
             if (!coalesce) ++previewBatches_;
             previewUndoGroupStarted_ = true;
             if (targetId_.empty() && resp.id_map.is_object()) {
@@ -1690,6 +1673,11 @@ bool PropertyManager::applyPreview(AppState& st) {
 
             if (st.isActiveMirrorDoc() && !resp.aicm_path.empty())
                 st.loadDocMeshAsync(resp.aicm_path);  // parked tabs are handled by the observer
+            // The feature now exists with these picks stored, so the engine can say where each
+            // edge is and which way the blend grows from it — even when this very preview failed
+            // to build (the input body is the state before the feature). Skipped while the form
+            // holds newer edits: the next preview lands with picks that match what is stored.
+            if (blendCap && !dirty_) requestEdgeRefGeometry(st);
 
             const bool currentFields = !dirty_ && readyForPreview(form_, fields_);
             if (currentFields) previewWarning_.clear();
@@ -1701,7 +1689,8 @@ bool PropertyManager::applyPreview(AppState& st) {
                 st.addLog("[pm] " + msg);
                 if (st.isActiveMirrorDoc()) st.toast(ui::ToastLevel::Warn, msg);
             }
-            if (currentFields && !resp.auto_rollback.is_object() && resp.feature_status.is_array()) {
+            if (currentFields && !deferred && !resp.auto_rollback.is_object() &&
+                resp.feature_status.is_array()) {
                 std::string hidden;
                 for (const auto& status : resp.feature_status) {
                     if (!status.is_object() || !status.value("rolled_back", false)) continue;
@@ -1783,12 +1772,13 @@ bool PropertyManager::applyPreview(AppState& st) {
                     }
                 }
             }
-            if (!cancelPending_ && acceptPending_ && finalQuality && currentFields && previewError_.empty() &&
+            if (!cancelPending_ && acceptPending_ && finalQuality && !deferred && currentFields &&
+                previewError_.empty() &&
                 resp.revision == baseRevision + 1) {
                 st.addLog("[pm] OK -> committed " + targetId_);
                 close();
             }
-        }, coalesce, timeoutMs);
+        }, coalesce, timeoutMs, previewThrough);
     return true;
 }
 
@@ -1814,7 +1804,7 @@ void PropertyManager::tick(AppState& st) {
     if (!active_ || previewInFlight_ || checkpointInFlight_) return;
     if (acceptPending_) {
         if (!readyForPreview(form_, fields_)) return; // wait for any newer edit to be applied
-        if (!dirty_ && firstPreviewDone_ && previewError_.empty() &&
+        if (!dirty_ && firstPreviewDone_ && previewError_.empty() && !previewRolledBack_ &&
             std::string(form_->type) != "thread") {
             if (formSourceCurrent(st)) {
                 st.addLog("[pm] OK -> committed " + targetId_);
@@ -2081,6 +2071,57 @@ PMSelectionWellResult pmDrawSelectionWell(const char* id, const char* label,
     }
     ImGui::PopID();
     return r;
+}
+
+// One row per edge of a fillet/chamfer's Edges well. A stored ref that names several edges lists
+// each, so any one can be taken out; pointing at a row (or its x) makes the viewport draw that
+// edge hot, and the x removes it and re-previews.
+void PropertyManager::drawEdgeList(PMField& well) {
+    const std::vector<EdgeRow> rows = pmBlendEdgeRows(well, ips_);
+    if (rows.empty()) return;
+    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = pmSurf();
+    const float S = ui::uiScale;
+    const float rowH = ImGui::GetFrameHeight();
+    const float gap = ImGui::GetStyle().ItemSpacing.y;
+    const int shown = (int)std::min<size_t>(rows.size(), 7);   // more rows scroll
+    ImGui::BeginChild("##blend_edge_list", ImVec2(0.0f, shown * (rowH + gap)), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    int removePick = -1, removeShape = -1;
+    for (size_t r = 0; r < rows.size(); ++r) {
+        const EdgeRow& row = rows[r];
+        ImGui::PushID((int)r);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float markW = rowH;   // the x is a square at the row's right end
+        ImGui::InvisibleButton("##row", ImVec2(std::max(1.0f, width - markW), rowH));
+        const bool rowHot = ImGui::IsItemHovered();
+        ImGui::SameLine(0.0f, 0.0f);
+        const ImVec2 m0 = ImGui::GetCursorScreenPos();
+        const bool markClicked = ImGui::InvisibleButton("##remove", ImVec2(markW, rowH));
+        const bool markHot = ImGui::IsItemHovered();
+        if (markHot) pmTooltip("Remove this edge");
+        if (rowHot || markHot) { hoverPick_ = row.pickIndex; hoverShape_ = row.shapeIndex; }
+        if (markClicked) { removePick = row.pickIndex; removeShape = row.shapeIndex; }
+        const ImVec2 p1(p0.x + width, p0.y + rowH);
+        ui::glassRowBackground(dl, p0, p1, 6.0f * S, /*stripe=*/false,
+                               /*selected=*/rowHot || markHot, (rowHot || markHot) ? 0.42f : 0.28f);
+        const float textY = p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+        dl->PushClipRect(p0, ImVec2(m0.x, p1.y), true);
+        dl->AddText(ImVec2(p0.x + 8.0f * S, textY),
+                    ImGui::ColorConvertFloat4ToU32(surf.textPrimary), row.label.c_str());
+        dl->PopClipRect();
+        const char* mark = "x";   // ASCII: the UI fonts don't carry U+00D7
+        const ImU32 markCol = markHot ? ui::Palette::toU32(pal.statusErr)
+                                      : ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
+        dl->AddText(ImVec2(m0.x + (markW - ImGui::CalcTextSize(mark).x) * 0.5f, textY), markCol, mark);
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (removePick >= 0 && pmEraseBlendEdge(well, removePick, removeShape)) {
+        dirty_ = true; lastEditTime_ = ImGui::GetTime();
+    }
 }
 
 void pmDrawFormHeader(const char* icon, const char* title, const char* description) {
@@ -2781,6 +2822,7 @@ void PropertyManager::drawBody(AppState& st) {
     // True if the user clicked any SelectorWell chip this frame (re-arm). Exempts that click
     // from the post-loop "click elsewhere in PM ends profile select" dismiss.
     bool wellClickedThisFrame = false;
+    hoverPick_ = hoverShape_ = -1;   // re-set below by the Edges list row under the cursor
 
     // PM group cards are CONTENT-sized groups, not auto-resize child windows. An AutoResizeY child
     // sizes itself from LAST frame's content, so on the frame a form opens (feature edit, command,
@@ -3192,9 +3234,15 @@ void PropertyManager::drawBody(AppState& st) {
             }
             case PMFieldKind::SelectorWell: {
                 // Chip shows count + entity kind for filled wells.
+                const bool blendEdges = &f == blendEdgeWell();
                 std::string chip;
                 if (f.picks.empty()) {
                     chip = "(pick in viewport)";
+                } else if (blendEdges) {
+                    // A stored ref can name many edges: count the edges, not the refs.
+                    size_t edges = 0;
+                    for (const auto& p : f.picks) edges += std::max<size_t>(1, p.shapes.size());
+                    chip = std::to_string(edges) + (edges == 1 ? " edge" : " edges");
                 } else if (f.picks.size() == 1) {
                     chip = f.picks.front().label;
                 } else {
@@ -3215,6 +3263,7 @@ void PropertyManager::drawBody(AppState& st) {
                     f.picks.clear(); f.wellDangling = false;
                     dirty_ = true; lastEditTime_ = ImGui::GetTime();
                 }
+                if (blendEdges) drawEdgeList(f);
                 break;
             }
             case PMFieldKind::Combo: {

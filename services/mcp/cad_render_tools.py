@@ -17,6 +17,8 @@ from services.agent.request_context import root_value
 from . import cad_viewpoint as _vp
 from . import shot_planner as _sp
 from .cad_common import (
+    COMPONENT_KEY_RE,
+    component_key_refusal,
     _CLOSEUP_H,
     _CLOSEUP_MARGIN,
     _CLOSEUP_W,
@@ -905,18 +907,24 @@ def _resolve_camera_target(d: str, target, part_bb: Optional[dict]) -> tuple:
     """(resolved, target_bb, point) for any close-up target: a feature / face / edge / sid
     through _resolve_inspect_target, or a bare world point framed as a cube of `radius`
     (default 8 % of the part diagonal, at least 2 mm)."""
-    if isinstance(target, str) and re.fullmatch(r"k\d+(?:#\d+)?", target):
+    if isinstance(target, str) and COMPONENT_KEY_RE.fullmatch(target):
         bodies = (cb.call("asm_world_bodies", {"doc_id": d, "explode": False}) or {}).get("bodies", [])
-        selected = [b for b in bodies if b.get("component") == target]
+        # doc_query's body_id is the 1-based POSITION in this list (the engine's world-body
+        # order) — NOT AsmBodyOut.body_id and NOT a source_ordinals STEP solid ordinal, which
+        # count every solid of every component and run past the body count (k23 -> "body_id
+        # 1051 out of range (doc has 55 bodies)") or, worse, land on another component.
+        selected = [(pos, b) for pos, b in enumerate(bodies, 1) if b.get("component") == target]
         if selected:
             matches = []
-            for body in selected:
-                for ordinal in body.get("source_ordinals") or [body["body_id"]]:
-                    result = cb.call("doc_query", {"doc_id": d,
-                                                  "query": {"of": "face", "body_id": ordinal}})
-                    matches.extend(result.get("matches") or [])
-            bbox = _union_bbox([b["bbox"] for b in selected])
+            for pos, _body in selected:
+                result = cb.call("doc_query", {"doc_id": d,
+                                               "query": {"of": "face", "body_id": pos}})
+                matches.extend(result.get("matches") or [])
+            bbox = _union_bbox([b["bbox"] for _pos, b in selected])
             return {"matches": matches, "label": target, "kind": "component"}, bbox, None
+        refusal = component_key_refusal(d, target, "render_part")
+        if refusal:
+            raise ValueError(refusal)
     p = _point_of(target)
     if p is None:
         resolved = _resolve_inspect_target(d, target)

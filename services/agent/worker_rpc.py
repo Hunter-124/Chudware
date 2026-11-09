@@ -11,8 +11,8 @@ below) in the persistent services worker that hostd's agent lane spawns
 - ``ai_roles_*`` — over :mod:`services.agent.role_models`
 - ``bench_*`` (Settings → Benchmarks) — gym CLI runner
 - ``office_extract`` (``OFFICE_METHODS``)
-- ``agent_admin_turn`` / ``agent_cancel`` / ``agent_steer``, the ``omp_*``
-  auth/model/session/STT seams and ``memory_*`` (``ADMIN_METHODS``)
+- ``agent_admin_turn`` / ``agent_cancel`` / ``agent_steer`` / ``agent_withdraw_steer``,
+  the ``omp_*`` auth/model/session/STT seams and ``memory_*`` (``ADMIN_METHODS``)
 - ``ai_prompt_*`` / ``ai_tool_*`` — prompt previews and the context-meter baseline
 
 All failures return contract-shaped ``{"ok": false, ...}`` envelopes — never a
@@ -46,7 +46,7 @@ from services.agent.online_turn import (
     resolve_model_and_effort,
     turn_budget_notice,
 )
-from services.agent import demo_lane
+from services.agent import demo_lane, omp_settings
 from services.agent.omp_host import get_default_omp_host
 from services.agent.request_context import (
     actor_state_root, bind_roots, control_delegate, in_cell, mint_handle, require_handle, scoped_key,
@@ -1891,6 +1891,12 @@ def omp_control(action: str, params: dict, *, private: bool = False) -> dict:
                 steer_id=params.get("steer_id"),
                 **_control_credentials(params),
             )
+        if command == "withdraw_steer":
+            return get_default_omp_host().withdraw_steer(
+                params.get("run_id"),
+                params.get("steer_id"),
+                **_control_credentials(params),
+            )
         if command == "answer":
             return get_default_omp_host().answer(
                 params.get("run_id"),
@@ -2062,6 +2068,58 @@ def _omp_memory_call(command: str, params: dict, _emit: Callable) -> dict:
             "ok": False,
             "reason": f"Agent service {command} failed: {type(exc).__name__}: {exc}",
         }
+
+
+class _ConfigReply(Exception):
+    """A refusal the OMP host answered with instead of settings."""
+
+
+def _omp_config_call(command: str, params: dict) -> dict:
+    result = get_default_omp_host().config_call(command, params)
+    if not isinstance(result, dict):
+        raise TypeError(f"Agent service {command} returned non-object")
+    if result.get("ok") is False:
+        raise _ConfigReply(result)
+    return result
+
+
+def _omp_config(command: str, run: Callable[[], dict]) -> dict:
+    """Settings → AI gets a clean reply for a refusal or an outage, never an exception."""
+    try:
+        return {"ok": True, **run()}
+    except omp_settings.Refused as exc:
+        return {"ok": False, "reason": str(exc)}
+    except _ConfigReply as exc:
+        return _cell_refusal(exc.args[0]) or exc.args[0]
+    except Exception as exc:  # noqa: BLE001 - Settings must get a clean refusal
+        return _cell_refusal(exc) or {
+            "ok": False, "reason": f"Agent service {command} failed: {type(exc).__name__}: {exc}"}
+
+
+def _omp_config_get(params: dict, _emit: Callable) -> dict:
+    """The OMP settings Settings → AI exposes (``omp_settings`` is the policy)."""
+    if _has_unknown_params(params, frozenset()):
+        return {"ok": False, "reason": "omp_config_get has unknown params"}
+    from services.agent.config import memory_backend
+
+    def read() -> dict:
+        backend = memory_backend()
+        result = _omp_config_call("config_list", {"sources": omp_settings.sources(backend)})
+        return {"agentDir": result["agentDir"], "chudwareLayer": str(omp_settings.layer_path()),
+                "settings": omp_settings.present(result["settings"], backend)}
+
+    return _omp_config("config_list", read)
+
+
+def _omp_config_set(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"key", "value"})):
+        return {"ok": False, "reason": "omp_config_set has unknown params"}
+    key, value = params.get("key"), params.get("value")
+    if not isinstance(key, str) or not isinstance(value, str):
+        return {"ok": False, "reason": "omp_config_set takes a setting key and a string value"}
+    from services.agent.config import memory_backend
+
+    return _omp_config("config_set", lambda: omp_settings.apply(_omp_config_call, key, value, memory_backend()))
 
 
 def _auth_provider(raw: Any) -> dict[str, Any] | None:
@@ -2760,6 +2818,10 @@ def _agent_steer(params: dict, _emit: Callable) -> dict:
     return omp_control("steer", params)
 
 
+def _agent_withdraw_steer(params: dict, _emit: Callable) -> dict:
+    return omp_control("withdraw_steer", params)
+
+
 def _memory_remember(params: dict, _emit: Callable) -> dict:
     if set(params) - {"root", "content", "context", "source", "importance"}:
         return {"ok": False, "code": "unsupported", "reason": "Unsupported memory save parameters"}
@@ -3270,9 +3332,10 @@ def _session_launch_params(
         params.update(byok_key=byok_key, byok_provider=provider_name, byok_tenant="desktop")
     if project_root:
         params["workspace_dir"] = project_root
-    from services.agent.config import memory_backend
+    from services.agent.config import get_task_list_preference, memory_backend
 
     params["memory_backend"] = memory_backend()
+    params["task_list_preference"] = get_task_list_preference()
     for key, source in (
         ("omp_session_dir", ("omp_session_dir", "sessions_dir")),
         ("omp_session_file", ("omp_session_file",)),
@@ -3830,10 +3893,13 @@ ADMIN_METHODS: dict[str, Callable] = {
     "agent_admin_turn": _agent_admin_turn,
     "agent_cancel": _agent_cancel,
     "agent_steer": _agent_steer,
+    "agent_withdraw_steer": _agent_withdraw_steer,
     "omp_provider_list": _omp_provider_list,
     "omp_auth_state": _omp_auth_state,
     "omp_set_key": _omp_set_key,
     "omp_remove_key": _omp_remove_key,
+    "omp_config_get": _omp_config_get,
+    "omp_config_set": _omp_config_set,
     "omp_logout_accounts": _omp_logout_accounts,
     "omp_logout": _omp_logout,
     "omp_login": _omp_login,

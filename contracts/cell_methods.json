@@ -79,6 +79,11 @@
     "right": "write",
     "scope": "actor"
   },
+  "agent_withdraw_steer": {
+    "cell": "allow",
+    "right": "run",
+    "scope": "actor"
+  },
   "ai_prompt_baseline": {
     "cell": "allow",
     "right": "read",
@@ -615,6 +620,11 @@
     "scope": "workspace"
   },
   "doc_face_wires": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "workspace"
+  },
+  "doc_feature_edges": {
     "cell": "allow",
     "right": "read",
     "scope": "workspace"
@@ -2055,6 +2065,16 @@
     "scope": "actor"
   },
   "omp_close_session": {
+    "cell": "allow",
+    "right": "write",
+    "scope": "actor"
+  },
+  "omp_config_get": {
+    "cell": "allow",
+    "right": "read",
+    "scope": "actor"
+  },
+  "omp_config_set": {
     "cell": "allow",
     "right": "write",
     "scope": "actor"

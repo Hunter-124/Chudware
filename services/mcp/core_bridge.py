@@ -581,7 +581,7 @@ def _dispatch_call(method: str, params: Optional[dict] = None) -> dict:
 # engine has no daemon to ask, so this copy must stay aligned with hostd.
 _HOSTD_READ_EXACT = frozenset({
     "doc_list", "doc_tree", "doc_query", "doc_bbox", "doc_adjacency",
-    "doc_get_meta", "doc_validate", "doc_dry_run_ops", "doc_resolve_pick",
+    "doc_get_meta", "doc_validate", "doc_dry_run_ops", "doc_resolve_pick", "doc_feature_edges",
     "doc_mesh_ref_list", "doc_mesh_ref_mesh", "doc_rebuild", "doc_activate",
     "doc_dep_query", "doc_drawing_views", "doc_sketch_overview",
     "doc_sketch_regions", "doc_compile_cpp", "doc_save", "doc_export_step",

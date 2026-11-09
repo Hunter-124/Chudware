@@ -754,7 +754,7 @@ def _git_gh_auth_login(params, _emit):  return _git_rpc(params, _emit, "gh_auth_
 # ---------------------------------------------------------------------------
 
 def _plm_add_remote(params: dict, _emit: Callable) -> dict:
-    """Register a remote profile (folder/ssh/https/chudware-cloud config)."""
+    """Register a remote profile (folder/ssh/https/plm-server)."""
     try:
         from services.plm import remote as remote_mod
     except ImportError:
@@ -773,14 +773,13 @@ def _plm_add_remote(params: dict, _emit: Callable) -> dict:
         kind=kind,
         url=url,
         display_name=p.get("display_name"),
-        account_id=p.get("account_id"),
     )
 
 
 def _live_participant(params: dict) -> dict[str, Any] | None:
     value = (params or {}).get("participant")
     if value is not None:
-        return value if isinstance(value, dict) else {"id": "", "display": "", "account_id": None}
+        return value if isinstance(value, dict) else {"id": "", "display": ""}
     participant_id = str((params or {}).get("participant_id") or "").strip()
     display = str(
         (params or {}).get("participant_display")
@@ -789,11 +788,7 @@ def _live_participant(params: dict) -> dict[str, Any] | None:
     ).strip()
     if not participant_id and not display:
         return None
-    return {
-        "id": participant_id,
-        "display": display,
-        "account_id": (params or {}).get("account_id") or None,
-    }
+    return {"id": participant_id, "display": display}
 
 
 def _live_call(fn: Callable[[], dict]) -> dict:

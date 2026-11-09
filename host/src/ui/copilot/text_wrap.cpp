@@ -1,6 +1,7 @@
 #include "ui/copilot/text_wrap.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 
 namespace ui::copilot {
@@ -43,6 +44,11 @@ void noteEdit(WrapState& ws, const char* buf, int len, int cursor) {
 
 bool isHardBreak(const std::vector<int>& hard, int off) {
     return std::binary_search(hard.begin(), hard.end(), off);
+}
+
+int logicalLineStart(const std::vector<int>& hard, int pos) {
+    const auto it = std::lower_bound(hard.begin(), hard.end(), pos);
+    return it == hard.begin() ? 0 : *std::prev(it) + 1;
 }
 
 std::string normalizeComposerSelection(std::string_view wrapped,

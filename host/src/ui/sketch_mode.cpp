@@ -508,7 +508,21 @@ core::OpsResponse SketchMode::applySketchOps(AppState& st, const nlohmann::json&
     const long before = st.docMirror.revision();
     if (active_ && before != cancelRevision_)
         cancelRevision_ = -1;
-    auto result = st.docMirror.applyOps(st.worker, ops, coalesce);
+    // Model-snap tokens ("@m<k>") bind into THIS batch as sketch_convert external references, so the
+    // placed entity and its associative relations to the model commit (and undo) together.
+    const nlohmann::json* sent = &ops;
+    nlohmann::json bound;
+    int converts = 0;
+    if (!modelRefs_.empty() && modelref::uses(ops)) {
+        bound = ops;
+        converts = modelref::bind(bound, fid_, modelRefs_, [&](const nlohmann::json& ref) {
+            return modelref::convertedEntity(st.docMirror.tree(), fid_, ref);
+        });
+        sent = &bound;
+    }
+    // The session id lets the engine rebuild only up to this sketch; sketch_exit rebuilds the rest.
+    auto result = st.docMirror.applyOps(st.worker, *sent, coalesce, active_ ? sketchSessionId_ : 0);
+    if (converts) result.id_map = modelref::restoreIdMap(result.id_map, converts);
     if (active_ && cancelRevision_ >= 0) {
         const bool unchanged = !result.ok && result.rejected && result.unchanged &&
                                result.revision == before && st.docMirror.revision() == before;
@@ -1046,11 +1060,13 @@ void SketchMode::commitDrag(AppState& st) {
         cancelRevision_ = sketchRevision_;
     else
         cancelRevision_ = -1;
+    // The commit's reply is the committed tree. doc_tree would rebuild the history after the
+    // sketch, which an interactive session deliberately leaves unbuilt until it exits.
+    if (!st.docMirror.ingestTreeResponse(res)) resyncMirror(st);
     if (res.contains("tess") && res["tess"].is_object()) {
         std::string aicm = res["tess"].value("aicm_path", std::string());
         if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
     }
-    resyncMirror(st);
     resolve(st);   // refresh statuses against the committed doc
 }
 
@@ -1589,14 +1605,20 @@ bool SketchMode::smartDimPicking() const {
     return active_ && tool_ == SketchTool::SmartDim && !dimPopupOpen_ && dimPicks_.size() < 2;
 }
 
-// Project external geometry (model edge / planar face / datum plane) into the sketch as a FIXED
-// construction entity and chain it into the Smart Dimension pick buffer. The worker does the 3D
-// math (sketch_project_ref); the entity goes through the normal ops path so it undoes cleanly.
+// Bring an external reference into the sketch and chain it into the Smart Dimension pick buffer.
+// Model vertices and edges become associative external references (modelRefEntity — the same
+// sketch_convert mechanism as Convert Entities, so the dimension follows the model); datum planes /
+// axes and faces project through the worker (sketch_project_ref) as a FIXED construction entity.
+// Either way the entity goes through the normal ops path so it undoes cleanly.
 std::string SketchMode::addProjectedDimRef(AppState& st, const nlohmann::json& ref,
-                                           const std::string& srcKey) {
+                                           const std::string& srcKey, const char* sub) {
     std::string eid;
+    const std::string kind = ref.value("kind", std::string());
     auto it = projRefs_.find(srcKey);
-    if (it != projRefs_.end() && entById(it->second)) {
+    if (kind == "vertex" || kind == "edge") {
+        eid = modelRefEntity(st, ref);
+        if (eid.empty()) return eid;
+    } else if (it != projRefs_.end() && entById(it->second)) {
         eid = it->second;   // same source picked before — reuse its reference entity
     } else {
         nlohmann::json res;
@@ -1624,6 +1646,12 @@ std::string SketchMode::addProjectedDimRef(AppState& st, const nlohmann::json& r
     if (!e) return std::string();
     DimPick p;
     if (e->type == "point") { p.isPoint = true; p.handle = eid + ".p"; p.u = e->p1[0]; p.v = e->p1[1]; }
+    else if (sub) {   // a point OF the entity: a line's midpoint or a circle / arc's center
+        p.isPoint = true; p.handle = eid + "." + sub;
+        if (std::strcmp(sub, "mid") == 0) {
+            p.u = (e->p1[0] + e->p2[0]) * 0.5f; p.v = (e->p1[1] + e->p2[1]) * 0.5f;
+        } else { p.u = e->center[0]; p.v = e->center[1]; }
+    }
     else { p.entId = eid; p.entIdx = entIndexById(eid); }
     for (const auto& q : dimPicks_)
         if (q.isPoint == p.isPoint && (p.isPoint ? q.handle == p.handle : q.entId == p.entId))
@@ -1890,6 +1918,7 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
             if (cancelRevision_ != st.docMirror.revision()) cancelRevision_ = -1;
         }
     }
+    entryContent_ = st.docMirror.featureContent(fid_);
     st.addLog("[sketch] entered " + fid_ + "  (dof=" + std::to_string(dof_) + ")");
     return true;
 }
@@ -2051,6 +2080,14 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
         std::string aicm = res["tess"].value("aicm_path", std::string());
         if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
     }
+    // Rolling the history forward can find that the session's edits broke a later feature; the
+    // engine then leaves the bar before it. Say so, exactly as an ordinary edit would.
+    if (exited && res.contains("auto_rollback") && res["auto_rollback"].is_object()) {
+        const std::string msg = res.value("warning", std::string(
+            "Downstream features failed; history was rolled back for repair."));
+        st.addLog("[sketch] " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    }
     // Resync the mirror revision (sketch_exit bumps it server-side).
     resyncMirror(st);
     // Empty-sketch cleanup: Finish removes empty sketches; Cancel removes only a new empty sketch.
@@ -2079,6 +2116,7 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     std::string().swap(relModelInputScratch_);
     cons_.clear();              // C37-D
     autoPlace_.clear(); projRefs_.clear();         // C37-D
+    modelRefs_.clear(); modelSnap_.clear(); modelDownstreamRevision_ = -1;
     cancelCheckpoint_.clear();  // C37-D
     cancelRevision_ = -1;
     sketchSessionId_ = 0;
@@ -2161,6 +2199,7 @@ void SketchMode::cancelSketch(AppState& st) {
     std::string().swap(relModelInputScratch_);
     cons_.clear();
     autoPlace_.clear(); projRefs_.clear();
+    modelRefs_.clear(); modelSnap_.clear(); modelDownstreamRevision_ = -1;
     cancelCheckpoint_.clear();
     cancelRevision_ = -1;
     sketchSessionId_ = 0;
@@ -3203,6 +3242,131 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
         if (infer->alignU) u = infer->srcU.x;
         if (infer->alignV) v = infer->srcV.y;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Model-geometry inference (see sketch_model_snap.h)
+// ---------------------------------------------------------------------------
+
+bool SketchMode::placesPoints() const {
+    switch (tool_) {
+        case SketchTool::None: case SketchTool::SmartDim: case SketchTool::Convert:
+        case SketchTool::Trim: case SketchTool::Extend: case SketchTool::Offset:
+        case SketchTool::SkFillet: case SketchTool::SkChamfer:
+        case SketchTool::Mirror: case SketchTool::LinPattern: case SketchTool::CircPattern:
+        case SketchTool::Move: case SketchTool::MoveEntities: case SketchTool::RotateEntities:
+        case SketchTool::Text: case SketchTool::EqCurve: case SketchTool::Airfoil:
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool SketchMode::queryModelSnap(AppState& st, const ImVec2& imgMin, int vw, int vh,
+                                const ImVec2& cursor, float reachPx, bool onEdge,
+                                ModelSnapHit& out) {
+    // The candidates' ids feed resolvePick, so only the tessellation of the CURRENT revision is
+    // usable (adoptCurrentOpsResponse drops the cached mesh the moment a revision supersedes it).
+    const DocSession* session = st.activeSession();
+    if (!basisOk_ || !st.renderer || !st.idPass || !session || !session->cachedDocMesh ||
+        session->cachedRevision != st.docMirror.revision())
+        return false;
+    // Geometry owned by a feature that depends on this sketch (the extrude built from this very
+    // profile, say) is not offered: referencing it would make the sketch depend on its own output.
+    const int revision = st.docMirror.revision();
+    if (modelDownstreamRevision_ != revision) {
+        modelDownstream_ = modelref::downstreamOf(st.docMirror.tree(), fid_);
+        modelDownstreamRevision_ = revision;
+    }
+    if (!modelSnap_.upToDate(session->cachedDocMesh, frame_, uint64_t(revision))) {
+        const core::DocMirror& mirror = st.docMirror;
+        modelSnap_.sync(session->cachedDocMesh, frame_, uint64_t(revision),
+            modelDownstream_.empty() ? SketchModelSnap::EdgeFilter()
+                : SketchModelSnap::EdgeFilter([&](uint32_t body, uint32_t edge) {
+                      return modelDownstream_.count(mirror.ownerOfEdge(body, edge)) != 0;
+                  }));
+    }
+    const auto& cam = st.renderer->camera();
+    const int probeRadius = (int)std::lround(3.0f * ui::uiScale);
+    // A candidate counts only where the id buffer shows its own vertex / edge: the buffer holds
+    // visible geometry only, so back faces and hidden bodies never win a snap.
+    auto visible = [&](const ModelSnapHit& hit) {
+        const bool vertex = hit.kind == ModelSnapKind::Vertex;
+        const render::PickKind want = vertex ? render::PickKind::Vertex : render::PickKind::Edge;
+        for (int i = 0; i < hit.probes; ++i) {
+            ImVec2 s;
+            if (!worldToScreen(cam, imgMin, vw, vh, hit.probe[size_t(i)][0], hit.probe[size_t(i)][1],
+                               hit.probe[size_t(i)][2], s))
+                continue;
+            const render::PickHit pick = st.idPass->pickFinalPreferEdge(
+                (int)(s.x - imgMin.x), (int)(s.y - imgMin.y), vw, vh, probeRadius, vertex);
+            if (pick.kind == want && pick.body_id == hit.body && pick.topo_id == hit.topo)
+                return true;
+        }
+        return false;
+    };
+    ModelSnapScreen screen;
+    screen.ox = originS_.x; screen.oy = originS_.y;
+    screen.ux = uAxisS_.x;  screen.uy = uAxisS_.y;
+    screen.vx = vAxisS_.x;  screen.vy = vAxisS_.y;
+    return modelSnap_.query(screen, cursor.x, cursor.y, reachPx, inferenceOn_, onEdge, visible, out);
+}
+
+// A sketch point snap keeps priority; model key points (vertex, midpoint, circle center) beat the
+// sketch's own midpoint / rim / alignment guides; a point on a model edge only claims a cursor
+// that has no guide at all. st.hover lights the model vertex / edge behind the snap.
+void SketchMode::snapToModel(AppState& st, const ImVec2& imgMin, int vw, int vh,
+                             const ImVec2& cursor, bool hovered, float& u, float& v,
+                             std::string& snapH, SnapInfer& infer) {
+    modelHitLive_ = false;
+    st.hover = render::PickHit{};
+    if (!hovered || !placesPoints() || !coincRef(snapH).empty()) return;
+    const bool free = snapH.empty() && !infer.alignU && !infer.alignV;
+    ModelSnapHit hit;
+    if (!queryModelSnap(st, imgMin, vw, vh, cursor, kSnapPx * ui::uiScale, free, hit)) return;
+    u = hit.u; v = hit.v;
+    infer = SnapInfer{};
+    snapH = modelref::snapRecord(hit.kind, -1);
+    modelHit_ = hit;
+    modelHitLive_ = true;
+    st.hover = render::PickHit{hit.body, hit.kind == ModelSnapKind::Vertex ? render::PickKind::Vertex
+                                                                           : render::PickKind::Edge,
+                               hit.topo};
+}
+
+int SketchMode::internModelRef(AppState& st, const ModelSnapHit& hit) {
+    std::string err;
+    const render::PickHit pick{hit.body, hit.kind == ModelSnapKind::Vertex ? render::PickKind::Vertex
+                                                                           : render::PickKind::Edge,
+                               hit.topo};
+    const auto ref = modelPickReference(st, pick, err);
+    if (!ref.is_object()) {
+        st.toast(ui::ToastLevel::Warn, "Can't reference that model geometry" +
+                 (err.empty() ? std::string() : ": " + err));
+        return -1;
+    }
+    const auto at = std::find(modelRefs_.begin(), modelRefs_.end(), ref);
+    if (at != modelRefs_.end()) return (int)(at - modelRefs_.begin());
+    modelRefs_.push_back(ref);
+    return (int)modelRefs_.size() - 1;
+}
+
+std::string SketchMode::modelRefEntity(AppState& st, const nlohmann::json& ref) {
+    std::string eid = modelref::convertedEntity(st.docMirror.tree(), fid_, ref);
+    if (!eid.empty()) return eid;
+    const nlohmann::json op = {{"op", "sketch_convert"}, {"sketch", fid_},
+                               {"refs", nlohmann::json::array({ref})},
+                               {"construction", true}, {"fix", true}, {"associative", true}};
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
+    if (!r.ok) {
+        st.addLog("[sketch] model reference failed: " + r.error_message);
+        st.toast(ui::ToastLevel::Warn, "Can't reference that model geometry: " + r.error_message);
+        return {};
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    resolve(st);
+    return r.id_map.is_object() && r.id_map.contains("$0") ? r.id_map["$0"].get<std::string>()
+                                                           : std::string();
 }
 
 int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uOut, float& vOut) const {
@@ -5287,20 +5451,20 @@ void SketchMode::inSketchUndo(AppState& st) {
         if (!toolSnaps_.empty()) toolSnaps_.pop_back();
         return;
     }
-    st.docUndo();
+    st.docUndo(sketchSessionId_);
     afterSketchHistory(st);
 }
 
 void SketchMode::inSketchRedo(AppState& st) {
-    st.docRedo();
+    st.docRedo(sketchSessionId_);
     afterSketchHistory(st);
 }
 
-// Shared post-undo/redo refresh: resync the mirror, re-solve the active sketch, or close cleanly
-// if the sketch feature itself was undone/redone away.
+// Shared post-undo/redo refresh: re-solve the active sketch, or close cleanly if the sketch
+// feature itself was undone/redone away. docUndo/docRedo already adopted the engine's reply;
+// pulling doc_tree here would rebuild the history the session leaves unbuilt until it exits.
 void SketchMode::afterSketchHistory(AppState& st) {
     cancelRevision_ = -1;
-    resyncMirror(st);
     // Does the sketch still exist? Re-solving an absent sketch returns an error envelope.
     nlohmann::json res;
     if (!callSketch(st, "sketch_solve", nlohmann::json::object(), res)) {
@@ -5316,6 +5480,7 @@ void SketchMode::afterSketchHistory(AppState& st) {
         active_ = false; isNewEmpty_ = false; fid_.clear(); docId_.clear();
         sketchSessionId_ = 0; sketchRevision_ = -1;
         ents_.clear(); cons_.clear(); autoPlace_.clear(); projRefs_.clear(); cancelCheckpoint_.clear();
+        modelRefs_.clear(); modelSnap_.clear(); modelDownstreamRevision_ = -1;
         status_.clear(); dof_ = 0;
         conflicting_.clear(); redundant_.clear(); solveRejected_ = false;   // C50f
         relOverDefOpen_ = false; relOverDefOps_ = nullptr; relOverDefLabel_.clear();   // C50g
@@ -6693,6 +6858,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // drawing/edit tool owns the cursor (tool_ != None) or before the idle-hover pass below runs;
     // the tool_==None branch narrows this to the actual per-frame hit-test result.
     entityHoverHot_ = (tool_ != SketchTool::None);
+    modelHitLive_ = false;   // re-set by the drawing tools' model snap below
     // Sketch dimensions + Modify box follow the document unit system (mm / inch); refreshed each
     // frame so a status-bar units toggle reformats on-canvas dims and the Modify box live.
     g_skIps = st.ips();
@@ -6940,10 +7106,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // geometry pass (search "paste-placement preview").
     if (pastePlacing_) imgHovered = false;
 
-    // C41 (T1): Esc consumption flag. The specific Esc behaviors that KEEP the tool armed
-    // (Smart Dim pick-buffer clear, Offset stage back-out, Modify box close) set this so the
-    // hover-independent catch-all at the end of drawOverlay doesn't also disarm the tool.
+    // Esc consumption flag. Esc is one step per press: a handler that consumes it without
+    // disarming the tool (Modify box close, Offset distance box) sets this so the hover-independent
+    // ladder at the end of drawOverlay doesn't also take its step. `escIdleAtStart` records that
+    // nothing was armed, selected or open when the frame began, so a tool or selection Esc just
+    // released can never cascade into leaving the sketch on the same press.
     bool escHandled = false;
+    const bool escIdleAtStart = tool_ == SketchTool::None && selIds_.empty() && selRelIds_.empty() &&
+        !pastePlacing_ && !relPopupOpen_ && !relModelPicking_ && !dimPopupOpen_ && !overDefOpen_ &&
+        !editOverDefOpen_ && !relOverDefOpen_ && !boxArmed_ && !boxSelecting_ && !entityDragActive();
     // The relation popup is not modal; keep its clicks off the canvas below.
     if (relPopupOpen_) imgHovered = false;
 
@@ -8463,10 +8634,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                escHandled = true;   // C41 (T1): stage back-out keeps the tool armed
-                // Esc backs out one stage; from the chain stage it exits the tool.
-                if (offsetStage_ == 2) { offsetStage_ = 1; offsetFocusInput_ = true; }
-                else if (offsetStage_ == 1) offsetStage_ = 0;
+                // The distance box (stage 1) owns Esc like any text popup and only closes itself;
+                // the chain pick and side pick are gestures, so Esc cancels them and disarms.
+                if (offsetStage_ == 1) { offsetStage_ = 0; escHandled = true; }
                 else cancelTool();
             }
         }
@@ -8476,8 +8646,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // The radius/distance numeric field lives in a small always-on overlay pinned top-left
         // (drawn after the interaction pass) and persists across corners. On the second pick the op
         // is applied; success appends the new arc/line + re-solves and we stay armed for another
-        // corner. A non-line pick toasts and is ignored. Esc clears a held first pick (or exits the
-        // tool if none is held).
+        // corner. A non-line pick toasts and is ignored. Esc drops a held first pick and exits
+        // the tool in one press.
         else if (tool_ == SketchTool::SkFillet || tool_ == SketchTool::SkChamfer) {
             const ImU32 ac = col(pal.accent, 0.95f);
             const ImU32 hc = col(pal.hoverHighlight, 0.9f);
@@ -8507,18 +8677,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     applyCornerOp(st, e.id);           // second line: build + apply, then stay armed
                 }
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                escHandled = true;   // C41 (T1): clear a held first pick, else exit the tool
-                if (!corner1Id_.empty()) corner1Id_.clear();
-                else cancelTool();
-            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();   // also drops corner1Id_
         }
 
         // ----- C53 MIRROR / LINEAR PATTERN / CIRCULAR PATTERN: collect an entity selection -----
         // Stage 0 collects line/circle/arc entities (click toggles, like the Offset chain). Enter
         // advances: Mirror -> stage 1 pick a construction line (the mirror axis); Circular -> stage 1
         // pick the center point; Linear -> stage 1 the numeric panel. The op is applied from the
-        // numeric panel / line pick (drawn after the interaction pass). Esc backs out a stage.
+        // numeric panel / line pick (drawn after the interaction pass). Esc closes the numeric
+        // panel back to its pick stage; anywhere else it cancels the picks and exits the tool.
         else if (tool_ == SketchTool::Mirror || tool_ == SketchTool::LinPattern ||
                  tool_ == SketchTool::CircPattern) {
             const ImU32 ac = col(pal.accent, 0.95f);
@@ -8590,8 +8757,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                               col(pal.accent, 0.95f), 16, 2.0f);
 
             if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                escHandled = true;
-                if (mpStage_ > 0) { mpStage_ = (tool_ == SketchTool::CircPattern) ? mpStage_ - 1 : 0; }
+                // The Count/Spacing/Angle panel owns Esc like any popup and only closes itself;
+                // the entity, mirror-line and center picks are gestures: cancel and disarm.
+                const bool panelStage = (tool_ == SketchTool::LinPattern && mpStage_ == 1) ||
+                                        (tool_ == SketchTool::CircPattern && mpStage_ == 2);
+                if (panelStage) { mpStage_ = tool_ == SketchTool::CircPattern ? 1 : 0; escHandled = true; }
                 else cancelTool();
             }
         }
@@ -8686,11 +8856,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             }
 
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                escHandled = true;
-                if (mpStage_ > 0) mpStage_ = mpStage_ - 1;   // back out from to-pick -> from-pick -> select
-                else cancelTool();
-            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();   // drops the pick stages too
         }
         // ----- Gizmo MOVE / ROTATE ENTITIES: stage 0 selects (like Move); stage 1 shows an -----
         // ----- in-plane manipulator at the (draggable) selection centroid. Move = two axis -----
@@ -8905,11 +9071,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
 
                 // ---- finish / cancel (HUD buttons, Enter, Esc) ----
+                // Esc abandons the manipulation and disarms the tool; the HUD ✗ only backs out to
+                // the entity-select stage.
                 bool finish = hudFinish_ || ImGui::IsKeyPressed(ImGuiKey_Enter);
-                bool cancel = hudCancel_ || ImGui::IsKeyPressed(ImGuiKey_Escape);
+                const bool escCancel = ImGui::IsKeyPressed(ImGuiKey_Escape);
+                bool cancel = hudCancel_;
                 hudFinish_ = false; hudCancel_ = false;
-                if (cancel) {
-                    escHandled = true;
+                if (escCancel) {
+                    cancelTool();
+                } else if (cancel) {
                     mpStage_ = 0; gzDragging_ = false; gzDragAxis_ = -1;
                     moveDx_ = moveDy_ = 0.0f; rotCurAng_ = 0.0f;   // stay in tool, back to select
                 } else if (finish) {
@@ -8974,6 +9144,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         float su = mu, sv = mv; std::string snapH;
         SnapInfer infer;
         if (imgHovered) snapPoint(su, sv, snapH, &infer);
+        // Model geometry (vertex / midpoint / circle center / edge) is an inference source too.
+        snapToModel(st, imgMin, vw, vh, io.MousePos, imgHovered, su, sv, snapH, infer);
 
         // C49: direction inference for the Line tool's SECOND point only (polygon/spline legs
         // and the 3-pt arc chord deliberately stay free). Priority: point snap > tangent > h/v.
@@ -9504,6 +9676,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 dl->AddCircleFilled(sCur, ms * 0.7f, inferCol);
                 dl->AddCircle(sCur, ms * 1.4f, inferCol, 0, w12);
             }
+            if (modelHitLive_)   // inferred from MODEL geometry: a square frames the usual glyph
+                dl->AddRect(ImVec2(sCur.x - ms * 1.9f, sCur.y - ms * 1.9f),
+                            ImVec2(sCur.x + ms * 1.9f, sCur.y + ms * 1.9f), inferCol, 0, 0, w12);
         }
         // Live relation chips near the cursor (same style + vector glyphs as the C41 badges).
         if (hvH || hvV || tanSnap) {
@@ -9542,6 +9717,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 std::string vH = infer.alignV ? infer.srcVHandle : std::string();
                 if (!uH.empty() || !vH.empty())
                     clickSnap += (clickSnap.empty() ? "align:" : ";align:") + uH + "|" + vH;
+            }
+            // A model snap resolves its pick to a persistent selector now (one RPC), so the token the
+            // record carries stays valid until the commit binds it in as an external reference.
+            if (modelHitLive_) {
+                const int k = internModelRef(st, modelHit_);
+                clickSnap = k >= 0 ? modelref::withRef(clickSnap, k) : std::string();
             }
             toolUV_.push_back(ImVec2(su, sv));
             toolSnaps_.push_back(clickSnap);
@@ -10159,10 +10340,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
 
-        // External (model) geometry: when nothing sketch-side is under the cursor, probe the
-        // id-buffer for a model edge/face. st.hover drives the standard 3D hover highlight
-        // (rendered next frame); a click projects the reference into the sketch as a FIXED
-        // construction entity (worker sketch_project_ref) and chains it as a pick.
+        // External (model) geometry: when nothing sketch-side is under the cursor, the model's
+        // visible vertices, straight-edge midpoints, circle centers and edges are picks (the same
+        // inference index the drawing tools snap to); anything else falls back to the id-buffer
+        // pick. st.hover drives the standard 3D hover highlight (rendered next frame); a click
+        // brings the reference into the sketch (associative for vertices / edges) and chains it
+        // as a pick.
         std::string datumAxis;
         if (canAddPick && imgHovered && !hoverHit) {
             std::string axisName;
@@ -10173,7 +10356,24 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else datumAxis.clear();
         }
         render::PickHit extHit{};
-        if (canAddPick && imgHovered && !hoverHit && datumAxis.empty() && st.hasDocMesh && st.idPass) {
+        ModelSnapHit modelHit;
+        bool haveModel = false;
+        if (canAddPick && imgHovered && !hoverHit && datumAxis.empty())
+            haveModel = queryModelSnap(st, imgMin, vw, vh, io.MousePos, kHandlePx * ui::uiScale,
+                                       /*onEdge=*/true, modelHit);
+        if (haveModel) {
+            extHit = render::PickHit{modelHit.body, modelHit.kind == ModelSnapKind::Vertex
+                                         ? render::PickKind::Vertex : render::PickKind::Edge,
+                                     modelHit.topo};
+            const ImVec2 m = uvToScreen(modelHit.u, modelHit.v);
+            const float r = 5.0f * sdS;
+            if (modelHit.kind == ModelSnapKind::Midpoint)
+                dl->AddQuadFilled(ImVec2(m.x, m.y - r), ImVec2(m.x + r, m.y),
+                                  ImVec2(m.x, m.y + r), ImVec2(m.x - r, m.y), hiCol);
+            else
+                dl->AddCircle(m, 6.0f * sdS, hiCol, 0, 2.0f * sdS);
+        } else if (canAddPick && imgHovered && !hoverHit && datumAxis.empty() && st.hasDocMesh &&
+                   st.idPass) {
             int px = (int)(io.MousePos.x - imgMin.x), py = (int)(io.MousePos.y - imgMin.y);
             render::PickHit h = st.idPass->pickFinalPreferEdge(px, py, vw, vh,
                 (int)std::lround(7.0f * ui::uiScale));
@@ -10222,7 +10422,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     std::string perr;
                     const auto ref = modelPickReference(st, extHit, perr);
                     if (ref.is_object()) {
-                        if (!addProjectedDimRef(st, ref, ref.dump()).empty()) {
+                        const char* sub = !haveModel ? nullptr
+                            : modelHit.kind == ModelSnapKind::Midpoint ? "mid"
+                            : modelHit.kind == ModelSnapKind::Center ? "center" : nullptr;
+                        if (!addProjectedDimRef(st, ref, ref.dump(), sub).empty()) {
                             pickAdded = true;
                             dimBuildPending(io.MousePos, mu, mv);
                         }
@@ -10251,20 +10454,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
 
-        // Esc semantics: with the Modify box open, item-4 handler closes it (below). With picks in
-        // the buffer, first Esc clears the buffer; second Esc exits the tool.
-        if (!dimPopupOpen_ && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            escHandled = true;   // C41 (T1): pick-buffer clear keeps the tool armed
-            if (!dimPicks_.empty()) { dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr; }
-            else cancelTool();
-        }
+        // Esc semantics: with the Modify box open, the box handler (below) closes it. Otherwise
+        // Esc drops any buffered picks and exits the tool in one press.
+        if (!dimPopupOpen_ && ImGui::IsKeyPressed(ImGuiKey_Escape)) cancelTool();
         // Right-click also clears the pick buffer.
         if (imgHovered && rightClickReleased()) {
             dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
         }
-    } else if (st.hover.valid()) {
-        // Smart Dimension was the only in-sketch writer of st.hover (model-ref picking); clear a
-        // stale highlight once the tool disarms (the viewport's own picking is off in-sketch).
+    } else if (!modelHitLive_ && tool_ != SketchTool::Convert && st.hover.valid()) {
+        // Smart Dimension, Convert and the point-placing tools' model snap are the in-sketch writers
+        // of st.hover (model-geometry highlight); clear a stale highlight once they disarm (the
+        // viewport's own picking is off in-sketch).
         st.hover = render::PickHit{};
     }
 
@@ -10281,7 +10481,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         bool overCanvas = ImGui::IsMouseHoveringRect(imgMin, imgMax);
         // (The ✓/✗ confirmation corner moved to the Sketch-tab ribbon; no in-viewport carve-out.)
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            pastePlacing_ = false; pasteBundle_ = nlohmann::json();
+            pastePlacing_ = false; pasteBundle_ = nlohmann::json(); escHandled = true;
             st.toast(ui::ToastLevel::Info, "Paste cancelled");
         } else if (overCanvas && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             float cu = 0, cv = 0; screenToUV(io.MousePos, cu, cv);
@@ -10753,14 +10953,27 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
 
     drawAddRelations(st, escHandled);
 
-    // ---- C41 (T1): catch-all Esc — disarm the armed tool / in-progress chain even when the
-    // viewport image is NOT hovered. The more specific handlers above run first: the ones that
-    // fully cancel leave tool_ == None (no-op here); the ones that keep the tool armed (Modify
-    // box close, Smart Dim pick clear, Offset stage back-out) mark escHandled. Suppressed while
-    // any text field owns the keyboard. Esc with no tool armed does nothing here.
-    if (!escHandled && tool_ != SketchTool::None && !io.WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_Escape))
-        cancelTool();
+    // ---- Esc ladder — one step per press, hover-independent, suppressed while a text field owns
+    // the keyboard. The tool handlers above run first: those that consume Esc without disarming
+    // (Modify box / Offset distance box / pattern panel / paste placement / popups) mark escHandled.
+    //   1. a tool is armed          -> cancel its in-progress gesture and disarm it;
+    //   2. entities are selected    -> clear the selection;
+    //   3. nothing armed or selected, no popup/drag, and this sketch's own content (params + refs)
+    //      equals its content at entry -> leave the sketch exactly like Finish Sketch.
+    // A sketch that has been edited is never left by Esc; the user confirms with Finish Sketch.
+    // `escIdleAtStart` keeps a tool or selection released by this very press from cascading into 3.
+    if (!escHandled && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        if (tool_ != SketchTool::None) {
+            cancelTool();
+        } else if (!selIds_.empty() || !selRelIds_.empty()) {
+            clearEntitySelection();
+        } else if (escIdleAtStart && !entryContent_.is_null() && st.docMirror.docId() == docId_ &&
+                   st.docMirror.featureContent(fid_) == entryContent_ &&
+                   !st.contextPickActive && !ImGui::IsAnyItemActive() &&
+                   !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+            onRibbonCommand(st, "sketch_exit");
+        }
+    }
 }
 
 }  // namespace ui

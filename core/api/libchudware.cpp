@@ -2322,7 +2322,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.contains("ops") ? params["ops"] : json::array(),
                                 params.value("coalesce", false),
                                 params.value("with_tess", true),
-                                origin == "agent" || origin == "mcp"),
+                                origin == "agent" || origin == "mcp",
+                                params.value("sketch_session_id", std::uint64_t{0}),
+                                params.value("with_exact", true),
+                                params.value("preview_through", std::string())),
                             out_json, 0);
             }
             if (m == "doc_dry_run_ops")
@@ -2332,9 +2335,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("budget_ms", 0)),
                             out_json, 0);
             if (m == "doc_undo")
-                return emit(chudware::doc::doc_undo(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_undo(params.value("doc_id", std::string()),
+                                                    params.value("sketch_session_id", std::uint64_t{0})),
+                            out_json, 0);
             if (m == "doc_redo")
-                return emit(chudware::doc::doc_redo(params.value("doc_id", std::string())), out_json, 0);
+                return emit(chudware::doc::doc_redo(params.value("doc_id", std::string()),
+                                                    params.value("sketch_session_id", std::uint64_t{0})),
+                            out_json, 0);
             if (m == "doc_clear_history")
                 return emit(chudware::doc::doc_clear_history(params.value("doc_id", std::string())),
                             out_json, 0);
@@ -2527,7 +2534,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                                  params.value("recovered", false),
                                                  params.value("reuse_open", false),
                                                  params.value("recovery_original_path", std::string()),
-                                                 params.value("recovery_base_stamp", json(nullptr))),
+                                                 params.value("recovery_base_stamp", json(nullptr)),
+                                                 params.value("display_quality", std::string())),
                             out_json, 0);
             if (m == "doc_reload")
                 return emit(chudware::doc::doc_reload(
@@ -2547,6 +2555,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("doc_id", std::string()),
                                 params.value("body_id", 0),
                                 params.value("topo_id", 0)),
+                            out_json, 0);
+            if (m == "doc_feature_edges")
+                return emit(chudware::doc::doc_feature_edges(
+                                params.value("doc_id", std::string()),
+                                params.value("feature_id", std::string()),
+                                params.contains("revision") && params["revision"].is_number_integer()
+                                    ? params["revision"].get<long>() : -1),
                             out_json, 0);
             if (m == "doc_push_pull")
                 return emit(chudware::doc::doc_push_pull(

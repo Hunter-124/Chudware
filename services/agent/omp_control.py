@@ -48,7 +48,8 @@ class ControlServer:
     ) -> None:
         self._handler = handler
         self._accepted_actions = frozenset(accepted_actions) if accepted_actions is not None else frozenset(
-            {"cancel", "steer", "answer", "status", "release", "apply_compaction_policy"}
+            {"cancel", "steer", "withdraw_steer", "answer", "status", "release",
+             "apply_compaction_policy"}
         )
         self._delegated_controls = accepted_actions is None
         self._platform = platform or ("nt" if os.name == "nt" else "posix")

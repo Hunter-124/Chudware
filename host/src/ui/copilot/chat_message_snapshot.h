@@ -68,10 +68,12 @@ inline bool sameMessage(const ChatMsg& a, const ChatMsg& b, bool activity = true
         const auto& x = a.activity[i]; const auto& y = b.activity[i];
         if (std::tie(x.stage, x.title, x.detail, x.reason, x.status, x.durationMs,
                      x.tokensIn, x.tokensOut, x.opsCount, x.expanded, x.missionHeader,
-                     x.rowKind, x.ctxTokens, x.streaming, x.userToggled) !=
+                     x.rowKind, x.ctxTokens, x.streaming, x.userToggled, x.parentId,
+                     x.subagentId) !=
             std::tie(y.stage, y.title, y.detail, y.reason, y.status, y.durationMs,
                      y.tokensIn, y.tokensOut, y.opsCount, y.expanded, y.missionHeader,
-                     y.rowKind, y.ctxTokens, y.streaming, y.userToggled)) return false;
+                     y.rowKind, y.ctxTokens, y.streaming, y.userToggled, y.parentId,
+                     y.subagentId)) return false;
     }
     return true;
 }

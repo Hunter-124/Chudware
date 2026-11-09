@@ -1356,6 +1356,11 @@ def _meta_handler(name: str) -> Callable[..., Any] | None:
 
 # --------------------------------------------------------------------------- public API
 
+#: Chudware tools an OMP built-in replaces in this lane, never advertised to it. OMP's
+#: ``todo`` is the task list: its frames feed the Tasks panel, and Settings → "Task
+#: list preference" drives it through the session overlay (``todo.eager``).
+OMP_SUPERSEDED_TOOLS: frozenset[str] = frozenset({"task_list"})
+
 
 def build_host_tools(context: Any) -> list[HostToolBinding]:
     """Build the selected and discoverable policy-authorized CAD tool surface."""
@@ -1403,7 +1408,7 @@ def build_host_tools(context: Any) -> list[HostToolBinding]:
     out: list[HostToolBinding] = []
     for name in names:
         entry = entries.get(name)
-        if name in AGENT_DENIED_TOOLS:
+        if name in AGENT_DENIED_TOOLS or name in OMP_SUPERSEDED_TOOLS:
             continue
         if not _collision_allowed(name, entry, context):
             continue

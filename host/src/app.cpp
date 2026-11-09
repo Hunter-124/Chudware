@@ -4419,7 +4419,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           const auto &tree = st.docMirror.tree();
           if (tree.is_object()) {
             auto tci = tree.find("components");
-            if (tci != tree.end() && tci->is_array() && !tci->empty()) {
+            auto tmi = tree.find("mesh_references");
+            if ((tci != tree.end() && tci->is_array() && !tci->empty()) ||
+                (tmi != tree.end() && tmi->is_array() && !tmi->empty())) {
               solid = true;
             } else {
               auto tfi = tree.find("features");
@@ -4529,7 +4531,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Stop/steer when hostd is already down is a quiet local finalize — log
     // only, no red Error toast.
     if (method == "agent_cancel" || method == "agent_steer" ||
-        method == "agent_answer") {
+        method == "agent_withdraw_steer" || method == "agent_answer") {
       st.addLog("[worker] " + method + ": " + err);
       return;
     }
@@ -8031,6 +8033,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         emit("agent.tool_call", {{"subagent_id", "geometry"}, {"id", "geo-2"},
                                  {"tool_name", "extrude"}, {"target", "boss sketch"},
                                  {"ok", true}, {"latency_ms", 2100}});
+        emit("sub_run", {{"subagent_id", "geometry"}, {"id", "geometry"},
+                         {"purpose", "Geometry"}, {"status", "running"}, {"requests", 38},
+                         {"tokens", 1250000}, {"context_tokens", 182000},
+                         {"context_window", 1000000}, {"cost_usd", 1.74},
+                         {"duration_ms", 94000}, {"resolved_model", model}});
         emit("agent.message",
              {{"from", "geometry"}, {"channel", "board"}, {"message_id", "shot-msg-2"},
               {"text", "Bosses are placed on the datasheet pattern; pilot holes next. The "

@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "../worker_client.h"
+#include "../../../services/ipc/background_query.h"
 
 namespace {
 bool blocksInteraction(std::string_view method, const nlohmann::json& params) {
@@ -110,6 +111,12 @@ void AsyncRpc::callImpl(std::string method, nlohmann::json params, Done done, Ev
     // parts_queue_status / vendors_health_* / login_wizard_* — while calls that pass real
     // arguments worked fine. Normalize here so no null params can ever reach a handler.
     p->params = params.is_null() ? nlohmann::json::object() : std::move(params);
+#ifndef __EMSCRIPTEN__
+    const bool background = !primary && p->coalesceKey.empty() && debounceMs <= 0 &&
+        chudware_ipc::isBackgroundQuery(p->method, p->params);
+#else
+    const bool background = false;  // the browser build keeps one dispatch thread
+#endif
     p->timeoutMs = timeoutMs;
     p->done = std::move(done);
     p->onEvent = std::move(onEvent);
@@ -126,39 +133,43 @@ void AsyncRpc::callImpl(std::string method, nlohmann::json params, Done done, Ev
                     if (queued->blocksInteraction != p->blocksInteraction)
                         interactionPending_.fetch_add(p->blocksInteraction ? 1 : -1);
                     queued = std::move(p);
-                    cv_.notify_one();
+                    cv_.notify_all();
                     return;
                 }
             }
         }
-        queue_.push_back(std::move(p));
+        (background ? bgQueue_ : queue_).push_back(std::move(p));
         pending_.fetch_add(1);
         if (blocking) interactionPending_.fetch_add(1);
         // GL-thread-only by contract, so the lazy start can't race another call().
-        if (!threadStarted_) {
-            threadStarted_ = true;
-            thread_ = std::thread([this]() { threadMain(); });
+        bool& started = background ? bgThreadStarted_ : threadStarted_;
+        if (!started) {
+            started = true;
+            (background ? bgThread_ : thread_) =
+                std::thread([this, background]() { threadMain(background); });
         }
     }
-    cv_.notify_one();
+    cv_.notify_all();  // both lanes wait on cv_
 }
 
-void AsyncRpc::threadMain() {
+void AsyncRpc::threadMain(bool background) {
+    auto& queue = background ? bgQueue_ : queue_;
     for (;;) {
         std::unique_ptr<Pending> p;
         {
             std::unique_lock<std::mutex> lk(mtx_);
-            cv_.wait(lk, [this]() { return quit_ || !queue_.empty(); });
+            cv_.wait(lk, [this, &queue]() { return quit_ || !queue.empty(); });
             if (quit_) return;
-            const auto readyAt = queue_.front()->readyAt;
+            const auto readyAt = queue.front()->readyAt;
             if (readyAt != std::chrono::steady_clock::time_point{} &&
                 readyAt > std::chrono::steady_clock::now()) {
                 cv_.wait_until(lk, readyAt);
                 continue;  // replacement, shutdown, or spurious wake: re-read the FIFO head
             }
-            p = std::move(queue_.front());
-            queue_.pop_front();
-            inFlight_ = p.get();
+            p = std::move(queue.front());
+            queue.pop_front();
+            // Only the document lane's in-flight call is a flushCoalesced barrier.
+            if (!background) inFlight_ = p.get();
         }
         if (quit_.load()) return;  // shutdown may have begun immediately after the pop
         // The blocking round-trip happens here, off the GL thread. The errorSink (if any)
@@ -190,7 +201,7 @@ void AsyncRpc::threadMain() {
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            inFlight_ = nullptr;
+            if (!background) inFlight_ = nullptr;
             if (quit_) return;  // result no longer wanted; pending_ is moot past shutdown
             doneQ_.push_back(std::move(p));
         }
@@ -241,13 +252,15 @@ void AsyncRpc::shutdown() {
         std::lock_guard<std::mutex> lk(mtx_);
         quit_ = true;
         queue_.clear();   // queued calls never run
+        bgQueue_.clear();
         doneQ_.clear();   // undrained callbacks never run
         eventQ_.clear();  // undelivered events never run
     }
-    cv_.notify_one();
-    // Unblock a round-trip the dispatch thread may be parked in (readLine poll loop).
+    cv_.notify_all();
+    // Unblock a round-trip the dispatch threads may be parked in (readLine poll loop).
     worker_.abortPending();
     if (thread_.joinable()) thread_.join();
+    if (bgThread_.joinable()) bgThread_.join();
     pending_.store(0);
     interactionPending_.store(0);
 }

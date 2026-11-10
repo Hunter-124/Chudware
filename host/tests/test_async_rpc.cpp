@@ -117,6 +117,51 @@ void test_mesh_reference_reads_do_not_block_interaction() {
     }
 }
 
+// A multi-second provider/worker status poll (ai_prompt_baseline, subscription_usage, …) must
+// not queue a document open behind it: background queries have their own dispatch lane. Before
+// the split, opening a part right after an assembly sat ~20 s behind these polls.
+bool primaryOpenCall(const std::string& method, const json&, json& result, std::string&, int,
+                     const std::atomic<bool>&) {
+    result = {{"ok", true}, {"method", method}};
+    return true;
+}
+
+void test_background_queries_do_not_delay_document_calls() {
+    WorkerClient w;
+    core::AsyncRpc rpc(w);
+    rpc.setPrimaryCaller(&primaryOpenCall);
+    std::atomic<bool> entered{false}, release{false};
+    g_fakeCall = [&](const std::string& method, const json&, json& result, std::string&,
+                     const WorkerClient::EventFn&) {
+        if (method == "ai_prompt_baseline") {
+            entered.store(true);
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        result = {{"ok", true}};
+        return true;
+    };
+    bool baselineDone = false, openDone = false, readDone = false;
+    rpc.call("ai_prompt_baseline", json::object(),
+             [&](const core::RpcResult& r) { assert(r.ok); baselineDone = true; });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!entered.load()) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    rpc.callPrimary("doc_open", {{"path", "p.step+"}},
+                    [&](const core::RpcResult& r) { assert(r.ok); openDone = true; });
+    // A doc_id-scoped call stays on the document lane even under a background name.
+    rpc.call("skills_list", {{"doc_id", "D"}},
+             [&](const core::RpcResult& r) { assert(r.ok); readDone = true; });
+    drainUntil(rpc, openDone);
+    drainUntil(rpc, readDone);
+    assert(!baselineDone && rpc.busy());
+    release.store(true);
+    drainUntil(rpc, baselineDone);
+    assert(!rpc.busy());
+    rpc.shutdown();
+}
+
 void test_events_deliver_on_drain_thread_in_order_before_done() {
     WorkerClient w;
     core::AsyncRpc rpc(w);
@@ -1076,6 +1121,7 @@ void test_worker_method_absent_is_strict_and_separate_from_lane_busy() {
 int main() {
     test_no_event_call_passes_empty_eventfn_and_completes();
     test_mesh_reference_reads_do_not_block_interaction();
+    test_background_queries_do_not_delay_document_calls();
     test_events_deliver_on_drain_thread_in_order_before_done();
     test_shutdown_drops_undelivered_events();
     test_mirror_async_completion_does_not_modify_another_document();

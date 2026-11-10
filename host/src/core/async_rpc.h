@@ -14,6 +14,11 @@
 //     (GL thread), so they may touch AppState / GL / the renderer freely.
 //   - Calls dispatch FIFO on a single thread — the same serialization WorkerClient::callMtx_
 //     enforces anyway, without parking the UI on it. Queue order is preserved.
+//   - Exception: document-free catalog/status queries (EngineClient::isBackgroundQuery —
+//     ai_prompt_baseline, subscription_usage, omp_models_list, …) run FIFO on a second
+//     background lane, so a multi-second provider/worker poll never delays a doc_open or
+//     an edit queued behind it. They may complete before earlier document calls; callers
+//     that read after a write already queue the read from the write's callback.
 //   - A SYNC call made from the GL thread while an async call is in flight still blocks on
 //     the WorkerClient mutex until that call finishes. Keep latency-critical sync paths
 //     (sketch_drag) clear of long async work, or check busy() first.
@@ -188,7 +193,7 @@ private:
         bool primary = false;
     };
 
-    void threadMain();
+    void threadMain(bool background);
     void callImpl(std::string method, nlohmann::json params, Done done, Event onEvent,
                   int timeoutMs, std::string coalesceKey, bool primary = false,
                   int debounceMs = 0);
@@ -199,10 +204,13 @@ private:
     WorkerClient& worker_;
     std::thread thread_;
     bool threadStarted_ = false;
+    std::thread bgThread_;                          // background-query lane (see contract)
+    bool bgThreadStarted_ = false;
 
     std::mutex mtx_;                                // guards queue_ / doneQ_
     std::condition_variable cv_;
     std::deque<std::unique_ptr<Pending>> queue_;    // waiting to run (FIFO)
+    std::deque<std::unique_ptr<Pending>> bgQueue_;  // background queries waiting to run (FIFO)
     Pending* inFlight_ = nullptr;                  // borrowed from dispatch thread, guarded by mtx_
     std::vector<std::unique_ptr<Pending>> doneQ_;   // finished, awaiting drain()
     // Streamed events awaiting drain() (Event copied per entry — the owning Pending may be

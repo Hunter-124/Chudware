@@ -87,18 +87,31 @@ deadline is ≤ 5 minutes away. `eta_seconds` is a rough estimate: current
 occupants free their slot at idle sleep; visitors ahead are assumed to hold one
 for the median of recent sessions (the idle timeout until there is history).
 
-### Admin (`/admin`)
+### Admin (`chudware.com/admin`)
 
-Exists only when `CHUDWARE_DEMO_ADMIN_KEY` (≥ 32 chars) is configured; otherwise every
-`/admin*` route is a 404/401. `POST /admin/login {"key": …}` (same-origin, ≤ 5 attempts
-per client network per 10 min, constant-time compare) sets a separate `__Host-cw_admin`
-cookie (HMAC under the admin key, 8 h, `SameSite=Strict`). `GET /admin/api/metrics`
-requires it; `POST /admin/api/session/end {"sid"}` sleeps a session and
-`POST /admin/api/workspace/delete {"sid"}` erases a sleeping workspace. The page shows:
-document pageviews vs asset/poll/404 traffic (today + 30 days, unique client tags),
-join/refusal/sleep event counters, host memory/disk/load, Claude spend, live sessions
-and sleeping workspaces with sizes. Metrics persist in `<state dir>/metrics.json`;
-client identity everywhere is the one-way `ip_tag` hash, never a raw address.
+The admin page lives on the **website** origin: `https://chudware.com/admin`.
+A Cloudflare Access application covers that path (one-time email code,
+allowlisted to `CHUDWARE_DEMO_ADMIN_EMAIL`, default the operator's address);
+a Pages Function (`website/functions/admin/`) proxies it to this front door,
+forwarding the Access JWT. The front door verifies the JWT itself (RS256
+against the team's keys, issuer, the app's AUD, expiry) and admits exactly
+that one email — the `Cf-Access-Authenticated-User-Email` header alone is
+never trusted (`access.py`). Without `CHUDWARE_DEMO_ACCESS_TEAM_DOMAIN` +
+`CHUDWARE_DEMO_ACCESS_AUD` every `/admin*` route here is a 404/401, and there
+is no key/password login. Break-glass: a direct loopback request carrying no
+Cloudflare headers (an SSH tunnel to the host) is accepted as the operator.
+
+`GET /admin/api/metrics` (Access JWT) returns both halves of the webservice:
+the demo's own counters and — when `CHUDWARE_DEMO_SITE_CF_ACCOUNT_ID` +
+`CHUDWARE_DEMO_SITE_CF_TOKEN` (read-only Analytics token) are set — the
+chudware.com site's traffic from its Analytics Engine request log
+(`site_metrics.py`, same document-pageview definition). The page shows
+document pageviews vs asset/poll/404 traffic (today + 30 days, unique client
+tags), join/refusal/sleep events, host memory/disk/load, Claude spend, live
+sessions and sleeping workspaces; `POST /admin/api/session/end {"sid"}`
+sleeps a session and `POST /admin/api/workspace/delete {"sid"}` erases a
+sleeping workspace. Metrics persist in `<state dir>/metrics.json`; client
+identity everywhere is the one-way `ip_tag` hash, never a raw address.
 
 Mutating routes require POST and refuse a cross-origin `Origin`. The session cookie is
 `__Host-cw_demo`, `HttpOnly; Secure; SameSite=Lax; Path=/`, an HMAC-signed random id.

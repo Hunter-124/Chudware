@@ -133,11 +133,16 @@ class DemoConfig:
     cookie_max_age: int = 365 * 24 * 3600
 
     # -- admin ---------------------------------------------------------------
-    # Key for /admin (at least 32 chars, installed env only). Empty disables /admin.
-    admin_key: bytes = field(default=b"", repr=False)
-    admin_cookie_seconds: int = 8 * 3600
-    admin_login_limit: int = 5
-    admin_login_window: int = 600
+    # /admin is behind Cloudflare Access (one-time email code). The front door
+    # verifies the Access JWT and admits exactly ADMIN_EMAIL. Unconfigured
+    # (no team/audience) disables /admin; there is no key/password login.
+    access_team_domain: str = ""        # https://<team>.cloudflareaccess.com
+    access_aud: str = ""                # the Access application's AUD tag
+    admin_email: str = "haedmonds69@gmail.com"
+    # Website metrics: Cloudflare Analytics Engine (dataset chudware_requests),
+    # queried with a read-only account token. Unconfigured hides that section.
+    site_cf_account_id: str = ""
+    site_cf_token: str = field(default="", repr=False)
 
     # -- admission ---------------------------------------------------------
     max_active: int = 3
@@ -251,14 +256,18 @@ class DemoConfig:
                      "ai_models_cache_seconds",
                      "ai_max_body_bytes", "pids_limit", "port_count", "max_request_bytes",
                      "ws_max_message_bytes", "cookie_max_age", "workspace_quota_bytes",
-                     "workspaces_total_bytes", "quota_check_seconds",
-                     "admin_cookie_seconds", "admin_login_limit", "admin_login_window"):
+                     "workspaces_total_bytes", "quota_check_seconds"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"{name} must be at least 1")
         if self.warn_seconds >= self.idle_seconds:
             raise ConfigError("warning lead time must be shorter than the idle timeout")
-        if self.admin_key and len(self.admin_key) < 32:
-            raise ConfigError("CHUDWARE_DEMO_ADMIN_KEY must be at least 32 characters")
+        if bool(self.access_team_domain) != bool(self.access_aud):
+            raise ConfigError("CHUDWARE_DEMO_ACCESS_TEAM_DOMAIN and CHUDWARE_DEMO_ACCESS_AUD "
+                              "must be set together (or neither, to disable /admin)")
+        if self.access_team_domain and not self.access_team_domain.startswith("https://"):
+            raise ConfigError("CHUDWARE_DEMO_ACCESS_TEAM_DOMAIN must be an https:// URL")
+        if "@" not in self.admin_email:
+            raise ConfigError("CHUDWARE_DEMO_ADMIN_EMAIL must be an email address")
         if not 1024 <= self.port_base <= 65535 - self.port_count:
             raise ConfigError("CHUDWARE_DEMO_PORT_BASE/PORT_COUNT leave the valid port range")
         if self.port_count < self.max_active:
@@ -335,7 +344,11 @@ class DemoConfig:
             public_hosts=_csv(get("PUBLIC_HOSTS")) or DEFAULT_PUBLIC_HOSTS,
             cookie_key=cookie_key.encode("utf-8"),
             cookie_key_persistent=bool(cookie_key),
-            admin_key=get("ADMIN_KEY").encode("utf-8"),
+            access_team_domain=get("ACCESS_TEAM_DOMAIN").rstrip("/"),
+            access_aud=get("ACCESS_AUD"),
+            admin_email=get("ADMIN_EMAIL", "haedmonds69@gmail.com"),
+            site_cf_account_id=get("SITE_CF_ACCOUNT_ID"),
+            site_cf_token=env.get("CHUDWARE_DEMO_SITE_CF_TOKEN", "").strip(),
             max_active=num("MAX_ACTIVE", 3),
             max_queue=num("MAX_QUEUE", 30),
             idle_seconds=num("IDLE_SECONDS", 15 * 60),

@@ -4,38 +4,48 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Chudware demo admin</title>
-<link rel="stylesheet" href="/demo/static/waiting.css">
-<link rel="stylesheet" href="/demo/static/admin.css">
+<title>Chudware admin</title>
+<link rel="stylesheet" href="https://app.chudware.com/demo/static/waiting.css">
+<link rel="stylesheet" href="https://app.chudware.com/demo/static/admin.css">
 </head>
 <body>
 <main>
-  <h1>Demo admin</h1>
-  <p class="muted">Live state of the public demo front door. Refreshes every 5 seconds.
-    Session/workspace ids are truncated except where an action needs the full id.
-    Nothing on this page is a pageview: admin traffic is counted separately.</p>
+  <h1>Chudware admin</h1>
+  <p class="muted">Live state of the shared webservice: <strong>chudware.com</strong> (site)
+    and <strong>app.chudware.com</strong> (demo). Refreshes every 5 seconds.
+    Access is via Cloudflare Access email code, allowlisted to the operator.</p>
 
-  <section id="login" hidden>
-    <p>Enter the admin key (<code>CHUDWARE_DEMO_ADMIN_KEY</code> on the host).</p>
-    <form id="login-form">
-      <input id="key" type="password" autocomplete="current-password" placeholder="Admin key">
-      <button type="submit">Sign in</button>
-    </form>
-    <p id="login-error" class="error" hidden></p>
+  <section id="denied" hidden>
+    <p class="error">Not signed in as the operator.</p>
+    <p>This page is protected by Cloudflare Access. If you reached it without the
+      email-code sign-in, or signed in with a different address, access is refused.
+      <a href="/cdn-cgi/access/logout">Sign out of Cloudflare Access</a> and open
+      <code>https://chudware.com/admin</code> again to get a fresh code by email.</p>
   </section>
 
   <div id="dash" hidden>
-    <p><button id="logout" type="button" class="secondary">Sign out</button>
-       <span id="updated" class="muted"></span></p>
+    <p><span id="who" class="muted"></span> · <span id="updated" class="muted"></span>
+       · <a href="/cdn-cgi/access/logout">Sign out</a></p>
 
     <section>
-      <h2>Right now</h2>
+      <h2>Right now (demo)</h2>
       <div id="cards" class="cards"></div>
       <p id="alerts"></p>
     </section>
 
     <section>
-      <h2>Traffic (honest pageviews)</h2>
+      <h2>chudware.com site traffic</h2>
+      <p class="muted">From the site's own request log (Cloudflare Analytics Engine,
+        3-month retention). Same honest pageview rule: document GETs only.</p>
+      <div id="site"></div>
+      <h3>Top site pages, last 7 days</h3>
+      <div id="site-paths"></div>
+      <h3>Site, last 30 days</h3>
+      <div id="site-daily"></div>
+    </section>
+
+    <section>
+      <h2>Demo traffic (honest pageviews)</h2>
       <p class="muted">A pageview is a document load only (<code>GET /</code> or
         <code>GET /app/</code>, status 200). Assets, status polls, health probes and
         404 scans are separate rows below — that split is how you tell real visitors
@@ -63,7 +73,7 @@
     </section>
   </div>
 </main>
-<script src="/demo/static/admin.js"></script>
+<script src="https://app.chudware.com/demo/static/admin.js"></script>
 <noscript><p class="notice">This page needs JavaScript.</p></noscript>
 </body>
 </html>

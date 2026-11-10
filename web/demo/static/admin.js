@@ -2,6 +2,10 @@
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
+  // Always same-origin: on chudware.com the Pages proxy forwards these calls
+  // (with the Cloudflare Access JWT) to the front door; the JWT never exists
+  // in the browser, so a cross-origin call to app.chudware.com could not auth.
+  const API = '';
   const fmtBytes = (n) => {
     if (n === null || n === undefined) return '-';
     const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -34,15 +38,14 @@
     return b;
   }
   async function post(path, body) {
-    const r = await fetch(path, { method: 'POST', credentials: 'same-origin',
+    const r = await fetch(API + path, { method: 'POST', credentials: 'include',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
-    if (r.status === 401) { showLogin('Session expired. Sign in again.'); throw new Error('auth'); }
+    if (r.status === 401) { showDenied(); throw new Error('auth'); }
     if (!r.ok) throw new Error(path + ' ' + r.status);
     return r.json();
   }
-  function showLogin(msg) {
-    $('dash').hidden = true; $('login').hidden = false;
-    if (msg) { $('login-error').textContent = msg; $('login-error').hidden = false; }
+  function showDenied() {
+    $('dash').hidden = true; $('denied').hidden = false;
   }
 
   function render(d) {
@@ -77,6 +80,24 @@
     $('alerts').textContent = alerts.join(' ');
     $('alerts').className = alerts.length ? 'error' : '';
 
+    if (d.site && d.site.configured && !d.site.error) {
+      table($('site'), ['Counter', 'Today'], [
+        ['Document pageviews', d.site.today.pageviews],
+        ['Total requests', d.site.today.requests],
+        ['Unique IPs', d.site.today.unique_ips],
+        ['404s (scans/probes)', d.site.today.not_found],
+      ]);
+      table($('site-paths'), ['Path', 'Pageviews (7d)'],
+        d.site.top_paths_7d.map((x) => [x.path, x.hits]));
+      table($('site-daily'), ['Day (UTC)', 'Pageviews', 'Unique IPs', 'Requests', '404s'],
+        d.site.daily.slice().reverse().map((x) => [x.day, x.pageviews, x.unique_ips, x.requests, x.not_found]));
+    } else {
+      $('site').textContent = d.site && d.site.configured
+        ? 'Site metrics query failed (' + (d.site.error || 'unknown') + ').'
+        : 'Site metrics not configured on the front door.';
+      $('site-paths').textContent = ''; $('site-daily').textContent = '';
+    }
+    $('who').textContent = 'Signed in as ' + (d.admin_email || 'operator');
     table($('traffic'), ['Counter', 'Today', 'All time (since tracking)'], [
       ['Document pageviews', d.traffic.today.pageviews || 0, d.traffic.pageviews_total],
       ['Total HTTP requests', d.traffic.today.requests || 0, d.traffic.requests_total],
@@ -124,25 +145,13 @@
 
   async function refresh() {
     try {
-      const r = await fetch('/admin/api/metrics', { credentials: 'same-origin', cache: 'no-store' });
-      if (r.status === 401) { showLogin(''); return; }
+      const r = await fetch(API + '/admin/api/metrics', { credentials: 'include', cache: 'no-store' });
+      if (r.status === 401) { showDenied(); return; }
       if (!r.ok) throw new Error('metrics ' + r.status);
-      $('login').hidden = true; $('dash').hidden = false;
+      $('denied').hidden = true; $('dash').hidden = false;
       render(await r.json());
     } catch (e) { /* next tick retries */ }
   }
-  $('login-form').addEventListener('submit', async (ev) => {
-    ev.preventDefault();
-    $('login-error').hidden = true;
-    try {
-      const r = await fetch('/admin/login', { method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: $('key').value }) });
-      if (!r.ok) { $('login-error').textContent = 'Refused (' + r.status + '). Check the key; logins are rate-limited.'; $('login-error').hidden = false; return; }
-      $('key').value = '';
-      refresh();
-    } catch (e) { $('login-error').textContent = 'Could not reach the server.'; $('login-error').hidden = false; }
-  });
-  $('logout').addEventListener('click', async () => { await post('/admin/logout', {}).catch(() => {}); showLogin(''); });
   refresh();
   setInterval(refresh, 5000);
 })();

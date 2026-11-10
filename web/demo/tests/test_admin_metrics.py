@@ -1,49 +1,102 @@
-"""Admin page, metrics honesty, workspace persistence and quotas."""
+"""Admin (Cloudflare Access JWT), metrics honesty, persistence and quotas."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+import time
+
+import pytest
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from demo.manager import ACTIVE
 from demo.podman import build_run_args
 
 from .support import front_door, ip_for, make_cfg, sid_for
 
-ADMIN_KEY = b"a" * 40
+TEAM = "https://team.example.com"
+AUD = "test-aud-token"
+EMAIL = "haedmonds69@gmail.com"
 ORIGIN_HEADERS = {"host": "app.chudware.com", "origin": "https://app.chudware.com"}
+# Requests through Cloudflare carry cf-ray; without any CF headers a loopback
+# peer is the operator's SSH break-glass (tested separately).
+PUBLIC = {**ORIGIN_HEADERS, "cf-ray": "8f00-LHR"}
 
 
-def _admin_cookie(fd) -> str:
-    resp = fd.client.post("/admin/login", headers=ORIGIN_HEADERS, json={"key": ADMIN_KEY.decode()})
-    assert resp.status_code == 200
-    return resp.headers["set-cookie"].split(";", 1)[0].split("=", 1)[1]
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def test_admin_is_disabled_without_a_key(tmp_path):
+@pytest.fixture(scope="module")
+def keypair():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key, key.public_key()
+
+
+def make_jwt(key, *, email=EMAIL, aud=AUD, iss=TEAM, expires_in=600, kid="test1") -> str:
+    now = int(time.time())
+    head = _b64(json.dumps({"alg": "RS256", "kid": kid, "typ": "JWT"}).encode())
+    body = _b64(json.dumps({"iss": iss, "aud": aud, "email": email,
+                            "iat": now, "exp": now + expires_in}).encode())
+    sig = key.sign(f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
+    return f"{head}.{body}.{_b64(sig)}"
+
+
+def arm_access(fd, keypair) -> None:
+    """Give the app's verifier the test team's public key (no network fetch)."""
+    access = fd.app.state.demo.door.access
+    access._keys = {"test1": keypair[1]}
+    access._keys_at = time.time()
+
+
+def access_cfg(**over):
+    return {"access_team_domain": TEAM, "access_aud": AUD, **over}
+
+
+def test_admin_is_disabled_without_access_config(tmp_path):
     with front_door(tmp_path) as fd:
         assert fd.client.get("/admin").status_code == 404
-        assert fd.client.post("/admin/login", json={"key": "x" * 40}).status_code == 404
-        assert fd.client.get("/admin/api/metrics").status_code == 404 or \
-            fd.client.get("/admin/api/metrics").status_code == 401
-
-
-def test_admin_login_and_metrics_flow(tmp_path):
-    with front_door(tmp_path, admin_key=ADMIN_KEY) as fd:
-        assert fd.client.get("/admin").status_code == 200
         assert fd.client.get("/admin/api/metrics").status_code == 401
-        bad = fd.client.post("/admin/login", headers=ORIGIN_HEADERS, json={"key": "wrong"})
-        assert bad.status_code == 401
-        cookie = _admin_cookie(fd)
-        headers = {**ORIGIN_HEADERS, "cookie": f"__Host-cw_admin={cookie}"}
-        body = fd.client.get("/admin/api/metrics", headers=headers).json()
-        assert body["limits"]["max_sessions"] == 3 and body["host"]["disk_free_bytes"] > 0
-        assert "sessions" in body and "workspaces" in body and "daily" in body["traffic"]
-        # Visitor cookies never authenticate as admin, and vice versa the page is no-store.
+        assert fd.client.post("/admin/login", json={"key": "x" * 40}).status_code in (404, 405)
+
+
+def test_admin_requires_a_valid_access_jwt_for_the_operator_email(tmp_path, keypair):
+    with front_door(tmp_path, **access_cfg()) as fd:
+        arm_access(fd, keypair)
+        assert fd.client.get("/admin").status_code == 200
+        # Public path (cf-ray present) without a JWT: refused.
+        assert fd.client.get("/admin/api/metrics", headers=PUBLIC).status_code == 401
+        key, _ = keypair
+        good = {"cf-access-jwt-assertion": make_jwt(key)}
+        body = fd.client.get("/admin/api/metrics", headers={**PUBLIC, **good})
+        assert body.status_code == 200
+        data = body.json()
+        assert data["admin_email"] == EMAIL and data["limits"]["max_sessions"] == 3
+        assert data["host"]["disk_free_bytes"] > 0 and "site" in data
+        # Every other claim shape is refused.
+        for token in (make_jwt(key, email="someone-else@example.com"),
+                      make_jwt(key, aud="other-app"),
+                      make_jwt(key, iss="https://evil.example.com"),
+                      make_jwt(key, expires_in=-10),
+                      make_jwt(rsa.generate_private_key(public_exponent=65537, key_size=2048)),
+                      "not-a-jwt"):
+            resp = fd.client.get("/admin/api/metrics",
+                                 headers={**PUBLIC, "cf-access-jwt-assertion": token})
+            assert resp.status_code == 401, token[:40]
+        # The page itself stays no-store.
         assert fd.client.get("/admin").headers["cache-control"] == "no-store"
 
 
+def test_loopback_without_cloudflare_headers_is_the_break_glass(tmp_path):
+    with front_door(tmp_path, **access_cfg()) as fd:
+        # TestClient peer is 127.0.0.1 and sends no CF headers: the SSH-tunnel path.
+        assert fd.client.get("/admin/api/metrics").status_code == 200
+
+
 def test_pageview_counting_excludes_assets_polls_and_404s(tmp_path):
-    with front_door(tmp_path, admin_key=ADMIN_KEY) as fd:
+    with front_door(tmp_path, **access_cfg()) as fd:
         fd.client.get("/")                       # landing document: a pageview
         fd.client.get("/demo/status")            # poll: not a pageview
         fd.client.get("/demo/health")            # probe: not a pageview
@@ -80,7 +133,6 @@ def test_workspace_survives_sleep_and_resumes_with_the_same_cookie(tmp_path):
 
 def test_persistent_mounts_replace_work_and_data_tmpfs(tmp_path):
     cfg = make_cfg(tmp_path)
-    from .support import FakeRuntime  # noqa: F401  (keeps the support import surface obvious)
     from demo.podman import SessionSpec
     spec = SessionSpec(sid=sid_for(1), port=18300, run_dir=tmp_path / "run", started=1,
                        ip_tag=ip_for(1), workspace_dir=tmp_path / "ws" / sid_for(1))
@@ -116,18 +168,29 @@ def test_workspace_quota_sleeps_but_never_deletes(tmp_path):
     asyncio.run(main())
 
 
-def test_admin_can_sleep_a_session_and_delete_a_workspace(tmp_path):
-    with front_door(tmp_path, admin_key=ADMIN_KEY) as fd:
+def test_admin_can_sleep_a_session_and_delete_a_workspace(tmp_path, keypair):
+    with front_door(tmp_path, **access_cfg()) as fd:
+        arm_access(fd, keypair)
         visitor = fd.visitor()
         visitor.join()
         visitor.wait_for("active")
         sid = next(iter(fd.manager.entries))
-        headers = {**ORIGIN_HEADERS, "cookie": f"__Host-cw_admin={_admin_cookie(fd)}"}
+        headers = {**PUBLIC, "cf-access-jwt-assertion": make_jwt(keypair[0])}
         ended = fd.client.post("/admin/api/session/end", headers=headers, json={"sid": sid[:8]})
         assert ended.status_code == 200
         assert visitor.get("/demo/status").json()["state"] == "sleeping"
         deleted = fd.client.post("/admin/api/workspace/delete", headers=headers, json={"sid": sid})
         assert deleted.status_code == 200 and not fd.manager.workspace_dir(sid).exists()
-        # Without the admin cookie both actions refuse.
-        assert fd.client.post("/admin/api/session/end", json={"sid": sid}).status_code == 401
-        assert fd.client.post("/admin/api/workspace/delete", json={"sid": sid}).status_code == 401
+        # Without the JWT (public path) both actions refuse.
+        assert fd.client.post("/admin/api/session/end", headers=PUBLIC, json={"sid": sid}).status_code == 401
+        assert fd.client.post("/admin/api/workspace/delete", headers=PUBLIC, json={"sid": sid}).status_code == 401
+
+
+def test_site_metrics_unconfigured_and_query_shape(tmp_path):
+    import asyncio as _asyncio
+
+    from demo.site_metrics import SiteMetrics
+
+    async def main():
+        assert await SiteMetrics("", "").snapshot() == {"configured": False}
+    _asyncio.run(main())

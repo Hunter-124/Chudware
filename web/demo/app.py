@@ -9,10 +9,8 @@ Run:  python -m uvicorn demo.app:create_app --factory --host 127.0.0.1 --port 83
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import hashlib
-import hmac
 import ipaddress
 import json
 import logging
@@ -36,10 +34,12 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import cookies
+from .access import AccessAuth
 from .broker import ProviderBroker
 from .config import DemoConfig
 from .manager import DemoManager, JoinRefused
 from .metrics import Metrics
+from .site_metrics import SiteMetrics
 from .podman import PodmanRuntime
 from .proxy import Proxy, same_origin
 
@@ -151,15 +151,17 @@ def ip_tag(address: str) -> str:
 
 
 class FrontDoor:
-    def __init__(self, cfg: DemoConfig, manager: DemoManager, metrics: Metrics | None = None):
+    def __init__(self, cfg: DemoConfig, manager: DemoManager, metrics: Metrics | None = None,
+                 access: AccessAuth | None = None, site: SiteMetrics | None = None):
         self.cfg, self.manager = cfg, manager
         self.metrics = metrics or Metrics()
+        self.access = access or AccessAuth(cfg.access_team_domain, cfg.access_aud, cfg.admin_email)
+        self.site = site or SiteMetrics(cfg.site_cf_account_id, cfg.site_cf_token)
         self.index_html = (STATIC_DIR / "index.html").read_bytes()
         admin_path = STATIC_DIR / "admin.html"
         self.admin_html = admin_path.read_bytes() if admin_path.exists() else b""
         self.static = {name: (STATIC_DIR / name).read_bytes() for name in STATIC_TYPES
                        if (STATIC_DIR / name).exists()}
-        self._admin_logins: dict[str, Any] = {}
 
     def session_of(self, conn: HTTPConnection) -> str | None:
         return cookies.verify(self.cfg.cookie_key, conn.cookies.get(cookies.COOKIE_NAME))
@@ -247,16 +249,23 @@ class FrontDoor:
         return self._json(self.manager.status(sid))
 
     # -- admin -------------------------------------------------------------------
-    # /admin exists only when CHUDWARE_DEMO_ADMIN_KEY is configured. The key is
-    # never a URL or a visitor cookie: a correct POST mints a separate short-lived
-    # admin cookie (HMAC under the admin key), logins are rate-limited per client
-    # network, and every admin response is no-store under the page CSP.
+    # /admin sits behind Cloudflare Access on chudware.com (one-time email code,
+    # allowlisted to the operator's address). Access signs a JWT; _admin_email
+    # verifies it cryptographically and checks the email claim (see access.py).
+    # There is no key/password login. Break-glass: a direct loopback request with
+    # no Cloudflare headers at all (an SSH tunnel to the host) is the operator.
     def _admin_on(self) -> bool:
-        return bool(self.cfg.admin_key and self.admin_html)
+        return bool(self.access.configured and self.admin_html)
 
-    def _admin_ok(self, request: Request) -> bool:
-        return self._admin_on() and cookies.verify_admin(
-            self.cfg.admin_key, request.cookies.get(cookies.ADMIN_COOKIE_NAME), time.time())
+    async def _admin_email(self, request: Request) -> str | None:
+        if not self._admin_on():
+            return None
+        peer = request.client.host if request.client else ""
+        if (peer in ("127.0.0.1", "::1") and "cf-ray" not in request.headers
+                and "cf-connecting-ip" not in request.headers
+                and "cf-access-jwt-assertion" not in request.headers):
+            return "loopback-break-glass"
+        return await self.access.verify(request.headers.get("cf-access-jwt-assertion"))
 
     async def admin_page(self, request: Request) -> Response:
         if not self._admin_on():
@@ -264,57 +273,21 @@ class FrontDoor:
         return Response(self.admin_html, media_type="text/html; charset=utf-8",
                         headers={"Cache-Control": "no-store"})
 
-    async def admin_login(self, request: Request) -> Response:
-        if not self._admin_on():
-            return Response("not found", status_code=404)
-        if not self._origin_ok(request):
-            return self._json({"error": {"code": "cross_origin"}}, 403)
-        tag = ip_tag(client_address(request))
-        now = time.time()
-        window = self._admin_logins.setdefault(tag, collections.deque())
-        while window and window[0] <= now - self.cfg.admin_login_window:
-            window.popleft()
-        if len(window) >= self.cfg.admin_login_limit:
-            self.metrics.event("admin_login_refused:rate_limited")
-            return self._json({"error": {"code": "rate_limited"}}, 429,
-                              {"Retry-After": str(self.cfg.admin_login_window)})
-        window.append(now)
-        try:
-            body = await request.json()
-        except (ValueError, json.JSONDecodeError):
-            body = {}
-        supplied = str(body.get("key", "") if isinstance(body, dict) else "").encode("utf-8")
-        if not hmac.compare_digest(supplied, self.cfg.admin_key):
-            self.metrics.event("admin_login_refused:bad_key")
-            return self._json({"error": {"code": "bad_key"}}, 401)
-        window.clear()
-        self.metrics.event("admin_login")
-        response = self._json({"ok": True})
-        response.set_cookie(cookies.ADMIN_COOKIE_NAME,
-                            cookies.sign_admin(self.cfg.admin_key,
-                                               int(now) + self.cfg.admin_cookie_seconds),
-                            max_age=self.cfg.admin_cookie_seconds, path="/", secure=True,
-                            httponly=True, samesite="strict")
-        return response
-
-    async def admin_logout(self, request: Request) -> Response:
-        response = self._json({"ok": True})
-        response.delete_cookie(cookies.ADMIN_COOKIE_NAME, path="/", secure=True,
-                               httponly=True, samesite="strict")
-        return response
-
     def _host_snapshot(self) -> dict[str, Any]:
         from .manager import host_capacity
         mem, _ = host_capacity(self.manager._disk_path)
-        disk = shutil.disk_usage(self.cfg.workspace_root if self.cfg.workspace_root.exists()
-                                 else self.cfg.state_dir)
+        path = self.cfg.workspace_root
+        while not path.exists() and path.parent != path:
+            path = path.parent
+        disk = shutil.disk_usage(path)
         load = os.getloadavg()
         return {"mem_available_bytes": mem, "disk_free_bytes": disk.free,
                 "disk_total_bytes": disk.total, "load": [round(v, 2) for v in load],
                 "cpu_count": os.cpu_count()}
 
     async def admin_metrics(self, request: Request) -> Response:
-        if not self._admin_ok(request):
+        email = await self._admin_email(request)
+        if email is None:
             return self._json({"error": {"code": "admin_auth_required"}}, 401)
         snap = self.manager.snapshot()
         broker = getattr(self.manager, "broker", None)
@@ -322,7 +295,9 @@ class FrontDoor:
         ai = {"free_available": self.broker_free(), "claude_available": self.broker_claude(),
               "claude_today_usd": round(claude.day_micros / 1_000_000, 4) if claude else None,
               "claude_month_usd": round(claude.month_micros / 1_000_000, 4) if claude else None}
-        return self._json({"now": time.time(), "traffic": self.metrics.snapshot(),
+        return self._json({"now": time.time(), "admin_email": email,
+                           "site": await self.site.snapshot(),
+                           "traffic": self.metrics.snapshot(),
                            "host": self._host_snapshot(), "ai": ai, **snap,
                            "limits": {"max_sessions": self.cfg.max_active,
                                       "max_queue": self.cfg.max_queue,
@@ -351,7 +326,7 @@ class FrontDoor:
         return sid if isinstance(sid, str) and sid else None
 
     async def admin_session_end(self, request: Request) -> Response:
-        if not self._admin_ok(request):
+        if await self._admin_email(request) is None:
             return self._json({"error": {"code": "admin_auth_required"}}, 401)
         if not self._origin_ok(request):
             return self._json({"error": {"code": "cross_origin"}}, 403)
@@ -365,7 +340,7 @@ class FrontDoor:
         return self._json({"ok": True})
 
     async def admin_workspace_delete(self, request: Request) -> Response:
-        if not self._admin_ok(request):
+        if await self._admin_email(request) is None:
             return self._json({"error": {"code": "admin_auth_required"}}, 401)
         if not self._origin_ok(request):
             return self._json({"error": {"code": "cross_origin"}}, 403)
@@ -389,7 +364,7 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
         config = DemoConfig.from_env()
         # The keys stay in this process only: scrub them from the environment that child
         # processes (podman, conmon) would otherwise inherit.
-        for name in ("OPENROUTER_KEY", "NVIDIA_KEY", "ANTHROPIC_KEY", "COOKIE_KEY", "ADMIN_KEY"):
+        for name in ("OPENROUTER_KEY", "NVIDIA_KEY", "ANTHROPIC_KEY", "COOKIE_KEY", "SITE_CF_TOKEN"):
             os.environ.pop("CHUDWARE_DEMO_" + name, None)
     cfg = config
     if not cfg.ai_enabled:
@@ -433,8 +408,6 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
         Route("/demo/workspace/delete", door.delete_workspace, methods=["POST"]),
         Route("/demo/health", door.health, methods=["GET"]),
         Route("/admin", door.admin_page, methods=["GET", "HEAD"]),
-        Route("/admin/login", door.admin_login, methods=["POST"]),
-        Route("/admin/logout", door.admin_logout, methods=["POST"]),
         Route("/admin/api/metrics", door.admin_metrics, methods=["GET"]),
         Route("/admin/api/session/end", door.admin_session_end, methods=["POST"]),
         Route("/admin/api/workspace/delete", door.admin_workspace_delete, methods=["POST"]),

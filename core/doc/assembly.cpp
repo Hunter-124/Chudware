@@ -2287,8 +2287,28 @@ std::shared_ptr<const ComponentOwners> component_owners(const std::string& abspa
     }
     const auto doc = live ? live->document : component_document(abspath);
     if (doc->value("schema", std::string()) == "aicad.asm/1") return nullptr;
-    CompileResult r = compile_document(*doc, env_from_doc(*doc), nullptr,
-                                       ::geom::DisplayQuality::Fine, false, /*with_owners=*/true);
+    const json env = env_from_doc(*doc);
+    // Seed from the part's saved build checkpoints (they carry the owner maps), as opening
+    // the part does. A cold compile re-runs every feature, including the fillet
+    // self-intersection checks, and held the assembly's pick for a minute. Checkpoints are
+    // content-addressed per feature, so a live edited part reuses only its unchanged prefix.
+    std::shared_ptr<CompileCache> seeded;
+    try {
+        const StepPlusDoc file = stepplus_open(abspath);
+        const auto ck = file.extra.find("cache.ckpt");
+        if (ck != file.extra.end() && stepplus_cache_verified(file.doc, file.extra)) {
+            json report;
+            seeded = compile_cache_decode(ck->second, *doc, env, ::geom::DisplayQuality::Fine,
+                                          stepplus_cache_engine_key(), nullptr, report);
+        }
+    } catch (...) {
+        seeded.reset();  // unreadable cache: compile cold, as before
+    }
+    CompileResult r = seeded
+        ? compile_document(*doc, env, seeded.get(), ::geom::DisplayQuality::Fine,
+                           /*with_display=*/true, /*with_owners=*/true)
+        : compile_document(*doc, env, nullptr, ::geom::DisplayQuality::Fine, false,
+                           /*with_owners=*/true);
     if (r.shape_face_owners.size() != r.shapes.size() ||
         r.shape_edge_owners.size() != r.shapes.size())
         return nullptr;

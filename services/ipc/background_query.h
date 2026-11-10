@@ -20,13 +20,16 @@ inline bool isBackgroundQuery(const std::string& method, const nlohmann::json& p
     // primary client identity, including its ro/CAS and edit-hold semantics.
     // omp_login is the one long call here (a whole browser OAuth flow, minutes): on the
     // primary socket it would park every other primary-socket call for that long.
+    // The PLM reads list a project folder's branches/items/status (git on a cold worker
+    // took 39 s and held a doc_open behind it); they take a path, never a document.
     static constexpr const char* queries[] = {
         "ping", "daemon_status", "worker_control_info", "agent_list_models",
         "subscription_accounts", "subscription_status", "subscription_usage",
         "omp_provider_list", "omp_auth_state", "omp_logout_accounts", "omp_models_list",
         "omp_login", "omp_session_stats", "omp_config_get", "skills_list", "skills_get",
         "ai_prompt_baseline", "ai_tool_catalog", "fw_projects", "fw_status",
-        "em_status", "sim_caps", "topology_capabilities", "topology_dfam"
+        "em_status", "sim_caps", "topology_capabilities", "topology_dfam",
+        "plm_branch_list", "plm_item_list", "plm_status"
     };
     for (const char* name : queries)
         if (method == name) return true;

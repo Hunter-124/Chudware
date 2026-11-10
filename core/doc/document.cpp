@@ -359,7 +359,9 @@ std::vector<uint64_t> cc_chain(const json& doc, const json& features, const json
     // chain seed: switching quality is a cache MISS (full and prefix) and re-meshes.
     h = cc_fnv1a(::geom::display_quality_name(quality), h);
     h = cc_fnv1a(with_display ? "display" : "component_geometry", h);
-    if (with_owners) h = cc_fnv1a("owners", h);
+    // A display compile attributes owners anyway, so asking for the per-shape owner maps
+    // too changes no checkpoint state: keep the display key and reuse saved checkpoints.
+    if (with_owners && !with_display) h = cc_fnv1a("owners", h);
     chain.push_back(h);
     std::optional<std::string> scad_identity;
     // Only refine depends on later topology references and document-level finishes.
@@ -3270,7 +3272,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // the post-loop AICM colors) -> serve the whole previous result.
         const uint64_t full_key = cc_full_key(doc, chain.back());
         if (cache->last_result && cache->full_key == full_key &&
-            cache->chain == chain) {
+            cache->chain == chain &&
+            (!with_owners ||
+             cache->last_result->shape_face_owners.size() == cache->last_result->shapes.size())) {
             CompileResult out = *cache->last_result;
             for (FeatureStatus& fst : out.statuses)
                 fst.reused = !fst.rolled_back;

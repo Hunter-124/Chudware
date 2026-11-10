@@ -6252,6 +6252,56 @@ TEST_CASE("eval_measure binds picked nonlast bodies and refuses invalid owners")
     CHECK(doc_close(id));
 }
 
+TEST_CASE("assembly pick owner lookup restores the component's saved build, not a cold compile") {
+    // Right-clicking a component resolves which of its part's features owns the face.
+    // That lookup compiled the part from scratch (every feature, fillet self-intersection
+    // checks included) while holding the assembly, so Open Part queued behind it.
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "OwnerSource").at("doc_id");
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / part;
+    std::filesystem::create_directories(dir);
+    const auto part_path = dir / "owner_source.step+";
+    struct Cleanup {
+        std::filesystem::path dir;
+        std::vector<std::string> ids;
+        ~Cleanup() {
+            for (const auto& id : ids) try { doc_close(id); } catch (...) {}
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir, {part}};
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Base"},
+            {"params", {{"length", 40.0}, {"width", 20.0}, {"height", 10.0},
+                        {"centered", false}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Boss"},
+            {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 30.0},
+                        {"centered", false}, {"mode", "add"}}}}}}
+    }), false);
+    doc_save(part, part_path.string());
+    const std::string asm_id = doc_new("assembly", "OwnerAsm").at("doc_id");
+    cleanup.ids.push_back(asm_id);
+    doc_apply_ops(asm_id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true},
+         {"transform", json::array({1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0,
+                                    0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0})}}
+    }), false);
+
+    const auto executed = [] {
+        return compile_cache_stats().at("features_executed").get<long long>();
+    };
+    const long long before = executed();
+    std::set<std::string> owners;
+    for (int face = 1; face <= 12; ++face) {
+        json reply;
+        try { reply = doc_resolve_pick(asm_id, 1, "face", face); } catch (...) { break; }
+        if (reply.contains("owner_feature")) owners.insert(reply.at("owner_feature").get<std::string>());
+    }
+    CHECK(executed() == before);  // every feature came from cache.ckpt
+    CHECK(owners.size() == 2);    // Base and Boss both own faces
+}
+
 TEST_CASE("eval_measure preserves repeated nested assembly pick identity and world placement") {
     using namespace chudware::doc;
     const std::string part = doc_new("part", "MeasureNestedSource").at("doc_id");

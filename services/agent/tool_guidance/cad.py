@@ -966,8 +966,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "show_in_app": {
         "prompt_note": (
-            "Daemon mode: the open app already mirrors every part live (reply live:true); "
-            "it cannot switch the user's active tab. Legacy engine: writes the handoff file."
+            "Daemon mode: the part you edit opens in the app by itself and the newest AI part "
+            "replaces older ones; use this only to bring back a part you are not editing. "
+            "Legacy engine: writes the handoff file."
         ),
     },
     "sketch3d_add_constraints": {

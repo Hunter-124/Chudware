@@ -2100,6 +2100,11 @@ def _omp_config_get(params: dict, _emit: Callable) -> dict:
     """The OMP settings Settings → AI exposes (``omp_settings`` is the policy)."""
     if _has_unknown_params(params, frozenset()):
         return {"ok": False, "reason": "omp_config_get has unknown params"}
+    if in_cell():
+        # A cell has no OMP service process or user OMP config to read (the provider lane and
+        # its private models.yml are the whole configuration), so Settings → AI has no OMP
+        # rows to show. An empty list renders as no rows, not as a failed read.
+        return {"ok": True, "agentDir": "", "chudwareLayer": "", "settings": []}
     from services.agent.config import memory_backend
 
     def read() -> dict:

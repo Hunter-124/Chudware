@@ -11429,6 +11429,78 @@ TEST_CASE("the ops reply carries B-rep-exact volume and bounds that resolve a sm
     CHECK_FALSE(lean.contains("exact"));
 }
 
+TEST_CASE("the ops reply flags a BRepCheck-invalid body in exact.invalid_bodies") {
+    using namespace chudware::doc;
+    namespace fs = std::filesystem;
+    OpvPart p("OpvInvalidBody");
+    CHECK(p.built.at("exact").at("invalid_bodies").empty());  // a sound box is clean
+
+    // A figure-eight prism: its crossing side faces make a SOLID that imports (the import
+    // feature does not validate) but fails BRepCheck. This is a public-op construction, not
+    // a test hook: add_feature{import} of a .brep.
+    BRepBuilderAPI_MakePolygon bowtie;
+    bowtie.Add(gp_Pnt(100.0, 0.0, 0.0));
+    bowtie.Add(gp_Pnt(140.0, 20.0, 0.0));
+    bowtie.Add(gp_Pnt(140.0, 0.0, 0.0));
+    bowtie.Add(gp_Pnt(100.0, 5.0, 0.0));
+    bowtie.Close();
+    REQUIRE(bowtie.IsDone());
+    const TopoDS_Shape folded = BRepPrimAPI_MakePrism(
+        BRepBuilderAPI_MakeFace(bowtie.Wire()).Face(), gp_Vec(0.0, 0.0, 10.0)).Shape();
+    REQUIRE_FALSE(folded.IsNull());
+    REQUIRE_FALSE(BRepCheck_Analyzer(folded, Standard_True, Standard_True).IsValid());
+    const fs::path brep_path = fs::temp_directory_path() / "chudware_exact_invalid_body.brep";
+    REQUIRE(BRepTools::Write(folded, brep_path.string().c_str()));
+
+    const json reply = p.apply(json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "import"}, {"name", "Folded"},
+            {"params", {{"source_path", brep_path.string()}, {"format", "brep"}}}}}},
+    }));
+    std::error_code ec;
+    fs::remove(brep_path, ec);
+    REQUIRE(reply.at("rebuild").at("ok").get<bool>());
+    const json& bad = reply.at("exact").at("invalid_bodies");
+    REQUIRE(bad.is_array());
+    REQUIRE(bad.size() == 1);
+    const std::size_t index = bad[0].get<std::size_t>();
+    CHECK(reply.at("exact").at("solid_count").get<int>() == 2);  // box + folded prism
+    CHECK(index < 2);
+
+    // Removing the offender clears the flag (the pass is per compile result, not sticky).
+    const json cleared = p.apply(json::array({{{"op", "delete_feature"},
+        {"id", reply.at("id_map").at("$0").get<std::string>()}}}));
+    CHECK(cleared.at("exact").at("invalid_bodies").empty());
+}
+
+TEST_CASE("a fillet radius the geometry cannot take is reported as an auto-adjustment") {
+    using namespace chudware::doc;
+    const std::string id = doc_new("part", "OpvFilletAdjust").at("doc_id").get<std::string>();
+    const json built = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Strip"},
+            {"params", {{"length", 40}, {"width", 0.7}, {"height", 20},
+                        {"centered", false}, {"at", {0, 0, 0}}}}}}},
+    }), false);
+    REQUIRE(built.at("rebuild").at("ok").get<bool>());
+    const double requested = 3.0;
+    const json edge = {{"kind", "edge"}, {"centroid", {20, 0, 20}},
+                       {"surf", "line"}, {"axis", {1, 0, 0}}};
+    const json reply = doc_apply_ops(id, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "Round"},
+            {"params", {{"radius", requested}}}, {"refs", {{"edges", json::array({edge})}}}}}},
+    }), false);
+    const json& rows = reply.at("rebuild").at("feature_status");
+    const json& row = rows.at(rows.size() - 1);
+    REQUIRE_MESSAGE(row.value("ok", false), row.dump());
+    const json& fil = row.at("data").at("fillet");
+    CHECK(fil.at("adjustment") != "none");
+    CHECK(fil.at("requested").at("radius") == requested);
+    const double applied = fil.at("effective").at("radius").get<double>();
+    CHECK(applied > 0.0);
+    CHECK(applied < 0.7);  // the strip is 0.7 mm thick
+    CHECK((requested - applied) / requested > 0.5);  // the >50% "RADIUS CHANGED" regime
+    try { doc_close(id); } catch (...) {}
+}
+
 TEST_CASE("closed feature parameter vocabularies reject unread keys")
 {
     using namespace chudware::doc;

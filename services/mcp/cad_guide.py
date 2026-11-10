@@ -841,11 +841,13 @@ EMBEDDED PYTHON EVAL
   enable_tools, wait for it to succeed before using that device in another call.
 
 PRESENTATION & SAVE DISCIPLINE
-  New/imported AI documents stay out of the viewport while you work. Saving, building,
-  or finishing does not open a tab. Call show_in_app(doc_id) explicitly for a product
-  or artifact you choose to present; it does not save or take editing custody.
+  The part you create or edit opens in the viewport by itself, and only the newest AI
+  part stays open: older AI parts close (they stay live and reachable from Artifacts),
+  so build in one document at a time. The user's own parts, parts they have edited
+  and a tab they closed by hand are never closed or reopened by this, and unsaved
+  user edits keep the viewport. show_in_app(doc_id) brings back a part you are not
+  editing; it does not save or take editing custody.
   Documents the user opens themselves remain live and keep receiving your edits.
-  Presentation preserves the user's selection and does not reopen a dismissed tab.
   Agent edits persist automatically unless human edits are pending; never ask the user
   to save AI work. AI recovery is automatic when the backing file is unchanged; conflicts
   are retained for agent recovery. External file rewrites refresh open documents unless

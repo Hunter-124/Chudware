@@ -334,6 +334,12 @@ def _digest(doc_id: str) -> dict:
     except Exception:  # noqa: BLE001
         tree = {}
     try:
+        # doc_activate first: it memoizes the exact bbox that doc_bbox then serves for free
+        # (otherwise both pay the same ~20 s swept-surface bound on a big harness).
+        cb.call("doc_activate", {"doc_id": doc_id})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         bbox = cb.call("doc_bbox", {"doc_id": doc_id})
     except Exception:  # noqa: BLE001
         bbox = {}

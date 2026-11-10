@@ -5233,8 +5233,13 @@ static bool ompConfigReplyOk(const core::RpcResult& r) {
 
 static std::string ompConfigFailure(const core::RpcResult& r) {
     if (!r.ok) return r.err;
-    const std::string reason = r.result.is_object() ? optionalJsonString(r.result, "reason") : "";
-    return reason.empty() ? "no reply" : reason;
+    if (!r.result.is_object()) return "no reply";
+    // A refusal can arrive as {reason}, or reshaped by the daemon as {message} / {code}.
+    for (const char* key : {"reason", "message", "code"}) {
+        const std::string text = optionalJsonString(r.result, key);
+        if (!text.empty()) return text;
+    }
+    return "no reply";
 }
 
 static void requestOmpConfig(AppState& st) {

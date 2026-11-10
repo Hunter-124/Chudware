@@ -3783,3 +3783,22 @@ only when the lane serves a model through it or lists none at all; `omp_auth_sta
 `configured` for it. The private `models.yml` points the `nvidia` provider at
 `http://127.0.0.1:18081/v1` (`openai-completions`) with the placeholder key, like `openrouter`.
 Turns are admitted under the provider of the chosen row, as in revision 2.4.
+
+## Cells answer `omp_config_get` with no rows; AI edits present their document (append-only, 2026-11-10)
+
+Worker RPC contract revision 2.6. The wire protocol major remains 2. Two additive changes.
+
+* **`omp_config_get` in a cell.** A cell has no OMP service process and no user OMP config (the
+  demo lane's private `models.yml` is its whole configuration), so the call answers
+  `{ok:true, agentDir:"", chudwareLayer:"", settings:[]}` instead of a refusal. Settings → AI
+  then shows no OMP rows rather than a failed read. `omp_config_set` still refuses in a cell. A
+  client that shows a refusal reads `reason`, then `message`, then `code`.
+* **Presentation follows an AI edit (daemon).** The first edit by a client of kind `agent` or
+  `mcp` to a non-internal document that is not already the most recently presented one marks it
+  `presented`, assigns it the next `presented_seq`, and fans out `doc.presented`
+  (`{doc_id, name, revision}`, the revision of that edit) before that edit's `doc.changed`.
+  Further edits of the same document send nothing. `doc_present` assigns a `presented_seq` the
+  same way. `doc_list` rows carry `presented_seq` (0 = never presented). A client that opens
+  presented documents on connect opens only the highest `presented_seq` among documents it did
+  not open itself; GUI-origin documents are unaffected. Documents an AI has not edited, and
+  edits by a `gui` client, still present nothing.

@@ -2,9 +2,14 @@
 //
 // Called from the app.cpp main loop right after st.rpc.drain(). In-process
 // cache refreshes use the same document-change routing as daemon pushes.
-// Only GUI-origin or explicitly presented documents are automatically mirrored.
-//   doc.presented    -> reveal an admitted background mirror without taking
-//                       focus from user content, attached read-only.
+// Only GUI-origin or presented documents are automatically mirrored. An AI client's edit
+// presents its document, so the part the AI is building is the part on show.
+//   doc.presented    -> reveal the part (attached read-only) and bring it onto the viewport,
+//                       unless the user's own tab has unsaved edits or an open sketch / form
+//                       (then it opens in its own tab); the older un-adopted AI mirrors are
+//                       closed, detach only, so only the newest AI part stays open. A part
+//                       closed that way comes back on its next presentation; one the user
+//                       closed by hand stays closed.
 //   doc.opened       -> reveal only GUI-origin documents.
 //   doc.changed      -> refresh the active mirror + mesh, or prewarm the
 //                       inactive tab's snapshot and mesh without selecting it.

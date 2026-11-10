@@ -366,9 +366,13 @@ consumes the id (a module entry point such as `SketchMode::onRibbonCommand`,
 RPC over `WorkerClient` → `chudware-hostd` executes in libchudware → `doc.changed` events
 drained per frame → admitted `AppState`/`DocTab` update → tree and viewport repaint.
 Shared engine documents are not automatically tabs: admission is limited to GUI-origin,
-intentional user-open/recovery, or explicitly presented documents. `show_in_app` requests
-`doc_present`, without saving; a native user-open reuses the live document and keeps its
-selection and updates. Dismissed tabs remain dismissed. See
+intentional user-open/recovery, or presented documents. An AI client's (agent or MCP) edit
+presents its document (`doc.presented`, once per change of the latest document) and
+`show_in_app` requests `doc_present`, without saving; a native user-open reuses the live
+document and keeps its selection and updates. Only the newest presented part stays open: the
+GUI closes older un-adopted AI mirrors (detach only; they stay in the Artifacts panel) and
+the viewport follows the new one unless the user's own tab holds unsaved edits or an open
+sketch / form. A tab the user closed by hand stays dismissed. See
 [`HOSTD.md`](../reference/HOSTD.md#live-documents-and-presentation).
 
 **Adding a command.**

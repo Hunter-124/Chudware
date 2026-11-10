@@ -147,8 +147,9 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
 - **Shared metadata is per-member atomic.** Independent provenance writes update members
   without replacing each other's metadata; `metadata_revision` lets autosave detect metadata
   changes independently of geometry revision.
-- **Presentation is explicit.** Live shared documents need not be visible: GUI-origin,
-  intentional user-open/recovery, and explicitly presented documents are admitted.
+- **Presentation follows the AI's latest edit.** Live shared documents need not be visible: GUI-origin,
+  intentional user-open/recovery, and presented documents (an AI edit presents its document;
+  only the newest stays open) are admitted.
   `show_in_app` requests `doc_present` without saving; legacy publication is opt-in and
   updates only presented documents. See [HOSTD](../reference/HOSTD.md#live-documents-and-presentation).
 - **Interactive previews do not acquire custody.** Human edits remain available during

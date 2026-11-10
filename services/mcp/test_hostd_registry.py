@@ -1656,13 +1656,15 @@ def test_explicit_presentation_tracks_live_document_without_edit_custody(scratch
 
         assert row(doc)["presented"] is False
         assert row(hidden)["presented"] is False
-        assert owner.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
-        assert row(doc)["presented"] is False
         assert not _events(viewer, "doc.presented")
+        # An AI client's first edit presents the document by itself (see the next test).
+        assert owner.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
+        assert row(doc)["presented"] is True and row(hidden)["presented"] is False
+        assert [e["data"] for e in _events(viewer, "doc.presented")] == [
+            {"doc_id": doc, "name": "presentation", "revision": 1}]
         path = tmp_path / "source.step+"
         assert owner.call("doc_save", {"doc_id": doc, "path": str(path)}).get("_is_error") is None
         before = path.read_bytes()
-        assert row(doc)["presented"] is False
 
         # Another writer (or ro observer) can present the explicit id without a hold.
         assert peer.call("attach_doc", {"doc_id": doc, "mode": "ro"})["ok"]
@@ -1682,6 +1684,67 @@ def test_explicit_presentation_tracks_live_document_without_edit_custody(scratch
         assert peer.call("doc_present", {}).get("_is_error") is True
     finally:
         for client in (owner, peer, viewer):
+            client.close()
+
+
+def test_an_ai_edit_presents_its_document_and_only_the_latest_stays_presented(scratch_daemon):
+    ai, other_ai, viewer, gui = DaemonClient(), DaemonClient(), DaemonClient(), DaemonClient()
+    ai.connect()
+    scratch_daemon.append(_pid(ai))
+    other_ai.connect()
+    viewer.connect()
+    gui.connect()
+    gui.call("hello", {"client": "gui", "proto": 1})     # re-stamp the kind: a human's client
+    try:
+        viewer.call("subscribe", {"doc_ids": "*"})
+        first = ai.call("doc_new", {"name": "first"})["doc_id"]
+        second = ai.call("doc_new", {"name": "second"})["doc_id"]
+        shadow = ai.call("doc_new", {"name": "shadow", "internal": True})["doc_id"]
+        mine = gui.call("doc_new", {"name": "mine"})["doc_id"]
+
+        def rows():
+            return {r["doc_id"]: r for r in viewer.call("doc_list")["docs"]}
+
+        def presented():
+            return [e["data"]["doc_id"] for e in _events(viewer, "doc.presented")]
+
+        # Creating a document, reading it and a human's own edits present nothing.
+        ai.call("doc_tree", {"doc_id": first})
+        assert gui.call("doc_apply_ops", {"doc_id": mine, "ops": BOX_OPS})["revision"] == 1
+        assert presented() == []
+        assert not any(r["presented"] for r in rows().values())
+
+        # The first AI edit presents; the rest of that build is silent. (presented() returns
+        # the events that arrived since its last call.)
+        revisions = {}
+
+        def edit(client, doc, name):
+            ops = [{"op": "add_feature", "feature": {
+                "type": "box", "name": name, "refs": {},
+                "params": {"length": 10, "width": 10, "height": 10}}}]
+            reply = client.call("doc_apply_ops", {"doc_id": doc, "ops": ops})
+            assert reply.get("_is_error") is None and reply.get("ok") is not False, reply
+            revisions[doc] = revisions.get(doc, 0) + 1
+            assert reply["revision"] == revisions[doc], reply
+
+        edit(ai, first, "a1")
+        edit(ai, first, "a2")
+        assert presented() == [first]
+        # An edit to a second part moves the presentation, from any AI client.
+        edit(other_ai, second, "b1")
+        assert presented() == [second]
+        # Going back to the first part brings it forward again.
+        edit(ai, first, "a3")
+        edit(ai, first, "a4")
+        assert presented() == [first]
+        table = rows()
+        assert table[first]["presented_seq"] > table[second]["presented_seq"] > 0
+        assert table[mine]["presented"] is False and table[mine]["presented_seq"] == 0
+        # An internal document is invisible and never presents.
+        edit(ai, shadow, "s1")
+        assert shadow not in rows() and presented() == []
+    finally:
+        for client in (ai, other_ai, viewer, gui):
             client.close()
 
 

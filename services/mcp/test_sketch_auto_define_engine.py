@@ -42,6 +42,9 @@ def test_explicit_preflight_predicts_the_same_prepared_sketch_batch(
     doc, add, check = sketch_doc
     monkeypatch.setenv("CHUDWARE_PREFLIGHT", "always")
     monkeypatch.setattr(preflight, "_ledger_append", lambda event: None)
+    # This test checks prediction equivalence, not speed: a loaded machine must not turn the
+    # wall-clock rebuild budget into a spurious "skipped" verdict.
+    monkeypatch.setattr(preflight, "_REBUILD_BUDGET_MS", 300_000)
     seed = cb.call("doc_apply_ops", {"doc_id": doc, "ops": [{
         "op": "add_feature", "feature": {"type": "box", "name": "Seed",
             "params": {"length": 5, "width": 5, "height": 5}}}]})

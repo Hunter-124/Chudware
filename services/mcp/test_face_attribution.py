@@ -336,3 +336,29 @@ class TestFastMCPPath:
         addresses the dialect through the var-kw field the schema DOES carry."""
         r = json.loads(_fastmcp_text("describe_part", {"kwargs": {"part": boss_doc}}))
         assert r["ok"] and "Plate" in r["outline"]
+
+
+# ------------------------------------------------------------------ (e) describe_part RPC budget
+
+
+class TestDigestRpcBudget:
+    """describe_part exceeded the eval deadline on a many-body harness because every
+    doc_face_points call redid whole-document work. Timing-insensitive guard: the number of
+    engine round trips stays linear in faces, and the bbox is requested after doc_activate
+    (which memoizes the exact bbox doc_bbox then serves for free)."""
+
+    def test_rpc_count_is_linear_and_bbox_follows_activate(self, spout_doc, monkeypatch):
+        calls: list = []
+        real = gt.cb.call
+
+        def spy(method, params=None):
+            calls.append(method)
+            return real(method, params)
+
+        monkeypatch.setattr(gt.cb, "call", spy)
+        monkeypatch.setattr(cc.cb, "call", spy)
+        d = gt._digest(spout_doc)
+        assert calls.count("doc_face_points") <= d["faces"]
+        for once in ("doc_bbox", "doc_adjacency", "doc_tree", "asm_world_bodies"):
+            assert calls.count(once) == 1, once
+        assert calls.index("doc_activate") < calls.index("doc_bbox")

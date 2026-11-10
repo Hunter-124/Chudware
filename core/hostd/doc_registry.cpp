@@ -468,6 +468,8 @@ bool DocRegistry::handleMethod(int clientId, const std::string& kind,
             } else {
                 DocState& d = it->second;
                 d.presented = true;
+                d.presentedSeq = ++presentSeq_;
+                latestPresentedDoc_ = docId;
                 json data{{"doc_id", docId}, {"name", d.name}, {"revision", d.revision}};
                 result = data;
                 result["ok"] = true;
@@ -1031,6 +1033,21 @@ void DocRegistry::postCall(int clientId, const std::string& kind, const std::str
                     data["saved_metadata_revision"] = d.savedMetadataRevision;
                     if (!d.lastWriterActorKey.empty()) data["actor_key"] = d.lastWriterActorKey;
                     if (!study) d.lastPush = data;
+                    // An edit by an AI client (agent or MCP) presents its document, so the
+                    // part being built or changed is the one the user sees. Presenting comes
+                    // before the change event so a client admits that revision. Only the
+                    // first edit after another document was presented announces itself;
+                    // the rest of a build is plain doc.changed traffic.
+                    if (!study && !system && (kind == "agent" || kind == "mcp") &&
+                        !d.originKind.empty() && latestPresentedDoc_ != docId) {
+                        d.presented = true;
+                        d.presentedSeq = ++presentSeq_;
+                        latestPresentedDoc_ = docId;
+                        fanoutLocked(docId, json{{"event", "doc.presented"},
+                                                 {"data", {{"doc_id", docId}, {"name", d.name},
+                                                           {"revision", rev}}}},
+                                     -1, pending);
+                    }
                     json event{{"event", study ? "doc.studies_changed" : "doc.changed"},
                                {"data", std::move(data)}};
                     if (d.originKind.empty()) d.pendingChanges.emplace_back(std::move(event), fanoutExclude);
@@ -1144,6 +1161,7 @@ void DocRegistry::annotateDocList(json& result, int clientId) {
         e["saved_metadata_revision"] = it != docs_.end() ? it->second.savedMetadataRevision : -1;
         e["saved_revision"] = it != docs_.end() ? it->second.savedRevision : -1;
         e["presented"] = it != docs_.end() && it->second.presented;
+        e["presented_seq"] = it != docs_.end() ? it->second.presentedSeq : 0L;
         if (it != docs_.end()) {
             if (!it->second.lastWriterActorKey.empty())
                 e["lastWriter"] = {{"actor_key", it->second.lastWriterActorKey}};

@@ -115,6 +115,7 @@
 #include <gp_Lin.hxx>
 #include <gp_Sphere.hxx>
 #include <BRepClass_FaceClassifier.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>  // eval_feature_attachment support probes
 #include <BRepTopAdaptor_FClass2d.hxx>      // eval_feature_attachment UV-grid face sampling
 #include <BRepLProp_SLProps.hxx>
@@ -7597,6 +7598,37 @@ bool same_bodies(const CompileResult& a, const CompileResult& b) {
     return true;
 }
 
+// Exact (no mesh, no gap) bounds of each shape, computed in parallel. AddOptimal runs a
+// particle-swarm search on every swept/revolved/B-spline face, ~0.5 s a body on a 44-sweep
+// harness and independent per body, so the bodies are spread over the governor's thread
+// budget. The caller merges the boxes in body order, so the result is deterministic.
+std::vector<Bnd_Box> exact_bounds_per_shape(const std::vector<TopoDS_Shape>& shapes) {
+    std::vector<Bnd_Box> boxes(shapes.size());
+    std::atomic<std::size_t> next{0};
+    auto work = [&] {
+        for (std::size_t i = next.fetch_add(1); i < shapes.size(); i = next.fetch_add(1)) {
+            if (shapes[i].IsNull()) continue;
+            try {
+                BRepBndLib::AddOptimal(shapes[i], boxes[i], /*useTriangulation=*/Standard_False,
+                                       /*useShapeTolerance=*/Standard_False);
+            } catch (const Standard_Failure&) {
+                boxes[i] = Bnd_Box();
+            }
+        }
+    };
+    const std::size_t threads = std::min<std::size_t>(
+        std::max<std::size_t>(1, chudware::governor::solver_threads()), shapes.size());
+    std::vector<std::thread> pool;
+    try {
+        for (std::size_t k = 1; k < threads; ++k) pool.emplace_back(work);
+    } catch (...) {
+        // Fewer workers than planned still drain the queue.
+    }
+    work();
+    for (std::thread& th : pool) th.join();
+    return boxes;
+}
+
 // B-rep-exact stats of a compile's surviving shapes, memoized on the result. `basis` names
 // the method so a consumer never mixes it with the triangulated `volume`. Solids contribute
 // volume; surface bodies (open shells) only faces and bbox. The bbox is the exact one
@@ -7612,20 +7644,41 @@ const json& exact_geometry_stats(const CompileResult& r,
     double volume = 0.0;
     int faces = 0, solids = 0;
     json invalid_bodies = json::array();
+    // A body the incremental compile shares with an earlier checked result (same TShape and
+    // location) keeps that result's verdict; only new or changed bodies pay for BRepCheck.
+    struct Verdict { const TopoDS_Shape* shape; bool valid; };
+    std::unordered_map<const void*, std::vector<Verdict>> known;
+    for (const CompileResult* previous : earlier) {
+        if (!previous || previous->exact_stats.is_null()) continue;
+        const auto bad = previous->exact_stats.find("invalid_bodies");
+        if (bad == previous->exact_stats.end() || !bad->is_array()) continue;
+        for (std::size_t j = 0; j < previous->shapes.size(); ++j) {
+            if (previous->shapes[j].IsNull()) continue;
+            const bool valid = std::find(bad->begin(), bad->end(), static_cast<int>(j)) == bad->end();
+            known[previous->shapes[j].TShape().get()].push_back({&previous->shapes[j], valid});
+        }
+    }
     Bnd_Box box;
+    const std::vector<Bnd_Box> shape_boxes = exact_bounds_per_shape(r.shapes);
     for (std::size_t i = 0; i < r.shapes.size(); ++i) {
         const TopoDS_Shape& shape = r.shapes[i];
         if (shape.IsNull()) continue;
         // Topology validity rides the same memoized pass (parallel, no geometry controls
         // beyond the default) so an op that yields a corrupt body is reported in its reply.
-        try {
-            if (!BRepCheck_Analyzer(shape, Standard_True, Standard_True).IsValid())
-                invalid_bodies.push_back(static_cast<int>(i));
-        } catch (const Standard_Failure&) {
-            invalid_bodies.push_back(static_cast<int>(i));
+        bool valid = true, cached = false;
+        const auto hit = known.find(shape.TShape().get());
+        if (hit != known.end())
+            for (const Verdict& v : hit->second)
+                if (v.shape->IsSame(shape)) { valid = v.valid; cached = true; break; }
+        if (!cached) {
+            try {
+                valid = BRepCheck_Analyzer(shape, Standard_True, Standard_True).IsValid();
+            } catch (const Standard_Failure&) {
+                valid = false;
+            }
         }
-        BRepBndLib::AddOptimal(shape, box, /*useTriangulation=*/Standard_False,
-                               /*useShapeTolerance=*/Standard_False);
+        if (!valid) invalid_bodies.push_back(static_cast<int>(i));
+        if (!shape_boxes[i].IsVoid()) box.Add(shape_boxes[i]);
         TopTools_IndexedMapOfShape face_map, solid_map;
         TopExp::MapShapes(shape, TopAbs_FACE, face_map);
         TopExp::MapShapes(shape, TopAbs_SOLID, solid_map);
@@ -12278,6 +12331,24 @@ double sim_bbox_diag(const TopoDS_Shape& shape) {
     }
 }
 
+// Same quantity as sim_bbox_diag from BRepBndLib::Add on the analytic geometry (no mesh).
+// AddOptimal runs a particle-swarm search on every swept/revolved/B-spline face, which cost
+// ~22 s once per revision on a 44-sweep harness; this diagonal only scales face-resolve
+// tolerances, so the slightly looser (never smaller) box is fine.
+double sim_coarse_bbox_diag(const TopoDS_Shape& shape) {
+    try {
+        Bnd_Box box;
+        BRepBndLib::Add(shape, box, Standard_False);
+        if (box.IsVoid()) return 100.0;
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        const double dx = xmax - xmin, dy = ymax - ymin, dz = zmax - zmin;
+        return std::max(std::sqrt(dx * dx + dy * dy + dz * dz), 1e-3);
+    } catch (const Standard_Failure&) {
+        return 100.0;
+    }
+}
+
 // Sample a face's triangulation nodes in WORLD space — port of bridge.py::
 // _sample_face_nodes. BRepMesh_IncrementalMesh(shape, 0.5, false, 0.5, true) ensures a
 // triangulation; BRep_Tool::Triangulation yields the Poly_Triangulation; nodes are
@@ -16001,10 +16072,23 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
         throw_no_bodies(doc_id, rr_fail, "evaluate");
     }
 
+    // A multi-body doc gets a FRESH wrapper compound from whole_doc_shape on every call, so
+    // IsEqual on the wrapper never matched and each call re-ran describe_faces plus a
+    // whole-document BRepBndLib::AddOptimal (minutes on a 44-sweep harness, once per face
+    // describe_part asked about). Same document revision + pairwise-equal children is the
+    // same shape.
+    auto same_doc_shape = [](const TopoDS_Shape& a, const TopoDS_Shape& b) {
+        if (a.IsEqual(b)) return true;
+        if (a.ShapeType() != TopAbs_COMPOUND || b.ShapeType() != TopAbs_COMPOUND) return false;
+        TopoDS_Iterator ia(a), ib(b);
+        for (; ia.More() && ib.More(); ia.Next(), ib.Next())
+            if (!ia.Value().IsEqual(ib.Value())) return false;
+        return !ia.More() && !ib.More();
+    };
     if (s.face_info_revision != s.revision || s.face_info_shape.IsNull() ||
-        !s.face_info_shape.IsEqual(shape)) {
+        !same_doc_shape(s.face_info_shape, shape)) {
         auto infos = describe_faces(shape);
-        const double diag = sim_bbox_diag(shape);
+        const double diag = sim_coarse_bbox_diag(shape);
         s.face_infos = std::move(infos);
         s.face_info_diag = diag;
         s.face_info_shape = shape;
@@ -16125,6 +16209,9 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
             BRepTools::UVBounds(face, u0, u1, v0, v1);
             Handle(Geom_Surface) surf = BRep_Tool::Surface(face);
             const int N = 16;
+            // Built once per face: BRepClass_FaceClassifier rebuilt the wire/edge maps for each
+            // of the 256 samples, which dominated doc_face_points on faces of a big import.
+            BRepTopAdaptor_FClass2d trim_classifier(face, 1e-7);
             double max_step = 0.0;  // max world-space distance between adjacent kept samples
             std::array<double, 3> prev{};
             bool have_prev = false;
@@ -16133,8 +16220,7 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
                 const double u = u0 + (u1 - u0) * (ii + 0.5) / N;
                 for (int jj = 0; jj < N; ++jj) {
                     const double v = v0 + (v1 - v0) * (jj + 0.5) / N;
-                    BRepClass_FaceClassifier cls(face, gp_Pnt2d(u, v), 1e-7);
-                    const TopAbs_State st = cls.State();
+                    const TopAbs_State st = trim_classifier.Perform(gp_Pnt2d(u, v));
                     if (st != TopAbs_IN && st != TopAbs_ON) { have_prev = false; continue; }
                     gp_Pnt p = surf->Value(u, v);
                     pts.push_back({p.X(), p.Y(), p.Z()});
@@ -16245,11 +16331,25 @@ json doc_bbox(const std::string& doc_id) {
     const auto shapes = gather_export_shapes(s);
     if (shapes.empty())
         throw_no_bodies(doc_id, ensure_compiled(s), "bound");
+    // A part whose compile already carries exact_stats (doc_activate computed it) holds this
+    // very box: AddOptimal's particle-swarm bound on swept/revolved faces took ~20 s per pass
+    // on a 44-sweep harness, so reuse it instead of repeating it.
+    if (!s.is_assembly()) {
+        const CompileResult& compiled = ensure_compiled(s);
+        if (!compiled.exact_stats.is_null() && compiled.exact_stats.contains("bbox") &&
+            compiled.exact_stats["bbox"].is_object()) {
+            const json& b = compiled.exact_stats["bbox"];
+            const json& lo = b["min"];
+            const json& hi = b["max"];
+            return json{{"min", lo}, {"max", hi}, {"size", b["size"]},
+                        {"center", {(lo[0].get<double>() + hi[0].get<double>()) / 2.0,
+                                    (lo[1].get<double>() + hi[1].get<double>()) / 2.0,
+                                    (lo[2].get<double>() + hi[2].get<double>()) / 2.0}}};
+        }
+    }
     Bnd_Box box;
-    for (const TopoDS_Shape& shp : shapes)
-        if (!shp.IsNull())
-            BRepBndLib::AddOptimal(shp, box, /*useTriangulation=*/Standard_False,
-                                   /*useShapeTolerance=*/Standard_False);
+    for (const Bnd_Box& part : exact_bounds_per_shape(shapes))
+        if (!part.IsVoid()) box.Add(part);
     box.SetGap(0.0);
     if (box.IsVoid())
         throw OpError("invalid_op", "bounding box is empty", {{"doc_id", doc_id}});

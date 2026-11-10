@@ -243,6 +243,88 @@ bool closePending(const std::string& docId) {
         if (close.docId == docId) return true;
     return false;
 }
+
+// The part an AI edit presented last. A newer one replaces the older mirrors (see
+// pruneOlderAiParts), and the viewport follows it unless the user's own work is in the way.
+// Parts the pruning closed are remembered apart from the ones the user closed by hand: a later
+// AI edit brings a pruned part back, a part the user closed stays closed.
+std::set<std::string> focusWanted;
+std::set<std::string> prunedAiParts;
+std::string latestPresented;  // the doc id of the newest doc.presented
+std::set<std::string> presentedUnopened;  // presented by an event, no tab opened for it yet
+std::chrono::steady_clock::time_point lastAiFocus{};
+constexpr std::chrono::milliseconds kAiFocusMinGap{1500};
+
+// Replacing the view with the AI's part never disrupts unsaved work: an open sketch or PM form,
+// edits not yet saved, a drawing or ECAD editor. A clean part (the user's own included) or an
+// empty workspace is a view, not work, so the AI's part takes the viewport.
+bool canFocusAiPart(AppState& st, bool rateLimited) {
+    if (userMidEdit(st) || crashLoopBraked) return false;
+    if (rateLimited && std::chrono::steady_clock::now() - lastAiFocus < kAiFocusMinGap)
+        return false;
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return true;
+    const AppState::DocTab& tab = st.docTabs[st.activeTab];
+    return tab.kind == AppState::DocTab::TabKind::Part && !tab.dirty && !tabMidEdit(tab);
+}
+
+// Only the newest AI part stays open: older mirrors of AI work the user has not touched are
+// released (detach only, the document lives on and is saved with the mission), so the workspace
+// holds the current part instead of one tab per attempt. The tab on screen is left for the
+// focus switch to replace. Closed parts stay reachable from the Artifacts panel.
+void pruneOlderAiParts(AppState& st, const std::string& keepDocId) {
+    for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+        const AppState::DocTab& tab = st.docTabs[i];
+        if (tab.docId.empty() || tab.docId == keepDocId || !tab.aiHandoff || tab.userAdopted ||
+            tab.dirty || tab.kind != AppState::DocTab::TabKind::Part || i == st.activeTab ||
+            tabMidEdit(tab))
+            continue;
+        prunedAiParts.insert(tab.docId);
+        st.closeDocTab(i, true);
+    }
+}
+
+void admitPrunedPart(AppState& st, const std::string& docId) {
+    if (!prunedAiParts.erase(docId)) return;
+    st.dismissedMirrorDocs.erase(docId);
+    // A close that has not gone out yet is superseded; one in flight finishes first and the
+    // reveal retries behind it.
+    for (auto it = pendingClose.begin(); it != pendingClose.end();) {
+        if (it->docId == docId && !(closeInFlight && it == pendingClose.begin()))
+            it = pendingClose.erase(it);
+        else ++it;
+    }
+}
+
+// Brings the AI's part onto the viewport once its mirror tab exists. The snapshot is primed
+// first (lock-free), so the switch binds from the parked state instead of a doc_activate that
+// would queue behind the agent's writes.
+void focusAiPart(AppState& st, const std::string& docId) {
+    const int idx = tabIndexForDoc(st, docId);
+    if (idx < 0) return;
+    if (idx == st.activeTab) { pruneOlderAiParts(st, docId); return; }
+    if (!canFocusAiPart(st, true)) { pruneOlderAiParts(st, docId); return; }
+    const int activeBefore = st.activeTab;
+    const std::string activeDocBefore =
+        activeBefore >= 0 && activeBefore < (int)st.docTabs.size()
+            ? st.docTabs[activeBefore].docId : std::string();
+    core::primeMirrorFromSnapshot(st, docId,
+                                  [&st, docId, activeBefore, activeDocBefore](bool) {
+        // The user can switch tabs or start an edit while the snapshot is in flight: their
+        // intent wins.
+        if (st.activeTab != activeBefore ||
+            (activeBefore >= 0 &&
+             (activeBefore >= (int)st.docTabs.size() ||
+              st.docTabs[activeBefore].docId != activeDocBefore)) ||
+            !canFocusAiPart(st, false))
+            return;
+        const int i = tabIndexForDoc(st, docId);
+        if (i < 0 || i == st.activeTab) return;
+        lastAiFocus = std::chrono::steady_clock::now();
+        st.switchToTab(i);
+        pruneOlderAiParts(st, docId);
+    });
+}
+
 struct RecoveredInfo {
     bool humanDirty;
     int revision;
@@ -320,15 +402,29 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
         }
         pendingOpen.erase(docId);  // a deferred reveal is satisfied — don't retry every frame
         attachedPendingReveal.erase(docId);
+        if (focusWanted.erase(docId)) focusAiPart(st, docId);
         return true;
     }
     // The user closed this mirror by hand. The agent keeps building (hostd degraded
     // that close to a detach), but re-revealing the tab on its next edit made the
     // close look broken. Stay closed until the user opens it again from Artifacts.
     if (st.dismissedMirrorDocs.count(docId)) {
+        focusWanted.erase(docId);
         pendingOpen.erase(docId);
         attachedPendingReveal.erase(docId);
         pendingHumanDirty.erase(docId);
+        pendingChanged.erase(docId);
+        return true;
+    }
+    // A part the AI moved on from before its tab ever opened is not worth opening: the newest
+    // presentation is the part on show. It stays reachable from the Artifacts panel.
+    if (!latestPresented.empty() && docId != latestPresented && prunedAiParts.count(docId) == 0 &&
+        presentedUnopened.count(docId)) {
+        presentedUnopened.erase(docId);
+        prunedAiParts.insert(docId);
+        st.dismissedMirrorDocs[docId] = name.empty() ? std::string("AI part") : name;
+        pendingOpen.erase(docId);
+        attachedPendingReveal.erase(docId);
         pendingChanged.erase(docId);
         return true;
     }
@@ -377,7 +473,12 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     bool anyMirror = false;
     for (const auto& t : st.docTabs)
         if (t.aiHandoff) anyMirror = true;
-    const bool takeFocus = canFocusMirror(st, !anyMirror);
+    // An AI edit presented this part: it takes the viewport (and the older AI parts are
+    // closed). A mirror revealed for any other reason keeps the old rule: only into an empty
+    // workspace.
+    const bool presentedByAi = focusWanted.count(docId) != 0;
+    const bool takeFocus = presentedByAi ? canFocusAiPart(st, true)
+                                         : canFocusMirror(st, !anyMirror);
     const int activeBefore = st.activeTab;
     const std::string activeDocBefore =
         activeBefore >= 0 && activeBefore < (int)st.docTabs.size()
@@ -462,7 +563,7 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // doc_activate that queues on the doc's engine mutex behind the agent writing it.
     if (takeFocus && !crashLoopBraked) {
         core::primeMirrorFromSnapshot(st, docId,
-                                      [&st, docId, activeBefore, activeDocBefore, anyMirror](bool) {
+                                      [&st, docId, activeBefore, activeDocBefore, anyMirror, presentedByAi](bool) {
             // A user can switch or edit tabs while the snapshot request is in
             // flight. Never steal the viewport after that change of intent.
             if (userMidEdit(st) || crashLoopBraked || st.activeTab != activeBefore ||
@@ -471,8 +572,12 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
                   st.docTabs[activeBefore].docId != activeDocBefore)))
                 return;
             const int i = tabIndexForDoc(st, docId);
-            if (i >= 0 && i != st.activeTab &&
-                canFocusMirror(st, !anyMirror)) st.switchToTab(i);
+            if (i < 0 || i == st.activeTab) return;
+            if (presentedByAi ? canFocusAiPart(st, false) : canFocusMirror(st, !anyMirror)) {
+                if (presentedByAi) lastAiFocus = std::chrono::steady_clock::now();
+                st.switchToTab(i);
+                if (presentedByAi) pruneOlderAiParts(st, docId);
+            }
         });
         st.toast(ui::ToastLevel::Info, "Presented part — live updates are enabled");
     } else {
@@ -488,6 +593,15 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
         }
     }
     pendingOpen.erase(docId);
+    presentedUnopened.erase(docId);
+    if (presentedByAi) {
+        focusWanted.erase(docId);
+        if (!takeFocus) {
+            // The viewport is busy with the user's own work: say where the part is.
+            st.toast(ui::ToastLevel::Info, "The AI's part is open in its own tab");
+            pruneOlderAiParts(st, docId);
+        }
+    }
     return true;
 }
 
@@ -785,7 +899,15 @@ void handleEvent(AppState& st, json evt) {
     }
     if (name == "doc.presented") {
         queuedPresentations.erase(docId);
-        if (!docId.empty()) openMirrorTab(st, docId, eventDocName(d));
+        if (!docId.empty()) {
+            // The newest presentation is the one that takes the viewport.
+            admitPrunedPart(st, docId);
+            focusWanted.clear();
+            focusWanted.insert(docId);
+            latestPresented = docId;
+            if (tabIndexForDoc(st, docId) < 0) presentedUnopened.insert(docId);
+            openMirrorTab(st, docId, eventDocName(d));
+        }
         return;
     }
     if (name == "doc.disk_conflict") {
@@ -1030,6 +1152,12 @@ void tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
             const json& list = r.result;
             if (r.ok && list.is_object() && list.contains("docs") && list["docs"].is_array()) {
                 std::set<std::string> liveIds;
+                // Presented AI parts are not all reopened on a reconnect or reload: only the
+                // newest presentation is the one kept open.
+                long newestPresented = 0;
+                for (const auto& doc : list["docs"])
+                    if (doc.is_object() && doc.value("origin_kind", std::string()) != "gui")
+                        newestPresented = std::max(newestPresented, doc.value("presented_seq", 0L));
                 for (const auto& doc : list["docs"]) {
                     const std::string id = doc.is_object() ? doc.value("doc_id", std::string())
                                                           : std::string();
@@ -1037,7 +1165,8 @@ void tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
                     liveIds.insert(id);
                     const bool guiOrigin = doc.value("origin_kind", std::string()) == "gui";
                     if (tabIndexForDoc(st, id) < 0 &&
-                        (guiOrigin || doc.value("presented", false)) &&
+                        (guiOrigin || (doc.value("presented", false) &&
+                                       doc.value("presented_seq", 0L) == newestPresented)) &&
                         !st.dismissedMirrorDocs.count(id))
                         pendingOpen[id] = eventDocName(doc);
                     const int ti = tabIndexForDoc(st, id);
@@ -1473,6 +1602,7 @@ void queueMirrorClose(AppState& st, const std::string& docId,
     pendingChanged.erase(docId);
     attachInFlight.erase(docId);
     attachedPendingReveal.erase(docId);
+    focusWanted.erase(docId);
     ui::anim::requestFrames();
     queuedPresentations.erase(docId);
 }
@@ -1725,6 +1855,7 @@ void engineEventsTick(AppState& st) {
                 latestChanged.clear();
             if (name == "doc.presented" && event.contains("data") && event["data"].is_object()) {
                 const std::string id = event["data"].value("doc_id", std::string());
+                admitPrunedPart(st, id);
                 if (!id.empty() && !st.dismissedMirrorDocs.count(id)) queuedPresentations.insert(id);
             }
             if ((name == "doc.changed" || name == "doc.cache_refreshed") &&

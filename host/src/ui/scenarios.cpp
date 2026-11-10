@@ -6528,14 +6528,25 @@ void presentationTick(AppState& st) {
     }
     case 1:
         if (pipingNow() - P.since < 1.0) return;
-        if (!presentationCheck("working_documents_hidden", tab(P.hidden) < 0 && tab(P.shown) < 0 &&
-                               active() == P.user,
-                               {{"hidden_tab", tab(P.hidden)}, {"shown_tab", tab(P.shown)}, {"active", active()}})) return;
+        // An AI edit presents its document by itself and only the newest part stays open: the
+        // part edited last opens, the one before it does not. The viewport follows the AI's part
+        // unless the user's own tab holds unsaved edits.
+        if (tab(P.shown) < 0 && pipingNow() - P.since < 30.0) return;
+        {
+            const int userTab = tab(P.user);
+            const bool userDirty = userTab >= 0 && st.docTabs[userTab].dirty;
+            if (!presentationCheck("latest_ai_part_opens_and_the_older_one_is_not_kept",
+                                   tab(P.shown) >= 0 && tab(P.hidden) < 0 &&
+                                   active() == (userDirty ? P.user : P.shown),
+                                   {{"hidden_tab", tab(P.hidden)}, {"shown_tab", tab(P.shown)},
+                                    {"active", active()}, {"user_dirty", userDirty}})) return;
+        }
         if (!call("doc_present", {{"doc_id", P.shown}}, r)) return;
         ++P.step; return;
     case 2:
         if (tab(P.shown) < 0) return;
-        if (!presentationCheck("presentation_reveals_only_selected", tab(P.hidden) < 0 && active() == P.user,
+        if (!presentationCheck("presentation_reveals_only_selected",
+                               tab(P.hidden) < 0 && (active() == P.user || active() == P.shown),
                                {{"shown_tab", tab(P.shown)}, {"hidden_tab", tab(P.hidden)}, {"active", active()}})) return;
         if (!presentationCheck("open_presented_started", ui::featureTreeOpenPath(st, P.shownPath),
                                {{"path", P.shownPath}})) return;

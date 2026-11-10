@@ -1195,6 +1195,18 @@ def test_omp_config_get_lists_the_policy_rows_for_the_selected_memory_backend(
     assert worker_rpc.WORKER_METHODS["omp_config_get"]({"extra": 1}, lambda _: None)["ok"] is False
 
 
+def test_omp_config_get_in_a_cell_is_an_empty_list_not_a_refusal(monkeypatch):
+    monkeypatch.setattr(worker_rpc, "in_cell", lambda: True)
+
+    def never(*_a, **_k):
+        raise AssertionError("a cell must not start the OMP service process")
+
+    monkeypatch.setattr(worker_rpc, "_omp_config_call", never)
+    assert worker_rpc.WORKER_METHODS["omp_config_get"]({}, lambda _: None) == {
+        "ok": True, "agentDir": "", "chudwareLayer": "", "settings": []}
+    assert worker_rpc.WORKER_METHODS["omp_config_get"]({"extra": 1}, lambda _: None)["ok"] is False
+
+
 def test_omp_config_only_reaches_the_exposed_omp_settings(online_lane, monkeypatch, tmp_path):
     from services import paths
     from services.agent.omp_bridge import BridgeError

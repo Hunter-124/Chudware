@@ -214,8 +214,11 @@ private:
         // Kind of the client that minted this doc (gui|mcp|agent|test). Immutable
         // once set — the origin of ownership (user vs AI). Empty = unknown.
         std::string originKind;
-        // Explicit presentation is independent of editing, attachment and persistence.
+        // Presentation (explicit doc_present, or automatic on an AI edit) is independent of
+        // editing, attachment and persistence. presentedSeq orders presentations: the highest
+        // is the one part clients keep open.
         bool presented = false;
+        long presentedSeq = 0;
         std::string name;
         // Internal doc: minted with {"internal":true} and deliberately invisible on
         // the wire — the registry NEVER fans out doc.opened/doc.changed/doc.closed
@@ -280,6 +283,11 @@ private:
     std::mutex mutationMtx_;
     std::map<std::string, std::weak_ptr<std::recursive_mutex>> mutationLocks_;
     std::map<std::string, DocState> docs_;
+    // The document presented last, and the presentation counter behind DocState::presentedSeq.
+    // An AI edit presents its document only when it is not already this one, so a long build
+    // on one part sends a single doc.presented.
+    std::string latestPresentedDoc_;
+    long presentSeq_ = 0;
     // Late postCall responses must not recreate a document closed in the meantime.
     std::set<std::string> closedIds_;
     std::map<int, std::string> writerGroups_;

@@ -15,8 +15,12 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 
 The registry shares live engine documents independently of GUI tabs. The GUI admits
 GUI-origin documents, intentional user opens and recovery, and documents marked
-`presented=true` in the registry or delivered by `doc.presented`. Agent-created
-documents otherwise stay hidden. `show_in_app` explicitly requests `doc_present`:
+`presented=true` in the registry or delivered by `doc.presented`. The first edit by
+an `agent` or `mcp` client to a document that is not already the latest presented one
+presents it (`doc.presented` before that edit's `doc.changed`), so the part an AI is
+building or changing is the one on show; `doc_list` carries `presented_seq`, and a
+client reopening on reconnect opens only the highest. Documents an AI has not edited
+stay hidden. `show_in_app` explicitly requests `doc_present`:
 it marks only the live document and does not save it. Legacy publication requires
 explicit opt-in and updates only presented documents.
 

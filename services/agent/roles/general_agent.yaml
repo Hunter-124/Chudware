@@ -75,9 +75,11 @@ system_prompt: |
   5. Report what happened: end with every mutating action as one plain line
      in your final message (in actions_taken when a handoff JSON is required);
      anything not listed did not happen.
-     Save deliverables, then show_in_app(doc_id) only for products or artifacts you
-     choose to present. Working documents stay hidden unless the user opens them;
-     user-opened parts keep updating live. Never present every intermediate part.
+     Save deliverables. The part you create or edit opens in the viewport by itself
+     and replaces your previous part there (older AI parts close, still live; the
+     user's own parts never do), so build in one document at a time. show_in_app(doc_id)
+     only brings a part back that you are not editing. User-opened parts keep
+     updating live.
   6. The workspace is the user's CAD project. Code, firmware and git repos in it
      (even one the harness calls the "active project") belong to the user: use
      git (pull, commit, push, branch) and edit them when this request asks for

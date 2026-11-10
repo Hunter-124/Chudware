@@ -6302,6 +6302,87 @@ TEST_CASE("assembly pick owner lookup restores the component's saved build, not 
     CHECK(owners.size() == 2);    // Base and Boss both own faces
 }
 
+TEST_CASE("a recovered unsaved part revision in an assembly reuses the file's checkpoints") {
+    // A daemon autosave keeps an unsaved part edit inside the assembly's recovery manifest.
+    // Without an authenticating cache.json (an unconverged assembly writes none) its embedded
+    // geometry is ignored, and opening the assembly compiled that revision cold: every feature
+    // again, fillet checks included (55 s for a real part).
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "RecoveredSource").at("doc_id");
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / part;
+    std::filesystem::create_directories(dir);
+    const auto part_path = dir / "recovered_source.step+";
+    const auto asm_path = dir / "recovered.step+";
+    struct Cleanup {
+        std::filesystem::path dir;
+        std::vector<std::string> ids;
+        ~Cleanup() {
+            for (const auto& id : ids) try { doc_close(id); } catch (...) {}
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir, {part}};
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Base"},
+            {"params", {{"length", 40.0}, {"width", 20.0}, {"height", 10.0},
+                        {"centered", false}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Boss"},
+            {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 30.0},
+                        {"centered", false}, {"mode", "add"}}}}}}
+    }), false);
+    doc_save(part, part_path.string());
+    const std::string boss = doc_tree(part).at("tree").at("features").at(1).at("id");
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "edit_feature"}, {"id", boss}, {"params", {{"height", 25.0}}}}}), false);
+
+    const std::string asm_id = doc_new("assembly", "Recovered").at("doc_id");
+    cleanup.ids.push_back(asm_id);
+    doc_apply_ops(asm_id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true},
+         {"transform", json::array({1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0,
+                                    0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0})}}
+    }), false);
+    doc_save(asm_id, asm_path.string(), /*preserve_path=*/true);  // the recovery snapshot
+    REQUIRE(doc_close(asm_id));
+    REQUIRE(doc_close(part));  // the edit now exists only in the recovery manifest
+    cleanup.ids.clear();
+    {
+        StepPlusDoc file = stepplus_open(asm_path.string());
+        REQUIRE(file.extra.count("recovery/assembly_sources.json"));
+        file.extra.erase("cache.json");  // as written for an unconverged assembly
+        // Make the recovered revision one this process never compiled (a fresh daemon has
+        // no in-memory component cache): Boss 20 high, re-hashed wherever it is referenced.
+        json manifest = json::parse(file.extra.at("recovery/assembly_sources.json"));
+        REQUIRE(manifest.at("sources").size() == 1);
+        json& row = manifest["sources"][0];
+        row["document"]["features"][1]["params"]["height"] = 20.0;
+        const std::string old_hash = row.at("doc_hash");
+        const std::string new_hash = stepplus_doc_hash(row.at("document"));
+        row["doc_hash"] = new_hash;
+        std::function<void(json&)> rehash = [&](json& j) {
+            if (j.is_string() && j.get<std::string>() == old_hash) j = new_hash;
+            else if (j.is_structured()) for (auto& child : j) rehash(child);
+        };
+        rehash(file.doc);
+        file.extra["recovery/assembly_sources.json"] = manifest.dump();
+        stepplus_save(file.doc, asm_path.string(), file.extra);
+    }
+
+    const auto executed = [] {
+        return compile_cache_stats().at("features_executed").get<long long>();
+    };
+    const long long before = executed();
+    const std::string opened = doc_open(asm_path.string()).at("doc_id");
+    cleanup.ids.push_back(opened);
+    // The recovered revision (Boss 20 high) is what the assembly shows ...
+    const json mass = doc_eval_mass(opened, 1);
+    CHECK(mass.at("volume_mm3").get<double>() ==
+          doctest::Approx(40.0 * 20.0 * 10.0 + 10.0 * 10.0 * 10.0));
+    // ... and only that edited feature ran; Base came from the part file's cache.ckpt.
+    CHECK(executed() - before == 1);
+}
+
 TEST_CASE("eval_measure preserves repeated nested assembly pick identity and world placement") {
     using namespace chudware::doc;
     const std::string part = doc_new("part", "MeasureNestedSource").at("doc_id");

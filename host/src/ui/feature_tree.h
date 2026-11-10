@@ -178,6 +178,8 @@ std::string featureTreeActivePath();
 void featureTreeSetSavedPath(AppState& st, const std::string& docId, const std::string& path);
 // "Opening part.step+… 42 s" for the oldest document open still building ("" when none).
 std::string featureTreeOpenProgress();
+// Per frame: keep the status line's "Opening …  N s" readout counting while an open builds.
+void featureTreeTickOpenProgress(AppState& st);
 
 // Explicitly discard a conflicting legacy mirror and replace it with its published snapshot.
 void reloadLegacyHandoffConflict(AppState& st, const std::string& docId, const std::string& path);

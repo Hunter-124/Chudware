@@ -24657,6 +24657,10 @@ CompileResult compile_component_with_build_state(const std::string& path, const 
     part->doc = doc;
     part->path = path;
     part->source_doc_hash = stepplus_doc_hash(doc);
+    // The display cache was stale, but its per-feature checkpoints still serve every
+    // unchanged feature (an edit made outside Chudware re-runs only what changed).
+    if (auto saved = component_saved_checkpoints(path, doc, part->display_quality))
+        part->compile_cache = std::move(saved);
     ensure_compiled(*part);
     CompileResult result;
     result.ok = part->compiled->ok;

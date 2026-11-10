@@ -427,10 +427,16 @@ std::vector<TopoDS_Shape> load_bodies(
         // A self-contained part compiles like a part session and saves the build into its
         // file (stepplus.md §17): the saved state was stale, and every later load would pay
         // this rebuild again. Legacy file-backed imports never serve from saved state.
+        // A live or recovered revision (an unsaved edit of this part) reuses the file's saved
+        // checkpoints for its unchanged feature prefix instead of re-running every feature.
+        const auto seeded = !live || !self_contained ? nullptr
+            : component_saved_checkpoints(abspath, source_doc, ::geom::DisplayQuality::Fine);
         CompileResult r = !live && self_contained
             ? compile_component_with_build_state(abspath, source_doc, stamp, build_state)
-            : compile_document(source_doc, env_from_doc(source_doc), nullptr,
-                               ::geom::DisplayQuality::Fine, false);
+            : seeded ? compile_document(source_doc, env_from_doc(source_doc), seeded.get(),
+                                        ::geom::DisplayQuality::Fine)
+                     : compile_document(source_doc, env_from_doc(source_doc), nullptr,
+                                        ::geom::DisplayQuality::Fine, false);
         for (const FeatureStatus& st : r.statuses)
             if (!st.ok)
                 append_load_error(error, "feature '" + st.id + "' in '" + abspath +
@@ -2290,20 +2296,8 @@ std::shared_ptr<const ComponentOwners> component_owners(const std::string& abspa
     const json env = env_from_doc(*doc);
     // Seed from the part's saved build checkpoints (they carry the owner maps), as opening
     // the part does. A cold compile re-runs every feature, including the fillet
-    // self-intersection checks, and held the assembly's pick for a minute. Checkpoints are
-    // content-addressed per feature, so a live edited part reuses only its unchanged prefix.
-    std::shared_ptr<CompileCache> seeded;
-    try {
-        const StepPlusDoc file = stepplus_open(abspath);
-        const auto ck = file.extra.find("cache.ckpt");
-        if (ck != file.extra.end() && stepplus_cache_verified(file.doc, file.extra)) {
-            json report;
-            seeded = compile_cache_decode(ck->second, *doc, env, ::geom::DisplayQuality::Fine,
-                                          stepplus_cache_engine_key(), nullptr, report);
-        }
-    } catch (...) {
-        seeded.reset();  // unreadable cache: compile cold, as before
-    }
+    // self-intersection checks, and held the assembly's pick for a minute.
+    const auto seeded = component_saved_checkpoints(abspath, *doc, ::geom::DisplayQuality::Fine);
     CompileResult r = seeded
         ? compile_document(*doc, env, seeded.get(), ::geom::DisplayQuality::Fine,
                            /*with_display=*/true, /*with_owners=*/true)
@@ -2343,6 +2337,22 @@ bool same_probe(const TopoProbe& a, const TopoProbe& b, double diag) {
            a.centroid.Distance(b.centroid) <= 1e-6 * std::max(1.0, diag);
 }
 }  // namespace
+
+std::shared_ptr<CompileCache> component_saved_checkpoints(const std::string& abspath,
+                                                          const json& doc,
+                                                          ::geom::DisplayQuality quality) {
+    try {
+        const StepPlusDoc file = stepplus_open(abspath);
+        const auto ck = file.extra.find("cache.ckpt");
+        if (ck == file.extra.end() || !stepplus_cache_verified(file.doc, file.extra))
+            return nullptr;
+        json report;
+        return compile_cache_decode(ck->second, doc, env_from_doc(doc), quality,
+                                    stepplus_cache_engine_key(), nullptr, report);
+    } catch (...) {
+        return nullptr;  // unreadable cache: the caller compiles cold
+    }
+}
 
 std::string component_pick_owner(const json& asm_doc, const std::string& base_dir,
                                  const AsmBodyOut& body, const std::string& kind, int topo_id) {

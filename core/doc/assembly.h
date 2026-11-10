@@ -187,6 +187,13 @@ bool asm_fingerprints_match(const nlohmann::json& doc, const std::string& base_d
 // stepplus_file_stamp taken before `doc` was read. Implemented in session.cpp. Returns
 // the compile (bodies for the assembly); `build_state` receives the write-back report.
 struct NativeFileStamp;
+// The part file's saved build checkpoints (cache.ckpt) decoded for `doc` at `quality`, or
+// null when the file has none, is unverified or unreadable. Checkpoints are content-addressed
+// per feature, so `doc` may be an edited live/recovered revision of that file: only its
+// unchanged feature prefix is restored. Feed it to a display-mode compile_document.
+std::shared_ptr<CompileCache> component_saved_checkpoints(const std::string& abspath,
+                                                          const nlohmann::json& doc,
+                                                          ::geom::DisplayQuality quality);
 CompileResult compile_component_with_build_state(const std::string& path,
                                                  const nlohmann::json& doc,
                                                  const NativeFileStamp& stamp,

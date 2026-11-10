@@ -15,6 +15,7 @@
 
 #include "../core/app_state.h"
 #include "sketch_mode.h"   // C18
+#include "feature_tree.h"  // long-open elapsed readout
 #include "sketch3d_mode.h" // 3D sketch status readout
 #include "plm/plm_quickbar.h"  // embedded per-doc PLM control
 #include "parts/parts_internal.h"  // Parts Library download queue (Downloads: N token)
@@ -85,6 +86,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     sc.w = 1.0f;
     ImGui::Dummy(ImVec2(dr * 2 + ui::metrics::px(8), 0));
     ImGui::SameLine();
+    featureTreeTickOpenProgress(st);
     const std::string statusText = sbEllipsize(st.status, std::max(1.0f, vp->Size.x * 0.30f));
     ImGui::TextColored(sc, "%s", statusText.c_str());
     if (statusText != st.status && ImGui::IsItemHovered())

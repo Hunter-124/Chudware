@@ -3496,12 +3496,7 @@ void drawFeatureTreeGlyph(ImDrawList* dl, ImVec2 mn, float sz, ImU32 ink) {
     }
 }
 
-static void tickOpenProgress(AppState& st);   // long-open progress readout (defined below)
-
 void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, float paneCenterX) {
-    // The pane header is drawn every frame on every left-pane tab, so a long open's elapsed
-    // readout keeps advancing even while the FeatureManager body itself is not the visible tab.
-    tickOpenProgress(st);
     const float S = ui::uiScale;
     const ui::AdaptiveSurface& surf = fmSurf();
     const float iconSz  = 16.0f * S;
@@ -3647,8 +3642,9 @@ static void setOpenStatus(AppState& st, std::string text, int kind) {
     s_openStatusText = std::move(text);
 }
 
-// Per frame (tree body + pane header): advance the elapsed readout in the status line.
-static void tickOpenProgress(AppState& st) {
+// Per frame, from the status bar (drawn even on the start page, where no FeatureManager pane
+// exists to tick it): advance the elapsed readout in the status line.
+void featureTreeTickOpenProgress(AppState& st) {
     if (s_openProgress.empty() || st.status != s_openStatusText) return;
     std::string label = openProgressLabel();
     if (label != s_openStatusText) setOpenStatus(st, std::move(label), 0);
@@ -4628,7 +4624,6 @@ void drawFeatureTreeBody(AppState& st,
     drawFeatureManagerTopStrip(st);
     // A doc_open / mesh activation still building (long cache-miss rebuild): spinner row with the
     // elapsed time, above the tree of whatever doc is on screen meanwhile.
-    tickOpenProgress(st);
     if (!s_openProgress.empty()) {
         const std::string label = openProgressLabel();
         ui::kit::spinner(label.c_str());

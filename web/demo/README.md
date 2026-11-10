@@ -1,6 +1,6 @@
 # Chudware public demo front door
 
-A host-side service that offers a **free, public, throwaway** Chudware web session at
+A host-side service that offers a **free, public** Chudware web session at
 `app.chudware.com` without accounts and without exposing the host. It is not part of the
 container image and is separate from the single-operator [gateway](../README.md): that
 gateway trusts whoever reaches it, this front door is what makes reaching it safe for a
@@ -20,15 +20,25 @@ stranger.
 
 * **Queue.** At most 3 sessions run at once; everyone else waits in a FIFO queue with a
   waiting page (position, estimated wait, automatic hand-over to the app).
-* **Sessions.** 15 minutes idle or 45 minutes total, whichever comes first. The app shows a
-  banner 5 minutes before either, with a *download your work* action. At expiry the container
-  and **all** of its data are destroyed (tmpfs only; nothing is ever written to disk).
+* **Sessions.** No total time limit: a session in use runs indefinitely. After 15 minutes
+  idle its container stops ("sleeps") and frees the slot; the app shows a banner 5 minutes
+  before that, with a *download your work* action. Sleeping never deletes files.
+* **Workspaces.** Each visitor's `/work` and `/data` are a persistent directory on disk
+  (`<state dir>/workspaces/<sid>/`), bind-mounted into their container. The same cookie
+  resumes the same workspace in a fresh container, across sleeps, restarts and upgrades.
+  Per-workspace cap 1 GiB (over it the workspace is slept, not deleted) and a 20 GiB total
+  cap on brand-new workspaces (returning ones always reopen); see `config.example.env`.
+  Only the visitor (`POST /demo/workspace/delete`) or the admin can ever delete one.
 * **Isolation.** Every session is its own rootless podman container running as a dedicated
   host user whose network egress is firewalled away from the LAN/tailnet (below).
 * **AI.** Free OpenRouter models plus Claude Opus/Sonnet/Haiku 5.5 on the owner's Claude API
   key, through a per-session unix socket. Both keys are read by the front door alone and
   never enter a container.
-* **No accounts.** An anonymous signed cookie names the queue entry / session.
+* **No accounts.** An anonymous signed cookie (1-year `Max-Age`) names the workspace.
+  Clearing cookies loses it irrecoverably — there is no account to reclaim it with.
+* **Admin.** `/admin` (only when `CHUDWARE_DEMO_ADMIN_KEY` is set) shows honest traffic
+  metrics (document pageviews split from assets/polls/404 scans), host health, live
+  sessions and sleeping workspaces, and can sleep a session or delete a workspace.
 
 ## Behaviour
 
@@ -40,38 +50,55 @@ stranger.
 | Holding a place | A queued visitor must keep asking `GET /demo/status`; an entry not polled for 60 s is dropped. The waiting page keeps one long-poll (`?wait=20`) in flight, which is not a timer, so a background tab whose timers the browser throttles keeps its place. |
 | Admission | When a slot frees, the head is admitted: container started, `/healthz` awaited (90 s) → `active`; on failure the entry ends as `start_failed`, everything is cleaned up and the next visitor is admitted. |
 | Capacity guard | Admission is refused while host `MemAvailable` < 4 GiB or free disk on podman's storage < 3 GiB (sessions still *starting* count 1 GiB each against the floor). The visitor stays queued with `note: "capacity"`; an unreadable probe fails closed. |
-| Activity | Proxied HTTP requests and client-to-server WebSocket frames count; `/healthz`, `/demo/status` polls and pings do not. Any periodic background traffic from the app therefore keeps a session from idling, but the 45-minute hard limit always applies. |
-| Expiry | Checked every second. Every 15 s the front door also reconciles with podman: a session whose container died ends as `container_exited`, and any untracked `chudware-demo-*` container is removed. |
-| Graceful stop | `systemctl stop` ends every session (so no container outlives its reaper). |
-| Crash / SIGKILL | On the next start, labelled running containers whose labels are complete, whose host directory exists, that pass a health probe and are within their hard lifetime are **adopted** (quota counters restored); everything else is removed. Adoption requires a persistent `CHUDWARE_DEMO_COOKIE_KEY` (otherwise nobody could reclaim a session, so all leftovers are removed). |
+| Activity | Proxied HTTP requests and client-to-server WebSocket frames count; `/healthz`, `/demo/status` polls and pings do not. Any periodic background traffic from the app therefore keeps a session from idling. There is no other time limit. |
+| Sleep | Checked every second. Idle/ended/quota-exceeded sessions lose their container and become `sleeping` (workspace on disk, resumable). Every 15 s the front door also reconciles with podman: a session whose container died sleeps as `container_exited`, and any untracked `chudware-demo-*` container is removed. Workspace sizes are re-checked every 60 s against the 1 GiB cap. |
+| Graceful stop | `systemctl stop` sleeps every session (so no container outlives its reaper); workspaces stay on disk. |
+| Crash / SIGKILL | On the next start, labelled running containers whose labels are complete, whose host directory exists and that pass a health probe are **adopted** (usage counters restored from the workspace); everything else is removed. Adoption requires a persistent `CHUDWARE_DEMO_COOKIE_KEY` (otherwise nobody could reclaim a session, so containers are removed — their workspaces still survive as sleeping). |
 
 ## HTTP surface
 
 Own routes: `GET /`, `GET /demo/status`, `POST /demo/join`, `POST /demo/end`,
-`GET /demo/health`, `GET /demo/static/{waiting.js,waiting.css}`.
+`POST /demo/workspace/delete`, `GET /demo/health`, `GET /demo/static/{waiting,admin}.{js,css}`,
+and the admin surface below.
 Proxied to an **admitted** visitor's container only: `/app`, `/app/*`, `/engine` (WebSocket),
 `/workspace/*`, `/files/*`, `/reveng/*`, `/healthz`. Everything else is a 404.
 
 `GET /demo/status` (cookie-scoped, never cached):
 
 ```json
-{"state":"queued|starting|active|expired|none","position":int|null,"queue_length":int,
- "eta_seconds":int|null,"idle_expires_at":epoch|null,"hard_expires_at":epoch|null,"warn":bool,
- "note":null|"capacity"|"idle"|"hard_limit"|"ended"|"queue_timeout"|"start_failed"|"container_exited"|"shutdown",
- "active_sessions":int,"max_sessions":int,"free_ai_available":bool,"claude_available":bool}
+{"state":"queued|starting|active|sleeping|expired|none","position":int|null,"queue_length":int,
+ "eta_seconds":int|null,"idle_expires_at":epoch|null,"hard_expires_at":null,"warn":bool,
+ "note":null|"capacity"|"storage"|"idle"|"ended"|"quota_exceeded"|"queue_timeout"|"start_failed"|"container_exited"|"shutdown",
+ "active_sessions":int,"max_sessions":int,"free_ai_available":bool,"claude_available":bool,
+ "has_workspace":bool,"workspace_bytes":int,"last_seen_at":epoch|null}
 ```
 
-The first seven keys are the cross-slice contract. Additions: `note` (why a session ended,
-or `capacity` while the host is full), the session counts, `free_ai_available` (true when
-some free model is routable: through NVIDIA, or through OpenRouter while its daily allowance
-is not spent), `claude_available` (true when a Claude key is configured
-and neither the daily nor the monthly USD budget is spent) and the state `none`, returned
-only to a caller without a valid cookie (an in-app caller whose session no longer exists
-gets `expired`). `?wait=N` (clamped to 25)
-holds the request until the state or position changes. `warn` is true when either the hard
-or the idle deadline is ≤ 5 minutes away. `eta_seconds` is a rough estimate: current
-occupants free their slot at min(hard, idle) expiry; visitors ahead are assumed to hold one
-for the median of recent sessions (half the hard limit until there is history).
+The first seven keys are the cross-slice contract (`hard_expires_at` is retained, always
+null: there is no hard deadline). Additions: `note` (why a session slept, or
+`capacity`/`storage` while admission is held), the session counts, `free_ai_available`
+(true when some free model is routable: through NVIDIA, or through OpenRouter while its
+daily allowance is not spent), `claude_available` (true when a Claude key is configured
+and neither the daily nor the monthly USD budget is spent), the workspace fields, and the
+states `sleeping` (container stopped, files on disk; `POST /demo/join` resumes) and
+`none`, returned only to a caller without a valid cookie (an in-app caller whose session
+no longer exists gets `expired`). `?wait=N` (clamped to 25)
+holds the request until the state or position changes. `warn` is true when the idle
+deadline is ≤ 5 minutes away. `eta_seconds` is a rough estimate: current
+occupants free their slot at idle sleep; visitors ahead are assumed to hold one
+for the median of recent sessions (the idle timeout until there is history).
+
+### Admin (`/admin`)
+
+Exists only when `CHUDWARE_DEMO_ADMIN_KEY` (≥ 32 chars) is configured; otherwise every
+`/admin*` route is a 404/401. `POST /admin/login {"key": …}` (same-origin, ≤ 5 attempts
+per client network per 10 min, constant-time compare) sets a separate `__Host-cw_admin`
+cookie (HMAC under the admin key, 8 h, `SameSite=Strict`). `GET /admin/api/metrics`
+requires it; `POST /admin/api/session/end {"sid"}` sleeps a session and
+`POST /admin/api/workspace/delete {"sid"}` erases a sleeping workspace. The page shows:
+document pageviews vs asset/poll/404 traffic (today + 30 days, unique client tags),
+join/refusal/sleep event counters, host memory/disk/load, Claude spend, live sessions
+and sleeping workspaces with sizes. Metrics persist in `<state dir>/metrics.json`;
+client identity everywhere is the one-way `ip_tag` hash, never a raw address.
 
 Mutating routes require POST and refuse a cross-origin `Origin`. The session cookie is
 `__Host-cw_demo`, `HttpOnly; Secure; SameSite=Lax; Path=/`, an HMAC-signed random id.
@@ -117,7 +144,7 @@ sets failed.
 | `--security-opt systempaths=unconfined` | The nested bubblewrap actor sandbox mounts a fresh `/proc`; podman masks parent `/proc` paths and refuses (`bwrap: Can't mount proc on /proc`). |
 | `--security-opt label=disable` | Needed on this SELinux host for the same nested mount. **Tradeoff:** SELinux confinement of the container is off. Remaining boundaries: default seccomp profile (deliberately *not* relaxed, `seccomp=unconfined` did not help), the user namespace (container root and uid 10001 are unprivileged subuids), no capabilities, read-only root, no-new-privileges, the nested bwrap sandbox that runs all untrusted worker code, and the dedicated host user with its egress firewall. |
 | `--cpus 2 --memory 3500m --memory-swap 3500m --pids-limit 512` | Per-session ceiling; no swap. `--shm-size 256m`, `nofile 8192`, `core 0` as in compose. |
-| `--tmpfs` on `/data` 256m, `/work` 1g, `/state` 1g, `/run` 64m, `/tmp` 512m, each `rw,nosuid,nodev,U,mode=0700` (`/tmp` 1777) | No named volumes, nothing on disk: destruction is `podman rm -f`. `U` is podman's spelling of compose's `uid=/gid=` (the image refuses a `/data` `/work` `/state` not owned by uid 10001 with mode 0700). tmpfs is charged to the memory limit, so a session filling it to the brim OOMs only itself (the caps sum to 2.8 GiB of the 3.5). |
+| `--volume <workspace>/<sid>/{work,data}:/{work,data}:rw,nosuid,nodev,U`; `--tmpfs` on `/state` 1g, `/run` 64m, `/tmp` 512m, each `rw,nosuid,nodev,U,mode=0700` (`/tmp` 1777) | The visitor's saved files persist on disk across containers; caches/state stay throwaway. Sleeping is `podman rm -f` (the binds are the host's, untouched). `U` chowns the bind to the container's mapped uid (the image refuses a `/data` `/work` `/state` not owned by uid 10001 with mode 0700). tmpfs is charged to the memory limit, so a session filling it to the brim OOMs only itself. Containers adopted from before persistent workspaces keep the old all-tmpfs layout for that one run. |
 | `--volume <session dir>/run:/run/chudware-demo:rw,nosuid,nodev,noexec` | The only host path in the container: the provider socket directory. |
 | `--network pasta` | The rootless default. Measured: host loopback services are **not** reachable, the public internet is, the LAN **is** (hence the firewall). |
 | `--publish 127.0.0.1:<port>:8300/tcp` | The inner gateway, on a free port in `PORT_BASE..` (loopback only). |
@@ -208,7 +235,8 @@ scripts/testbox.py --suite platform                       # includes web/demo/te
 scripts/testbox.py -- python -m pytest web/demo/tests -q  # just this package
 ```
 
-Covers: queue FIFO and 3-slot admission, poll-timeout drop, idle/hard expiry and the warn flag
+Covers: queue FIFO and 3-slot admission, poll-timeout drop, idle sleep (files kept) and the warn flag,
+workspace persistence/resume/delete, per-workspace quota sleep, admin auth + metrics pageview split
 (fake clock), start failure → next admitted, capacity guard, per-client and rate limits,
 adoption of labelled containers, reconcile, the exact podman flag set, proxy refusing
 non-admitted/queued/tampered cookies, header isolation, Host/Origin rewriting, WebSocket
@@ -259,9 +287,10 @@ SOCK=/run/user/$(id -u chudware-demo)/chudware-demo/${SID#chudware-demo-}/run/pr
 sudo curl -s --unix-socket $SOCK http://x/v1/models | head -c 300; echo
 sudo curl -s --unix-socket $SOCK -d '{"model":"gpt-4o","messages":[]}' http://x/v1/chat/completions   # 403 model_not_allowed
 
-# Expiry: temporarily set CHUDWARE_DEMO_HARD_SECONDS=120, WARN_SECONDS=60, IDLE_SECONDS=60 in
+# Sleep/resume: temporarily set WARN_SECONDS=60, IDLE_SECONDS=60 in
 # /etc/chudware-demo/demo.env and restart. Join; status shows "warn":true for the last minute,
-# then "expired" (note idle/hard_limit); `dp ps` is empty and /run/user/<uid>/chudware-demo/ has no <sid> dir.
+# then "sleeping" (note idle); `dp ps` is empty and /run/user/<uid>/chudware-demo/ has no <sid> dir,
+# but the workspace remains under the state dir's workspaces/<sid>/ and rejoining resumes it.
 # Queue: set CHUDWARE_DEMO_MAX_ACTIVE=1, join from two "clients" (loopback peers may set the header):
 curl -si -X POST -H 'CF-Connecting-IP: 198.51.100.1' $B/demo/join >/dev/null
 curl -s  -X POST -H 'CF-Connecting-IP: 198.51.100.2' $B/demo/join   # state queued, position 1, eta_seconds
@@ -281,11 +310,16 @@ shell polling `GET /demo/status` (same origin, ≈ every 15 s) only when `/healt
 
 ## Known limits
 
-* The session gets full CAD for 45 minutes; the front door cannot judge *what* a visitor
-  runs. Containment is the container/bwrap/user/firewall stack above, not content filtering.
+* The session gets full CAD with no time limit while it stays active; the front door cannot
+  judge *what* a visitor runs. Containment is the container/bwrap/user/firewall stack above,
+  not content filtering.
 * The free-tier OpenRouter allowance (≈ 50 requests/day account-wide) is the real AI
   ceiling; the demo says so on the waiting page and degrades to "modeling still works".
 * Idle detection counts client-to-server traffic; if the app sends periodic background
-  requests, a session whose tab is merely left open only ends at the 45-minute hard limit.
+  requests, a session whose tab is merely left open may never sleep. That is accepted:
+  there is no hard limit to fall back on, only the 3-session slot cap and the admin page.
+* Sleeping workspaces accumulate until the 20 GiB stored-total cap holds new visitors;
+  nothing auto-deletes them, so watch `/admin` (stored bytes, sleeping list) and delete
+  abandoned workspaces there deliberately.
 * Capacity guard and `--memory` are *limits*, not reservations: three sessions at their
   3.5 GiB ceiling plus the other service on the host can still exceed 15 GiB.

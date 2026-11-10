@@ -46,3 +46,27 @@ def verify(key: bytes, value: str | None) -> str | None:
     if not hmac.compare_digest(mac.encode("ascii"), _mac(key, sid).encode("ascii")):
         return None
     return sid
+
+
+# The admin cookie is a different domain separation from the visitor cookie: it carries
+# only an expiry epoch, MACed with the admin key itself. Knowing a visitor cookie (or
+# the cookie-signing key) never mints one.
+ADMIN_COOKIE_NAME = "__Host-cw_admin"
+_ADMIN_DOMAIN = b"chudware-demo-admin-v1\0"
+
+
+def sign_admin(key: bytes, expires_at: int) -> str:
+    mac = base64.urlsafe_b64encode(
+        hmac.digest(key, _ADMIN_DOMAIN + str(expires_at).encode("ascii"), hashlib.sha256)
+    ).decode("ascii").rstrip("=")
+    return f"{expires_at}.{mac}"
+
+
+def verify_admin(key: bytes, value: str | None, now: float) -> bool:
+    if not key or not value or len(value) > 128:
+        return False
+    raw, dot, mac = value.partition(".")
+    if not dot or not raw.isdigit() or not _MAC_RE.fullmatch(mac):
+        return False
+    expected = sign_admin(key, int(raw)).partition(".")[2]
+    return hmac.compare_digest(mac.encode("ascii"), expected.encode("ascii")) and int(raw) > now

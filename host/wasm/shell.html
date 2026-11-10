@@ -910,8 +910,8 @@
         banner.classList.toggle('warn', warn);
         banner.classList.toggle('critical', warn && secs !== null && secs <= 60);
         var text = warn
-          ? 'Demo session ending soon \u2014 download your work now' + (left ? ' (' + left + ')' : '')
-          : 'Demo session' + (left ? ' \u2014 ' + left : '');
+          ? 'Workspace going to sleep soon \u2014 save your work' + (left ? ' (' + left + ')' : '')
+          : 'Demo workspace' + (left ? ' \u2014 sleeps in ' + left : '');
         if (downloadNote) text = downloadNote;
         if (msgEl.textContent !== text) msgEl.textContent = text;
         // Free models carry no limit; Claude has its own caps.
@@ -937,14 +937,16 @@
         document.documentElement.style.setProperty('--demo-banner-h', '0px');
         endedBody.textContent = '';
         var h = document.createElement('h1');
-        h.textContent = 'Session ended \u2014 your files were deleted';
+        h.textContent = 'Workspace asleep \u2014 your saved files are kept';
         var p = document.createElement('p');
         p.className = 'dim';
-        p.textContent = 'Demo sessions are temporary. Join the queue to start a fresh one.';
+        p.textContent = 'This workspace stopped (idle timeout or server restart). '
+          + 'Files you saved are still on the server under this browser\u2019s cookie; '
+          + 'resume to reopen them. Unsaved changes in the open document may be lost.';
         var a = document.createElement('a');
         a.className = 'rejoin';
         a.href = '/';
-        a.textContent = 'Rejoin the queue';
+        a.textContent = 'Resume my workspace';
         endedBody.appendChild(h);
         endedBody.appendChild(p);
         endedBody.appendChild(a);

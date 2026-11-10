@@ -191,7 +191,7 @@ def test_proxied_traffic_is_activity_but_healthz_and_status_polls_are_not(tmp_pa
         time.sleep(0.2)
         assert visitor.state() == "active"
         clock.advance(200)                                   # 1000 s since the last request
-        assert visitor.wait_for("expired")["note"] == "idle"
+        assert visitor.wait_for("sleeping")["note"] == "idle"
 
 
 def test_websocket_is_proxied_both_ways_with_rewritten_origin_and_host(tmp_path, inner):
@@ -236,7 +236,7 @@ def test_open_websockets_are_closed_when_the_session_ends(tmp_path, inner):
         with fd.client.websocket_connect("/engine", headers=visitor.ws_headers()) as ws:
             ws.send_text("alive")
             assert ws.receive_text() == "echo:alive"
-            assert visitor.end().json()["state"] == "expired"
+            assert visitor.end().json()["state"] == "sleeping"
             with pytest.raises(WebSocketDisconnect):
                 for _ in range(50):
                     ws.receive_text()

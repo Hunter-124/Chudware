@@ -11,7 +11,7 @@
 <main>
   <h1>Chudware live demo</h1>
   <p class="lead">A free, public, shared demo of the Chudware CAD workspace running in your
-    browser. Everyone gets a private, short-lived sandbox; only a few can use it at once, so
+    browser. Everyone gets a private sandbox; only a few can run at once, so
     visitors wait in line.</p>
 
   <section id="panel" aria-live="polite">
@@ -32,23 +32,34 @@
       <p class="position">Your turn. Starting a private workspace&hellip;</p>
       <p class="muted">This usually takes under a minute.</p>
     </div>
+    <div id="sleeping" hidden>
+      <p class="position">Your workspace is saved on this server.</p>
+      <p id="sleeping-detail" class="muted"></p>
+      <p><button id="resume" type="button">Resume my workspace</button>
+         <button id="delete-workspace" type="button" class="secondary">Delete my saved files</button></p>
+      <p id="sleeping-error" class="error" role="alert" hidden></p>
+    </div>
     <p id="load" class="muted"></p>
   </section>
 
   <section>
     <h2>Before you start</h2>
     <ul>
-      <li><strong>Nothing persists.</strong> Your workspace is deleted when the session ends. Download
-        your work before then; a banner reminds you five minutes ahead.</li>
-      <li><strong>Session limits.</strong> Up to <span id="max-sessions">3</span> people at a time; a
-        session ends after 45 minutes, or after 15 minutes without activity.</li>
+      <li><strong>Your files persist.</strong> Your workspace is saved on the server and the same
+        browser reopens it next time. There is no total time limit; after 15 minutes without
+        activity the workspace goes to sleep (its container stops) and resuming starts it again.
+        Download a copy of anything important anyway.</li>
+      <li><strong>Running limits.</strong> Up to <span id="max-sessions">3</span> people at a time, and
+        each saved workspace is capped at 1 GiB. A workspace over the cap is put to sleep, not deleted.</li>
       <li><strong>AI models.</strong> The AI assistant offers Claude Opus, Sonnet and Haiku 5.5 with a
         per-visitor allowance that can run out, plus free models with no demo limit (their provider
         may still ask you to wait a minute when it is busy).
         <span id="ai"></span> Modeling works without it.</li>
-      <li><strong>Privacy.</strong> No account is needed. A cookie identifies your session in this browser
-        only. Your IP address, timestamps and per-session request counts are logged for abuse
-        prevention; your files and prompts are not logged and are deleted with the session.</li>
+      <li><strong>Privacy.</strong> No account is needed. A cookie (kept for a year) identifies your
+        workspace in this browser only — clearing cookies or using another browser starts a new,
+        empty one, and the old one cannot be recovered. Your IP address, timestamps and
+        per-session request counts are logged for abuse prevention; your files and prompts are
+        not logged. Use <em>Delete my saved files</em> above to erase your workspace.</li>
       <li>Experimental software: results may be wrong. Do not upload confidential or personal data.</li>
     </ul>
   </section>

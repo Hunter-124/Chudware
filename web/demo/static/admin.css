@@ -1,0 +1,10 @@
+/* Admin dashboard extras on top of waiting.css. No external assets. */
+.cards { display: flex; flex-wrap: wrap; gap: 0.6em; margin: 0.6em 0; }
+.card { border: 1px solid #3a4652; border-radius: 8px; padding: 0.6em 0.8em; min-width: 9em; }
+.card strong { display: block; font-size: 1.25em; }
+.card span { color: #9aa7b2; font-size: 0.85em; }
+table { border-collapse: collapse; margin: 0.6em 0 1em; font-size: 0.9em; }
+th, td { border: 1px solid #3a4652; padding: 0.3em 0.55em; text-align: left; vertical-align: top; }
+.cols { display: flex; flex-wrap: wrap; gap: 1.2em; }
+.cols pre { font-size: 0.8em; white-space: pre-wrap; word-break: break-word; max-width: 26em; }
+input[type="password"] { padding: 0.5em; min-width: 22em; }

@@ -9,11 +9,15 @@ Run:  python -m uvicorn demo.app:create_app --factory --host 127.0.0.1 --port 83
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import hashlib
+import hmac
 import ipaddress
+import json
 import logging
 import os
+import shutil
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -35,6 +39,7 @@ from . import cookies
 from .broker import ProviderBroker
 from .config import DemoConfig
 from .manager import DemoManager, JoinRefused
+from .metrics import Metrics
 from .podman import PodmanRuntime
 from .proxy import Proxy, same_origin
 
@@ -44,6 +49,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_TYPES = {
     "waiting.js": "application/javascript; charset=utf-8",
     "waiting.css": "text/css; charset=utf-8",
+    "admin.js": "application/javascript; charset=utf-8",
+    "admin.css": "text/css; charset=utf-8",
 }
 # The front door's own pages carry no inline script/style and load nothing off-origin.
 PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
@@ -80,6 +87,37 @@ class _SecurityHeaders:
         await self.app(scope, receive, with_headers)
 
 
+class _MetricsMiddleware:
+    """Counts every HTTP request once, by route class and status (see metrics.py
+    for what counts as a pageview). WebSockets are counted as events by the proxy
+    path itself, not here."""
+
+    def __init__(self, app: ASGIApp, metrics: Metrics) -> None:
+        self.app, self.metrics = app, metrics
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            self.metrics.event("websocket_connection")
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        status = {"code": 0}
+
+        async def capture(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                status["code"] = int(message["status"])
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        finally:
+            request = Request(scope)
+            self.metrics.record(str(scope.get("method", "GET")), request.url.path,
+                                status["code"] or 500, ip_tag(client_address(request)))
+
+
 def client_address(conn: HTTPConnection) -> str:
     """The visitor's address: CF-Connecting-IP, trusted only from a loopback peer.
 
@@ -113,10 +151,15 @@ def ip_tag(address: str) -> str:
 
 
 class FrontDoor:
-    def __init__(self, cfg: DemoConfig, manager: DemoManager):
+    def __init__(self, cfg: DemoConfig, manager: DemoManager, metrics: Metrics | None = None):
         self.cfg, self.manager = cfg, manager
+        self.metrics = metrics or Metrics()
         self.index_html = (STATIC_DIR / "index.html").read_bytes()
-        self.static = {name: (STATIC_DIR / name).read_bytes() for name in STATIC_TYPES}
+        admin_path = STATIC_DIR / "admin.html"
+        self.admin_html = admin_path.read_bytes() if admin_path.exists() else b""
+        self.static = {name: (STATIC_DIR / name).read_bytes() for name in STATIC_TYPES
+                       if (STATIC_DIR / name).exists()}
+        self._admin_logins: dict[str, Any] = {}
 
     def session_of(self, conn: HTTPConnection) -> str | None:
         return cookies.verify(self.cfg.cookie_key, conn.cookies.get(cookies.COOKIE_NAME))
@@ -167,10 +210,12 @@ class FrontDoor:
         try:
             self.manager.join(sid, ip_tag(address), address)
         except JoinRefused as refused:
+            self.metrics.event(f"join_refused:{refused.code}")
             headers = {"Retry-After": str(refused.retry_after)} if refused.retry_after else None
             return self._json({"error": {"code": refused.code,
                                          "message": REFUSAL_STATUS_TEXT.get(refused.code, refused.code)}},
                               refused.status, headers)
+        self.metrics.event("join")
         response = self._json(self.manager.status(sid))
         if fresh:
             response.set_cookie(cookies.COOKIE_NAME, cookies.sign(self.cfg.cookie_key, sid),
@@ -191,6 +236,147 @@ class FrontDoor:
         return self._json({"ok": True, "active": status["active_sessions"],
                            "queued": status["queue_length"], "max": status["max_sessions"]})
 
+    async def delete_workspace(self, request: Request) -> Response:
+        """The visitor erases their own saved workspace (cookie-named, sleeping only)."""
+        if not self._origin_ok(request):
+            return self._json({"error": {"code": "cross_origin"}}, 403)
+        sid = self.session_of(request)
+        if sid is None or not await self.manager.delete_workspace(sid):
+            return self._json({"error": {"code": "no_sleeping_workspace"}}, 409)
+        self.metrics.event("workspace_deleted_by_visitor")
+        return self._json(self.manager.status(sid))
+
+    # -- admin -------------------------------------------------------------------
+    # /admin exists only when CHUDWARE_DEMO_ADMIN_KEY is configured. The key is
+    # never a URL or a visitor cookie: a correct POST mints a separate short-lived
+    # admin cookie (HMAC under the admin key), logins are rate-limited per client
+    # network, and every admin response is no-store under the page CSP.
+    def _admin_on(self) -> bool:
+        return bool(self.cfg.admin_key and self.admin_html)
+
+    def _admin_ok(self, request: Request) -> bool:
+        return self._admin_on() and cookies.verify_admin(
+            self.cfg.admin_key, request.cookies.get(cookies.ADMIN_COOKIE_NAME), time.time())
+
+    async def admin_page(self, request: Request) -> Response:
+        if not self._admin_on():
+            return Response("not found", status_code=404)
+        return Response(self.admin_html, media_type="text/html; charset=utf-8",
+                        headers={"Cache-Control": "no-store"})
+
+    async def admin_login(self, request: Request) -> Response:
+        if not self._admin_on():
+            return Response("not found", status_code=404)
+        if not self._origin_ok(request):
+            return self._json({"error": {"code": "cross_origin"}}, 403)
+        tag = ip_tag(client_address(request))
+        now = time.time()
+        window = self._admin_logins.setdefault(tag, collections.deque())
+        while window and window[0] <= now - self.cfg.admin_login_window:
+            window.popleft()
+        if len(window) >= self.cfg.admin_login_limit:
+            self.metrics.event("admin_login_refused:rate_limited")
+            return self._json({"error": {"code": "rate_limited"}}, 429,
+                              {"Retry-After": str(self.cfg.admin_login_window)})
+        window.append(now)
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            body = {}
+        supplied = str(body.get("key", "") if isinstance(body, dict) else "").encode("utf-8")
+        if not hmac.compare_digest(supplied, self.cfg.admin_key):
+            self.metrics.event("admin_login_refused:bad_key")
+            return self._json({"error": {"code": "bad_key"}}, 401)
+        window.clear()
+        self.metrics.event("admin_login")
+        response = self._json({"ok": True})
+        response.set_cookie(cookies.ADMIN_COOKIE_NAME,
+                            cookies.sign_admin(self.cfg.admin_key,
+                                               int(now) + self.cfg.admin_cookie_seconds),
+                            max_age=self.cfg.admin_cookie_seconds, path="/", secure=True,
+                            httponly=True, samesite="strict")
+        return response
+
+    async def admin_logout(self, request: Request) -> Response:
+        response = self._json({"ok": True})
+        response.delete_cookie(cookies.ADMIN_COOKIE_NAME, path="/", secure=True,
+                               httponly=True, samesite="strict")
+        return response
+
+    def _host_snapshot(self) -> dict[str, Any]:
+        from .manager import host_capacity
+        mem, _ = host_capacity(self.manager._disk_path)
+        disk = shutil.disk_usage(self.cfg.workspace_root if self.cfg.workspace_root.exists()
+                                 else self.cfg.state_dir)
+        load = os.getloadavg()
+        return {"mem_available_bytes": mem, "disk_free_bytes": disk.free,
+                "disk_total_bytes": disk.total, "load": [round(v, 2) for v in load],
+                "cpu_count": os.cpu_count()}
+
+    async def admin_metrics(self, request: Request) -> Response:
+        if not self._admin_ok(request):
+            return self._json({"error": {"code": "admin_auth_required"}}, 401)
+        snap = self.manager.snapshot()
+        broker = getattr(self.manager, "broker", None)
+        claude = getattr(broker, "claude", None)
+        ai = {"free_available": self.broker_free(), "claude_available": self.broker_claude(),
+              "claude_today_usd": round(claude.day_micros / 1_000_000, 4) if claude else None,
+              "claude_month_usd": round(claude.month_micros / 1_000_000, 4) if claude else None}
+        return self._json({"now": time.time(), "traffic": self.metrics.snapshot(),
+                           "host": self._host_snapshot(), "ai": ai, **snap,
+                           "limits": {"max_sessions": self.cfg.max_active,
+                                      "max_queue": self.cfg.max_queue,
+                                      "idle_seconds": self.cfg.idle_seconds,
+                                      "workspace_quota_bytes": self.cfg.workspace_quota_bytes,
+                                      "workspaces_total_bytes": self.cfg.workspaces_total_bytes}})
+
+    def broker_free(self) -> bool:
+        try:
+            return bool(self.manager.broker.free_ai_available())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def broker_claude(self) -> bool:
+        try:
+            return bool(self.manager.broker.claude_available())
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _admin_body_sid(self, request: Request) -> str | None:
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return None
+        sid = body.get("sid") if isinstance(body, dict) else None
+        return sid if isinstance(sid, str) and sid else None
+
+    async def admin_session_end(self, request: Request) -> Response:
+        if not self._admin_ok(request):
+            return self._json({"error": {"code": "admin_auth_required"}}, 401)
+        if not self._origin_ok(request):
+            return self._json({"error": {"code": "cross_origin"}}, 403)
+        sid = await self._admin_body_sid(request)
+        # Accept the truncated id shown in the table as well as a full one.
+        full = next((s for s in list(self.manager.entries) + list(self.manager.dormant)
+                     if s == sid or s.startswith(str(sid))), None) if sid else None
+        if full is None or not await self.manager.end(full, "admin_ended"):
+            return self._json({"error": {"code": "no_such_session"}}, 404)
+        self.metrics.event("admin_session_ended")
+        return self._json({"ok": True})
+
+    async def admin_workspace_delete(self, request: Request) -> Response:
+        if not self._admin_ok(request):
+            return self._json({"error": {"code": "admin_auth_required"}}, 401)
+        if not self._origin_ok(request):
+            return self._json({"error": {"code": "cross_origin"}}, 403)
+        sid = await self._admin_body_sid(request)
+        full = next((s for s in list(self.manager.dormant) if s == sid or s.startswith(str(sid))),
+                    None) if sid else None
+        if full is None or not await self.manager.delete_workspace(full):
+            return self._json({"error": {"code": "no_such_workspace"}}, 404)
+        self.metrics.event("admin_workspace_deleted")
+        return self._json({"ok": True})
+
 
 def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker: Any = None,
                clock: Callable[[], float] = time.time, capacity_probe: Any = None,
@@ -203,7 +389,7 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
         config = DemoConfig.from_env()
         # The keys stay in this process only: scrub them from the environment that child
         # processes (podman, conmon) would otherwise inherit.
-        for name in ("OPENROUTER_KEY", "NVIDIA_KEY", "ANTHROPIC_KEY", "COOKIE_KEY"):
+        for name in ("OPENROUTER_KEY", "NVIDIA_KEY", "ANTHROPIC_KEY", "COOKIE_KEY", "ADMIN_KEY"):
             os.environ.pop("CHUDWARE_DEMO_" + name, None)
     cfg = config
     if not cfg.ai_enabled:
@@ -221,7 +407,9 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
     if port_free is not None:
         kwargs["port_free"] = port_free
     manager = DemoManager(cfg, runtime, broker, **kwargs)
-    door = FrontDoor(cfg, manager)
+    metrics = Metrics(cfg.state_dir / "metrics.json", clock=clock)
+    manager.event_hook = metrics.event
+    door = FrontDoor(cfg, manager, metrics)
     proxy = Proxy(cfg, manager, door.session_of, client=http_client)
     manager.add_end_hook(proxy.close_session)
 
@@ -232,6 +420,7 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
             yield
         finally:
             await manager.shutdown()
+            metrics.flush()
             await broker.aclose()
             await proxy.aclose()
 
@@ -241,7 +430,14 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
         Route("/demo/status", door.status, methods=["GET"]),
         Route("/demo/join", door.join, methods=["POST"]),
         Route("/demo/end", door.end, methods=["POST"]),
+        Route("/demo/workspace/delete", door.delete_workspace, methods=["POST"]),
         Route("/demo/health", door.health, methods=["GET"]),
+        Route("/admin", door.admin_page, methods=["GET", "HEAD"]),
+        Route("/admin/login", door.admin_login, methods=["POST"]),
+        Route("/admin/logout", door.admin_logout, methods=["POST"]),
+        Route("/admin/api/metrics", door.admin_metrics, methods=["GET"]),
+        Route("/admin/api/session/end", door.admin_session_end, methods=["POST"]),
+        Route("/admin/api/workspace/delete", door.admin_workspace_delete, methods=["POST"]),
         Route("/app", proxy.http, methods=PROXY_METHODS),
         Route("/app/{path:path}", proxy.http, methods=PROXY_METHODS),
         Route("/workspace/{path:path}", proxy.http, methods=PROXY_METHODS),
@@ -251,9 +447,10 @@ def create_app(config: DemoConfig | None = None, *, runtime: Any = None, broker:
         WebSocketRoute("/engine", proxy.websocket),
     ]
     app = Starlette(routes=routes, lifespan=lifespan, middleware=[
+        Middleware(_MetricsMiddleware, metrics=metrics),
         Middleware(TrustedHostMiddleware, allowed_hosts=list(cfg.public_hosts)),
         Middleware(_SecurityHeaders),
     ])
     app.state.demo = SimpleNamespace(cfg=cfg, manager=manager, broker=broker, runtime=runtime,
-                                     proxy=proxy, door=door)
+                                     proxy=proxy, door=door, metrics=metrics)
     return app

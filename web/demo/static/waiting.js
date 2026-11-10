@@ -6,13 +6,16 @@
 
   const $ = (id) => document.getElementById(id);
   const NOTES = {
-    idle: 'Your session ended after 15 minutes without activity.',
-    hard_limit: 'Your 45-minute session has ended.',
-    ended: 'Your session was ended.',
+    idle: 'Your workspace went to sleep after 15 minutes without activity. Your files are saved.',
+    ended: 'Your workspace was put to sleep. Your files are saved.',
+    admin_ended: 'The operator put your workspace to sleep. Your files are saved.',
+    quota_exceeded: 'Your workspace is over its 1 GiB storage cap, so it was put to sleep. '
+      + 'Resume it and delete or download files, or delete the saved workspace below.',
     queue_timeout: 'You were removed from the line because this page stopped checking in.',
     start_failed: 'Your workspace could not be started. Please try again.',
-    container_exited: 'Your workspace stopped unexpectedly. Please try again.',
-    shutdown: 'The demo is restarting. Please rejoin in a minute.',
+    container_exited: 'Your workspace stopped unexpectedly. Your saved files are still there; resume below.',
+    shutdown: 'The demo restarted. Your saved files are still there; resume below.',
+    workspace_deleted: 'Your saved workspace was deleted.',
   };
   const REFUSALS = {
     queue_full: 'The line is full right now. Please try again in a few minutes.',
@@ -29,8 +32,15 @@
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function show(name) {
-    for (const id of ['intro', 'queue', 'starting']) $(id).hidden = id !== name;
+    for (const id of ['intro', 'queue', 'starting', 'sleeping']) $(id).hidden = id !== name;
   }
+  const fmtBytes = (n) => {
+    if (!n && n !== 0) return '';
+    const units = ['B', 'KiB', 'MiB', 'GiB'];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return (i ? v.toFixed(1) : String(v)) + ' ' + units[i];
+  };
 
   function showError(message) {
     const el = $('error');
@@ -72,6 +82,10 @@
       renderEta();
     } else if (s.state === 'starting') {
       show('starting');
+    } else if (s.state === 'sleeping') {
+      show('sleeping');
+      const size = s.workspace_bytes ? ' (' + fmtBytes(s.workspace_bytes) + ' saved)' : '';
+      $('sleeping-detail').textContent = (NOTES[s.note] || 'Your workspace is saved.') + size;
     } else {
       show('intro');
       const note = $('notice');
@@ -147,7 +161,26 @@
     }
   }
 
+  async function deleteWorkspace() {
+    if (!confirm('Delete your saved workspace and all its files? This cannot be undone.')) return;
+    $('delete-workspace').disabled = true;
+    try {
+      const r = await fetch('/demo/workspace/delete', { method: 'POST', credentials: 'same-origin' });
+      if (!r.ok) throw new Error('delete ' + r.status);
+      const s = await r.json();
+      render(s);
+    } catch (err) {
+      const el = $('sleeping-error');
+      el.textContent = 'Could not delete the workspace. Please try again.';
+      el.hidden = false;
+    } finally {
+      $('delete-workspace').disabled = false;
+    }
+  }
+
   $('join').addEventListener('click', join);
+  $('resume').addEventListener('click', join);
+  $('delete-workspace').addEventListener('click', deleteWorkspace);
   $('leave').addEventListener('click', leave);
   setInterval(renderEta, 1000);
   follow();

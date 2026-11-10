@@ -98,7 +98,7 @@ def test_queued_entry_must_keep_polling_or_it_is_dropped(tmp_path):
     run(main())
 
 
-def test_idle_expiry_destroys_container_directory_and_socket(tmp_path):
+def test_idle_sleep_stops_container_and_socket_but_keeps_the_workspace(tmp_path):
     async def main():
         mgr, runtime, broker, clock, _ = build(tmp_path)
         hooks = []
@@ -111,6 +111,8 @@ def test_idle_expiry_destroys_container_directory_and_socket(tmp_path):
         await settle(mgr)
         session_dir = mgr.session_dir(sid)
         assert session_dir.is_dir()
+        saved = mgr.workspace_dir(sid) / "work" / "part.step+"
+        saved.write_text("saved work")
         clock.advance(899)
         await mgr.tick()
         assert mgr.entries[sid].state == ACTIVE
@@ -124,31 +126,35 @@ def test_idle_expiry_destroys_container_directory_and_socket(tmp_path):
         assert runtime.removed == [NAME_PREFIX + sid] and not runtime.containers
         assert not session_dir.exists()
         assert broker.closed == [sid] and hooks == [sid]
-        assert mgr.status(sid)["state"] == "expired" and mgr.status(sid)["note"] == "idle"
+        # Slept, not deleted: the file is still there and the same cookie resumes it.
+        assert saved.read_text() == "saved work"
+        status = mgr.status(sid)
+        assert status["state"] == "sleeping" and status["note"] == "idle"
+        assert status["has_workspace"] is True and status["workspace_bytes"] > 0
+        mgr.join(sid, ip_for(1))
+        await settle(mgr)
+        assert mgr.entries[sid].state == ACTIVE and saved.read_text() == "saved work"
+        assert len(runtime.started) == 2          # a fresh container, same workspace
     run(main())
 
 
-def test_hard_expiry_applies_even_to_a_busy_session(tmp_path):
+def test_no_total_time_limit_for_a_busy_session(tmp_path):
     async def main():
         mgr, runtime, broker, clock, _ = build(tmp_path)
         sid = sid_for(1)
         mgr.join(sid, ip_for(1))
         await settle(mgr)
-        for _ in range(44):               # busy: never idle for 15 minutes
+        for _ in range(180):              # busy for 3 hours: never idle for 15 minutes
             clock.advance(60)
             mgr.touch(sid)
             await mgr.tick()
-        assert mgr.entries[sid].state == ACTIVE      # 44 min
-        clock.advance(60)
-        mgr.touch(sid)
-        await mgr.tick()
-        assert sid not in mgr.entries                # 45 min
-        assert mgr.status(sid)["note"] == "hard_limit"
-        assert runtime.removed == [NAME_PREFIX + sid]
+        assert mgr.entries[sid].state == ACTIVE
+        assert mgr.status(sid)["hard_expires_at"] is None
+        assert runtime.removed == []
     run(main())
 
 
-def test_warn_flag_before_hard_expiry_and_before_idle_expiry(tmp_path):
+def test_warn_flag_before_idle_sleep(tmp_path):
     async def main():
         mgr, _, _, clock, _ = build(tmp_path)
         sid = sid_for(1)
@@ -157,7 +163,7 @@ def test_warn_flag_before_hard_expiry_and_before_idle_expiry(tmp_path):
         started = clock()
         status = mgr.status(sid)
         assert status["state"] == "active" and status["warn"] is False
-        assert status["hard_expires_at"] == started + 2700
+        assert status["hard_expires_at"] is None
         assert status["idle_expires_at"] == started + 900
 
         # Idle approach: 599 s quiet = 301 s of idle time left, 600 s = exactly 300.
@@ -167,14 +173,6 @@ def test_warn_flag_before_hard_expiry_and_before_idle_expiry(tmp_path):
         assert mgr.status(sid)["warn"] is True
         mgr.touch(sid)
         assert mgr.status(sid)["warn"] is False
-
-        # Hard approach (kept busy, so idle never triggers): 301 s left, then 300 s left.
-        clock.now = started + 2399
-        mgr.touch(sid)
-        assert mgr.status(sid)["warn"] is False
-        clock.now = started + 2400
-        mgr.touch(sid)
-        assert mgr.status(sid)["warn"] is True       # 300 s left
     run(main())
 
 
@@ -300,10 +298,10 @@ def test_eta_comes_from_remaining_session_time(tmp_path):
         for n in (1, 2, 3):
             mgr.join(sid_for(n), ip_for(n))
         await settle(mgr)
-        # Active session frees its slot at min(hard, idle) = 900 s; each queued visitor
-        # ahead is assumed to hold a slot for half the hard lifetime until history exists.
+        # Active session frees its slot at idle sleep = 900 s; each queued visitor
+        # ahead is assumed to hold a slot for the idle timeout until history exists.
         assert mgr.status(sid_for(2))["eta_seconds"] == 900
-        assert mgr.status(sid_for(3))["eta_seconds"] == 900 + 1350
+        assert mgr.status(sid_for(3))["eta_seconds"] == 900 + 900
         clock.advance(300)
         assert mgr.status(sid_for(2))["eta_seconds"] == 600
         mgr.touch(sid_for(1))
@@ -329,7 +327,7 @@ def test_eta_assumes_the_median_of_recent_session_durations_for_those_ahead(tmp_
     run(main())
 
 
-def test_end_destroys_everything_and_is_idempotent(tmp_path):
+def test_end_sleeps_the_session_and_is_idempotent(tmp_path):
     async def main():
         mgr, runtime, broker, _, _ = build(tmp_path)
         sid = sid_for(1)
@@ -339,8 +337,14 @@ def test_end_destroys_everything_and_is_idempotent(tmp_path):
         assert await mgr.end(sid) is False
         assert runtime.removed == [NAME_PREFIX + sid]
         assert not mgr.session_dir(sid).exists() and broker.closed == [sid]
-        assert mgr.status(sid)["state"] == "expired" and mgr.status(sid)["note"] == "ended"
+        # The workspace stays: status is sleeping (resumable), not expired.
+        assert mgr.workspace_dir(sid).is_dir()
+        assert mgr.status(sid)["state"] == "sleeping" and mgr.status(sid)["note"] == "ended"
         assert mgr.admitted(sid) is None
+        # And only an explicit delete removes it.
+        assert await mgr.delete_workspace(sid) is True
+        assert not mgr.workspace_dir(sid).is_dir()
+        assert mgr.status(sid)["note"] == "workspace_deleted"
     run(main())
 
 
@@ -501,23 +505,30 @@ def test_startup_adopts_labelled_containers_and_removes_everything_else(tmp_path
             runtime.containers[info.name] = info
         (mgr.cfg.session_root / ("f" * 24)).mkdir()            # stale directory, no container
 
+        # Usage now lives in the persistent workspace's host dir, not the session dir.
+        host_dir = mgr.workspace_dir(good.sid) / "host"
+        host_dir.mkdir(parents=True)
+        (host_dir / "usage.json").write_text(json.dumps({"requests": 3, "tokens": 5000}))
+
         await mgr.startup(run_loop=False)
 
-        assert list(mgr.entries) == [good.sid]
+        # No hard lifetime any more: the 2701 s-old container is adopted too.
+        assert set(mgr.entries) == {good.sid, expired.sid}
         entry = mgr.entries[good.sid]
         assert entry.state == ACTIVE and entry.port == good.port
         assert entry.activated_at == good.started
         assert (entry.usage.requests, entry.usage.tokens) == (3, 5000)
         status = mgr.status(good.sid)
-        assert status["hard_expires_at"] == good.started + 2700
+        assert status["hard_expires_at"] is None
         assert good.sid in broker.opened                            # provider socket re-created
         assert mgr.ip_index[good.ip_tag] == good.sid
-        assert set(runtime.containers) == {good.name}
-        assert [p.name for p in mgr.cfg.session_root.iterdir()] == [good.sid]
-        # An adopted session expires like any other.
-        clock.advance(2700 - 600)
+        assert set(runtime.containers) == {good.name, expired.name}
+        assert {p.name for p in mgr.cfg.session_root.iterdir()} == {good.sid, expired.sid}
+        # An adopted session sleeps on idle like any other (workspace kept).
+        clock.advance(901)
         await mgr.tick()
         assert good.sid not in mgr.entries and not runtime.containers
+        assert mgr.status(good.sid)["state"] == "sleeping"
     run(main())
 
 

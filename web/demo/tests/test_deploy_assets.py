@@ -19,7 +19,8 @@ def test_example_env_has_no_secret_values_and_only_known_names():
         match = re.fullmatch(r"(CHUDWARE_DEMO_[A-Z_]+)=(.*)", stripped)
         if not line.startswith("#") and match:
             if match.group(1) in ("CHUDWARE_DEMO_OPENROUTER_KEY", "CHUDWARE_DEMO_NVIDIA_KEY",
-                                  "CHUDWARE_DEMO_ANTHROPIC_KEY", "CHUDWARE_DEMO_COOKIE_KEY"):
+                                  "CHUDWARE_DEMO_ANTHROPIC_KEY", "CHUDWARE_DEMO_COOKIE_KEY",
+                                  "CHUDWARE_DEMO_ADMIN_KEY"):
                 assert match.group(2) == "", line                  # secrets are never in the repository
     assert not re.search(r"sk-or-|sk-ant-|nvapi-|ghp_|BEGIN [A-Z ]*PRIVATE", text)
     # Every documented name is one the config actually reads (the keys are read verbatim).

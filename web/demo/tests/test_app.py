@@ -26,8 +26,8 @@ def test_waiting_page_is_static_strict_and_self_contained(tmp_path):
         assert not re.search(r"<script(?![^>]*\bsrc=)", html) and "style=" not in html
         assert not re.search(r"https?://", html)
         # What the page tells visitors (the owner's required disclosures).
-        for phrase in ("Nothing persists", "45 minutes", "15 minutes", "AI models", "Privacy",
-                       "deleted"):
+        for phrase in ("Your files persist", "15 minutes", "AI models", "Privacy",
+                       "Delete my saved files", "cookie"):
             assert phrase in html
         js = fd.client.get("/demo/static/waiting.js")
         css = fd.client.get("/demo/static/waiting.css")
@@ -51,7 +51,8 @@ def test_join_sets_a_hardened_cookie_reaches_active_and_root_redirects_to_the_ap
         assert "path=/" in lowered and "domain=" not in lowered
         status = visitor.wait_for("active")
         assert status["position"] is None and status["warn"] is False
-        assert status["hard_expires_at"] - status["idle_expires_at"] == pytest.approx(1800, abs=2)
+        assert status["hard_expires_at"] is None and status["idle_expires_at"] is not None
+        assert "max-age=31536000" in cookie.lower()      # a year: the cookie is the identity
         assert fd.runtime.started and fd.runtime.started[0].name.startswith(NAME_PREFIX)
         root = visitor.get("/")
         assert root.status_code == 307 and root.headers["location"] == "/app/"
@@ -163,18 +164,19 @@ def test_join_rate_limit_and_queue_cap_through_the_api(tmp_path):
         assert full.status_code == 503 and full.json()["error"]["code"] == "queue_full"
 
 
-def test_end_destroys_the_session_immediately(tmp_path):
+def test_end_sleeps_the_session_immediately_and_keeps_the_workspace(tmp_path):
     with front_door(tmp_path) as fd:
         visitor = fd.visitor()
         visitor.join()
         visitor.wait_for("active")
         sid = next(iter(fd.manager.entries))
         ended = visitor.end()
-        assert ended.status_code == 200 and ended.json()["state"] == "expired" and ended.json()["note"] == "ended"
+        assert ended.status_code == 200 and ended.json()["state"] == "sleeping" and ended.json()["note"] == "ended"
         assert fd.runtime.removed == [NAME_PREFIX + sid] and not fd.runtime.containers
         assert not (fd.cfg.session_root / sid).exists() and fd.broker.closed == [sid]
+        assert fd.manager.workspace_dir(sid).is_dir()          # files kept
         assert visitor.get("/workspace/list").status_code == 401
-        assert visitor.get("/demo/status").json()["state"] == "expired"
+        assert visitor.get("/demo/status").json()["state"] == "sleeping"
         # A visitor with no session can call end harmlessly.
         assert fd.visitor("198.51.100.9").end().json()["state"] == "none"
 
@@ -215,8 +217,8 @@ def test_idle_expiry_through_the_running_loop(tmp_path):
         visitor.join()
         visitor.wait_for("active")
         clock.advance(901)
-        status = visitor.wait_for("expired")
-        assert status["note"] == "idle"
+        status = visitor.wait_for("sleeping")
+        assert status["note"] == "idle" and status["has_workspace"] is True
         assert visitor.get("/workspace/list").status_code == 401
         assert visitor.get("/").status_code == 200                      # may rejoin from the waiting page
         assert visitor.join().json()["state"] in ("queued", "starting", "active")

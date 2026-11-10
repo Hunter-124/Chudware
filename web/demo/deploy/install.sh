@@ -107,8 +107,21 @@ if command -v restorecon >/dev/null; then restorecon -R "$APP_DIR" || true; fi
 if [[ ! -e $ENV_FILE ]]; then
     step "creating $ENV_FILE"
     key=$("$APP_DIR/venv/bin/python" -c 'import secrets; print(secrets.token_hex(32))')
-    (umask 077 && sed "s|^CHUDWARE_DEMO_COOKIE_KEY=.*|CHUDWARE_DEMO_COOKIE_KEY=${key}|" \
+    admin=$("$APP_DIR/venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(48))')
+    (umask 077 && sed -e "s|^CHUDWARE_DEMO_COOKIE_KEY=.*|CHUDWARE_DEMO_COOKIE_KEY=${key}|" \
+        -e "s|^CHUDWARE_DEMO_ADMIN_KEY=.*|CHUDWARE_DEMO_ADMIN_KEY=${admin}|" \
         "$demo_src/config.example.env" >"$ENV_FILE")
+fi
+# An env file from before /admin existed gets an admin key: appended when the line
+# is absent, filled when present-but-empty. A real value is never touched.
+if ! grep -q '^CHUDWARE_DEMO_ADMIN_KEY=.' "$ENV_FILE"; then
+    step "adding a CHUDWARE_DEMO_ADMIN_KEY to $ENV_FILE"
+    admin=$("$APP_DIR/venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(48))')
+    if grep -q '^CHUDWARE_DEMO_ADMIN_KEY=' "$ENV_FILE"; then
+        sed -i "s|^CHUDWARE_DEMO_ADMIN_KEY=.*|CHUDWARE_DEMO_ADMIN_KEY=${admin}|" "$ENV_FILE"
+    else
+        printf 'CHUDWARE_DEMO_ADMIN_KEY=%s\n' "$admin" >>"$ENV_FILE"
+    fi
 fi
 chown "$DEMO_USER:$DEMO_USER" "$ENV_FILE"
 chmod 0600 "$ENV_FILE"

@@ -48,6 +48,9 @@ class SessionSpec:
     run_dir: Path          # host directory bind-mounted at /run/chudware-demo
     started: int           # epoch seconds, stored in a label so a restart can adopt
     ip_tag: str
+    # Persistent per-visitor directory (<root>/<sid>/{work,data}); None keeps the
+    # old ephemeral tmpfs layout (only for containers adopted from before this).
+    workspace_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if not SID_RE.fullmatch(self.sid):
@@ -120,8 +123,15 @@ def build_run_args(cfg: DemoConfig, spec: SessionSpec) -> list[str]:
         "--shm-size", cfg.shm_size,
         "--ulimit", "nofile=8192:8192", "--ulimit", "core=0",
     ]
-    args += tmpfs("/data", cfg.tmpfs_data)
-    args += tmpfs("/work", cfg.tmpfs_work)
+    if spec.workspace_dir is not None:
+        # Persistent workspace: the visitor's saved files (/work) and cell data
+        # (/data) survive the container. ``U`` chowns the bind to the container's
+        # mapped uid (same trick as tmpfs above); nosuid/nodev as for tmpfs.
+        for sub, mount in (("work", "/work"), ("data", "/data")):
+            args += ["--volume", f"{spec.workspace_dir / sub}:{mount}:rw,nosuid,nodev,U"]
+    else:
+        args += tmpfs("/data", cfg.tmpfs_data)
+        args += tmpfs("/work", cfg.tmpfs_work)
     args += tmpfs("/state", cfg.tmpfs_state)
     args += tmpfs("/run", cfg.tmpfs_run)
     args += tmpfs("/tmp", cfg.tmpfs_tmp, mode="1777")
@@ -227,6 +237,40 @@ class PodmanRuntime:
 
             infos.append(ContainerInfo(name, state.lower(), sid, number(port), number(started), ip_tag))
         return infos
+
+    async def workspace_usage(self, workspace_dir: Path) -> int | None:
+        """Bytes under work+data, measured inside the caller's user namespace.
+
+        The container's files are owned by its mapped subuid at mode 0700, so the
+        front-door user cannot walk them directly; ``podman unshare`` can. None
+        means "could not measure" and the caller falls back to a plain walk.
+        """
+        targets = [str(workspace_dir / sub) for sub in ("work", "data")
+                   if (workspace_dir / sub).is_dir()]
+        if not targets:
+            return 0
+        try:
+            rc, out, _ = await self._podman("unshare", "du", "-sb", *targets, timeout=60)
+        except PodmanError:
+            return None
+        if rc != 0:
+            return None
+        total = 0
+        for line in out.splitlines():
+            head = line.split("\t", 1)[0].strip()
+            if head.isdigit():
+                total += int(head)
+        return total
+
+    async def remove_workspace(self, workspace_dir: Path) -> bool:
+        """Erase a workspace whose files belong to the container's mapped subuid."""
+        if not workspace_dir.is_dir():
+            return True
+        try:
+            rc, _, _ = await self._podman("unshare", "rm", "-rf", str(workspace_dir), timeout=120)
+        except PodmanError:
+            return False
+        return rc == 0 and not workspace_dir.is_dir()
 
     async def storage_path(self) -> Path | None:
         try:

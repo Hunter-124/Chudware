@@ -44,7 +44,7 @@ size; omit `--depth 1` for the repository's complete development history.
 - The image ships the OMP runtime (`CHUDWARE_OMP_BIN`) and the general Python workers, but
   a single-operator container has **no provider credential route**: online Copilot stays
   unavailable there because provider keys are never passed into a cell. The one exception is
-  the [public demo mode](#public-demo-mode), whose throwaway containers reach only a fixed,
+  the [public demo mode](#public-demo-mode), whose session containers reach only a fixed,
   quota-limited lane of free OpenRouter models and capped Claude models.
 
 - A current browser with WebAssembly, WebGL2 and cross-origin-isolated shared memory
@@ -140,7 +140,7 @@ or current hosting availability is implied.
 
 ## Public demo mode
 
-`CHUDWARE_WEB_DEMO=1` marks a container as one throwaway session of the public demo. It is
+`CHUDWARE_WEB_DEMO=1` marks a container as one session of the public demo. It is
 meant to be started only by the host-side front door in [`web/demo/`](demo/README.md), which
 admits visitors from a queue, runs one container per session, proxies to it and destroys the
 container and all of its data at expiry. The flag is exactly `1` or `0`; anything else
@@ -149,8 +149,10 @@ refuses to start so a typo cannot run a demo as a trusted single-operator contai
 What the flag changes inside the container, and nothing else:
 
 - `GET /healthz` answers `{"ok": true, "demo": true}` (otherwise exactly `{"ok": true}`). The
-  app shell then polls the front door's `/demo/status` and shows a time-left banner with a
-  *Download your work* action and an expiry overlay.
+  app shell then polls the front door's `/demo/status` and shows an idle-countdown banner
+  with a *Download your work* action and, once the workspace has gone to sleep, a
+  resume overlay. Saved files persist per browser cookie on the front-door host (see
+  `web/demo/README.md`); there is no total session time limit.
 - If the front door mounted its per-session socket at `/run/chudware-demo/provider.sock`, each
   actor sandbox also gets it at the same path plus a fixed loopback forwarder on
   `127.0.0.1:18081`. OMP's `openrouter` provider (the free models) is pointed at

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Chudware demo admin</title>
+<link rel="stylesheet" href="/demo/static/waiting.css">
+<link rel="stylesheet" href="/demo/static/admin.css">
+</head>
+<body>
+<main>
+  <h1>Demo admin</h1>
+  <p class="muted">Live state of the public demo front door. Refreshes every 5 seconds.
+    Session/workspace ids are truncated except where an action needs the full id.
+    Nothing on this page is a pageview: admin traffic is counted separately.</p>
+
+  <section id="login" hidden>
+    <p>Enter the admin key (<code>CHUDWARE_DEMO_ADMIN_KEY</code> on the host).</p>
+    <form id="login-form">
+      <input id="key" type="password" autocomplete="current-password" placeholder="Admin key">
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="login-error" class="error" hidden></p>
+  </section>
+
+  <div id="dash" hidden>
+    <p><button id="logout" type="button" class="secondary">Sign out</button>
+       <span id="updated" class="muted"></span></p>
+
+    <section>
+      <h2>Right now</h2>
+      <div id="cards" class="cards"></div>
+      <p id="alerts"></p>
+    </section>
+
+    <section>
+      <h2>Traffic (honest pageviews)</h2>
+      <p class="muted">A pageview is a document load only (<code>GET /</code> or
+        <code>GET /app/</code>, status 200). Assets, status polls, health probes and
+        404 scans are separate rows below — that split is how you tell real visitors
+        from bot/edge inflation.</p>
+      <div id="traffic"></div>
+      <h3>Last 30 days</h3>
+      <div id="daily"></div>
+    </section>
+
+    <section>
+      <h2>Sessions</h2>
+      <div id="sessions"></div>
+      <h3>Sleeping workspaces (files on disk, no container)</h3>
+      <div id="workspaces"></div>
+    </section>
+
+    <section>
+      <h2>Security &amp; abuse signals</h2>
+      <div id="security"></div>
+    </section>
+
+    <section>
+      <h2>Detail counters</h2>
+      <div id="detail" class="cols"></div>
+    </section>
+  </div>
+</main>
+<script src="/demo/static/admin.js"></script>
+<noscript><p class="notice">This page needs JavaScript.</p></noscript>
+</body>
+</html>

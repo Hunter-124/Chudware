@@ -55,7 +55,11 @@ def test_sign_refuses_malformed_sid():
 def test_default_config_values(tmp_path):
     cfg = make_cfg(tmp_path)
     assert (cfg.max_active, cfg.max_queue) == (3, 30)
-    assert (cfg.idle_seconds, cfg.hard_seconds, cfg.warn_seconds) == (900, 2700, 300)
+    assert (cfg.idle_seconds, cfg.warn_seconds) == (900, 300)
+    assert not hasattr(cfg, "hard_seconds")          # no total time limit any more
+    assert cfg.cookie_max_age == 365 * 24 * 3600     # the cookie is the identity
+    assert cfg.workspace_quota_bytes == 1024 ** 3 and cfg.workspaces_total_bytes == 20 * 1024 ** 3
+    assert cfg.workspace_root == cfg.state_dir / "workspaces" and cfg.admin_key == b""
     assert cfg.nvidia_key == "" and cfg.nvidia_base == "https://integrate.api.nvidia.com/v1"
     assert cfg.nvidia_models == ("mistralai/mistral-large-4-1t-a52b", "minimaxai/minimax-m3.1-flash")
     assert cfg.ai_models == DEFAULT_MODELS and all(m.endswith(":free") for m in cfg.ai_models)

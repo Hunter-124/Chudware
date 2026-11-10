@@ -1,13 +1,18 @@
-"""FIFO queue, admission, expiry and cleanup of demo sessions.
+"""FIFO queue, admission, idle sleep and persistent workspaces.
 
 All mutable state lives on the event loop thread; the only interleaving points are the
-awaits on podman and the broker. Time comes from an injectable ``clock`` so expiry is
+awaits on podman and the broker. Time comes from an injectable ``clock`` so sleep is
 testable without sleeping. A session passes through::
 
-    queued -> starting -> active -> ending -> (gone, remembered as a tombstone)
+    queued -> starting -> active -> ending -> sleeping (workspace kept on disk)
 
-and is *destroyed* (container removed, host directory deleted, provider socket closed,
-proxy connections closed) whenever it leaves ``active``/``starting`` for any reason.
+There is no total-time limit: a session that keeps being used runs indefinitely.
+After ``idle_seconds`` without activity the container is stopped (the slot and its
+RAM/CPU are freed) but the visitor's workspace -- ``<workspace_root>/<sid>/{work,data}``,
+named by their signed cookie -- stays on disk, and the same cookie later *resumes* it
+in a fresh container. Workspaces are never deleted by a timer; only the visitor (own
+cookie) or the admin can delete one. Sleeping likewise happens on explicit end,
+shutdown, container exit and quota excess (files always kept).
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import collections
 import contextlib
 import heapq
 import logging
+import os
 import shutil
 import socket
 import statistics
@@ -34,6 +40,7 @@ from .podman import NAME_PREFIX, ContainerInfo, PodmanError, SessionSpec
 log = logging.getLogger("chudware-demo.manager")
 
 QUEUED, STARTING, ACTIVE, ENDING = "queued", "starting", "active", "ending"
+SLEEPING = "sleeping"   # no container; the workspace is on disk, resumable by cookie
 TOMBSTONE_TTL = 3600.0
 TOMBSTONE_MAX = 2000
 
@@ -64,6 +71,20 @@ class Entry:
     usage: Usage = field(default_factory=Usage)
     start_task: asyncio.Task | None = field(default=None, repr=False)
     destroy_task: asyncio.Task | None = field(default=None, repr=False)
+    workspace_bytes: int = 0
+    quota_checked_at: float = 0.0
+    had_workspace: bool = False   # workspace existed before this start attempt
+
+
+@dataclass
+class Dormant:
+    """A sleeping workspace: on disk under workspace_root, no container."""
+    sid: str
+    ip_tag: str = ""
+    last_seen: float = 0.0
+    reason: str | None = None
+    workspace_bytes: int = 0
+    usage: Usage = field(default_factory=Usage)
 
 
 def host_capacity(disk_path: Path) -> tuple[int | None, int | None]:
@@ -104,11 +125,14 @@ class DemoManager:
         self.entries: dict[str, Entry] = {}
         self.queue: list[str] = []
         self.ip_index: dict[str, str] = {}
+        self.dormant: dict[str, Dormant] = {}
         self.tombstones: collections.OrderedDict[str, tuple[str, float]] = collections.OrderedDict()
         self.recent: collections.deque[float] = collections.deque(maxlen=20)
         self.capacity_blocked = False
+        self.storage_blocked = False
         self._joins: dict[str, collections.deque[float]] = {}
         self._end_hooks: list[EndHook] = []
+        self.event_hook: Callable[[str], None] | None = None   # metrics, set by the app
         self._kick = asyncio.Event()
         self._change = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
@@ -121,6 +145,91 @@ class DemoManager:
     def session_dir(self, sid: str) -> Path:
         return self.cfg.session_root / sid
 
+    # -- persistent workspaces ------------------------------------------------
+    def workspace_dir(self, sid: str) -> Path:
+        return self.cfg.workspace_root / sid
+
+    def ensure_workspace(self, sid: str) -> Path:
+        root = self.workspace_dir(sid)
+        for sub in ("work", "data", "host"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        # The container runtime requires its mounts owned by the container uid
+        # with mode 0700 (podman's :U does the chown at start; the mode is ours).
+        # After the first start work/data belong to the mapped subuid, so chmod
+        # there is best-effort only -- the mode set at creation already persists.
+        for sub in ("work", "data", "host"):
+            with contextlib.suppress(OSError):
+                (root / sub).chmod(0o700)
+        with contextlib.suppress(OSError):
+            root.chmod(0o700)
+        return root
+
+    async def _measure_workspace(self, sid: str) -> int:
+        """Workspace size. On the real host the files are owned by the container's
+        mapped subuid at mode 0700, so only the runtime (``podman unshare``) can
+        walk them; the plain walk is the fallback (tests, first creation)."""
+        fn = getattr(self.runtime, "workspace_usage", None)
+        if fn is not None:
+            try:
+                measured = await fn(self.workspace_dir(sid))
+            except Exception:  # noqa: BLE001 - fall back to whatever we can see
+                measured = None
+            if measured is not None:
+                return measured
+        return self.workspace_bytes(sid)
+
+    def workspace_bytes(self, sid: str) -> int:
+        """Bytes in the visitor-visible mounts (work+data); symlinks not followed."""
+        total = 0
+        for sub in ("work", "data"):
+            for dirpath, _dirs, files in os.walk(self.workspace_dir(sid) / sub):
+                for name in files:
+                    with contextlib.suppress(OSError):
+                        total += os.lstat(os.path.join(dirpath, name)).st_size
+        return total
+
+    def stored_bytes(self) -> int:
+        known = {sid: d.workspace_bytes for sid, d in self.dormant.items()}
+        known.update({sid: e.workspace_bytes for sid, e in self.entries.items()
+                      if e.state in (STARTING, ACTIVE, ENDING)})
+        return sum(known.values())
+
+    def scan_dormant(self) -> None:
+        """Rediscover sleeping workspaces left on disk (restart, upgrade)."""
+        root = self.cfg.workspace_root
+        if not root.is_dir():
+            return
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or not SID_RE.fullmatch(child.name):
+                continue
+            if child.name in self.entries or child.name in self.dormant:
+                continue
+            self.dormant[child.name] = Dormant(
+                sid=child.name, last_seen=child.stat().st_mtime,
+                workspace_bytes=self.workspace_bytes(child.name),
+                usage=Usage.load(child / "host" / "usage.json"))
+
+    async def delete_workspace(self, sid: str) -> bool:
+        """Explicitly erase a sleeping workspace (visitor or admin request only)."""
+        if not SID_RE.fullmatch(sid):
+            return False
+        entry = self.entries.get(sid)
+        if entry is not None and entry.state in (STARTING, ACTIVE, ENDING):
+            return False
+        if entry is not None:            # queued: leave the queue first
+            await self._destroy(entry, "workspace_deleted")
+        self.dormant.pop(sid, None)
+        removed = False
+        fn = getattr(self.runtime, "remove_workspace", None)
+        if fn is not None:               # files are the container subuid's; unshare rm
+            with contextlib.suppress(Exception):
+                removed = await fn(self.workspace_dir(sid))
+        if not removed:
+            await asyncio.to_thread(shutil.rmtree, self.workspace_dir(sid), True)
+        self.tombstones[sid] = ("workspace_deleted", self.clock())
+        self._changed()
+        return True
+
     async def startup(self, *, run_loop: bool = True) -> None:
         root = self.cfg.session_root
         root.mkdir(parents=True, exist_ok=True)
@@ -131,6 +240,9 @@ class DemoManager:
         else:
             self._disk_path = root
         await self.adopt()
+        self.scan_dormant()
+        for dormant in self.dormant.values():
+            dormant.workspace_bytes = await self._measure_workspace(dormant.sid)
         keep = set(self.entries)
         for child in root.iterdir():
             if child.name not in keep and child.is_dir():
@@ -208,7 +320,8 @@ class DemoManager:
             raise JoinRefused("queue_full", 503, 60)
         window.append(now)
         self.tombstones.pop(sid, None)
-        entry = Entry(sid=sid, ip_tag=ip_tag, joined_at=now, last_poll=now)
+        entry = Entry(sid=sid, ip_tag=ip_tag, joined_at=now, last_poll=now,
+                      had_workspace=sid in self.dormant or self.workspace_dir(sid).is_dir())
         self.entries[sid] = entry
         self.queue.append(sid)
         self.ip_index[ip_tag] = sid
@@ -251,30 +364,41 @@ class DemoManager:
             "max_sessions": self.cfg.max_active,
             "free_ai_available": self.broker.free_ai_available(),
             "claude_available": self.broker.claude_available(),
+            "has_workspace": False, "workspace_bytes": 0, "last_seen_at": None,
         }
         if sid is None:
             return out
         entry = self.entries.get(sid)
         if entry is None or entry.state == ENDING:
+            dormant = self.dormant.get(sid)
+            if dormant is not None:
+                out["state"] = SLEEPING
+                out["note"] = dormant.reason
+                out["has_workspace"] = True
+                out["workspace_bytes"] = dormant.workspace_bytes
+                out["last_seen_at"] = dormant.last_seen
+                return out
             tomb = self.tombstones.get(sid)
             out["state"] = "expired"
             out["note"] = (entry.end_reason if entry is not None else tomb[0] if tomb else None)
             return out
         out["state"] = entry.state
+        out["has_workspace"] = sid in self.dormant or self.workspace_dir(sid).is_dir()
+        out["workspace_bytes"] = entry.workspace_bytes
         if entry.state == QUEUED:
             entry.last_poll = now
             out["position"] = self.queue.index(sid) + 1
-            if self.capacity_blocked and self._occupied() < self.cfg.max_active:
+            if self.storage_blocked and not out["has_workspace"]:
+                out["note"] = "storage"
+            elif self.capacity_blocked and self._occupied() < self.cfg.max_active:
                 out["note"] = "capacity"
             else:
                 out["eta_seconds"] = self._eta(out["position"])
         elif entry.state == ACTIVE:
-            hard_end = entry.activated_at + self.cfg.hard_seconds
+            # No hard expiry any more; hard_expires_at stays in the document as null.
             idle_end = entry.last_activity + self.cfg.idle_seconds
-            out["hard_expires_at"] = hard_end
             out["idle_expires_at"] = idle_end
-            out["warn"] = (hard_end - now <= self.cfg.warn_seconds
-                           or idle_end - now <= self.cfg.warn_seconds)
+            out["warn"] = idle_end - now <= self.cfg.warn_seconds
         return out
 
     async def wait_for_change(self, sid: str, timeout: float) -> None:
@@ -306,13 +430,13 @@ class DemoManager:
         if len(self.recent) >= 3:
             typical = statistics.median(self.recent)
         else:
-            typical = self.cfg.hard_seconds / 2
-        return min(max(typical, 60.0), float(self.cfg.hard_seconds))
+            typical = float(self.cfg.idle_seconds)
+        return min(max(typical, 60.0), 4 * 3600.0)
 
     def _eta(self, position: int) -> int:
         """Rough seconds until the ``position``-th queued visitor is admitted.
 
-        Current occupants free their slot at min(hard, idle) expiry; every visitor ahead
+        Current occupants free their slot when they go idle; every visitor ahead
         in the queue is assumed to hold a slot for the typical (median recent) session.
         """
         now = self.clock()
@@ -320,8 +444,7 @@ class DemoManager:
         free_at: list[float] = []
         for entry in self.entries.values():
             if entry.state == ACTIVE:
-                end = min(entry.activated_at + self.cfg.hard_seconds,
-                          entry.last_activity + self.cfg.idle_seconds)
+                end = entry.last_activity + self.cfg.idle_seconds
                 free_at.append(max(0.0, end - now))
             elif entry.state == STARTING:
                 free_at.append(self.cfg.start_timeout + typical)
@@ -360,14 +483,25 @@ class DemoManager:
         for entry in self.entries.values():
             if entry.state != ACTIVE:
                 continue
-            if now - entry.activated_at >= self.cfg.hard_seconds:
-                due.append((entry, "hard_limit"))
-            elif now - entry.last_activity >= self.cfg.idle_seconds:
+            if now - entry.last_activity >= self.cfg.idle_seconds:
                 due.append((entry, "idle"))
+            elif now - entry.quota_checked_at >= self.cfg.quota_check_seconds:
+                entry.quota_checked_at = now
+                entry.workspace_bytes = await self._measure_workspace(entry.sid)
+                if entry.workspace_bytes > self.cfg.workspace_quota_bytes:
+                    due.append((entry, "quota_exceeded"))
         if due:
             await asyncio.gather(*(self._destroy(e, why) for e, why in due))
         while self.queue and self._occupied() < self.cfg.max_active:
             if not self._capacity_ok():
+                break
+            head = self.entries[self.queue[0]]
+            # Only brand-new workspaces count against the stored-total cap; a
+            # returning visitor's bytes are already on disk and already counted.
+            self.storage_blocked = (head.sid not in self.dormant
+                                    and not self.workspace_dir(head.sid).is_dir()
+                                    and self.stored_bytes() >= self.cfg.workspaces_total_bytes)
+            if self.storage_blocked:
                 break
             entry = self.entries[self.queue.pop(0)]
             entry.state = STARTING
@@ -376,6 +510,7 @@ class DemoManager:
             self._changed()
         if not self.queue:
             self.capacity_blocked = False
+            self.storage_blocked = False
         for ip_tag in [k for k, w in self._joins.items() if not w or w[-1] <= now - self.cfg.join_window]:
             del self._joins[ip_tag]
         for sid in [s for s, (_, t) in self.tombstones.items() if now - t > TOMBSTONE_TTL]:
@@ -390,7 +525,8 @@ class DemoManager:
 
     def _spec(self, entry: Entry, started: int) -> SessionSpec:
         return SessionSpec(sid=entry.sid, port=entry.port, run_dir=entry.run_dir,
-                           started=started, ip_tag=entry.ip_tag)
+                           started=started, ip_tag=entry.ip_tag,
+                           workspace_dir=self.workspace_dir(entry.sid))
 
     async def _start_entry(self, entry: Entry) -> None:
         try:
@@ -399,7 +535,14 @@ class DemoManager:
             session_dir.mkdir(parents=True, exist_ok=True)
             session_dir.chmod(0o700)
             entry.run_dir = session_dir / "run"
-            await self.broker.open_session(entry.sid, entry.run_dir, entry.usage, session_dir / "usage.json",
+            entry.had_workspace = self.workspace_dir(entry.sid).is_dir()
+            workspace = self.ensure_workspace(entry.sid)
+            self.dormant.pop(entry.sid, None)
+            entry.usage = Usage.load(workspace / "host" / "usage.json")
+            entry.workspace_bytes = await self._measure_workspace(entry.sid)
+            entry.quota_checked_at = self.clock()
+            await self.broker.open_session(entry.sid, entry.run_dir, entry.usage,
+                                           workspace / "host" / "usage.json",
                                            entry.ip_tag)
             spec = self._spec(entry, int(self.clock()))
             await self.runtime.start(spec)
@@ -419,6 +562,8 @@ class DemoManager:
         entry.activated_at = entry.last_activity = now
         entry.state = ACTIVE
         log.info("session active sid=%s port=%s", entry.sid[:8], entry.port)
+        if self.event_hook is not None:
+            self.event_hook("session_resumed" if entry.had_workspace else "session_started")
         self._changed()
 
     async def _destroy(self, entry: Entry, reason: str) -> None:
@@ -453,9 +598,22 @@ class DemoManager:
         self.entries.pop(sid, None)
         if self.ip_index.get(entry.ip_tag) == sid:
             del self.ip_index[entry.ip_tag]
-        self.tombstones[sid] = (reason, now)
+        # The workspace is NOT removed: the session sleeps and the same cookie
+        # resumes it. Only a session that never started (queued, or a start that
+        # failed before a workspace existed) leaves just a tombstone.
+        if self.workspace_dir(sid).is_dir() and (entry.had_workspace or entry.activated_at is not None):
+            entry.workspace_bytes = await self._measure_workspace(sid)
+            self.dormant[sid] = Dormant(sid=sid, ip_tag=entry.ip_tag, last_seen=now,
+                                        reason=reason, workspace_bytes=entry.workspace_bytes,
+                                        usage=entry.usage)
+        else:
+            if self.workspace_dir(sid).is_dir():   # created by a start that never ran
+                await asyncio.to_thread(shutil.rmtree, self.workspace_dir(sid), True)
+            self.tombstones[sid] = (reason, now)
         while len(self.tombstones) > TOMBSTONE_MAX:
             self.tombstones.popitem(last=False)
+        if self.event_hook is not None:
+            self.event_hook(f"slept:{reason}")
         self._changed()
         self._kick.set()
 
@@ -512,17 +670,49 @@ class DemoManager:
             entry = Entry(sid=info.sid, ip_tag=info.ip_tag, joined_at=now, last_poll=now,
                           state=ACTIVE, container=info.name, port=info.port,
                           run_dir=spec.run_dir, activated_at=float(info.started), last_activity=now,
-                          usage=Usage.load(session_dir / "usage.json"))
+                          had_workspace=self.workspace_dir(info.sid).is_dir(),
+                          usage=Usage.load(self.workspace_dir(info.sid) / "host" / "usage.json"))
             self.entries[info.sid] = entry
             self.ip_index[info.ip_tag] = info.sid
             try:
-                await self.broker.open_session(info.sid, spec.run_dir, entry.usage, session_dir / "usage.json",
-                                               entry.ip_tag)
+                await self.broker.open_session(
+                    info.sid, spec.run_dir, entry.usage,
+                    self.workspace_dir(info.sid) / "host" / "usage.json", entry.ip_tag)
             except Exception as exc:  # noqa: BLE001
                 log.error("adopted %s but its provider socket failed: %s", info.name, exc)
                 await self._destroy(entry, "adopt_failed")
                 continue
             log.info("adopted %s (started %ds ago)", info.name, int(now - info.started))
+
+    # -- admin snapshot ---------------------------------------------------------
+    def snapshot(self) -> dict[str, Any]:
+        """Live sessions + sleeping workspaces, for /admin. Ids are truncated:
+        the full sid is a bearer credential (it is the cookie's payload)."""
+        now = self.clock()
+        sessions = []
+        for e in self.entries.values():
+            sessions.append({
+                "sid": e.sid[:8], "state": e.state, "ip_tag": e.ip_tag[:8],
+                "joined_at": e.joined_at, "activated_at": e.activated_at,
+                "last_activity": e.last_activity,
+                "idle_in_seconds": (max(0, int(e.last_activity + self.cfg.idle_seconds - now))
+                                    if e.state == ACTIVE and e.last_activity else None),
+                "workspace_bytes": e.workspace_bytes, "port": e.port,
+                "ai_requests": e.usage.requests, "ai_tokens": e.usage.tokens,
+                "claude_usd": round(e.usage.claude_micros / 1_000_000, 4),
+            })
+        workspaces = [{
+            "sid": d.sid[:8], "full_sid": d.sid, "last_seen": d.last_seen,
+            "reason": d.reason, "workspace_bytes": d.workspace_bytes,
+            "ai_requests": d.usage.requests, "ai_tokens": d.usage.tokens,
+            "claude_usd": round(d.usage.claude_micros / 1_000_000, 4),
+        } for d in sorted(self.dormant.values(), key=lambda d: -d.last_seen)]
+        return {"sessions": sessions, "workspaces": workspaces,
+                "stored_workspaces": len(self.dormant) + sum(
+                    1 for e in self.entries.values() if e.had_workspace and e.sid not in self.dormant),
+                "stored_bytes": self.stored_bytes(),
+                "capacity_blocked": self.capacity_blocked,
+                "storage_blocked": self.storage_blocked}
 
     def _reject_reason(self, info: ContainerInfo, now: float) -> str | None:
         if not self.cfg.cookie_key_persistent:
@@ -539,8 +729,6 @@ class DemoManager:
             return "another adopted session already holds this client"
         if self._occupied() >= self.cfg.max_active:
             return "over capacity"
-        if now - info.started >= self.cfg.hard_seconds:
-            return "past its hard lifetime"
         if not (self.session_dir(info.sid) / "run").is_dir():
             return "its session directory is missing"
         return None

@@ -128,13 +128,23 @@ class DemoConfig:
     # sessions are never adopted after a restart unless the key came from the env.
     cookie_key: bytes = field(default=b"", repr=False)
     cookie_key_persistent: bool = False
-    cookie_max_age: int = 12 * 3600
+    # The cookie IS the visitor's identity (no accounts): a year, so a returning
+    # browser reopens its saved workspace instead of starting empty.
+    cookie_max_age: int = 365 * 24 * 3600
+
+    # -- admin ---------------------------------------------------------------
+    # Key for /admin (at least 32 chars, installed env only). Empty disables /admin.
+    admin_key: bytes = field(default=b"", repr=False)
+    admin_cookie_seconds: int = 8 * 3600
+    admin_login_limit: int = 5
+    admin_login_window: int = 600
 
     # -- admission ---------------------------------------------------------
     max_active: int = 3
     max_queue: int = 30
+    # Idle sleep only: an active session is never cut off for total elapsed time.
+    # Sleeping stops the container and frees the slot; the workspace stays on disk.
     idle_seconds: int = 15 * 60
-    hard_seconds: int = 45 * 60
     warn_seconds: int = 5 * 60
     queue_poll_timeout: int = 60
     start_timeout: int = 90
@@ -176,6 +186,19 @@ class DemoConfig:
     claude_daily_usd: float = 30.0
     claude_monthly_usd: float = 99.0
     claude_max_output_tokens: int = 32_000
+
+    # -- persistent workspaces ----------------------------------------------
+    # One directory per cookie id under here: <sid>/work and <sid>/data are bind
+    # mounts in the session container, <sid>/host is front-door-only metadata.
+    # Nothing here is ever deleted by a timer; only the visitor (own cookie) or
+    # the admin can delete a workspace. The quotas are the bound on that promise:
+    # a workspace over its quota is slept (files kept), and brand-new workspaces
+    # stop being created when the total cap is reached (returning ones reopen).
+    # None resolves to ``state_dir / "workspaces"`` in __post_init__.
+    workspace_root: Path | None = None
+    workspace_quota_bytes: int = 1 * GIB
+    workspaces_total_bytes: int = 20 * GIB
+    quota_check_seconds: int = 60
 
     # -- containers --------------------------------------------------------
     image: str = f"{DEFAULT_IMAGE_REPO}:edge"
@@ -221,17 +244,21 @@ class DemoConfig:
                      "claude_monthly_usd"):
             if not getattr(self, name) > 0:
                 raise ConfigError(f"{name} must be a positive amount")
-        for name in ("max_active", "max_queue", "idle_seconds", "hard_seconds", "warn_seconds",
+        for name in ("max_active", "max_queue", "idle_seconds", "warn_seconds",
                      "queue_poll_timeout", "start_timeout", "join_limit", "join_window",
                      "ai_max_output_tokens",
                      "claude_max_output_tokens",
                      "ai_models_cache_seconds",
                      "ai_max_body_bytes", "pids_limit", "port_count", "max_request_bytes",
-                     "ws_max_message_bytes", "cookie_max_age"):
+                     "ws_max_message_bytes", "cookie_max_age", "workspace_quota_bytes",
+                     "workspaces_total_bytes", "quota_check_seconds",
+                     "admin_cookie_seconds", "admin_login_limit", "admin_login_window"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"{name} must be at least 1")
-        if self.warn_seconds >= self.hard_seconds:
-            raise ConfigError("warning lead time must be shorter than the hard lifetime")
+        if self.warn_seconds >= self.idle_seconds:
+            raise ConfigError("warning lead time must be shorter than the idle timeout")
+        if self.admin_key and len(self.admin_key) < 32:
+            raise ConfigError("CHUDWARE_DEMO_ADMIN_KEY must be at least 32 characters")
         if not 1024 <= self.port_base <= 65535 - self.port_count:
             raise ConfigError("CHUDWARE_DEMO_PORT_BASE/PORT_COUNT leave the valid port range")
         if self.port_count < self.max_active:
@@ -259,6 +286,8 @@ class DemoConfig:
             raise ConfigError("CHUDWARE_DEMO_COOKIE_KEY must be at least 32 characters")
         self.session_root = Path(self.session_root)
         self.state_dir = Path(self.state_dir)
+        self.workspace_root = (Path(self.workspace_root) if self.workspace_root is not None
+                               else self.state_dir / "workspaces")
 
     @property
     def ai_enabled(self) -> bool:
@@ -299,17 +328,22 @@ class DemoConfig:
         if not _TAG_RE.fullmatch(tag):
             raise ConfigError("CHUDWARE_DEMO_IMAGE_TAG is not a valid image tag")
         cookie_key = get("COOKIE_KEY")
+        state_dir = Path(get("STATE_DIR")) if get("STATE_DIR") else default_state_dir(env)
         raw_nvidia = get("NVIDIA_MODELS")
         nvidia_models = () if raw_nvidia == "none" else _csv(raw_nvidia) or DEFAULT_NVIDIA_MODELS
         return cls(
             public_hosts=_csv(get("PUBLIC_HOSTS")) or DEFAULT_PUBLIC_HOSTS,
             cookie_key=cookie_key.encode("utf-8"),
             cookie_key_persistent=bool(cookie_key),
+            admin_key=get("ADMIN_KEY").encode("utf-8"),
             max_active=num("MAX_ACTIVE", 3),
             max_queue=num("MAX_QUEUE", 30),
             idle_seconds=num("IDLE_SECONDS", 15 * 60),
-            hard_seconds=num("HARD_SECONDS", 45 * 60),
             warn_seconds=num("WARN_SECONDS", 5 * 60),
+            workspace_root=(Path(get("WORKSPACE_ROOT")) if get("WORKSPACE_ROOT")
+                            else state_dir / "workspaces"),
+            workspace_quota_bytes=num("WORKSPACE_QUOTA_MIB", 1024) * MIB,
+            workspaces_total_bytes=num("WORKSPACES_TOTAL_MIB", 20 * 1024) * MIB,
             queue_poll_timeout=num("QUEUE_POLL_TIMEOUT", 60),
             start_timeout=num("START_TIMEOUT", 90),
             join_limit=num("JOIN_LIMIT", 6),
@@ -335,7 +369,7 @@ class DemoConfig:
             image=f"{get('IMAGE_REPO', DEFAULT_IMAGE_REPO)}:{tag}",
             podman_bin=get("PODMAN_BIN", "podman"),
             session_root=Path(get("SESSION_ROOT")) if get("SESSION_ROOT") else default_session_root(env),
-            state_dir=Path(get("STATE_DIR")) if get("STATE_DIR") else default_state_dir(env),
+            state_dir=state_dir,
             port_base=num("PORT_BASE", 18300),
             port_count=num("PORT_COUNT", 64),
             cpus=get("CPUS", "2"),

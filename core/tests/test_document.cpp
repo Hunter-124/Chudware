@@ -10831,6 +10831,66 @@ TEST_CASE("detached open reuses authored display cache after a unique-name chang
     std::filesystem::remove(changed);
 }
 
+TEST_CASE("reuse-open of one file never waits on another busy document") {
+    // A large assembly can hold its document lock for minutes (rebuild, picks). Opening a
+    // different file must not wait for it just to check whether its own path is open.
+    using namespace chudware::doc;
+    using Clock = std::chrono::steady_clock;
+    const std::string busy = doc_new("part", "BusyDoc").at("doc_id");
+    const std::string seed = doc_new("part", "OpenTarget").at("doc_id");
+    const auto dir = std::filesystem::temp_directory_path() / (seed + "-busy-open");
+    std::filesystem::create_directories(dir);
+    const auto busy_path = dir / "busy.step+";
+    const auto path = dir / "target.step+";
+    std::vector<std::string> ids{busy};
+    struct Cleanup {
+        std::filesystem::path dir;
+        std::vector<std::string>& ids;
+        ~Cleanup() {
+            for (const auto& id : ids) try { doc_close(id); } catch (...) {}
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir, ids};
+    doc_save(busy, busy_path.string());
+    doc_save(seed, path.string());
+    REQUIRE(doc_close(seed));
+
+    struct Barrier {
+        std::atomic<bool> held{false};
+        std::atomic<bool> release{false};
+    } barrier;
+    std::thread holder([&] {
+        with_doc_lock_for_testing(busy, [](void* context) {
+            auto& state = *static_cast<Barrier*>(context);
+            const auto deadline = Clock::now() + std::chrono::seconds(10);
+            state.held.store(true, std::memory_order_release);
+            while (!state.release.load(std::memory_order_acquire) && Clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }, &barrier);
+    });
+    struct Join {
+        Barrier& barrier;
+        std::thread& holder;
+        ~Join() {
+            barrier.release.store(true, std::memory_order_release);
+            if (holder.joinable()) holder.join();
+        }
+    } join{barrier, holder};
+    const auto ready_deadline = Clock::now() + std::chrono::seconds(1);
+    while (!barrier.held.load(std::memory_order_acquire) && Clock::now() < ready_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(barrier.held.load(std::memory_order_acquire));
+
+    const auto opened_at = Clock::now();
+    const json opened = doc_open(path.string(), false, false, false, true);
+    CHECK(Clock::now() - opened_at < std::chrono::seconds(5));  // the holder keeps it 10 s
+    ids.push_back(opened.at("doc_id"));
+    const json again = doc_open(path.string(), false, false, false, true);
+    CHECK(again.at("reused") == true);
+    CHECK(again.at("doc_id") == opened.at("doc_id"));
+}
+
 TEST_CASE("native path reuse, guarded save and in-place cached reload") {
     using namespace chudware::doc;
     const std::string seed = doc_new("part", "ReuseSeed").at("doc_id");

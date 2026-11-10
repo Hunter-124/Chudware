@@ -336,6 +336,10 @@ struct Session {
     std::vector<std::string> redo_stack;
     bool dirty = false;
     std::string path;                                  // current .step+ path (or empty)
+    // Copy of `path` guarded by g_path_index_mtx, not `mtx`: open-by-path lookups must
+    // not wait for a busy document (a large assembly rebuilding for minutes) just to
+    // read where it lives. Write both through set_session_path().
+    std::string path_index;
     NativeFileStamp file_stamp;  // last file version opened or published by this session
     // Only freshly minted, never persisted parts can prove there are no unknown
     // persisted consumers of their feature IDs. Embedded/opened parts cannot.
@@ -794,6 +798,14 @@ void drain_tracked_background_tasks() {
 }
 // Serializes lookup-or-open with every native path binding save.
 std::mutex g_open_path_mtx;
+// Leaf lock for Session::path_index; never held while taking another lock.
+std::mutex g_path_index_mtx;
+
+static void set_session_path(Session& s, std::string path) {
+    s.path = path;
+    std::lock_guard<std::mutex> index(g_path_index_mtx);
+    s.path_index = std::move(path);
+}
 
 // Assembly source snapshots and the reverse dependency index never hold a
 // document lock while looking up another document. Immutable compiled payloads
@@ -10566,14 +10578,18 @@ static std::string find_open_by_path_except(const std::string& path, const std::
     }
     for (const auto& [id, sp] : pins) {
         if (id == exclude || !sp->owns_journal) continue;
-        std::lock_guard<std::mutex> doc(sp->mtx);
-        if (sp->path.empty()) continue;
+        std::string bound;
+        {
+            std::lock_guard<std::mutex> index(g_path_index_mtx);
+            bound = sp->path_index;
+        }
+        if (bound.empty()) continue;
         std::error_code equivalent_ec;
-        if (fs::equivalent(fs::u8path(sp->path), fs::u8path(path), equivalent_ec) &&
+        if (fs::equivalent(fs::u8path(bound), fs::u8path(path), equivalent_ec) &&
             !equivalent_ec) return id;  // inode/file index, including hard links
         std::error_code have_ec;
-        fs::path have = fs::weakly_canonical(fs::u8path(sp->path), have_ec);
-        if (have_ec) have = fs::absolute(fs::u8path(sp->path), have_ec).lexically_normal();
+        fs::path have = fs::weakly_canonical(fs::u8path(bound), have_ec);
+        if (have_ec) have = fs::absolute(fs::u8path(bound), have_ec).lexically_normal();
         if (have == wanted) return id;
     }
     return {};
@@ -24038,7 +24054,7 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
         if (std::string(name) == "cache.json") cache_diag["written"] = true;
     }
     if (s.is_assembly()) s.doc = std::move(saved_doc);
-    s.path = out;
+    set_session_path(s, out);
     s.file_stamp = published_stamp;
     s.source_doc_hash = stepplus_doc_hash(s.doc);
     s.unverified_source_doc.reset();
@@ -25057,10 +25073,10 @@ static json doc_open_impl(const std::string& path, bool as_solid, bool detach_pa
         sp->is_assembly() && (loaded.extra.count("cache.json") || !detach_path)
             ? stepplus_doc_hash(sp->doc) : std::string();
     sp->revision = 0;
-    sp->path = detach_path ? std::string() : path;
+    set_session_path(*sp, detach_path ? std::string() : path);
     sp->file_stamp = opened_stamp;
     if (recovered && detach_path && !recovery_original_path.empty()) {
-        sp->path = recovery_original_path;
+        set_session_path(*sp, recovery_original_path);
         const NativeFileStamp base = stepplus_file_stamp(recovery_original_path);
         const json actual = base.valid ? json{{"size", base.size}, {"mtime_ns", base.mtime_ns},
                                                {"ino", base.ino}} : json(nullptr);
@@ -25300,7 +25316,7 @@ static json doc_open_impl(const std::string& path, bool as_solid, bool detach_pa
     }
     if (for_reload) {
         DocLock lock;
-        require_session(opened_doc_id).path.clear();
+        set_session_path(require_session(opened_doc_id), {});
         resp["drawings"] = json::array();
         rollback.committed = true;
         return resp;

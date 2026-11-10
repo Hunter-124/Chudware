@@ -213,14 +213,17 @@ void Autosave::stop(bool keepForRecovery) {
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
     if (engineState_ && engineState_->load() == 1 && !sessionDir_.empty()) {
-        // A failed capture is not an up-to-date snapshot. Keep the daemon alive
-        // and retry, including with periodic autosave disabled, rather than
-        // destroying the only in-memory copy on ordinary shutdown.
-        bool firstPass = true;
-        while (!saveDirtyDocs(firstPass)) {
-            firstPass = false;
+        // A failed capture is not an up-to-date snapshot, so retry briefly (a capture can
+        // lose a race with in-flight work). The retry is bounded: a document that can never
+        // be captured used to hold an idle-exited daemon alive forever. After the bound the
+        // earlier snapshots in the session dir are still migrated for recovery below.
+        constexpr int kMaxShutdownPasses = 10;
+        bool saved = false;
+        for (int pass = 0; pass < kMaxShutdownPasses && !(saved = saveDirtyDocs(pass == 0)); ++pass)
             std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+        if (!saved)
+            log().line("autosave: final snapshot still failing after %d passes — exiting "
+                       "with the last good snapshots", kMaxShutdownPasses);
         migrateSession(sessionDir_);
     }
     log().line("autosave: %s shutdown preserved non-discarded work",

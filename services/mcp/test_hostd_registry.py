@@ -1719,10 +1719,7 @@ def test_an_ai_edit_presents_its_document_and_only_the_latest_stays_presented(sc
         revisions = {}
 
         def edit(client, doc, name):
-            ops = [{"op": "add_feature", "feature": {
-                "type": "box", "name": name, "refs": {},
-                "params": {"length": 10, "width": 10, "height": 10}}}]
-            reply = client.call("doc_apply_ops", {"doc_id": doc, "ops": ops})
+            reply = client.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops(name)})
             assert reply.get("_is_error") is None and reply.get("ok") is not False, reply
             revisions[doc] = revisions.get(doc, 0) + 1
             assert reply["revision"] == revisions[doc], reply

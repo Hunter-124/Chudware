@@ -264,7 +264,9 @@ bool canFocusAiPart(AppState& st, bool rateLimited) {
         return false;
     if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return true;
     const AppState::DocTab& tab = st.docTabs[st.activeTab];
-    return tab.kind == AppState::DocTab::TabKind::Part && !tab.dirty && !tabMidEdit(tab);
+    const bool model = tab.kind == AppState::DocTab::TabKind::Part ||
+                       tab.kind == AppState::DocTab::TabKind::Assembly;
+    return model && !tab.dirty && !tabMidEdit(tab);
 }
 
 // Only the newest AI part stays open: older mirrors of AI work the user has not touched are

@@ -28,6 +28,13 @@
   let eta = null;
   let etaSince = 0;
   let running = false;
+  // Most joins are admitted within a second or two. The queue panel only appears
+  // if the visitor is *still* queued after this grace period, so someone who gets
+  // straight in never sees a queue flash past.
+  const QUEUE_SHOW_AFTER_MS = 3000;
+  let queuedAt = 0;
+  let queueTimer = 0;
+  let lastStatus = null;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -61,6 +68,11 @@
 
   function render(s) {
     state = s.state;
+    lastStatus = s;
+    if (s.state !== 'queued') {
+      queuedAt = 0;
+      if (queueTimer) { clearTimeout(queueTimer); queueTimer = 0; }
+    }
     $('max-sessions').textContent = String(s.max_sessions || 3);
     $('load').textContent = s.state === 'queued' || s.state === 'starting'
       ? s.active_sessions + ' of ' + s.max_sessions + ' sessions running, ' + s.queue_length + ' waiting'
@@ -74,6 +86,15 @@
       $('ai').textContent = 'AI is not enabled on this server right now.';
     }
     if (s.state === 'queued') {
+      if (!queuedAt) {
+        queuedAt = performance.now();
+        queueTimer = setTimeout(() => { if (state === 'queued' && lastStatus) render(lastStatus); },
+                                QUEUE_SHOW_AFTER_MS);
+      }
+      if (performance.now() - queuedAt < QUEUE_SHOW_AFTER_MS) {
+        show('starting');            // admitted almost immediately: no queue flash
+        return;
+      }
       show('queue');
       $('position').textContent = String(s.position);
       $('capacity').hidden = s.note !== 'capacity';

@@ -885,39 +885,17 @@
         };
       }
 
-      // ---- banner ----
-      function remainingSeconds() {
-        if (!state) return null;
-        var at = [];
-        if (typeof state.idle_expires_at === 'number') at.push(state.idle_expires_at);
-        if (typeof state.hard_expires_at === 'number') at.push(state.hard_expires_at);
-        if (!at.length) return null;
-        return Math.min.apply(null, at) - (Date.now() / 1000 + clockOffset);
-      }
+      // ---- banner: deliberately never shown ----
+      // Idle sleep is standard behaviour, not something to warn about: there is
+      // no countdown strip looming over the workspace. The banner element stays
+      // hidden for the whole session; the only demo UI a visitor ever sees is
+      // the "workspace asleep" overlay in end(), after the container has
+      // actually stopped. (The Download button inside the hidden strip is
+      // reachable the same way as before a sleep, from the landing page.)
       function render() {
         if (finished) return;
-        var show = !!state && state.state === 'active';
-        document.documentElement.style.setProperty('--demo-banner-h', show ? BANNER_H : '0px');
-        banner.classList.toggle('visible', show);
-        if (!show) return;
-        var secs = remainingSeconds();
-        var left = '';
-        if (secs !== null) {
-          var mins = Math.max(0, Math.ceil(secs / 60));
-          left = mins <= 1 ? 'less than a minute left' : mins + ' min left';
-        }
-        var warn = state.warn === true;
-        banner.classList.toggle('warn', warn);
-        banner.classList.toggle('critical', warn && secs !== null && secs <= 60);
-        var text = warn
-          ? 'Workspace going to sleep soon \u2014 save your work' + (left ? ' (' + left + ')' : '')
-          : 'Demo workspace' + (left ? ' \u2014 sleeps in ' + left : '');
-        if (downloadNote) text = downloadNote;
-        if (msgEl.textContent !== text) msgEl.textContent = text;
-        // Free models carry no limit; Claude has its own caps.
-        var aiText = state.free_ai_available === true ? 'Free models available' : '';
-        if (state.claude_available === true) aiText = 'Claude 5.5 available' + (aiText ? ' \u00b7 ' + aiText : '');
-        if (aiEl.textContent !== aiText) aiEl.textContent = aiText;
+        document.documentElement.style.setProperty('--demo-banner-h', '0px');
+        banner.classList.remove('visible', 'warn', 'critical');
       }
       function noteDownload(text, ms) {
         downloadNote = text;

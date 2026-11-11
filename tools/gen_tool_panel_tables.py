@@ -190,8 +190,9 @@ def render_header(snap: dict) -> str:
 
 def emit() -> int:
     snap = build_snapshot()
-    SNAPSHOT.write_text(json.dumps(snap, indent=1, ensure_ascii=False) + "\n")
-    HEADER.write_text(render_header(snap))
+    SNAPSHOT.write_text(json.dumps(snap, indent=1, ensure_ascii=False) + "\n",
+                        encoding="utf-8", newline="\n")
+    HEADER.write_text(render_header(snap), encoding="utf-8", newline="\n")
     total = sum(len(v) for v in snap["fam_tools"].values())
     print(f"emit: {total} tools across {len(snap['families'])} families, "
           f"{len(snap['descs'])} descriptions, "
@@ -207,12 +208,12 @@ def check() -> int:
               "tools/gen_tool_panel_tables.py")
         return 1
     try:
-        snap = json.loads(SNAPSHOT.read_text())
+        snap = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
         want = render_header(snap)
     except Exception as exc:  # noqa: BLE001
         print(f"FAIL tool_panel_sync: unreadable snapshot: {exc}")
         return 1
-    have = HEADER.read_text()
+    have = HEADER.read_text(encoding="utf-8")
     if have != want:
         print("FAIL tool_panel_sync: header does not match snapshot — re-run "
               "tools/gen_tool_panel_tables.py")

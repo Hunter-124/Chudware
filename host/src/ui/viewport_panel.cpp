@@ -4526,7 +4526,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 (pm->activeWellWantsAxis() || pm->activeWellWantsPlane());
             if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && selectionHovered &&
                 !s_viewSelector.active() && !s_lmbDragActive && !pmOwnsAxisPlane &&
-                st.originVisEff) {
+                st.originVisEff && !ui::workspaceHomeActive(st)) {
                 // Pick hitbox stays a generous fixed pixel radius (not zoom-dependent).
                 const float grabRadius = 20.0f * ui::uiScale;
                 // ITEM 14: DRAWN ring is a smaller fixed pixel radius — NOT grabRadius*0.8 and
@@ -4601,6 +4601,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const bool pmOwnsPlaneWell = pm && pm->active() && pm->activeWellWantsPlane();
             const bool pmOwnsAxisWell  = pm && pm->active() && pm->activeWellWantsAxis();
             if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && selectionHovered &&
+                !ui::workspaceHomeActive(st) &&
                 !s_viewSelector.active() && !s_lmbDragActive && !originPickHot &&
                 !pmOwnsAxisWell && !pmOwnsPlaneWell && !s_pp.active && !s_dim.active) {
                 ImVec2 a, b;
@@ -4652,7 +4653,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Wave4: also suppressed while the origin grab radius owns the cursor (origin wins).
         bool pointPickerHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
-            !originPickHot && !planePickerHot && !axisPickerHot)
+            !originPickHot && !planePickerHot && !axisPickerHot && !ui::workspaceHomeActive(st))
             pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- sweep/loft path picker (click a displayed helix / curve to set it as the path) ----
@@ -4671,7 +4672,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         bool datumSelectHot = false;
         if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !originPickHot && !planePickerHot && !axisPickerHot && !pointPickerHot &&
-            !curvePickerHot && !axisSelectHot)
+            !curvePickerHot && !axisSelectHot && !ui::workspaceHomeActive(st))
             datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, selectionHovered);
 
         // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----

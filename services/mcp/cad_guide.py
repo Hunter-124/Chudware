@@ -862,8 +862,9 @@ PRESENTATION & SAVE DISCIPLINE
   are refused after resolving symlinks. Pathless saves keep an existing native file
   in place, otherwise use CHUDWARE_PROJECT_SAVE_DIR (temp only with no project).
   Native STL export refuses collinear (zero-area) facets or a source-solid mesh that is not
-  closed and consistently oriented in the serialized output. It omits only facets whose
-  corners serialize to one point (zero boundary), and mesh exports tessellate without
+  closed and consistently oriented in the serialized output. It omits only zero-boundary
+  facets: those whose corners serialize to one point, and pairs in one solid that
+  serialize to the same triangle with opposite winding; mesh exports tessellate without
   edges under 10 nm (boolean residue BRepMesh cannot mesh across). validation_stages
   separates passed facet checks from the explicitly skipped B-rep round-trip; it is not
   mesh reimport proof. It does not weld nearby points. On a refusal, the error detail names

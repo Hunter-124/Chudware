@@ -2492,6 +2492,53 @@ Handle(Poly_Triangulation) stl_triangulation(const TopoDS_Shape& shape, bool asc
             return p[0] == p[1] || p[1] == p[2] || p[0] == p[2];
         }), kept.end());
     }
+    // Omit pairs of facets of one solid that serialize to the same three points with
+    // opposite winding: where a fillet tapers to nothing BRepMesh can fan one face over its
+    // neighbour, double-covering a strip. A pair sums to zero boundary and zero area, so
+    // omitting both moves nothing; validate_stl_solid still proves each solid closed. Only
+    // within a solid, so two separate solids touching face to face keep their faces.
+    using Corner = std::array<double, 3>;
+    using Triple = std::array<Corner, 3>;
+    auto canonical = [](Triple t) {
+        const auto first = std::min_element(t.begin(), t.end()) - t.begin();
+        return Triple{t[first], t[(first + 1) % 3], t[(first + 2) % 3]};
+    };
+    std::vector<std::vector<bool>> cancelled(facets.size());
+    for (std::size_t i = 0; i < facets.size(); ++i) cancelled[i].assign(facets[i].size(), false);
+    for (TopExp_Explorer sx(shape, TopAbs_SOLID); sx.More(); sx.Next()) {
+        std::map<Triple, std::vector<std::pair<std::size_t, std::size_t>>> open;
+        for (TopExp_Explorer fx(sx.Current(), TopAbs_FACE); fx.More(); fx.Next()) {
+            const TopoDS_Face face = TopoDS::Face(fx.Current());
+            const std::size_t fi = static_cast<std::size_t>(faces.FindIndex(face)) - 1;
+            TopLoc_Location loc;
+            const auto& tri = BRep_Tool::Triangulation(face, loc);
+            const gp_Trsf trsf = loc.Transformation();
+            for (std::size_t k = 0; k < facets[fi].size(); ++k) {
+                if (cancelled[fi][k]) continue;
+                int n[3];
+                facets[fi][k].Get(n[0], n[1], n[2]);
+                if (face.Orientation() == TopAbs_REVERSED) std::swap(n[1], n[2]);
+                Triple t;
+                for (int c = 0; c < 3; ++c)
+                    t[c] = stl_position(tri->Node(n[c]).Transformed(trsf), ascii);
+                const Triple key = canonical(t);
+                const auto reverse = open.find(canonical({t[0], t[2], t[1]}));
+                if (reverse != open.end() && !reverse->second.empty()) {
+                    const auto [rf, rk] = reverse->second.back();
+                    reverse->second.pop_back();
+                    cancelled[rf][rk] = cancelled[fi][k] = true;
+                } else {
+                    open[key].emplace_back(fi, k);
+                }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < facets.size(); ++i) {
+        std::size_t kept = 0;
+        for (std::size_t k = 0; k < facets[i].size(); ++k)
+            if (!cancelled[i][k]) facets[i][kept++] = facets[i][k];
+        facets[i].resize(kept);
+    }
     int nodes = 0, count = 0;
     for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
         const TopoDS_Face face = TopoDS::Face(ex.Current());

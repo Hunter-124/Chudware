@@ -428,6 +428,17 @@ static bool featureEyeShown(AppState& st, const std::string& fid,
     }
     return st.hiddenFeatures.find(fid) == st.hiddenFeatures.end();
 }
+// Only rows the user shows/hides as standalone geometry carry an eye: sketches, curves and
+// reference geometry. Solid/surface-producing features don't — their bodies are shown/hidden from
+// the Solid Bodies folder (assembly components carry their own eye on the component row).
+static bool featureRowHasEye(const std::string& type, const char* iconName) {
+    if (type == "sketch" || type == "sketch3d" || type == "helix" || type == "curve") return true;
+    if (iconName && std::strcmp(iconName, "sketch_node") == 0) return true;
+    return type == "plane" || type == "datum_plane" || type == "ref_plane" ||
+           type == "axis"  || type == "datum_axis"  || type == "ref_axis"  ||
+           type == "point" || type == "datum_point" || type == "ref_point" ||
+           type == "csys"  || type == "coordinate_system" || type == "ref_csys";
+}
 // Flip a feature's visibility. Body-owning => toggle every owned body (reuses setBodyShown so the
 // Solid Bodies folder agrees); other features => flip hiddenFeatures membership (the sketch-ghost
 // renderer honors it).
@@ -1672,8 +1683,9 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // The visible name is elided against the eye column (+ the status dot when this row shows one,
     // measured at the ambient ItemSpacing featureBadge lays out with) so it never runs under them.
     const float iconPx = std::min(16.0f * ui::uiScale, ImGui::GetFontSize());
-    const float rightReserve =
-        fmEyeColumnW() + (fmBadgeShown(c.fs.ok, c.fs.dangling, c.rolledBack) ? fmBadgeW() : 0.0f);
+    const bool hasEye = featureRowHasEye(c.type, c.iconName);
+    const float rightReserve = (hasEye ? fmEyeColumnW() : 0.0f) +
+        (fmBadgeShown(c.fs.ok, c.fs.dangling, c.rolledBack) ? fmBadgeW() : 0.0f);
     std::string suppressedName;
     const std::string& fullName = c.suppressed
         ? (suppressedName = c.name + " [S]") : c.name;
@@ -1734,7 +1746,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     float  eyePad  = 6.0f  * ui::uiScale;
     ImVec2 eyeMin(nodeMax.x - eyeSz - eyePad, nodeMin.y + (nodeMax.y - nodeMin.y - eyeSz) * 0.5f);
     ImVec2 eyeMax(eyeMin.x + eyeSz, eyeMin.y + eyeSz);
-    bool   overEye = ImGui::IsMouseHoveringRect(eyeMin, eyeMax);
+    bool   overEye = hasEye && ImGui::IsMouseHoveringRect(eyeMin, eyeMax);
 
     // ---- click classification (defer the actual selection change to the caller) ----
     bool itemHovered = ImGui::IsItemHovered();
@@ -1985,10 +1997,10 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 
     ui::popContextMenuStyle();
 
-    // ---- per-feature eye toggle (every row, right edge) ----
-    // Hidden body-owning features hide their bodies; hidden sketches/datums drop out of the ghost
-    // overlay. The glyph dims when hidden, with a slash (the atlas carries one eye icon, not a pair).
-    {
+    // ---- per-feature eye toggle (sketch/curve/reference rows only, right edge) ----
+    // Hidden sketches/datums drop out of the ghost overlay. The glyph dims when hidden, with a
+    // slash (the atlas carries one eye icon, not a pair).
+    if (hasEye) {
         bool shown = featureEyeShown(st, fid, c.ownedBodies);
         ImDrawList* eyeDl = ImGui::GetWindowDrawList();
         drawEyeGlyph(eyeDl, eyeMin, eyeMax, shown, overEye, fmSurf());

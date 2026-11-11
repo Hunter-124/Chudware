@@ -70,6 +70,8 @@
 #include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
+#include <BndLib_AddSurface.hxx>
+#include <Precision.hxx>
 #include <Poly_Triangulation.hxx>
 #include <Standard_Failure.hxx>
 #include <TopLoc_Location.hxx>
@@ -7610,10 +7612,74 @@ bool same_bodies(const CompileResult& a, const CompileResult& b) {
     return true;
 }
 
+// Exact (analytic, mesh-free) bounds of `shape`, as BRepBndLib::AddOptimal reports them.
+// AddOptimal bounds every face on its own, and for a torus or a spline that is a numeric
+// optimization costing tens of milliseconds: a body with a few hundred fillet faces spent
+// seconds here after every edit. A face whose cheap conservative box already lies inside
+// the bounds found so far cannot move them, so only the faces that reach the outside of
+// the body are optimized. Largest faces go first: they set the bounds the rest hide in.
+// "Inside" allows Precision::Confusion(): a fillet tangent to the top face reaches that
+// face's plane to within rounding, and the optimizer itself resolves no finer.
+static void add_exact_bounds(const TopoDS_Shape& shape, Bnd_Box& box) {
+    struct Candidate {
+        TopoDS_Face face;
+        double lo[3], hi[3];
+        double diagonal = 0.0;
+        bool bounded = false;  // lo/hi are a guaranteed enclosure of the face
+    };
+    std::vector<Candidate> faces;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        Candidate c;
+        c.face = TopoDS::Face(ex.Current());
+        // BndLib encloses these surface types analytically (or by their control net);
+        // the rest it samples, which is no guarantee.
+        const BRepAdaptor_Surface surface(c.face, Standard_True);
+        const GeomAbs_SurfaceType type = surface.GetType();
+        const bool enclosed = type == GeomAbs_Plane || type == GeomAbs_Cylinder ||
+                              type == GeomAbs_Cone || type == GeomAbs_Sphere ||
+                              type == GeomAbs_Torus || type == GeomAbs_BezierSurface ||
+                              type == GeomAbs_BSplineSurface;
+        Bnd_Box rough;
+        rough.SetGap(0.0);
+        if (enclosed) BndLib_AddSurface::Add(surface, 0.0, rough);
+        if (!rough.IsVoid() && !rough.IsOpen()) {
+            rough.Get(c.lo[0], c.lo[1], c.lo[2], c.hi[0], c.hi[1], c.hi[2]);
+            c.diagonal = std::sqrt(rough.SquareExtent());
+            c.bounded = true;
+        } else {
+            c.diagonal = std::numeric_limits<double>::max();  // unknown extent: decide first
+        }
+        faces.push_back(std::move(c));
+    }
+    std::stable_sort(faces.begin(), faces.end(),
+                     [](const Candidate& a, const Candidate& b) { return a.diagonal > b.diagonal; });
+    Bnd_Box exact;
+    for (const Candidate& c : faces) {
+        if (c.bounded && !exact.IsVoid() && !exact.IsOpen()) {
+            double lo[3], hi[3];
+            exact.Get(lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+            bool inside = true;
+            for (int k = 0; k < 3; ++k)
+                inside = inside && c.lo[k] >= lo[k] - Precision::Confusion() &&
+                         c.hi[k] <= hi[k] + Precision::Confusion();
+            if (inside) continue;
+        }
+        BRepBndLib::AddOptimal(c.face, exact, /*useTriangulation=*/Standard_False,
+                               /*useShapeTolerance=*/Standard_False);
+    }
+    // Wires, edges and vertices that belong to no face (reference curves and points).
+    for (TopExp_Explorer ex(shape, TopAbs_EDGE, TopAbs_FACE); ex.More(); ex.Next())
+        BRepBndLib::AddOptimal(ex.Current(), exact, Standard_False, Standard_False);
+    for (TopExp_Explorer ex(shape, TopAbs_VERTEX, TopAbs_EDGE); ex.More(); ex.Next())
+        exact.Add(BRep_Tool::Pnt(TopoDS::Vertex(ex.Current())));
+    box.Add(exact);
+}
+
 // Exact (no mesh, no gap) bounds of each shape, computed in parallel. AddOptimal runs a
-// particle-swarm search on every swept/revolved/B-spline face, ~0.5 s a body on a 44-sweep
-// harness and independent per body, so the bodies are spread over the governor's thread
-// budget. The caller merges the boxes in body order, so the result is deterministic.
+// particle-swarm search on every swept/revolved/B-spline face that reaches the body's
+// extents, ~0.5 s a body on a 44-sweep harness and independent per body, so the bodies are
+// spread over the governor's thread budget. The caller merges the boxes in body order, so
+// the result is deterministic.
 std::vector<Bnd_Box> exact_bounds_per_shape(const std::vector<TopoDS_Shape>& shapes) {
     std::vector<Bnd_Box> boxes(shapes.size());
     std::atomic<std::size_t> next{0};
@@ -7621,8 +7687,7 @@ std::vector<Bnd_Box> exact_bounds_per_shape(const std::vector<TopoDS_Shape>& sha
         for (std::size_t i = next.fetch_add(1); i < shapes.size(); i = next.fetch_add(1)) {
             if (shapes[i].IsNull()) continue;
             try {
-                BRepBndLib::AddOptimal(shapes[i], boxes[i], /*useTriangulation=*/Standard_False,
-                                       /*useShapeTolerance=*/Standard_False);
+                add_exact_bounds(shapes[i], boxes[i]);
             } catch (const Standard_Failure&) {
                 boxes[i] = Bnd_Box();
             }

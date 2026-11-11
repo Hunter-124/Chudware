@@ -1784,6 +1784,29 @@ TEST_CASE("doc_bbox reports the analytic box, not the padded triangulation") {
         for (int i = 0; i < 3; ++i)
             CHECK(s[i].get<double>() == doctest::Approx(24.0).epsilon(1e-12));
     }
+    // Rounded edges lie inside the box their neighbours span, so they are not bounded
+    // one by one; the reported size is still the block's.
+    {
+        json nr = doc_new("part", "BboxRound");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", json{{"type", "box"}, {"name", "B"},
+                {"params", {{"width", dim(40)}, {"length", dim(60)}, {"height", dim(20)}}}}}},
+            json{{"op", "add_feature"}, {"feature", json{{"type", "fillet"}, {"name", "F"},
+                {"params", {{"radius", dim(3)}}},
+                {"refs", {{"edges", {{"of", "edge"}, {"side", "top"}}}}}}}}});
+        json resp = doc_apply_ops(id, -1, ops, false);
+        REQUIRE_MESSAGE(resp.at("rebuild").at("ok").get<bool>(), resp.dump().substr(0, 400));
+        json s = chudware::doc::doc_bbox(id).at("size");
+        std::vector<double> got{s[0].get<double>(), s[1].get<double>(), s[2].get<double>()};
+        std::sort(got.begin(), got.end());
+        CHECK(got[0] == doctest::Approx(20.0).epsilon(1e-12));
+        CHECK(got[1] == doctest::Approx(40.0).epsilon(1e-12));
+        CHECK(got[2] == doctest::Approx(60.0).epsilon(1e-12));
+        // The reply's exact stats are the same box.
+        const json& exact = resp.at("exact").at("bbox").at("size");
+        for (int i = 0; i < 3; ++i) CHECK(exact[i].get<double>() == s[i].get<double>());
+    }
 }
 
 // 1i. PRIMITIVE `axis`: the feature-level orientation param. Before this, primitives were

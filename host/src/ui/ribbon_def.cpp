@@ -457,14 +457,14 @@ static const RibbonCmd kCmds[] = {
     { "appr_mat_steel",      "Steel",           "appr_steel",       "Appearance", "Material", true,  nullptr, false },
     { "appr_mat_brass",      "Brass",           "appr_brass",       "Appearance", "Material", true,  nullptr, false },
     { "appr_mat_dark",       "Dark Metal",      "appr_dark",        "Appearance", "Material", true,  nullptr, false },
-    { "appr_clear",          "Clear",           "refresh",          "Appearance", "Material", false, nullptr, false },
+    { "appr_clear",          "Clear",           "refresh",          "Appearance", "Material", true,  nullptr, false },
 
     // --- Group: Display --- (sets st.displayStyle; the viewport applies it each frame) ---
     { "display_shaded",       "Shaded",          "display_shaded",       "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
     { "display_shaded_edges", "Shaded Edges",    "display_shaded_edges", "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
     { "display_hlr",          "Hidden Removed",  "display_hlr",          "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
-    { "display_hlv",          "Hidden Visible",  "display_hlv",          "Appearance", "Display", false, nullptr, false, CommandCapability::Inspect },
-    { "display_wireframe",    "Wireframe",       "display_wireframe",    "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
+    { "display_hlv",          "Hidden Visible",  "display_hlv",          "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
+    { "display_wireframe",    "Wireframe",      "display_wireframe",    "Appearance", "Display", true,  nullptr, false, CommandCapability::Inspect },
 
     // =========================================================================
     // Polygon flyout variants (parent: sk_polygon, big=false). Each arms the

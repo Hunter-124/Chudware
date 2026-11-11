@@ -15,6 +15,7 @@
 #include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
 #include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
 #include "kit.h"
+#include "sketch_relations_strip.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -668,44 +669,40 @@ static float ribbon_bigBtnWMax(const RibbonGroup& grp, const ui::RibbonCmd* cmd,
     return w;
 }
 
-// N1-N5: the same widest-variant rule for the degraded "big-as-small" row (icon + side label).
-// Mirrors ribbon_bigBtnAsSmall's width (ribbon_smBtnW + optional drop-arrow slot) but over the
-// widest of {parent, injected default, every variant} label so the packed column reserves enough.
-static float ribbon_bigBtnAsSmallWMax(const RibbonGroup& grp, const ui::RibbonCmd* cmd, bool drop) {
-    float s = ui::uiScale;
-    float w = ribbon_smBtnW(cmd->label);
-    if (drop) {
-        if (!ribbon_isLauncher(cmd->cmd_id)) {   // launcher face never changes
-            if (const ParentDefault* pd = ribbon_parentDefault(cmd->cmd_id))
-                w = ImMax(w, ribbon_smBtnW(pd->defaultLabel));
-            for (const auto* sc : grp.subCmds)
-                if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
-                    w = ImMax(w, ribbon_smBtnW(sc->label));
-        }
-        // Snap the trailing arrow slot so mainW + dropW == totalW on the pixel grid.
-        w += snap(kDropArrowW * s);
+// Width of a degraded big command: a square icon-only tile one grid row tall, plus the trailing
+// arrow slot for a split button. The label moves to the tooltip. Degrading to icon + side label
+// instead produced strips several times wider than their visible text (each split row reserved
+// its widest variant's label), so a squeezed group read as a grid of stretched bars.
+static float ribbon_bigBtnAsSmallWMax(bool drop) {
+    // Snap the trailing arrow slot so mainW + dropW == totalW on the pixel grid.
+    return ribbon_smRowH() + (drop ? snap(kDropArrowW * ui::uiScale) : 0.0f);
+}
+
+// Pack a degraded group's rows: icon tiles (degraded big cmds) and labeled small rows each fill
+// their own columns, so a square tile never shares a column with — and stretches to — a label.
+// Column indices address the combined row list (tiles first, then small rows).
+static std::vector<SmColumn> ribbon_packRows(const std::vector<float>& tileWidths,
+                                             const std::vector<float>& rowWidths) {
+    const int rows = ribbon_rowsPerCol();
+    auto cols = ribbon_packColumns(tileWidths, rows);
+    for (SmColumn c : ribbon_packColumns(rowWidths, rows)) {
+        c.first += (int)tileWidths.size();
+        cols.push_back(c);
     }
-    return w;
+    return cols;
 }
 
 // C25c FIX (defect 1): measured width of the small-button zone for a group, packing rows into
 // independently-measured columns (each column's width = its widest row, not the group-wide max).
-// `extraSmallRows` are big-cmd labels that degrade to small rows (COL_SMALL/COL_LABEL).
+// `extraSmallRows` are big cmds that degrade to icon tiles (COL_SMALL/COL_LABEL).
 static float ribbon_smZoneW(const RibbonGroup& grp,
                             const std::vector<const ui::RibbonCmd*>& extraSmallRows) {
-    std::vector<float> widths;
-    widths.reserve(grp.smCmds.size() + extraSmallRows.size());
-    for (const auto* cmd : extraSmallRows) {
-        // N1-N5: degraded big rows reserve the widest-variant width so a variant switch never
-        // overflows the packed column.
-        bool drop = ribbon_hasSubs(grp, cmd);
-        widths.push_back(ribbon_bigBtnAsSmallWMax(grp, cmd, drop));
-    }
+    std::vector<float> tiles, rows;
+    for (const auto* cmd : extraSmallRows)
+        tiles.push_back(ribbon_bigBtnAsSmallWMax(ribbon_hasSubs(grp, cmd)));
     for (const auto* cmd : grp.smCmds)
-        widths.push_back(ribbon_smBtnW(cmd->label));
-    if (widths.empty()) return 0.0f;
-    auto cols = ribbon_packColumns(widths, ribbon_rowsPerCol());
-    return ribbon_columnsTotalW(cols);
+        rows.push_back(ribbon_smBtnW(cmd->label));
+    return ribbon_columnsTotalW(ribbon_packRows(tiles, rows));
 }
 
 // C25c FIX (defect 2): the group must be at least as wide as its centered caption + padding, so
@@ -1459,7 +1456,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* faceId, const char* ic
     return clicked && enabled;
 }
 
-// Draw a big button degraded to small-row layout (icon + side label, one row height).
+// Draw a big button degraded to a square icon-only tile one row tall (label in the tooltip).
 static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* faceId, const char* iconName,
                                   const char* label, bool enabled, bool hasDrop,
                                   float wOverride = -1.0f) {
@@ -1468,11 +1465,10 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* faceId, const c
     float iconSz = snap(kSmIconSz * s);
     // §2.2 (same fix as ribbon_smBtn): drive the drawn/hit width from the SAME helper the column
     // packer measures with, so measure and draw never disagree.
-    // N1-N5: wOverride (widest-variant width) keeps the row stable when the face label changes.
+    // wOverride is the packed column width, so every tile in a column shares one edge.
     // ONE snapped totalW / dropW / mainW for hit, fill, and content (mainW + dropW == totalW).
     float dropW  = hasDrop ? snap(kDropArrowW * s) : 0.0f;
-    float totalW = snap(wOverride >= 0.0f ? wOverride
-                                          : ribbon_smBtnW(label) + dropW);
+    float totalW = snap(wOverride >= 0.0f ? wOverride : rowH + dropW);
     float mainW  = totalW - dropW;
 
     // Pixel-snap origin so hit/fill/content share one grid-aligned tile.
@@ -1535,12 +1531,11 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* faceId, const c
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
-        // Center the icon+text block horizontally within the main (non-arrow) area.
-        // Content rect is [p0.x, p0.x+mainW] × [p0.y, p0.y+rowH] — same as the main hit strip.
+        // Icon-only tile: center the icon (plus material swatch) in the main (non-arrow) area.
+        // The label is shown by the tooltip. Content rect is [p0.x, p0.x+mainW] × [p0.y, p0.y+rowH].
         const float matPad   = matRgb ? 6.0f * s : 0.0f;
-        const float contentW = matPad + iconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
-        const float xoff     = snap(ImMax(ui::metrics::ribbonSmSplitInset(),
-                                          (mainW - contentW) * 0.5f));
+        const float contentW = matPad + iconSz;
+        const float xoff     = snap(ImMax(0.0f, (mainW - contentW) * 0.5f));
         float ix = snap(p0.x + xoff + matPad);
         float iy = snap(p0.y + (rowH - iconSz) * 0.5f);
         ribbon_icon(dl, iconName, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, enabled,
@@ -1558,13 +1553,6 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* faceId, const c
                         ui::Palette::toU32(ui::palette.border), 1.0f * s, 0,
                         ui::metrics::stroke(1.0f));
         }
-        float tx  = snap(ix + iconSz + 4.0f * s);
-        float ty  = snap(p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
-        ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
-                             : ui::Palette::toU32(ui::palette.textDisabled);
-        dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + mainW, p0.y + rowH), true);
-        dl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, label);
-        dl->PopClipRect();
     }
 
     if ((mainHovTip || (clicked && !enabled)) && (ribbon_tooltipsEnabled() || !enabled))
@@ -1884,11 +1872,11 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
-        // Center the icon+text block horizontally within the (column-wide) button — same totalW
-        // as hit/fill, so content cannot drift relative to the background tile.
+        // Left-align the icon+text block at a fixed inset inside the (column-wide) button, so a
+        // stacked column reads as a list with one icon edge. Centering each row's content in the
+        // column width staggered the icons and made short labels look stretched.
         const float matPad   = matRgb ? 6.0f * s : 0.0f;
-        const float contentW = matPad + iconSz + 4.0f * s + ImGui::CalcTextSize(label).x;
-        const float xoff     = snap(ImMax(0.0f, (totalW - contentW) * 0.5f));
+        const float xoff     = snap(4.0f * s);
         float ix  = snap(p0.x + xoff + matPad);
         float iy  = snap(p0.y + (rowH - iconSz) * 0.5f);
         ribbon_icon(dl, iconName, ix + iconSz * 0.5f, iy + iconSz * 0.5f,
@@ -2171,7 +2159,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     static LayoutCache layout;
     const float chevronW = 22.0f * s;
     const float bodyW = (mobile ? vp->Size.x * 0.5f : vp->Size.x) - 8.0f * s;
-    const float availW = bodyW - chevronW;
+    // Sketch relations strip (sketch_relations_strip.h) docks at the body's right end while a 2D
+    // sketch is edited; its width depends only on keys the layout cache already tracks.
+    const bool relStrip = !mobile && s_sketchActive && !s_sketch3dActive &&
+                          std::strcmp(actTabName, "Sketch") == 0;
+    const float relStripW = relStrip ? ui::sketchRelationsStripWidth() : 0.0f;
+    const float availW = bodyW - chevronW - relStripW;
     const std::string& study = s_commandContext.selectedStudyType;
     const bool rebuildLayout = layout.tab != activeTab || layout.workspace != s_workspace ||
         layout.sketch != s_sketchActive || layout.sketch3d != s_sketch3dActive ||
@@ -2347,15 +2340,15 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         group.contentW = ribbon_groupContentW(group, group.collapse);
         for (const auto* cmd : group.bigCmds)
             group.bigWidths.push_back(ribbon_bigBtnWMax(group, cmd, ribbon_hasSubs(group, cmd)));
-        std::vector<float> widths;
+        std::vector<float> tiles, widths;
         if (group.collapse != COL_BIG) {
             group.rows = group.bigCmds;
             for (const auto* cmd : group.bigCmds)
-                widths.push_back(ribbon_bigBtnAsSmallWMax(group, cmd, ribbon_hasSubs(group, cmd)));
+                tiles.push_back(ribbon_bigBtnAsSmallWMax(ribbon_hasSubs(group, cmd)));
         }
         group.rows.insert(group.rows.end(), group.smCmds.begin(), group.smCmds.end());
         for (const auto* cmd : group.smCmds) widths.push_back(ribbon_smBtnW(cmd->label));
-        group.columns = ribbon_packColumns(widths, ribbon_rowsPerCol());
+        group.columns = ribbon_packRows(tiles, widths);
     }
     }
 
@@ -2554,7 +2547,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         bool drop = ribbon_hasSubs(grp, cmd);
                         const char* showIcon; const char* showLabel;
                         const char* faceId = resolveFace(cmd, drop, showIcon, showLabel);
-                        // Uniform column width (the packer already reserved the widest variant).
+                        // Uniform column width (icon tiles pack in their own columns).
                         const auto face = commandAvailability(faceId, s_commandContext);
                         ribbon_bigBtnAsSmall(cmd->cmd_id, faceId, showIcon, showLabel,
                                              face.visible && face.enabled, drop, col.width);
@@ -2791,6 +2784,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         }
     }
     (void)chevronW;
+    if (relStrip) {
+        const ImVec2 cwp = ImGui::GetWindowPos();
+        ui::drawSketchRelationsStrip(ImVec2(cwp.x + bodyW - relStripW, cwp.y + ribbon_groupPadY()),
+                                     ImVec2(cwp.x + bodyW, cwp.y + bodyH2 - ribbon_groupPadY()),
+                                     ribbon_contentH());
+    }
 
     // Sketch Finish/Cancel now render as a highlighted "Finish Sketch" big button (with a Cancel
     // dropdown) in the New-Sketch slot of the Sketch group — see the bigCmds render loop above. The

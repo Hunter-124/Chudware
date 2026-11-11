@@ -473,6 +473,36 @@ int main() {
     CHECK(render::refAxisHalfLength("axis.auto:a|b", e) == e * 0.55f,
           "plane-derived auto axis spans the user-plane quad");
 
+    // The drawn dashes start and end exactly at ±refAxisHalfLength and stay on the axis line, so
+    // an overlay stroke spanning ±refAxisHalfLength (sketch-mode hover/selection) covers the drawn
+    // axis end to end — no dashed tip poking out past the highlight.
+    for (const char* id : {"axis.x", "axis.auto:a|b"}) {
+        render::RefDatum ax;
+        ax.kind = render::RefDatum::Kind::Axis;
+        ax.id = id;
+        ax.origin = Vec3(3.0f, -2.0f, 1.0f);
+        ax.dir = Vec3(0.6f, 0.8f, 0.0f);
+        render::RefDatumBatch b;
+        render::buildRefDatumBatch({ax}, {}, id, "", e, pal, b);
+        const float half = render::refAxisHalfLength(id, e);
+        float lo = 1e30f, hi = -1e30f, offLine = 0.0f;
+        for (size_t i = 0; i + 2 < b.verts.size(); i += 3) {
+            const float px = b.verts[i] - ax.origin.x, py = b.verts[i + 1] - ax.origin.y,
+                        pz = b.verts[i + 2] - ax.origin.z;
+            const float s = px * ax.dir.x + py * ax.dir.y + pz * ax.dir.z;
+            lo = std::min(lo, s);
+            hi = std::max(hi, s);
+            const float rx = px - ax.dir.x * s, ry = py - ax.dir.y * s, rz = pz - ax.dir.z * s;
+            offLine = std::max(offLine, std::sqrt(rx * rx + ry * ry + rz * rz));
+        }
+        char label[128];
+        std::snprintf(label, sizeof(label), "%s: drawn span == ±refAxisHalfLength", id);
+        CHECK(!b.verts.empty() && std::fabs(hi - half) < 1e-3f && std::fabs(lo + half) < 1e-3f,
+              label);
+        std::snprintf(label, sizeof(label), "%s: every dash vertex lies on the axis line", id);
+        CHECK(offLine < 1e-3f, label);
+    }
+
     // A hidden datum contributes nothing, and clearing the hide brings its geometry back.
     render::RefDatumBatch hiddenBatch, shownBatch;
     render::buildRefDatumBatch(datums, hidden, "", "", e, pal, hiddenBatch);

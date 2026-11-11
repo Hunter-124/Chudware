@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <functional>
 #include <set>
@@ -28,6 +29,7 @@
 #include "airfoil.h"            // NACA 4-/5-digit + .dat profile generator (SketchTool::Airfoil)
 #include "file_dialog.h"        // openFileDialog (.dat import)
 #include "widgets/kit.h"        // ui::kit primitives + bounded text elision
+#include "widgets/sketch_relations_strip.h"   // Sketch-ribbon relations strip
 
 namespace ui {
 
@@ -1204,7 +1206,7 @@ void SketchMode::fullyDefine(AppState& st) {
 }
 
 void SketchMode::drawRelationList(AppState& st, const ImVec2& lo, const ImVec2& hi) {
-    panelHoverRel_.clear();
+    panelHoverRel_ = stripHoverRel_;   // a relation chip hovered in the ribbon strip lights its badge
     if (!relationsPanel_.open) return;
     std::vector<RelationRow> rows;
     rows.reserve(cons_.size());
@@ -1242,13 +1244,90 @@ void SketchMode::drawRelationList(AppState& st, const ImVec2& lo, const ImVec2& 
     }
     auto result = drawRelationsPanel(relationsPanel_, rows, selRelIds_, lo, hi);
     if (result.selectionChanged) selRelIds_ = std::move(result.selectIds);
-    panelHoverRel_ = std::move(result.hoveredId);
+    if (!result.hoveredId.empty()) panelHoverRel_ = std::move(result.hoveredId);
     if (!result.deleteIds.empty()) {
         nlohmann::json ops = nlohmann::json::array();
         for (const auto& id : result.deleteIds)
             ops.push_back({{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", id}});
         applyRelationOps(st, ops, "Delete relations");
     }
+}
+
+void SketchMode::syncRelationsStrip(AppState& st) {
+    const SketchRelationsStripResult clicks = takeSketchRelationsStripResult();
+    stripHoverRel_ = clicks.hoveredId;
+    if (clicks.addIndex >= 0 && clicks.addIndex < (int)stripOffers_.size()) {
+        const RelationOffer& o = stripOffers_[clicks.addIndex];
+        nlohmann::json ops = nlohmann::json::array();
+        for (const auto& group : o.groups)
+            ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
+                           {"constraint", {{"type", o.type}, {"refs", group}}}});
+        // The over-define prompt (if any) opens where the strip was clicked.
+        if (ImGui::IsMousePosValid()) relPopupPos_ = ImGui::GetMousePos();
+        addRelationOps(st, ops, o.label);
+    }
+    if (!clicks.toggleId.empty()) {
+        // Entity selection stays so the strip keeps describing it; only the relation pick changes.
+        const auto it = std::find(selRelIds_.begin(), selRelIds_.end(), clicks.toggleId);
+        if (!clicks.additive) selRelIds_ = {clicks.toggleId};
+        else if (it != selRelIds_.end()) selRelIds_.erase(it);
+        else selRelIds_.push_back(clicks.toggleId);
+    }
+    if (!clicks.deleteId.empty()) {
+        selRelIds_.erase(std::remove(selRelIds_.begin(), selRelIds_.end(), clicks.deleteId),
+                         selRelIds_.end());
+        applyRelationOps(st, nlohmann::json::array(
+            {{{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", clicks.deleteId}}}),
+            "Delete relation");
+    }
+    if (clicks.openPanel) { relationsPanel_.open = true; relationsPanel_.filter = 5; }
+    if (clicks.openAddRelation) beginRelations(st);
+
+    SketchRelationsStripModel model;
+    model.hasSelection = !selIds_.empty() || !selRelIds_.empty();
+    model.drawGlyph = &drawRelationGlyph;
+    if (model.hasSelection) {
+        for (const auto& c : cons_) {
+            if (c.isDimensional() || c.refs.empty()) continue;
+            bool touches = isRelSelected(c.id);
+            for (const auto& h : c.refs)
+                for (const auto& selected : selIds_)
+                    if (selected == h || skBaseId(selected) == skBaseId(h)) touches = true;
+            if (!touches) continue;
+            SketchRelationsStripModel::Existing rel;
+            rel.id = c.id;
+            rel.type = c.type;
+            std::string refs;
+            for (const auto& h : c.refs) {
+                const auto* e = entById(skBaseId(h));
+                if (e && e->externalPierce && c.type == "coincident") rel.type = "pierce";
+                refs += refs.empty() ? h : ", " + h;
+            }
+            std::string name = rel.type;
+            std::replace(name.begin(), name.end(), '_', ' ');
+            name[0] = (char)std::toupper((unsigned char)name[0]);
+            rel.tip = name + (c.automatic ? " (auto)" : "") + ": " + refs;
+            rel.selected = isRelSelected(c.id);
+            rel.automatic = c.automatic;
+            auto listed = [&](const std::vector<std::string>& ids) {
+                return std::find(ids.begin(), ids.end(), c.id) != ids.end();
+            };
+            rel.problem = listed(conflicting_) || listed(redundant_) || skipped_.count(c.id) != 0;
+            model.existing.push_back(std::move(rel));
+        }
+    }
+    std::vector<RelationTarget> targets;
+    addRelationTargets(selIds_, targets);
+    stripOffers_ = targets.empty() ? std::vector<RelationOffer>() : relationOffers(targets, false);
+    // An offer whose every relation is already present has nothing left to add.
+    stripOffers_.erase(std::remove_if(stripOffers_.begin(), stripOffers_.end(),
+        [&](const RelationOffer& o) {
+            return std::all_of(o.groups.begin(), o.groups.end(), [&](const auto& group) {
+                return constraintExists(o.type, group);
+            });
+        }), stripOffers_.end());
+    for (const auto& o : stripOffers_) model.possible.push_back({o.type, o.label});
+    publishSketchRelationsStrip(std::move(model));
 }
 
 // World axes parallel to a sketch basis direction use the solver's fixed virtual lines.
@@ -1335,6 +1414,157 @@ void SketchMode::refreshRelationModelRefs(AppState& st) {
     }
 }
 
+SketchMode::RelationTarget SketchMode::makeRelationTarget(const std::string& h,
+                                                         const SketchEntity* e, int source) {
+    SketchMode::RelationTarget t;
+    t.ref = h; t.source = source;
+    t.type = e ? e->type : "line";
+    const auto dot = h.find('.');
+    const auto sub = dot == std::string::npos ? std::string() : h.substr(dot + 1);
+    t.point = h == "origin" || (e && (e->type == "point" || !sub.empty()));
+    if (e && (e->type == "spline" || e->type == "style_spline"))
+        t.splineEnd = sub == "start" || sub == "end" || sub == "p0" ||
+                      (!e->pts.empty() && sub == "p" + std::to_string(e->pts.size()-1));
+    return t;
+}
+
+// Sketch handles (entities, points, origin, datum axes the solver has a virtual line for) as
+// Add Relation targets. Handles that no longer resolve are skipped.
+void SketchMode::addRelationTargets(const std::vector<std::string>& handles,
+                                    std::vector<RelationTarget>& out) const {
+    for (const auto& h : handles) {
+        if (h.rfind("axis.", 0) == 0) {
+            const auto axis = sketchAxisHandle(h, frame_);
+            if (!axis.empty()) out.push_back(makeRelationTarget(axis, nullptr, -1));
+        } else if (h == "origin") out.push_back(makeRelationTarget(h, nullptr, -1));
+        else if (const auto* e = entById(skBaseId(h))) out.push_back(makeRelationTarget(h, e, -1));
+    }
+}
+
+// The relations the selection supports, in display order. Model-only offers (Pierce, the arc
+// length dimension) stay with the Add Relation popup, which owns the model references.
+std::vector<SketchMode::RelationOffer> SketchMode::relationOffers(
+        const std::vector<RelationTarget>& snapshot, bool hasModelRefs) {
+    using Target = RelationTarget;
+    std::vector<RelationOffer> offers;
+    auto offer = [&](const char* label, const char* type,
+                     const std::vector<std::vector<std::string>>& groups) {
+        offers.push_back({label, type, groups});
+    };
+    auto line = [](const Target& t) { return !t.point && (t.type == "line" || t.type == "slot"); };
+    auto circle = [](const Target& t) { return !t.point && (t.type == "circle" || t.type == "arc"); };
+    auto ellipse = [](const Target& t) { return !t.point && (t.type == "ellipse" || t.type == "ellipse_arc"); };
+    auto curve = [](const Target& t) {
+        return !t.point && (t.type == "line" || t.type == "circle" || t.type == "arc" ||
+            t.type == "ellipse" || t.type == "ellipse_arc" || t.type == "spline" ||
+            t.type == "style_spline" || t.type == "conic" || t.type == "parabola");
+    };
+    auto lengthCurve = [](const Target& t) { return !t.point && (t.type == "line" || t.type == "arc"); };
+    const size_t n = snapshot.size();
+    auto all = [&](const auto& pred) {
+        return n > 0 && std::all_of(snapshot.begin(), snapshot.end(), pred);
+    };
+    auto chain = [&](const char* label, const char* type) {
+        std::vector<std::vector<std::string>> groups;
+        for (size_t i = 1; i < n; ++i) groups.push_back({snapshot[0].ref, snapshot[i].ref});
+        offer(label, type, groups);
+    };
+    auto each = [&](const char* label, const char* type) {
+        std::vector<std::vector<std::string>> groups;
+        for (const auto& t : snapshot)
+            if (t.source < 0 && t.ref != "origin" && t.ref.rfind("axis.", 0) != 0)
+                groups.push_back({t.ref});
+        if (!groups.empty()) offer(label, type, groups);
+    };
+    if (n >= 2 && all([](const Target& t) { return t.point; })) {
+        chain("Coincident / Merge", "coincident");
+        chain("Horizontal (align Y)", "horizontal");
+        chain("Vertical (align X)", "vertical");
+    }
+    if (all(line)) {
+        if (all([](const Target& t) { return t.type == "line"; })) {
+            each("Horizontal (each)", "horizontal");
+            each("Vertical (each)", "vertical");
+        }
+        if (n >= 2) {
+            chain("Collinear", "collinear"); chain("Parallel", "parallel");
+            if (n == 2) chain("Perpendicular", "perpendicular");
+            if (all([](const Target& t) { return t.type == "line"; })) chain("Equal", "equal");
+        }
+    }
+    if (n >= 2 && all(circle)) {
+        chain("Equal", "equal"); chain("Coradial", "coradial");
+    }
+    if (n >= 2 && all(ellipse)) {
+        chain("Equal", "equal");
+    }
+    if (n >= 2 && all([](const Target& t) { return !t.point && t.type == "slot"; }))
+        chain("Equal slots (length and width)", "equal");
+    if (n >= 2 && all([](const Target& t) { return !t.point && t.type == "arc_slot"; })) {
+        chain("Equal arc slots (radius and width)", "equal");
+    }
+    if (n >= 2 && all([&](const Target& t) { return circle(t) || ellipse(t) ||
+                                                    (!t.point && t.type == "arc_slot"); })) {
+        chain("Concentric", "concentric");
+    }
+    if (n == 2) {
+        const auto& a = snapshot[0]; const auto& b = snapshot[1];
+        if (all(lengthCurve)) chain("Equal curve length", "equal_curve_length");
+        if ((a.splineEnd && (curve(b) || b.splineEnd)) ||
+            (b.splineEnd && (curve(a) || a.splineEnd))) {
+            const auto& end = a.splineEnd ? a : b;
+            const auto& other = a.splineEnd ? b : a;
+            offer("Tangent at spline endpoint", "tangent", {{end.ref, other.ref}});
+            if (other.splineEnd || other.type == "line" || circle(other))
+                offer("Smooth (equal curvature)", "smooth", {{end.ref, other.ref}});
+        } else if (!a.point && !b.point &&
+                   ((a.type == "line" && (circle(b) || ellipse(b))) ||
+                    (b.type == "line" && (circle(a) || ellipse(a))) ||
+                    ((circle(a) || ellipse(a)) && (circle(b) || ellipse(b))))) {
+            chain("Tangent", "tangent");
+        }
+        if (a.point != b.point) {
+            const auto& p = a.point ? a : b; const auto& c = a.point ? b : a;
+            if (curve(c))
+                offer(c.source >= 0 ? "On Edge" : "On curve", "point_on", {{p.ref, c.ref}});
+            if (c.type == "line" || c.type == "arc")
+                offer("Midpoint", "midpoint", {{p.ref, c.ref}});
+            if (circle(c) || ellipse(c) || c.type == "arc_slot") {
+                offer("Coincident to center", "coincident", {{p.ref, c.ref + ".center"}});
+                offer("Concentric with point", "concentric", {{p.ref, c.ref}});
+            }
+        }
+    }
+    if (n == 3) {
+        std::vector<const Target*> points, curves;
+        for (const auto& t : snapshot) {
+            if (t.point) points.push_back(&t);
+            else if (curve(t)) curves.push_back(&t);
+        }
+        if (points.size() == 1 && curves.size() == 2)
+            offer("Intersection", "intersection", {{points[0]->ref, curves[0]->ref, curves[1]->ref}});
+        // An explicit virtual axis takes precedence; otherwise the last selected line is axis.
+        int axis = -1;
+        for (int i = 0; i < 3; ++i)
+            if (snapshot[i].ref.rfind("axis.", 0) == 0) axis = i;
+        if (axis < 0)
+            for (int i = 0; i < 3; ++i)
+                if (snapshot[i].type == "line" && !snapshot[i].point) axis = i;
+        if (axis >= 0) {
+            std::vector<const Target*> subjects;
+            for (int i = 0; i < 3; ++i) if (i != axis) subjects.push_back(&snapshot[i]);
+            if ((subjects[0]->point && subjects[1]->point) ||
+                (circle(*subjects[0]) && circle(*subjects[1])) ||
+                (!subjects[0]->point && !subjects[1]->point &&
+                 subjects[0]->type == "line" && subjects[1]->type == "line"))
+                offer("Symmetric (last line / selected axis)", "symmetric",
+                      {{subjects[0]->ref, subjects[1]->ref, snapshot[axis].ref}});
+        }
+    }
+    if (n == 1 && !hasModelRefs) each("Fix", "fix");
+    return offers;
+}
+
 void SketchMode::drawAddRelations(AppState& st, bool& escHandled) {
     if (!relPopupOpen_ && !relModelPicking_) return;
     refreshRelationModelRefs(st);
@@ -1357,49 +1587,17 @@ void SketchMode::drawAddRelations(AppState& st, bool& escHandled) {
         return;
     }
 
-    struct Target {
-        std::string ref, type;
-        bool point = false, splineEnd = false;
-        int source = -1;
-    };
-    std::vector<Target> targets;
-    auto addTarget = [&](const std::string& h, const SketchEntity* e, int source) {
-        Target t;
-        t.ref = h; t.source = source;
-        t.type = e ? e->type : "line";
-        const auto dot = h.find('.');
-        const auto sub = dot == std::string::npos ? std::string() : h.substr(dot + 1);
-        t.point = h == "origin" || (e && (e->type == "point" || !sub.empty()));
-        if (e && (e->type == "spline" || e->type == "style_spline"))
-            t.splineEnd = sub == "start" || sub == "end" || sub == "p0" ||
-                          (!e->pts.empty() && sub == "p" + std::to_string(e->pts.size()-1));
-        targets.push_back(std::move(t));
-    };
-    for (const auto& h : relIds_) {
-        if (h.rfind("axis.", 0) == 0) {
-            const auto axis = sketchAxisHandle(h, frame_);
-            if (!axis.empty()) addTarget(axis, nullptr, -1);
-        } else if (h == "origin") addTarget(h, nullptr, -1);
-        else if (const auto* e = entById(skBaseId(h))) addTarget(h, e, -1);
-    }
+    std::vector<RelationTarget> targets;
+    addRelationTargets(relIds_, targets);
     size_t flat = 0;
     for (size_t i = 0; i < relModelRefs_.size(); ++i) {
         const auto& model = relModelRefs_[i];
         for (size_t j = 0; j < model.entities.size(); ++j, ++flat) {
             if ((int)j != model.selectedEntity) continue;
             const auto ref = flat == 0 ? "$0" : "$0#" + std::to_string(flat);
-            addTarget(ref, &model.entities[j], (int)i);
+            targets.push_back(makeRelationTarget(ref, &model.entities[j], (int)i));
         }
     }
-    auto line = [](const Target& t) { return !t.point && (t.type == "line" || t.type == "slot"); };
-    auto circle = [](const Target& t) { return !t.point && (t.type == "circle" || t.type == "arc"); };
-    auto ellipse = [](const Target& t) { return !t.point && (t.type == "ellipse" || t.type == "ellipse_arc"); };
-    auto curve = [](const Target& t) {
-        return !t.point && (t.type == "line" || t.type == "circle" || t.type == "arc" ||
-            t.type == "ellipse" || t.type == "ellipse_arc" || t.type == "spline" ||
-            t.type == "style_spline" || t.type == "conic" || t.type == "parabola");
-    };
-    auto lengthCurve = [](const Target& t) { return !t.point && (t.type == "line" || t.type == "arc"); };
     ImGui::SetNextWindowPos(relPopupPos_, ImGuiCond_Appearing);
     if (ImGui::Begin("Add Relation##SketchRel", nullptr,
                      ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
@@ -1430,126 +1628,27 @@ void SketchMode::drawAddRelations(AppState& st, bool& escHandled) {
                 }
             if (!failed) ui::kit::dimText("Resolving selected model geometry...");
         }
-        bool any = false, applied = false;
-        const auto& snapshot = targets;
-        auto offer = [&](const char* label, const char* type,
-                         const std::vector<std::vector<std::string>>& groups) {
-            any = true;
-            if (applied || !ui::kit::secondaryButton(label,
-                    projectionsReady && !referencesPending && !referencesChanged,
-                    referencesPending ? "Waiting for selected model geometry" :
-                    !projectionsReady ? "Choose a projectable reference" : nullptr)) return;
+        const bool enabled = projectionsReady && !referencesPending && !referencesChanged;
+        const char* disabledWhy = referencesPending ? "Waiting for selected model geometry" :
+                                  !projectionsReady ? "Choose a projectable reference" : nullptr;
+        const auto offers = relationOffers(targets, !relModelRefs_.empty());
+        bool any = !offers.empty(), applied = false;
+        for (size_t i = 0; i < offers.size() && !applied; ++i) {
+            const RelationOffer& o = offers[i];
+            ImGui::PushID((int)i);
+            const bool clicked = ui::kit::secondaryButton(o.label.c_str(), enabled, disabledWhy);
+            ImGui::PopID();
+            if (!clicked) continue;
             nlohmann::json ops = nlohmann::json::array(), refs = nlohmann::json::array();
             for (const auto& model : relModelRefs_) refs.push_back(model.source);
             if (!refs.empty())
                 ops.push_back({{"op", "sketch_convert"}, {"sketch", fid_}, {"refs", refs},
                                {"construction", true}, {"fix", true}, {"associative", true}});
-            for (const auto& group : groups)
+            for (const auto& group : o.groups)
                 ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_},
-                               {"constraint", {{"type", type}, {"refs", group}}}});
+                               {"constraint", {{"type", o.type}, {"refs", group}}}});
             applied = true;
-            addRelationOps(st, ops, label);
-        };
-        const size_t n = snapshot.size();
-        auto all = [&](const auto& pred) {
-            return n > 0 && std::all_of(snapshot.begin(), snapshot.end(), pred);
-        };
-        auto chain = [&](const char* label, const char* type) {
-            std::vector<std::vector<std::string>> groups;
-            for (size_t i = 1; i < n; ++i) groups.push_back({snapshot[0].ref, snapshot[i].ref});
-            offer(label, type, groups);
-        };
-        auto each = [&](const char* label, const char* type) {
-            std::vector<std::vector<std::string>> groups;
-            for (const auto& t : snapshot)
-                if (t.source < 0 && t.ref != "origin" && t.ref.rfind("axis.", 0) != 0)
-                    groups.push_back({t.ref});
-            if (!groups.empty()) offer(label, type, groups);
-        };
-        if (n >= 2 && all([](const Target& t) { return t.point; })) {
-            chain("Coincident / Merge", "coincident");
-            chain("Horizontal (align Y)", "horizontal");
-            chain("Vertical (align X)", "vertical");
-        }
-        if (all(line)) {
-            if (all([](const Target& t) { return t.type == "line"; })) {
-                each("Horizontal (each)", "horizontal");
-                each("Vertical (each)", "vertical");
-            }
-            if (n >= 2) {
-                chain("Collinear", "collinear"); chain("Parallel", "parallel");
-                if (n == 2) chain("Perpendicular", "perpendicular");
-                if (all([](const Target& t) { return t.type == "line"; })) chain("Equal", "equal");
-            }
-        }
-        if (n >= 2 && all(circle)) {
-            chain("Equal", "equal"); chain("Coradial", "coradial");
-        }
-        if (n >= 2 && all(ellipse)) {
-            chain("Equal", "equal");
-        }
-        if (n >= 2 && all([](const Target& t) { return !t.point && t.type == "slot"; }))
-            chain("Equal slots (length and width)", "equal");
-        if (n >= 2 && all([](const Target& t) { return !t.point && t.type == "arc_slot"; })) {
-            chain("Equal arc slots (radius and width)", "equal");
-        }
-        if (n >= 2 && all([&](const Target& t) { return circle(t) || ellipse(t) ||
-                                                        (!t.point && t.type == "arc_slot"); })) {
-            chain("Concentric", "concentric");
-        }
-        if (n == 2) {
-            const auto& a = snapshot[0]; const auto& b = snapshot[1];
-            if (all(lengthCurve)) chain("Equal curve length", "equal_curve_length");
-            if ((a.splineEnd && (curve(b) || b.splineEnd)) ||
-                (b.splineEnd && (curve(a) || a.splineEnd))) {
-                const auto& end = a.splineEnd ? a : b;
-                const auto& other = a.splineEnd ? b : a;
-                offer("Tangent at spline endpoint", "tangent", {{end.ref, other.ref}});
-                if (other.splineEnd || other.type == "line" || circle(other))
-                    offer("Smooth (equal curvature)", "smooth", {{end.ref, other.ref}});
-            } else if (!a.point && !b.point &&
-                       ((a.type == "line" && (circle(b) || ellipse(b))) ||
-                        (b.type == "line" && (circle(a) || ellipse(a))) ||
-                        ((circle(a) || ellipse(a)) && (circle(b) || ellipse(b))))) {
-                chain("Tangent", "tangent");
-            }
-            if (a.point != b.point) {
-                const auto& p = a.point ? a : b; const auto& c = a.point ? b : a;
-                if (curve(c))
-                    offer(c.source >= 0 ? "On Edge" : "On curve", "point_on", {{p.ref, c.ref}});
-                if (c.type == "line" || c.type == "arc")
-                    offer("Midpoint", "midpoint", {{p.ref, c.ref}});
-                if (circle(c) || ellipse(c) || c.type == "arc_slot") {
-                    offer("Coincident to center", "coincident", {{p.ref, c.ref + ".center"}});
-                    offer("Concentric with point", "concentric", {{p.ref, c.ref}});
-                }
-            }
-        }
-        if (n == 3) {
-            std::vector<const Target*> points, curves;
-            for (const auto& t : snapshot) {
-                if (t.point) points.push_back(&t);
-                else if (curve(t)) curves.push_back(&t);
-            }
-            if (points.size() == 1 && curves.size() == 2)
-                offer("Intersection", "intersection", {{points[0]->ref, curves[0]->ref, curves[1]->ref}});
-            // An explicit virtual axis takes precedence; otherwise the last selected line is axis.
-            int axis = -1;
-            for (int i = 0; i < 3; ++i)
-                if (snapshot[i].ref.rfind("axis.", 0) == 0) axis = i;
-            if (axis < 0)
-                for (int i = 0; i < 3; ++i)
-                    if (snapshot[i].type == "line" && !snapshot[i].point) axis = i;
-            if (axis >= 0) {
-                std::vector<const Target*> subjects;
-                for (int i = 0; i < 3; ++i) if (i != axis) subjects.push_back(&snapshot[i]);
-                if ((subjects[0]->point && subjects[1]->point) ||
-                    (circle(*subjects[0]) && circle(*subjects[1])) ||
-                    (!subjects[0]->point && !subjects[1]->point &&
-                     subjects[0]->type == "line" && subjects[1]->type == "line"))
-                    offer("Symmetric (last line / selected axis)", "symmetric",
-                          {{subjects[0]->ref, subjects[1]->ref, snapshot[axis].ref}});
-            }
+            addRelationOps(st, ops, o.label);
         }
         // Pierce is a coincident relation to the associative edge/plane intersection point.
         if (!applied && relIds_.size() == 1 && relModelRefs_.size() == 1 &&
@@ -1572,11 +1671,10 @@ void SketchMode::drawAddRelations(AppState& st, bool& escHandled) {
                 }
             }
         }
-        if (n == 1 && relModelRefs_.empty()) each("Fix", "fix");
-        if (!applied && n == 1 && relModelRefs_.empty() && !snapshot[0].point &&
-            snapshot[0].type == "arc" &&
+        if (!applied && targets.size() == 1 && relModelRefs_.empty() && !targets[0].point &&
+            targets[0].type == "arc" &&
             ui::kit::secondaryButton("Arc length dimension...##relation_arc_length")) {
-            const auto* e = entById(snapshot[0].ref);
+            const auto* e = entById(targets[0].ref);
             if (e) {
                 float sweep = e->end - e->start;
                 if (e->ccw) { while (sweep < 0) sweep += 360.0f; }
@@ -3944,6 +4042,15 @@ void SketchMode::boxSelect(const ImVec2& a, const ImVec2& b, bool crossing, bool
         }
         if (hit && !isSelected(e.id)) selIds_.push_back(e.id);
     }
+    // Relation badges drawn this frame join the selection by the same rule: window needs the
+    // whole chip inside, crossing takes any chip the box overlaps. Pair relations draw one chip
+    // per reference; either chip selects the relation once.
+    for (const auto& r : relHits_) {
+        const bool hit = crossing
+            ? (r.lo.x <= hi.x && r.hi.x >= lo.x && r.lo.y <= hi.y && r.hi.y >= lo.y)
+            : (ptInRect(r.lo, lo, hi) && ptInRect(r.hi, lo, hi));
+        if (hit && !isRelSelected(r.cid)) selRelIds_.push_back(r.cid);
+    }
 }
 
 // The point handles that rigidly translate an entity, with their current (u,v). Lines/slots move
@@ -6104,7 +6211,7 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
 
 // Shared hit-test: user-defined datum PLANES (docMirror refDatums kind=="plane") under the cursor.
 // Builds each datum plane's quad EXACTLY as Renderer::drawRefDatums does (origin ± xdir/ydir*ps,
-// ps = cam.radius*0.55) and barycentric depth-tests it, so the clickable area coincides with the
+// ps = effectiveSceneRadius()*1.25*0.55) and barycentric depth-tests it, so the clickable area coincides with the
 // drawn quad. Returns the FRONTMOST hit's feature id + name + camera-distance² (so callers can
 // compare it against the three origin-plane depths and pick the single frontmost target), plus the
 // winning quad's screen corners for a hover tint. This is what lets the user sketch on / reference
@@ -6118,7 +6225,9 @@ static bool hitTestDatumPlane(AppState& st, ImVec2 mouse, const ImVec2& imgMin, 
     if (!datums.is_array() || datums.empty()) return false;
     const Renderer& r = *st.renderer;
     const auto& cam = r.camera();
-    const float ps = cam.radius * 0.55f;   // matches drawRefDatums datum-plane half-extent
+    // drawRefDatums' datum-plane half-extent: e*0.55 with e = effectiveSceneRadius()*1.25.
+    // cam.radius dropped the 1.25, so the pick quad was 20% smaller than the drawn plane.
+    const float ps = r.effectiveSceneRadius() * 1.25f * 0.55f;
     auto v3 = [](const nlohmann::json& a, Vec3 dflt) -> Vec3 {
         if (a.is_array() && a.size() == 3 && a[0].is_number())
             return Vec3((float)a[0].get<double>(), (float)a[1].get<double>(), (float)a[2].get<double>());
@@ -6345,17 +6454,15 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
 // (defaults + auto cache + user) — never re-solves plane pairs. Returns true + the hovered
 // axis's screen endpoints + feature id/name when the cursor is within the
 // pick radius. Shared by the PM axis picker (route into a well) and general datum selection.
-// Pick segment half-length L must match the DRAWN axis half-length in Renderer::drawRefDatums:
-// plane half-extent e = (radius_>0 ? radius_ : kEmptySceneRadius), L = e * 1.0 (not the old e*1.6).
-// cam.radius is published as that same sceneR (renderer.cpp drawCurrent), so use it directly —
-// modelRadius() is 0 with no solid body (e.g. during Revolve: sketch + axis, no body).
+// Pick segment half-length must match the DRAWN axis half-length in Renderer::drawRefDatums, so
+// it comes from Renderer::refAxisHalfLength(id) (sceneR*1.25; auto axes span only their plane
+// quad). cam.radius is the bare sceneR — using it drew the hover/selection stroke 20% short of
+// the dashed axis, whose uncovered tips then poked out past the highlight.
 static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, int vw, int vh,
                              ImVec2& outA, ImVec2& outB, std::string& outFid, std::string& outName) {
     if (!st.renderer || !st.docMirror.hasDoc()) return false;
     const Renderer& r = *st.renderer;
     const auto& cam = r.camera();
-    // Match DRAWN axis half-length: e = plane half-extent, L = e (factor 1.0).
-    const float L = cam.radius;
     auto distToSeg = [](ImVec2 p, ImVec2 a, ImVec2 b) -> float {
         float vx = b.x - a.x, vy = b.y - a.y, wx = p.x - a.x, wy = p.y - a.y;
         float len2 = vx * vx + vy * vy;
@@ -6404,6 +6511,7 @@ static bool hitTestDatumAxis(AppState& st, ImVec2 mouse, const ImVec2& imgMin, i
     float best = 9.0f * ui::uiScale;   // pixel pick radius around the line
     bool found = false;
     for (const auto& c : cands) {
+        const float L = r.refAxisHalfLength(c.id);
         ImVec2 sa, sb;
         if (!worldToScreen(cam, imgMin, vw, vh,
                            c.P.x - c.D.x * L, c.P.y - c.D.y * L, c.P.z - c.D.z * L, sa))
@@ -7178,7 +7286,6 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // the pick stays visible after click, matching the origin selection treatment.
     if (st.renderer && !selIds_.empty()) {
         const auto& cam = st.renderer->camera();
-        const float L = cam.radius;   // matches hitTestDatumAxis / drawn half-length (factor 1.0)
         const auto& rds = st.renderer->refDatums();
         for (const auto& sid : selIds_) {
             if (sid.rfind("axis.", 0) != 0) continue;
@@ -7195,6 +7302,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
             if (!found || length(D) < 1e-9f) continue;
             D = normalize(D);
+            // Same span the renderer draws (and hitTestDatumAxis picks) so the stroke covers the
+            // dashed axis end to end.
+            const float L = st.renderer->refAxisHalfLength(sid);
             ImVec2 sa, sb;
             if (!worldToScreen(cam, imgMin, vw, vh,
                                P.x - D.x * L, P.y - D.y * L, P.z - D.z * L, sa))
@@ -10951,6 +11061,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     drawEqCurvePopup(st, escHandled);
     drawAirfoilPopup(st, escHandled);
 
+    syncRelationsStrip(st);
     drawAddRelations(st, escHandled);
 
     // ---- Esc ladder — one step per press, hover-independent, suppressed while a text field owns

@@ -665,6 +665,29 @@ private:
     void beginRelations(AppState& st);
     void refreshRelationModelRefs(AppState& st);
     void drawAddRelations(AppState& st, bool& escHandled);
+    // One Add Relation reference (sketch handle, virtual axis/origin, or "$0#n" projected model
+    // entity with source >= 0) and one relation the rule set offers for a target list. The same
+    // rules feed the Add Relation popup and the Sketch-ribbon relations strip.
+    struct RelationTarget {
+        std::string ref, type;
+        bool point = false, splineEnd = false;
+        int source = -1;
+    };
+    struct RelationOffer {
+        std::string label, type;
+        std::vector<std::vector<std::string>> groups;   // one constraint refs list per group
+    };
+    static RelationTarget makeRelationTarget(const std::string& h, const SketchEntity* e,
+                                             int source);
+    void addRelationTargets(const std::vector<std::string>& handles,
+                            std::vector<RelationTarget>& out) const;
+    static std::vector<RelationOffer> relationOffers(const std::vector<RelationTarget>& targets,
+                                                     bool hasModelRefs);
+    // Sketch-ribbon relations strip: apply last frame's clicks, then publish the existing and
+    // possible relations for the current selection (widgets/sketch_relations_strip.h).
+    void syncRelationsStrip(AppState& st);
+    std::vector<RelationOffer> stripOffers_;   // the offers last published, indexed by the strip
+    std::string stripHoverRel_;                // relation chip hovered in the strip
     void fullyDefine(AppState& st);
     RelationsPanelState relationsPanel_;
     std::string panelHoverRel_;
@@ -747,7 +770,8 @@ private:
     bool boxCtrl_ = false;            // Ctrl state captured at press (additive box select)
     ImVec2 boxStart_{0, 0};           // anchor corner (screen) of the rubber band
     // Apply a finished box: select every entity window-enclosed (crossing=false) or touched
-    // (crossing=true) by the screen rect (a,b). additive keeps the existing selection.
+    // (crossing=true) by the screen rect (a,b), plus every relation badge the same rule hits.
+    // additive keeps the existing selection.
     void boxSelect(const ImVec2& a, const ImVec2& b, bool crossing, bool additive);
 
     // ---- C51: closed-profile (region) shading + one-click loop select ----

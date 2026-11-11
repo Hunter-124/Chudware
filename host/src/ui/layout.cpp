@@ -496,15 +496,17 @@ void drawLeftPane(AppState& st,
     }
     s_pmWasActive = pmActive;
 
-    // Workspace home (workspace_home.h): arriving there shows the Explorer, and leaving it because
-    // a document of the user's became active shows that document's FeatureManager.
+    // Workspace home (workspace_home.h): no file or part is open, so there is no FeatureManager —
+    // its tab is hidden and the pane stays on the Explorer. Leaving home because a document of the
+    // user's became active shows that document's FeatureManager.
     static int s_wasHome = -1;
     const bool home = workspaceHomeActive(st);
+    if (home && (st.leftPaneTab == kLeftPaneFeatureManager ||
+                 st.leftPaneTab == kLeftPaneSimulation))
+        st.leftPaneTab = kLeftPaneExplorer;
     if (s_wasHome != (int)home) {
-        if (home && st.leftPaneTab == kLeftPaneFeatureManager && !pmActive)
-            st.leftPaneTab = kLeftPaneExplorer;
-        else if (!home && s_wasHome == 1 && st.activeWorkspace == AppState::Workspace::Model &&
-                 st.leftPaneTab == kLeftPaneExplorer)
+        if (!home && s_wasHome == 1 && st.activeWorkspace == AppState::Workspace::Model &&
+            st.leftPaneTab == kLeftPaneExplorer)
             st.leftPaneTab = kLeftPaneFeatureManager;
         s_wasHome = (int)home;
     }
@@ -1044,7 +1046,8 @@ void drawLeftPane(AppState& st,
     const float btn = 30.0f * S;
     const float glyph = 18.0f * S;
     const float gap = 6.0f * S;
-    const int   nTabs      = (int)(sizeof(kTabs)/sizeof(kTabs[0]));
+    // No FeatureManager tab until a file or part is open (see the workspace-home switch above).
+    const int   nTabs      = (int)(sizeof(kTabs)/sizeof(kTabs[0])) - (home ? 1 : 0);
     const float rowPad     = 6.0f * S;
     const float railRowH   = rowPad + btn + rowPad;   // full top-row height (icons + top/bottom pad)
     const float paneInnerWFull = ImGui::GetContentRegionAvail().x;
@@ -1060,8 +1063,10 @@ void drawLeftPane(AppState& st,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
     ImGui::SetCursorPosY(rowPad);
-    for (int i = 0; i < nTabs; ++i) {
-        const TabDef& t = kTabs[i];
+    for (int i = 0, k = 0; k < (int)(sizeof(kTabs)/sizeof(kTabs[0])); ++k) {
+        const TabDef& t = kTabs[k];
+        if (home && t.id == kLeftPaneFeatureManager) continue;
+        const int col = i++;
         const bool selected = (st.leftPaneTab == t.id) ||
                               (t.id == kLeftPaneFeatureManager && st.leftPaneTab == kLeftPaneSimulation);
         // PM form now lives in the FeatureManager tab, so the attention dot rides that tab.
@@ -1069,7 +1074,7 @@ void drawLeftPane(AppState& st,
         const int changes = t.id == kLeftPaneChanges ? fileChangesCount(st) : 0;
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
-        if (i == 0) ImGui::SetCursorPosX(0.0f);
+        if (col == 0) ImGui::SetCursorPosX(0.0f);
         else        ImGui::SameLine(0, gap);
         char tipBuf[64];
         if (changes > 0)

@@ -335,6 +335,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/icons.cpp
   src/ui/icons_sdf.cpp  # liquid-glass v2: runtime SDF glyphs + halo (drawIconGlass)
   src/ui/widgets/ribbon.cpp
+  src/ui/widgets/sketch_relations_strip.cpp  # Sketch-ribbon existing/add relations strip
   src/ui/widgets/web_view_backend.cpp  # IWebViewBackend factory → CEF (or NullWebView without the SDK)
   src/ui/widgets/interwebz.cpp
   src/ui/ribbon_def.cpp

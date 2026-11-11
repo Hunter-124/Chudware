@@ -9460,17 +9460,29 @@ void drawSettingsModal(AppState& st, bool busy) {
         // moves only its cursor (ImGui explicitly warns this smears content): on a resized
         // browser viewport the title stayed put while the tabs jumped ~200px down. Clamp the
         // saved position before Begin so decoration, tab row and hit boxes share one origin.
-        // The size tracks the band every frame; only correct position when it is outside it
-        // so normal dragging still works.
-        ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
+        // Only correct position when it is outside the band so normal dragging still works.
+        //
+        // The dialog is user-resizable. winW x winH is only the first-use size; afterwards the
+        // user's size is kept (and persisted in the ImGui ini). The band is the hard maximum,
+        // re-applied every frame, so a shrinking window still pulls the dialog back inside it.
+        // The minimum keeps the nav rail (compactTabs below engages under 520*sc) plus a usable
+        // page body; it never exceeds the band.
+        const ImVec2 sizeMax(maxW, maxH);
+        const ImVec2 sizeMin(std::min(ui::metrics::px(640.0f), maxW),
+                             std::min(ui::metrics::px(420.0f), maxH));
+        ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(sizeMin, sizeMax);
         const ImVec2 center((areaMin.x + areaMax.x) * 0.5f,
                             (areaMin.y + areaMax.y) * 0.5f);
         if (opening) {
             ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         } else if (ImGuiWindow* saved = ImGui::FindWindowByName("Settings")) {
+            // The size this frame will settle at once Begin applies the constraints.
+            const float curW = ImClamp(saved->SizeFull.x, sizeMin.x, sizeMax.x);
+            const float curH = ImClamp(saved->SizeFull.y, sizeMin.y, sizeMax.y);
             const ImVec2 clamped(
-                std::max(areaMin.x, std::min(saved->Pos.x, areaMax.x - winW)),
-                std::max(areaMin.y, std::min(saved->Pos.y, areaMax.y - winH)));
+                std::max(areaMin.x, std::min(saved->Pos.x, areaMax.x - curW)),
+                std::max(areaMin.y, std::min(saved->Pos.y, areaMax.y - curH)));
             if (clamped.x != saved->Pos.x || clamped.y != saved->Pos.y)
                 ImGui::SetNextWindowPos(clamped, ImGuiCond_Always);
         }
@@ -9500,7 +9512,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, ui::metrics::px(8.0f)));
         bool settingsBegun = ImGui::Begin("Settings", &s_settingsOpen,
-                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking);
+                                          ImGuiWindowFlags_NoDocking);
         // The native title-bar X has no built-in ItemInfo label; expose its real hitbox to
         // pointer-driven UI scenarios after Begin has submitted the window decorations.
         {

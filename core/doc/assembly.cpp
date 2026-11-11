@@ -8,6 +8,8 @@
 #include "doc/assembly.h"
 
 #define _USE_MATH_DEFINES
+#include "util/component_ref.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -194,11 +196,15 @@ void trim_load_cache(const std::string& path) {
 std::string resolve_source_path(const std::string& path, const std::string& base_dir) {
     if (native_policy::rooted()) return native_policy::resolve_reference(path, base_dir);
     std::filesystem::path p(path);
-    if (p.is_absolute()) return p.string();
-    if (!base_dir.empty())
-        return (std::filesystem::path(base_dir) / p).lexically_normal().string();
     std::error_code ec;
-    return std::filesystem::absolute(p, ec).string();
+    if (p.is_relative() && base_dir.empty()) return std::filesystem::absolute(p, ec).string();
+    const auto resolved = p.is_absolute() ? p : (std::filesystem::path(base_dir) / p).lexically_normal();
+    // A nested sub-assembly saved on another machine: re-root its dead references.
+    if (!base_dir.empty() && !std::filesystem::exists(resolved, ec)) {
+        const auto moved = chudware::util::relocateComponentRef(path, std::filesystem::path(base_dir));
+        if (!moved.empty()) return moved.string();
+    }
+    return resolved.string();
 }
 
 std::string lower(std::string s) {

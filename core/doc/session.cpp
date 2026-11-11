@@ -16,6 +16,7 @@
 #include "util/aicm_handoff.h"
 #include "util/resource_governor.h"
 #include "util/process_isolation.h"
+#include "util/component_ref.h"  // absolutize_component_paths: re-root moved projects
 
 #include <algorithm>
 #include <array>
@@ -10273,15 +10274,31 @@ static void absolutize_component_paths(json& doc, const std::filesystem::path& b
         if (!component.contains("source") || !component["source"].is_object()) continue;
         json& source = component["source"];
         if (!source.contains("path") || !source["path"].is_string()) continue;
-        const auto ref = std::filesystem::u8path(source["path"].get<std::string>());
-        if (!ref.empty() && ref.is_relative())
-            source["path"] = native_policy::path_utf8((base / ref).lexically_normal());
+        const std::string stored = source["path"].get<std::string>();
+        const auto ref = std::filesystem::u8path(stored);
+        if (ref.empty()) continue;
+        // "/home/..." has no root name on Windows, so it is relative there; either way a
+        // reference that no longer exists (a project copied from another machine) is
+        // re-rooted against this assembly's folders before it is reported missing.
+        const auto resolved = ref.is_relative() ? (base / ref).lexically_normal() : ref;
+        std::error_code ec;
+        if (!base.empty() && !std::filesystem::exists(resolved, ec)) {
+            const auto moved = chudware::util::relocateComponentRef(stored, base);
+            if (!moved.empty()) {
+                source["path"] = native_policy::path_utf8(moved);
+                continue;
+            }
+        }
+        if (ref.is_relative()) source["path"] = native_policy::path_utf8(resolved);
     }
 }
 
 // The document's references are interpreted relative to its current location. Rebase
-// them for a save-as, and write paths under the destination assembly's directory as
-// portable POSIX-relative paths. References outside that subtree remain absolute.
+// them for a save-as, and write paths that share a folder with the destination assembly
+// as portable POSIX-relative paths ("parts/a.step+", "../parts/a.step+") so a project
+// folder opens on another machine or OS. A reference whose only common ancestor is the
+// filesystem root or another drive stays absolute; a rooted (workspace) cell refuses
+// "..", so there only the destination's own subtree is written relative.
 static void rebase_component_paths(json& doc, const std::filesystem::path& old_base,
                                    const std::filesystem::path& target_base) {
     if (!doc.is_object() || !doc.contains("components")) return;
@@ -10293,12 +10310,26 @@ static void rebase_component_paths(json& doc, const std::filesystem::path& old_b
         const auto ref = std::filesystem::u8path(source["path"].get<std::string>());
         // No base folder (unsaved, no project): keep the stored text, never guess the cwd.
         if (ref.empty() || (ref.is_relative() && old_base.empty())) continue;
-        const auto absolute = std::filesystem::absolute(
+        auto absolute = std::filesystem::absolute(
             ref.is_absolute() ? ref : old_base / ref).lexically_normal();
+        // A reference saved on another machine is written back as the file it resolves to.
+        std::error_code missing;
+        if (!old_base.empty() && !native_policy::rooted() &&
+            !std::filesystem::exists(absolute, missing)) {
+            const auto moved = chudware::util::relocateComponentRef(
+                source["path"].get<std::string>(), old_base);
+            if (!moved.empty()) absolute = std::filesystem::absolute(moved).lexically_normal();
+        }
         const auto relative = absolute.lexically_relative(dest);
         const auto first = relative.begin();
-        if (!relative.empty() && first != relative.end() && *first != ".." &&
-            *first != ".")
+        // Count the ".." steps: climbing every folder of `dest` means the only shared
+        // ancestor is the root, where an absolute path says more than a relative one.
+        std::size_t up = 0, depth = 0;
+        for (const auto& part : relative) if (part == "..") ++up;
+        for (const auto& part : dest.relative_path()) if (!part.empty()) ++depth;
+        const bool shares_folder = up < depth;
+        if (!relative.empty() && first != relative.end() && *first != "." &&
+            (*first != ".." || (shares_folder && !native_policy::rooted())))
             source["path"] = native_policy::generic_path_utf8(relative);
         else
             source["path"] = native_policy::path_utf8(absolute);

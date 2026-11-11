@@ -95,6 +95,7 @@
 #include "geom/text.h"     // resolve_font_path (bundled-font lookup regression)
 #include "geom/dress.h"    // edge_boundary_uses (free-edge rule the dress ops share)
 #include "util/aicm_handoff.h"
+#include "util/component_ref.h"  // relocateComponentRef (moved-project references)
 
 using json = nlohmann::json;
 using chudware::doc::CompileResult;
@@ -6323,6 +6324,76 @@ TEST_CASE("assembly pick owner lookup restores the component's saved build, not 
     }
     CHECK(executed() == before);  // every feature came from cache.ckpt
     CHECK(owners.size() == 2);    // Base and Boss both own faces
+}
+
+TEST_CASE("assembly references stay portable across machines and folders") {
+    // A project laid out proj/asm/top.step+ -> proj/parts/block.step+ must open after the
+    // folder is copied elsewhere (another user, another OS).
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "PortableBlock").at("doc_id");
+    const auto root = std::filesystem::temp_directory_path() / (part + "-portable");
+    const auto proj = root / "proj";
+    std::filesystem::create_directories(proj / "parts");
+    std::filesystem::create_directories(proj / "asm");
+    struct Cleanup {
+        std::filesystem::path dir;
+        std::vector<std::string> ids;
+        ~Cleanup() {
+            for (const auto& id : ids) try { doc_close(id); } catch (...) {}
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{root, {part}};
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"},
+            {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 10.0}}}}}}
+    }), false);
+    const auto part_path = proj / "parts" / "block.step+";
+    doc_save(part, part_path.string());
+    const std::string assembly = doc_new("assembly", "PortableTop").at("doc_id");
+    cleanup.ids.push_back(assembly);
+    doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}}, {"fixed", true}}
+    }), false);
+    const auto assembly_path = proj / "asm" / "top.step+";
+    doc_save(assembly, assembly_path.string());
+
+    SUBCASE("a sibling folder is saved as a relative reference") {
+        const auto stored = stepplus_open(assembly_path.string());
+        CHECK(stored.doc.at("components")[0].at("source").at("path") == "../parts/block.step+");
+    }
+    SUBCASE("another machine's absolute reference is re-rooted on open") {
+        auto stored = stepplus_open(assembly_path.string());
+        stored.doc["components"][0]["source"]["path"] = "/home/someone/Desktop/PROJ/parts/block.step+";
+        stepplus_save(stored.doc, assembly_path.string(), {});
+        REQUIRE(doc_close(assembly));
+        cleanup.ids.pop_back();
+        const std::string reopened = doc_open(assembly_path.string()).at("doc_id");
+        cleanup.ids.push_back(reopened);
+        CHECK(doc_asm_world_bodies(reopened).at("bodies").size() == 1);
+        // The next save writes the portable form.
+        doc_save(reopened, assembly_path.string());
+        CHECK(stepplus_open(assembly_path.string()).doc.at("components")[0].at("source").at("path") ==
+              "../parts/block.step+");
+    }
+}
+
+TEST_CASE("relocateComponentRef prefers the nearest folder and never matches a bare name upward") {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "chudware-relocate-ref";
+    fs::remove_all(root);
+    fs::create_directories(root / "proj" / "parts");
+    fs::create_directories(root / "proj" / "asm");
+    std::ofstream(root / "proj" / "parts" / "a.step+") << "x";
+    std::ofstream(root / "b.step+") << "x";
+    const auto base = root / "proj" / "asm";
+    CHECK(chudware::util::relocateComponentRef("/home/me/PROJ/parts/a.step+", base) ==
+          root / "proj" / "parts" / "a.step+");
+    CHECK(chudware::util::relocateComponentRef("C:\\work\\proj\\parts\\a.step+", base) ==
+          root / "proj" / "parts" / "a.step+");
+    CHECK(chudware::util::relocateComponentRef("/home/me/b.step+", base).empty());
+    CHECK(chudware::util::relocateComponentRef("../parts/a.step+", base).empty());
+    fs::remove_all(root);
 }
 
 TEST_CASE("a recovered unsaved part revision in an assembly reuses the file's checkpoints") {

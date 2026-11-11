@@ -21,6 +21,7 @@
 #include "gl_compat.h"
 #include "render/aicm_loader.h"
 #include "render/doc_thumbnail.h"
+#include "util/component_ref.h"
 #include "../ui_theme.h"   // ui::uiScale
 #endif
 
@@ -174,6 +175,12 @@ struct Composer {
             if (rel.empty()) continue;
             fs::path source = fs::u8path(rel);
             if (source.is_relative()) source = path.parent_path() / source;
+            // Same re-rooting the kernel applies on open (a project copied from another machine).
+            std::error_code ec;
+            if (!fs::exists(source, ec))
+                if (fs::path moved = chudware::util::relocateComponentRef(rel, path.parent_path());
+                    !moved.empty())
+                    source = std::move(moved);
             const MeshPtr part = load(source, depth + 1, nullptr);
             if (!part) continue;
             double m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};

@@ -280,8 +280,8 @@ TopoDS_Edge segment(const Handle(Geom_Curve)& curve, double a, double b) {
 }
 
 // The parameter of `p` on the support's section, on the side that enters the face.
-std::optional<double> locate(const Support& s, const gp_Pnt& p, double far, double tolerance) {
-    const double lo = std::min(s.start, far), hi = std::max(s.start, far);
+std::optional<double> locate(const Support& s, const gp_Pnt& p, double far_end, double tolerance) {
+    const double lo = std::min(s.start, far_end), hi = std::max(s.start, far_end);
     GeomAPI_ProjectPointOnCurve projection(p, s.curve, lo, hi);
     if (projection.NbPoints() == 0 || projection.LowerDistance() > tolerance) return {};
     const double u = projection.LowerDistanceParameter();
@@ -320,14 +320,14 @@ bool round_section(const std::array<Support, 2>& supports, const gp_Pnt& corner,
     const gp_Pln plane(corner, axis);
     why = "no arc of this radius is tangent to both faces at the edge";
     for (double window = 2.0 * radius; window <= 64.0 * radius; window *= 2.0) {
-        std::array<double, 2> far{};
+        std::array<double, 2> far_end{};
         std::array<TopoDS_Edge, 2> local;
         bool bounded = true;
         for (int i = 0; i < 2; ++i) {
             const auto end = advance(supports[i], window);
             if (!end) { bounded = false; break; }
-            far[i] = *end;
-            local[i] = segment(supports[i].curve, supports[i].start, far[i]);
+            far_end[i] = *end;
+            local[i] = segment(supports[i].curve, supports[i].start, far_end[i]);
             if (local[i].IsNull()) { bounded = false; break; }
         }
         if (!bounded) break;
@@ -351,7 +351,7 @@ bool round_section(const std::array<Support, 2>& supports, const gp_Pnt& corner,
         for (int i = 0; i < 2; ++i) {
             for (int e = 0; e < 2; ++e) {
                 if (e == which[0]) continue;
-                const auto at = locate(supports[i], ends[e], far[i], tolerance);
+                const auto at = locate(supports[i], ends[e], far_end[i], tolerance);
                 if (!at) continue;
                 u[i] = *at;
                 which[i] = e;
@@ -424,15 +424,15 @@ bool chamfer_section(const std::array<Support, 2>& supports, int reference, cons
         }
         const gp_Dir back(-first.sense * d);
         const double reach = 64.0 * std::max(profile.size, tolerance);
-        const auto far = advance(second, reach);
+        const auto far_end = advance(second, reach);
         double best = std::numeric_limits<double>::infinity();
-        if (far) {
+        if (far_end) {
             for (double sign : {1.0, -1.0}) {
                 const gp_Dir direction = back.Rotated(gp_Ax1(a, axis), sign * profile.size2);
                 Handle(Geom_Line) line = new Geom_Line(a, direction);
                 GeomAPI_ExtremaCurveCurve extrema(line, second.curve, 0.0, reach,
-                                                  std::min(second.start, *far),
-                                                  std::max(second.start, *far));
+                                                  std::min(second.start, *far_end),
+                                                  std::max(second.start, *far_end));
                 for (int i = 1; i <= extrema.NbExtrema(); ++i) {
                     if (extrema.Distance(i) > tolerance) continue;
                     double t = 0.0, u = 0.0;

@@ -861,11 +861,15 @@ PRESENTATION & SAVE DISCIPLINE
   and "~" destinations may be outside the workspace, but credential/key locations
   are refused after resolving symlinks. Pathless saves keep an existing native file
   in place, otherwise use CHUDWARE_PROJECT_SAVE_DIR (temp only with no project).
-  Native STL export refuses collapsed facets or a source-solid mesh that is not closed
-  and consistently oriented in the serialized output. validation_stages separates passed
-  facet checks from the explicitly skipped B-rep round-trip; it is not mesh reimport proof.
-  It does not heal geometry or weld nearby points. Inspect the source/export conditions
-  rather than deleting triangles or claiming an unchecked mesh is print-ready.
+  Native STL export refuses collinear (zero-area) facets or a source-solid mesh that is not
+  closed and consistently oriented in the serialized output. It omits only facets whose
+  corners serialize to one point (zero boundary), and mesh exports tessellate without
+  edges under 10 nm (boolean residue BRepMesh cannot mesh across). validation_stages
+  separates passed facet checks from the explicitly skipped B-rep round-trip; it is not
+  mesh reimport proof. It does not weld nearby points. On a refusal, the error detail names
+  the face and coordinates: fix the model there (eval_solid_health finds sliver faces and
+  self-intersecting sweeps) rather than deleting triangles or claiming an unchecked mesh
+  is print-ready.
   Make deliverables (STL/3MF/STEP for printing, fabrication or hand-off) from the native
   .step+ part or assembly, never by converting another export file: an exported STEP is a
   snapshot that goes stale as soon as its source changes, and checking the result against

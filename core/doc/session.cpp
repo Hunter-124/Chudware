@@ -22619,15 +22619,67 @@ static int default_export_units(const Session& s) {
     return 4;
 }
 
-// A STEP file Chudware exported from a saved native document whose saved tree has changed
-// since: {source, exported_doc_hash, source_doc_hash, message}. Null for a current export,
-// a foreign STEP, or a source that no longer exists or cannot be read.
+// The hash a STEP export records for a saved native document. A part hashes its own tree.
+// An assembly also folds in every component source it references, nested assemblies
+// included, so editing a component makes the assembly's export stale too. Components are
+// hashed as saved on disk; an unreadable one hashes as missing, which is itself a change.
+static std::string export_source_hash(const json& doc, const std::string& doc_path,
+                                      std::set<std::string>& visiting) {
+    const std::string own = stepplus_doc_hash(doc);
+    const json components = doc.value("components", json::array());
+    if (!components.is_array() || components.empty()) return own;
+    const std::filesystem::path base = std::filesystem::path(doc_path).parent_path();
+    std::set<std::string> sources;
+    for (const json& component : components) {
+        if (!component.is_object() || !component.contains("source") ||
+            !component["source"].is_object())
+            continue;
+        const std::string path = component["source"].value("path", std::string());
+        if (path.empty()) continue;
+        try {
+            if (native_policy::rooted()) {
+                sources.insert(native_policy::resolve_reference(path, base.string()));
+            } else {
+                const std::filesystem::path p(path);
+                sources.insert((p.is_absolute() ? p : base / p).lexically_normal().string());
+            }
+        } catch (...) {
+            sources.insert(path);
+        }
+    }
+    std::string composite = own;
+    for (const std::string& source : sources) {
+        composite += "|" + source + "=";
+        if (!visiting.insert(source).second) {
+            composite += "cycle";
+            continue;
+        }
+        try {
+            composite += export_source_hash(stepplus_read_document(source), source, visiting);
+        } catch (...) {
+            composite += "missing";
+        }
+        visiting.erase(source);
+    }
+    return stepplus_doc_hash(json(composite));
+}
+
+static std::string export_source_hash(const json& doc, const std::string& doc_path) {
+    std::set<std::string> visiting{doc_path};
+    return export_source_hash(doc, doc_path, visiting);
+}
+
+// A STEP file Chudware exported from a saved native document whose saved tree (or, for an
+// assembly, any component's) has changed since: {source, exported_doc_hash,
+// source_doc_hash, message}. Null for a current export, a foreign STEP, or a source that
+// no longer exists or cannot be read.
 static json stale_step_export(const std::string& step_path) {
     const auto provenance = read_step_provenance(step_path);
     if (!provenance) return nullptr;
     std::string current;
     try {
-        current = stepplus_doc_hash(stepplus_read_document(provenance->source));
+        current = export_source_hash(stepplus_read_document(provenance->source),
+                                     provenance->source);
     } catch (...) {
         return nullptr;
     }
@@ -22706,13 +22758,12 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
     if (expected_solids == 0) expected_solids = shapes.size();
     // A STEP export of a saved native document records which document revision it came from,
     // so importing it after that source changes reports the file as stale (import_file).
-    // An assembly's hash covers its own tree, not its components' edits.
     ExportProvenance provenance;
-    if (!s.path.empty()) {
+    if (!s.path.empty() && fmt == "step") {
         std::error_code aec;
         const auto abs = std::filesystem::absolute(s.path, aec);
         provenance.source = aec ? s.path : abs.lexically_normal().string();
-        provenance.doc_hash = stepplus_doc_hash(s.doc);
+        provenance.doc_hash = export_source_hash(s.doc, provenance.source);
     }
     std::string out = export_bodies(shapes, path, fmt, tess, provenance);  // throws on a writer error
 

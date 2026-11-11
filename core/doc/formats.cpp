@@ -162,6 +162,7 @@
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <ShapeFix_Solid.hxx>
+#include <ShapeFix_Wireframe.hxx>
 #include <Poly_Triangle.hxx>
 #include <TColStd_IndexedDataMapOfStringString.hxx>
 #include <TDF_LabelSequence.hxx>
@@ -2316,7 +2317,9 @@ namespace {
 //    UV edge X-Y (a node column inserted toward the pole), giving (P1,X,Y) and
 //    (P2,Y,X) with P1, P2 on the same degenerate edge at one exact point. In 3D that
 //    is one facet plus its reverse, a double-covered spike: the pair sums to zero.
-// Collinear facets, short edges, and float32 collapse are NOT filtered.
+// A facet with coincident corners off a pole is kept here; stl_triangulation omits it
+// with every other facet whose corners serialize to one point.
+// Collinear facets and short edges are NOT filtered.
 std::vector<Poly_Triangle> stl_face_facets(const TopoDS_Face& face) {
     TopLoc_Location loc;
     const auto& tri = BRep_Tool::Triangulation(face, loc);
@@ -2344,9 +2347,6 @@ std::vector<Poly_Triangle> stl_face_facets(const TopoDS_Face& face) {
             const int a = n[k], b = n[(k + 1) % 3];
             if (tri->Node(a).SquareDistance(tri->Node(b)) != 0.0) continue;
             for (const auto& on : pole) omit |= on[a] && on[b];
-            if (!omit)
-                throw OpError("export_failed",
-                              "STL contains coincident facet corners outside a native pole");
         }
         if (!omit) facets.push_back(facet);
     }
@@ -2473,8 +2473,25 @@ Handle(Poly_Triangulation) stl_triangulation(const TopoDS_Shape& shape, bool asc
     TopTools_IndexedMapOfShape faces;
     TopExp::MapShapes(shape, TopAbs_FACE, faces);
     std::vector<std::vector<Poly_Triangle>> facets(static_cast<std::size_t>(faces.Extent()));
-    for (int i = 1; i <= faces.Extent(); ++i)
-        facets[static_cast<std::size_t>(i) - 1] = stl_face_facets(TopoDS::Face(faces(i)));
+    for (int i = 1; i <= faces.Extent(); ++i) {
+        const TopoDS_Face face = TopoDS::Face(faces(i));
+        auto& kept = facets[static_cast<std::size_t>(i) - 1];
+        kept = stl_face_facets(face);
+        // Omit a facet whose corners serialize to one point (distinct mesh nodes closer
+        // than the output precision, e.g. 1e-6 mm apart at 500 mm in float32). In the
+        // output its boundary is A->A + A->C + C->A = 0, so omitting it moves no node and
+        // welds nothing; validate_stl_solid still proves the serialized solid is closed.
+        TopLoc_Location loc;
+        const auto& tri = BRep_Tool::Triangulation(face, loc);
+        const gp_Trsf trsf = loc.Transformation();
+        kept.erase(std::remove_if(kept.begin(), kept.end(), [&](const Poly_Triangle& facet) {
+            int n[3];
+            facet.Get(n[0], n[1], n[2]);
+            std::array<std::array<double, 3>, 3> p;
+            for (int k = 0; k < 3; ++k) p[k] = stl_position(tri->Node(n[k]).Transformed(trsf), ascii);
+            return p[0] == p[1] || p[1] == p[2] || p[0] == p[2];
+        }), kept.end());
+    }
     int nodes = 0, count = 0;
     for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
         const TopoDS_Face face = TopoDS::Face(ex.Current());
@@ -2506,8 +2523,17 @@ Handle(Poly_Triangulation) stl_triangulation(const TopoDS_Shape& shape, bool asc
                 const auto key = stl_position(mesh->Node(n[k]), ascii);
                 p[k].SetCoord(key[0], key[1], key[2]);
             }
-            if (gp_Vec(p[0], p[1]).Crossed(gp_Vec(p[0], p[2])).SquareMagnitude() == 0.0)
-                throw OpError("export_failed", "STL facet collapses in the output representation");
+            if (gp_Vec(p[0], p[1]).Crossed(gp_Vec(p[0], p[2])).SquareMagnitude() == 0.0) {
+                nlohmann::json source = nlohmann::json::array(), output = nlohmann::json::array();
+                for (int k = 0; k < 3; ++k) {
+                    const gp_Pnt& q = mesh->Node(n[k]);
+                    source.push_back({q.X(), q.Y(), q.Z()});
+                    output.push_back({p[k].X(), p[k].Y(), p[k].Z()});
+                }
+                throw OpError("export_failed", "STL facet collapses in the output representation",
+                              {{"face_index", faces.FindIndex(face)}, {"source_corners", source},
+                               {"output_corners", output}});
+            }
             mesh->SetTriangle(++written, Poly_Triangle(n[0], n[1], n[2]));
         }
         offset += tri->NbNodes();
@@ -3589,6 +3615,48 @@ std::string provenance_decode(const std::string& s) {
     return out;
 }
 
+// Edges shorter than this are boolean residue (a 3e-6 mm edge in a real cover part), far
+// below any mesh deflection. BRepMesh triangulates the two faces beside such an edge with
+// different boundary nodes, so the mesh is not closed even though the B-rep is.
+constexpr double kMicroEdgeMm = 1e-5;
+
+// `body` with its micro edges dropped for tessellation, or `body` itself when it has none
+// or the fixed copy is not an equally valid solid of the same volume. Mesh exports only;
+// B-rep exports write the model as it is.
+TopoDS_Shape without_micro_edges(const TopoDS_Shape& body) {
+    if (body.IsNull()) return body;
+    bool micro = false;
+    for (TopExp_Explorer ex(body, TopAbs_EDGE); ex.More() && !micro; ex.Next()) {
+        const TopoDS_Edge edge = TopoDS::Edge(ex.Current());
+        if (BRep_Tool::Degenerated(edge) || !BRep_Tool::IsGeometric(edge)) continue;
+        try {
+            micro = GCPnts_AbscissaPoint::Length(BRepAdaptor_Curve(edge)) < kMicroEdgeMm;
+        } catch (const Standard_Failure&) {
+        }
+    }
+    if (!micro) return body;
+    try {
+        ShapeFix_Wireframe fix(body);
+        fix.SetPrecision(kMicroEdgeMm);
+        fix.ModeDropSmallEdges() = Standard_True;
+        if (!fix.FixSmallEdges()) return body;
+        const TopoDS_Shape fixed = fix.Shape();
+        auto volume = [](const TopoDS_Shape& s) {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(s, props);
+            return props.Mass();
+        };
+        const double before = volume(body);
+        if (fixed.IsNull() ||
+            (BRepCheck_Analyzer(body).IsValid() && !BRepCheck_Analyzer(fixed).IsValid()) ||
+            std::abs(volume(fixed) - before) > 1e-6 * std::max(1.0, std::abs(before)))
+            return body;
+        return fixed;
+    } catch (const Standard_Failure&) {
+        return body;
+    }
+}
+
 }  // namespace
 
 std::optional<ExportProvenance> read_step_provenance(const std::string& path) {
@@ -3627,7 +3695,13 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
         std::error_code ec;
         std::filesystem::create_directories(parent, ec);
     }
-    const TopoDS_Shape shape = as_compound(bodies);
+    const bool mesh_fmt = fmt == "stl" || fmt == "obj" || fmt == "ply" || fmt == "gltf" ||
+                          fmt == "glb" || fmt == "3mf" || fmt == "3dm";
+    std::vector<TopoDS_Shape> tessellated;
+    if (mesh_fmt)
+        for (const TopoDS_Shape& body : bodies) tessellated.push_back(without_micro_edges(body));
+    const std::vector<TopoDS_Shape>& source = mesh_fmt ? tessellated : bodies;
+    const TopoDS_Shape shape = as_compound(source);
 
     try {
         if (fmt == "step") {
@@ -3756,7 +3830,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
         }
         if (fmt == "obj" || fmt == "ply") {
             MeshData mesh;
-            for (const TopoDS_Shape& body : bodies) {
+            for (const TopoDS_Shape& body : source) {
                 MeshData part = shape_to_mesh(body, tess);
                 if (part.triangle_count() == 0) continue;
                 const uint32_t base = static_cast<uint32_t>(mesh.vertex_count());
@@ -3772,7 +3846,7 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
         }
         if (fmt == "gltf" || fmt == "glb") {
             std::vector<TopoDS_Shape> meshed;
-            for (const TopoDS_Shape& body : bodies)
+            for (const TopoDS_Shape& body : source)
                 if (shape_to_mesh(body, tess).triangle_count() != 0) meshed.push_back(body);
             if (meshed.empty())
                 throw OpError("export_failed", "export: no triangles to write as " + fmt,
@@ -3787,11 +3861,11 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             // + build item per body). Export parity is gated as a ROUND-TRIP (the OCCT
             // tessellation differs from the oracle's), not byte/mesh-identical.
             std::vector<NamedMesh> meshes;
-            for (std::size_t i = 0; i < bodies.size(); ++i) {
-                if (bodies[i].IsNull()) continue;
+            for (std::size_t i = 0; i < source.size(); ++i) {
+                if (source[i].IsNull()) continue;
                 NamedMesh nm;
                 nm.name = "Body" + std::to_string(i + 1);
-                nm.mesh = shape_to_mesh(bodies[i], tess);
+                nm.mesh = shape_to_mesh(source[i], tess);
                 if (nm.mesh.triangle_count() > 0) meshes.push_back(std::move(nm));
             }
             write_3mf_meshes(meshes, out);
@@ -3810,11 +3884,11 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             // Export parity is gated as a ROUND-TRIP (the OCCT tessellation differs
             // from the oracle's), not byte/mesh-identical.
             std::vector<OnNamedMesh> meshes;
-            for (std::size_t i = 0; i < bodies.size(); ++i) {
-                if (bodies[i].IsNull()) continue;
+            for (std::size_t i = 0; i < source.size(); ++i) {
+                if (source[i].IsNull()) continue;
                 OnNamedMesh nm;
                 nm.name = "Body" + std::to_string(i + 1);
-                nm.mesh = shape_to_mesh(bodies[i], tess);
+                nm.mesh = shape_to_mesh(source[i], tess);
                 if (nm.mesh.triangle_count() > 0) meshes.push_back(std::move(nm));
             }
             write_3dm_meshes(meshes, out);

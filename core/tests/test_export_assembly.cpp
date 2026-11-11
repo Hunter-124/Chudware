@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <GProp_GProps.hxx>
@@ -826,4 +827,60 @@ TEST_CASE("a STEP export carries its native source and imports as stale once the
     CHECK_FALSE(read_step_provenance((dir / "foreign.step").string()));
     doc_close(part);
     fs::remove_all(dir);
+}
+
+TEST_CASE("an assembly STEP export goes stale when a component part is edited") {
+    // The assembly's own tree does not change when a component is edited and saved, so its
+    // export hash folds in each component source.
+    using namespace chudware::doc;
+    const fs::path dir = tmp("provenance_asm");
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path part_path = dir / "bracket.step+";
+    const fs::path asm_path = dir / "top.step+";
+    const fs::path step_path = dir / "top.step";
+    const std::string part = doc_new("part", "Bracket").at("doc_id");
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Base"},
+            {"params", {{"length", 30.0}, {"width", 20.0}, {"height", 10.0},
+                        {"centered", false}}}}}}}), false);
+    doc_save(part, part_path.string());
+    const std::string assembly = doc_new("assembly", "Top").at("doc_id");
+    doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}}}), false);
+    doc_save(assembly, asm_path.string());
+    doc_export_file(assembly, step_path.string(), "step");
+    const json fresh = doc_import_file(step_path.string(), "", false, "");
+    CHECK_FALSE(fresh.contains("stale_export"));
+    doc_close(fresh.at("doc_id"));
+
+    const std::string base = doc_tree(part).at("tree").at("features").at(0).at("id");
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "edit_feature"}, {"id", base}, {"params", {{"height", 14.0}}}}}), false);
+    doc_save(part, part_path.string());
+    const json stale = doc_import_file(step_path.string(), "", false, "");
+    REQUIRE(stale.contains("stale_export"));
+    CHECK(fs::path(stale["stale_export"].at("source").get<std::string>()) ==
+          fs::absolute(asm_path).lexically_normal());
+    doc_close(stale.at("doc_id"));
+    doc_close(assembly);
+    doc_close(part);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("an STL export meshes through a sub-10 nm boolean step far from the origin") {
+    // A 1e-6 mm step left by a boolean at x = 500 (a real cover part had a 3e-6 mm edge):
+    // BRepMesh gives the faces beside it different boundary nodes, so the STL was refused
+    // as not closed though the B-rep is. Mesh exports tessellate without such edges.
+    const TopoDS_Shape fused = BRepAlgoAPI_Fuse(
+        BRepPrimAPI_MakeBox(gp_Pnt(500, 0, 0), 10.0, 10.0, 10.0).Shape(),
+        BRepPrimAPI_MakeBox(gp_Pnt(505, 0, 0), 10.0, 10.0, 10.0 + 1e-6).Shape()).Shape();
+    const fs::path out = tmp("micro_step.stl");
+    chudware::doc::TessOptions tess;
+    tess.lin_deflection = 0.02;
+    tess.ang_deflection = 0.1;
+    CHECK_NOTHROW(chudware::doc::export_bodies({fused}, out.string(), "stl", tess));
+    CHECK(fs::file_size(out) > 84);
+    fs::remove(out);
 }

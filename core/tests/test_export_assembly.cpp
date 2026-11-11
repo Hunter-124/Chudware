@@ -776,3 +776,54 @@ TEST_CASE("component geometry mode preserves curved display across compile cache
     CHECK(displayed_again.aicm == displayed.aicm);
     CHECK(displayed_again.owner_map == displayed.owner_map);
 }
+
+TEST_CASE("a STEP export carries its native source and imports as stale once the source changes") {
+    // An agent asked for "the latest STLs" converted a folder of STEP exports that were days
+    // older than the native parts; nothing in the STEP said which part revision it held.
+    using namespace chudware::doc;
+    const fs::path dir = tmp("provenance");
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path part_path = dir / "it's a part.step+";  // quote + space survive encoding
+    const fs::path step_path = dir / "export" / "part.step";
+    const std::string part = doc_new("part", "ProvenancePart").at("doc_id");
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Base"},
+            {"params", {{"length", 40.0}, {"width", 20.0}, {"height", 10.0},
+                        {"centered", false}}}}}}}), false);
+    doc_save(part, part_path.string());
+    doc_export_file(part, step_path.string(), "step");
+
+    const auto provenance = read_step_provenance(step_path.string());
+    REQUIRE(provenance);
+    CHECK(fs::path(provenance->source) == fs::absolute(part_path).lexically_normal());
+    CHECK(provenance->doc_hash == stepplus_doc_hash(stepplus_read_document(part_path.string())));
+
+    // Current export: no stale flag.
+    const json fresh = doc_import_file(step_path.string(), "", false, "");
+    CHECK_FALSE(fresh.contains("stale_export"));
+    doc_close(fresh.at("doc_id"));
+
+    // The part changes after the export: importing the old STEP says so, and so does a
+    // deliverable exported from that import.
+    const std::string base = doc_tree(part).at("tree").at("features").at(0).at("id");
+    doc_apply_ops(part, -1, json::array({
+        {{"op", "edit_feature"}, {"id", base}, {"params", {{"height", 25.0}}}}}), false);
+    doc_save(part, part_path.string());
+    const json stale = doc_import_file(step_path.string(), "", false, "");
+    REQUIRE(stale.contains("stale_export"));
+    CHECK(fs::path(stale["stale_export"].at("source").get<std::string>()) ==
+          fs::absolute(part_path).lexically_normal());
+    const json stl = doc_export_file(stale.at("doc_id"), (dir / "part.stl").string(), "stl");
+    REQUIRE(stl.contains("stale_sources"));
+    CHECK(stl["stale_sources"].size() == 1);
+    CHECK(stl.at("warnings").size() == 1);
+    doc_close(stale.at("doc_id"));
+
+    // A STEP written without a native source (any foreign file) carries no provenance.
+    export_bodies({BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape()}, (dir / "foreign.step").string(),
+                  "step");
+    CHECK_FALSE(read_step_provenance((dir / "foreign.step").string()));
+    doc_close(part);
+    fs::remove_all(dir);
+}

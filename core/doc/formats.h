@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -155,9 +156,20 @@ constexpr std::size_t kMaxSewnMeshTriangles = 50000;
 // Bodies are merged into one compound for the B-rep writers (mirrors formats.py::
 // _shapes_to_export_list). Throws OpError("export_failed") on an unsupported format or
 // a writer failure. Returns the absolute path written.
+// The saved native document a STEP export was written from. A STEP export carries it in
+// FILE_DESCRIPTION, so importing that file later can tell that the source has since changed
+// and the export is stale (a re-export from the STEP would ship old geometry).
+struct ExportProvenance {
+    std::string source;    // absolute path of the saved .step+
+    std::string doc_hash;  // stepplus_doc_hash of the exported document revision
+};
 std::string export_bodies(const std::vector<TopoDS_Shape>& bodies,
                           const std::string& path, const std::string& fmt,
-                          const TessOptions& tess = TessOptions{});
+                          const TessOptions& tess = TessOptions{},
+                          const ExportProvenance& provenance = ExportProvenance{});
+
+// The provenance a Chudware STEP export carries, or nullopt for any other STEP file.
+std::optional<ExportProvenance> read_step_provenance(const std::string& path);
 
 // Read solid and non-solid bodies from `path`. Supported: step (multi-body), iges (sewn+healed),
 // brep, mesh formats stl/obj/ply/gltf/glb/3mf/3dm (sewn into a shell/solid),

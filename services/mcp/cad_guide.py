@@ -866,6 +866,13 @@ PRESENTATION & SAVE DISCIPLINE
   facet checks from the explicitly skipped B-rep round-trip; it is not mesh reimport proof.
   It does not heal geometry or weld nearby points. Inspect the source/export conditions
   rather than deleting triangles or claiming an unchecked mesh is print-ready.
+  Make deliverables (STL/3MF/STEP for printing, fabrication or hand-off) from the native
+  .step+ part or assembly, never by converting another export file: an exported STEP is a
+  snapshot that goes stale as soon as its source changes, and checking the result against
+  that same STEP proves nothing. "Mirror the STEP folder" means export each file's native
+  source into that layout. A Chudware STEP records its source; import_part returns
+  stale_export and export_part returns stale_sources (with the source path) when the source
+  has changed since — stop and export the named source instead.
 
 PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
   A primitive is built CENTRED ON THE ORIGIN and then placed. These are the placement keys,

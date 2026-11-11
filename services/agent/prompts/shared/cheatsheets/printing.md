@@ -16,6 +16,9 @@
    `verify_gcode`. `copies=N` repeats one part on its plate.
    Explicit user preferences win: no brim means `brim=0`; a direct-drive conversion needs
    appropriate retraction overrides instead of blindly retaining Bowden retraction.
+   Slice or export print STLs from the native `.step+` part, never from an exported STEP:
+   an export folder can be days behind its source. `stale_export` / `stale_sources` in an
+   import_part/export_part reply names the newer source to use instead.
    Several parts in one job: `slice_part(parts=[{"doc_id": a, "copies": 2}, {"doc_id": b},
    {"path": "…stl"}], printer=…, name="small_parts")` — each part is oriented and analysed on
    its own (per-entry `orientation`/`build_dir`/`preserve_faces`/`strength_dir`), the

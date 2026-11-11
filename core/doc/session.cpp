@@ -22619,6 +22619,27 @@ static int default_export_units(const Session& s) {
     return 4;
 }
 
+// A STEP file Chudware exported from a saved native document whose saved tree has changed
+// since: {source, exported_doc_hash, source_doc_hash, message}. Null for a current export,
+// a foreign STEP, or a source that no longer exists or cannot be read.
+static json stale_step_export(const std::string& step_path) {
+    const auto provenance = read_step_provenance(step_path);
+    if (!provenance) return nullptr;
+    std::string current;
+    try {
+        current = stepplus_doc_hash(stepplus_read_document(provenance->source));
+    } catch (...) {
+        return nullptr;
+    }
+    if (current == provenance->doc_hash) return nullptr;
+    return {{"source", provenance->source},
+            {"exported_doc_hash", provenance->doc_hash},
+            {"source_doc_hash", current},
+            {"message", "This STEP is a stale export: its source " + provenance->source +
+                            " has changed since it was written. Open or export the source "
+                            "instead; deliverables made from this file carry old geometry."}};
+}
+
 json doc_export_file(const std::string& doc_id, const std::string& path, const std::string& fmt,
                      double lin_deflection, double ang_deflection, bool relative, bool ascii,
                      const std::string& units) {
@@ -22683,7 +22704,17 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
         expected_solids += (n > 0 ? n : 1);
     }
     if (expected_solids == 0) expected_solids = shapes.size();
-    std::string out = export_bodies(shapes, path, fmt, tess);  // throws on a writer error
+    // A STEP export of a saved native document records which document revision it came from,
+    // so importing it after that source changes reports the file as stale (import_file).
+    // An assembly's hash covers its own tree, not its components' edits.
+    ExportProvenance provenance;
+    if (!s.path.empty()) {
+        std::error_code aec;
+        const auto abs = std::filesystem::absolute(s.path, aec);
+        provenance.source = aec ? s.path : abs.lexically_normal().string();
+        provenance.doc_hash = stepplus_doc_hash(s.doc);
+    }
+    std::string out = export_bodies(shapes, path, fmt, tess, provenance);  // throws on a writer error
 
     // Real metadata + a flush check: never report success on a missing/empty (truncated) file.
     std::error_code fec;
@@ -22697,6 +22728,33 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
               {"expected_solids", static_cast<int>(expected_solids)}};
     if (acis_fmt) meta["units"] = tess.units;
     if (s.is_assembly()) meta["components"] = std::move(components);
+    // Geometry imported from a STEP export whose native source has since changed is old
+    // geometry: say so on the deliverable, not only at import time.
+    json stale_sources = json::array();
+    for (const json& feature : s.doc.value("features", json::array())) {
+        if (!feature.is_object() || feature.value("type", std::string()) != "import" ||
+            feature.value("suppressed", false))
+            continue;
+        const json params = feature.value("params", json::object());
+        if (!params.is_object() || params.value("format", std::string()) != "step") continue;
+        std::string source;
+        try {
+            source = native_policy::resolve_reference(params.value("source_path", std::string()));
+        } catch (...) {
+            continue;
+        }
+        json stale = stale_step_export(source);
+        if (!stale.is_null()) {
+            stale["imported_step"] = source;
+            stale_sources.push_back(std::move(stale));
+        }
+    }
+    if (!stale_sources.empty()) {
+        json warnings = json::array();
+        for (const json& stale : stale_sources) warnings.push_back(stale.at("message"));
+        meta["warnings"] = std::move(warnings);
+        meta["stale_sources"] = std::move(stale_sources);
+    }
 
     // DXF / DWG / SAT carry exact ACIS solids: re-read them with the ACIS reader and require
     // the same solids (count, validity, volume) back, so a writer defect fails here rather
@@ -23107,6 +23165,13 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
 
     json resp = apply_ops_locked(*s, -1, ops, /*coalesce=*/false);
     resp["doc_id"] = s->doc_id;
+    if (f == "step") {
+        json stale = stale_step_export(import_path_);
+        if (!stale.is_null()) {
+            import_warnings.push_back(stale.at("message").get<std::string>());
+            resp["stale_export"] = std::move(stale);
+        }
+    }
     if (!import_warnings.empty()) resp["warnings"] = import_warnings;
     if (solidworks_tessellation) {
         resp["import_fidelity"] = "saved_display_tessellation";

@@ -86,6 +86,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -153,8 +154,11 @@
 #include <RWGltf_CafWriter.hxx>
 #include <RWObj.hxx>
 #include <RWStl.hxx>
+#include <APIHeaderSection_MakeHeader.hxx>
+#include <Interface_HArray1OfHAsciiString.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
+#include <TCollection_HAsciiString.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <ShapeFix_Solid.hxx>
@@ -3551,10 +3555,70 @@ DxfDocument bodies_to_dxf_document(const std::vector<TopoDS_Shape>& bodies,
     return doc;
 }
 
+// FILE_DESCRIPTION token for ExportProvenance. The path is percent-encoded so the value
+// survives as a plain STEP string (no quote, backslash or non-ASCII byte to escape).
+constexpr const char* kProvenanceSource = "chudware-export:source=";
+constexpr const char* kProvenanceHash = ";doc_hash=";
+
+std::string provenance_encode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || std::strchr("/._-~: ", c)) {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+std::string provenance_decode(const std::string& s) {
+    std::string out;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+            out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
+std::optional<ExportProvenance> read_step_provenance(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    // The token lives in the HEADER section; the writer may wrap a long string across lines.
+    std::string header;
+    std::string line;
+    while (header.size() < (1u << 16) && std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        header += line;
+        if (line.find("ENDSEC;") != std::string::npos) break;
+    }
+    const std::size_t at = header.find(kProvenanceSource);
+    if (at == std::string::npos) return std::nullopt;
+    const std::size_t begin = at + std::strlen(kProvenanceSource);
+    const std::size_t end = header.find('\'', begin);
+    const std::size_t hash = header.find(kProvenanceHash, begin);
+    if (end == std::string::npos || hash == std::string::npos || hash > end) return std::nullopt;
+    ExportProvenance p;
+    p.source = provenance_decode(header.substr(begin, hash - begin));
+    p.doc_hash = header.substr(hash + std::strlen(kProvenanceHash),
+                               end - hash - std::strlen(kProvenanceHash));
+    if (p.source.empty() || p.doc_hash.empty()) return std::nullopt;
+    return p;
+}
+
 std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::string& path,
-                          const std::string& fmt, const TessOptions& tess) {
+                          const std::string& fmt, const TessOptions& tess,
+                          const ExportProvenance& provenance) {
     if (bodies.empty())
         throw OpError("export_failed", "export: no bodies to write", {{"format", fmt}});
     const std::string out = abs_path(path);
@@ -3587,6 +3651,17 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
             for (const TopoDS_Shape& u : units)
                 if (w.Transfer(u, STEPControl_AsIs) != IFSelect_RetDone)
                     throw OpError("export_failed", "STEP writer: transfer failed", {{"format", fmt}});
+            if (!provenance.source.empty() && !provenance.doc_hash.empty()) {
+                APIHeaderSection_MakeHeader header(w.Model());
+                Handle(Interface_HArray1OfHAsciiString) description =
+                    new Interface_HArray1OfHAsciiString(1, 2);
+                description->SetValue(1, new TCollection_HAsciiString("Open CASCADE Model"));
+                description->SetValue(
+                    2, new TCollection_HAsciiString(
+                           (kProvenanceSource + provenance_encode(provenance.source) +
+                            kProvenanceHash + provenance.doc_hash).c_str()));
+                header.SetDescription(description);
+            }
             if (w.Write(out.c_str()) != IFSelect_RetDone)
                 throw OpError("export_failed", "STEP writer: write failed", {{"path", out}});
             return out;

@@ -1,10 +1,12 @@
 #include "geom/tessellate.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBndLib.hxx>
@@ -12,14 +14,23 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepLib_ToolTriangulatedShape.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepTools_WireExplorer.hxx>
+#include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <ElSLib.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <IMeshTools_Parameters.hxx>
+#include <NCollection_DataMap.hxx>
+#include <OSD_Parallel.hxx>
 #include <Poly_PolygonOnTriangulation.hxx>
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
+#include <Poly_TriangulationParameters.hxx>
+#include <Precision.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColStd_Array1OfReal.hxx>
 #include <TopAbs.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -27,16 +38,25 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <TopTools_MapOfShape.hxx>
+#include <TopTools_ShapeMapHasher.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Iterator.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Vertex.hxx>
+#include <TopoDS_Wire.hxx>
 #include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Elips.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pnt2d.hxx>
 #include <gp_Trsf.hxx>
+
+#include "../../extern/mapbox/earcut.hpp"
 
 namespace geom {
 
@@ -175,6 +195,404 @@ double spline_mesh_min_size(const TopoDS_Shape& shape, double lin, double ang) {
     }
 }
 
+// ---- planar fast path ---------------------------------------------------------
+// BRepMesh's Delaunay degrades badly on a planar face bounded by thousands of nodes
+// (a plate with a few hundred holes: seconds per face, superlinear in the hole count),
+// and every edit that touches such a face re-meshes it from scratch. A plane needs no
+// interior nodes, so those faces are ear-clipped here over exactly the boundary nodes
+// their edges carry on the neighbouring faces, and attached the way BRepMesh attaches
+// its own result: node and triangle counts are what BRepMesh produces, shared edges stay
+// watertight, and BRepMesh treats the face as already meshed.
+
+// Below this many estimated boundary nodes BRepMesh is fast and its output is kept.
+constexpr int kPlanarFastPathMinNodes = 256;
+
+struct EdgeNodes {
+    std::vector<gp_Pnt> pts;  // world frame, in the edge's forward parameter order
+    std::vector<double> prm;
+};
+using EdgeNodeCache = NCollection_DataMap<TopoDS_Shape, EdgeNodes, TopTools_ShapeMapHasher>;
+
+// One planar face between gathering its boundary and attaching its triangulation.
+struct PlanarFace {
+    struct LoopEdge {
+        TopoDS_Edge edge;
+        std::vector<int> nodes;  // node index per polygon point, forward parameter order
+        std::vector<double> prm;
+    };
+    TopoDS_Face face;
+    gp_Pln plane;
+    gp_Trsf to_local;                    // world -> the frame the face's TShape is meshed in
+    std::vector<gp_Pnt> nodes;           // world frame
+    std::vector<std::vector<int>> loops; // node indices per wire
+    std::vector<LoopEdge> edges;
+    Handle(Poly_Triangulation) tri;
+};
+
+// Was `tri` produced by this request? Such a face needs no second look. The recorded
+// deflection is never the requested one to the last digit: BRepMesh records a per-face
+// value derived from it, and the size-relative request itself moves in the fourth digit
+// once a body's bounding box is measured off its mesh.
+bool meshed_as_requested(const Handle(Poly_Triangulation)& tri, const IMeshTools_Parameters& params) {
+    if (tri.IsNull()) return false;
+    const Handle(Poly_TriangulationParameters)& made = tri->Parameters();
+    return !made.IsNull() &&
+           std::abs(made->Deflection() - params.Deflection) <= 0.01 * params.Deflection &&
+           std::abs(made->Angle() - params.Angle) <= 1.0e-9;
+}
+
+// Boundary-node estimate of a face, without discretizing anything. BRepMesh steps a
+// circular edge by half the angular deflection.
+int estimate_boundary_nodes(const TopoDS_Face& face, double ang) {
+    int n = 0;
+    for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next()) {
+        const BRepAdaptor_Curve c(TopoDS::Edge(ex.Current()));
+        switch (c.GetType()) {
+            case GeomAbs_Line: n += 1; break;
+            case GeomAbs_Circle:
+            case GeomAbs_Ellipse:
+                n += static_cast<int>(std::abs(c.LastParameter() - c.FirstParameter()) /
+                                      (0.5 * ang)) + 1;
+                break;
+            default: n += 16; break;
+        }
+    }
+    return n;
+}
+
+enum class Attached { None, Found, Unusable };
+
+// The nodes a meshed neighbouring face already gave `edge`. Unusable: a neighbour is
+// meshed but its nodes for this edge cannot be read back, so this face could not be
+// made to share them. `pending` are the fast-path faces themselves, whose current
+// triangulation (if any) is about to be replaced.
+Attached attached_edge_nodes(const TopoDS_Edge& edge,
+                             const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces,
+                             const TopTools_MapOfShape& pending, EdgeNodes& out) {
+    if (!edge_faces.Contains(edge)) return Attached::None;
+    bool meshed_neighbour = false;
+    for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromKey(edge)); it.More(); it.Next()) {
+        if (pending.Contains(it.Value())) continue;
+        TopLoc_Location loc;
+        const Handle(Poly_Triangulation) tri =
+            BRep_Tool::Triangulation(TopoDS::Face(it.Value()), loc);
+        if (tri.IsNull()) continue;
+        meshed_neighbour = true;
+        const Handle(Poly_PolygonOnTriangulation) poly =
+            BRep_Tool::PolygonOnTriangulation(edge, tri, loc);
+        if (poly.IsNull() || !poly->HasParameters() || poly->NbNodes() < 2) continue;
+        const gp_Trsf trsf = loc.Transformation();
+        out.pts.clear();
+        out.prm.clear();
+        for (int i = 1; i <= poly->NbNodes(); ++i) {
+            out.pts.push_back(tri->Node(poly->Node(i)).Transformed(trsf));
+            out.prm.push_back(poly->Parameters()->Value(i));
+        }
+        return Attached::Found;
+    }
+    return meshed_neighbour ? Attached::Unusable : Attached::None;
+}
+
+// Collect a planar face's boundary as closed loops of shared nodes. False leaves the
+// face to BRepMesh: anything but simple closed wires of once-used edges. `fresh` holds
+// the edges discretized here, so two fast-path faces sharing one agree on its nodes.
+bool gather_planar_face(const TopoDS_Face& face,
+                        const TopTools_IndexedDataMapOfShapeListOfShape& edge_faces,
+                        const TopTools_MapOfShape& pending, EdgeNodeCache& fresh,
+                        const IMeshTools_Parameters& params, PlanarFace& out) {
+    const gp_Trsf to_world = face.Location().Transformation();
+    if (to_world.IsNegative() || std::abs(std::abs(to_world.ScaleFactor()) - 1.0) > 1.0e-12)
+        return false;
+    const BRepAdaptor_Surface surf(face, Standard_False);
+    if (surf.GetType() != GeomAbs_Plane) return false;
+    out.face = face;
+    out.plane = surf.Plane();
+    out.to_local = to_world.Inverted();
+
+    TopTools_MapOfShape seen;
+    for (TopoDS_Iterator wi(face); wi.More(); wi.Next()) {
+        if (wi.Value().ShapeType() != TopAbs_WIRE) return false;
+        const TopAbs_Orientation wo = wi.Value().Orientation();
+        if (wo != TopAbs_FORWARD && wo != TopAbs_REVERSED) return false;
+        const TopoDS_Wire wire = TopoDS::Wire(wi.Value());
+        int n_edges = 0;
+        for (TopoDS_Iterator ei(wire); ei.More(); ei.Next()) ++n_edges;
+
+        std::vector<int> loop;
+        const std::size_t first_edge = out.edges.size();
+        int walked = 0;
+        for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next(), ++walked) {
+            const TopoDS_Edge edge = we.Current();
+            if (BRep_Tool::Degenerated(edge)) return false;
+            const TopoDS_Shape key = edge.Oriented(TopAbs_FORWARD);
+            if (!seen.Add(key)) return false;  // seam or slit: both sides in one face
+            EdgeNodes en;
+            const Attached attached = attached_edge_nodes(edge, edge_faces, pending, en);
+            if (attached == Attached::Unusable) return false;
+            if (attached == Attached::None) {
+                if (const EdgeNodes* known = fresh.Seek(key)) {
+                    en = *known;
+                } else {
+                    const BRepAdaptor_Curve curve(edge);
+                    const GCPnts_TangentialDeflection disc(
+                        curve, 0.5 * params.Angle, params.Deflection, 2, Precision::PConfusion(),
+                        params.MinSize > 0.0 ? params.MinSize : 1.0e-7);
+                    if (disc.NbPoints() < 2) return false;
+                    for (int i = 1; i <= disc.NbPoints(); ++i) {
+                        en.pts.push_back(disc.Value(i));
+                        en.prm.push_back(disc.Parameter(i));
+                    }
+                    // End nodes sit on the vertices, as BRepMesh places them.
+                    TopoDS_Vertex vf, vl;
+                    TopExp::Vertices(TopoDS::Edge(key), vf, vl);
+                    if (vf.IsNull() || vl.IsNull()) return false;
+                    en.pts.front() = BRep_Tool::Pnt(vf);
+                    en.pts.back() = BRep_Tool::Pnt(vl);
+                    fresh.Bind(key, en);
+                }
+            }
+            const bool reversed = edge.Orientation() == TopAbs_REVERSED;
+            const std::size_t m = en.pts.size();
+            PlanarFace::LoopEdge le;
+            le.edge = edge;
+            le.nodes.assign(m, 0);
+            le.prm = en.prm;
+            // Walk the edge in wire direction; its first node is the previous edge's last.
+            for (std::size_t k = 0; k < m; ++k) {
+                const std::size_t src = reversed ? m - 1 - k : k;
+                int idx = 0;
+                if (k == 0 && !loop.empty()) {
+                    idx = loop.back();
+                    const double tol =
+                        BRep_Tool::Tolerance(we.CurrentVertex()) + Precision::Confusion();
+                    if (out.nodes[static_cast<std::size_t>(idx)].Distance(en.pts[src]) > 2.0 * tol)
+                        return false;
+                } else {
+                    out.nodes.push_back(en.pts[src]);
+                    idx = static_cast<int>(out.nodes.size()) - 1;
+                    loop.push_back(idx);
+                }
+                le.nodes[src] = idx;
+            }
+            out.edges.push_back(std::move(le));
+        }
+        if (walked != n_edges || loop.size() < 4) return false;
+        // Close the wire: its last node, the one appended last, repeats its first.
+        const int last = loop.back(), first = loop.front();
+        if (out.nodes[static_cast<std::size_t>(last)].Distance(
+                out.nodes[static_cast<std::size_t>(first)]) >
+            2.0 * (BRep_Tool::Tolerance(face) + Precision::Confusion()))
+            return false;
+        loop.pop_back();
+        out.nodes.pop_back();
+        for (std::size_t k = first_edge; k < out.edges.size(); ++k)
+            for (int& idx : out.edges[k].nodes)
+                if (idx == last) idx = first;
+        out.loops.push_back(std::move(loop));
+    }
+    return !out.loops.empty();
+}
+
+// Ear-clip the gathered boundary. False (no triangulation) when the result does not
+// cover the face exactly with every node used: BRepMesh then meshes the face.
+bool triangulate_planar_face(PlanarFace& pf, const IMeshTools_Parameters& params) {
+    const std::size_t n = pf.nodes.size();
+    std::vector<gp_Pnt2d> uv(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        double u = 0.0, v = 0.0;
+        ElSLib::Parameters(pf.plane, pf.nodes[i], u, v);
+        uv[i].SetCoord(u, v);
+    }
+    // The wire enclosing the largest area is the outer boundary.
+    std::vector<double> areas(pf.loops.size());
+    std::size_t outer = 0;
+    for (std::size_t k = 0; k < pf.loops.size(); ++k) {
+        const std::vector<int>& loop = pf.loops[k];
+        double a = 0.0;
+        for (std::size_t j = 0; j < loop.size(); ++j) {
+            const gp_Pnt2d& p = uv[static_cast<std::size_t>(loop[j])];
+            const gp_Pnt2d& q = uv[static_cast<std::size_t>(loop[(j + 1) % loop.size()])];
+            a += p.X() * q.Y() - q.X() * p.Y();
+        }
+        areas[k] = std::abs(0.5 * a);
+        if (areas[k] > areas[outer]) outer = k;
+    }
+    double expected = areas[outer];
+    for (std::size_t k = 0; k < pf.loops.size(); ++k)
+        if (k != outer) expected -= areas[k];
+    if (!(expected > 0.0)) return false;
+
+    // earcut numbers the rings' points consecutively, outer ring first.
+    std::vector<std::vector<std::array<double, 2>>> rings;
+    std::vector<int> ring_node;
+    ring_node.reserve(n);
+    auto add_ring = [&](const std::vector<int>& loop) {
+        std::vector<std::array<double, 2>> ring;
+        ring.reserve(loop.size());
+        for (const int idx : loop) {
+            const gp_Pnt2d& p = uv[static_cast<std::size_t>(idx)];
+            ring.push_back({p.X(), p.Y()});
+            ring_node.push_back(idx);
+        }
+        rings.push_back(std::move(ring));
+    };
+    add_ring(pf.loops[outer]);
+    for (std::size_t k = 0; k < pf.loops.size(); ++k)
+        if (k != outer) add_ring(pf.loops[k]);
+    const std::vector<uint32_t> ears = mapbox::earcut<uint32_t>(rings);
+    const std::size_t n_tris = ears.size() / 3;
+    // A polygon with h holes has exactly n - 2 + 2h triangles over all of its n nodes.
+    if (n_tris != n - 2 + 2 * (pf.loops.size() - 1)) return false;
+
+    Handle(Poly_Triangulation) tri =
+        new Poly_Triangulation(static_cast<int>(n), static_cast<int>(n_tris), Standard_True);
+    double covered = 0.0;
+    for (std::size_t t = 0; t < n_tris; ++t) {
+        const int a = ring_node[ears[3 * t]];
+        int b = ring_node[ears[3 * t + 1]], c = ring_node[ears[3 * t + 2]];
+        const gp_Pnt2d& pa = uv[static_cast<std::size_t>(a)];
+        const gp_Pnt2d& pb = uv[static_cast<std::size_t>(b)];
+        const gp_Pnt2d& pc = uv[static_cast<std::size_t>(c)];
+        const double area2 = (pb.X() - pa.X()) * (pc.Y() - pa.Y()) -
+                             (pc.X() - pa.X()) * (pb.Y() - pa.Y());
+        if (area2 < 0.0) std::swap(b, c);  // counter-clockwise in the surface's (u, v)
+        covered += 0.5 * std::abs(area2);
+        tri->SetTriangle(static_cast<int>(t) + 1, Poly_Triangle(a + 1, b + 1, c + 1));
+    }
+    if (std::abs(covered - expected) > 1.0e-9 * areas[outer]) return false;
+
+    // Nodes and normals in the TShape's frame; the normal is the surface's own
+    // (u x v), which extraction flips for a reversed face.
+    const gp_Dir normal = pf.plane.Position().XDirection()
+                              .Crossed(pf.plane.Position().YDirection())
+                              .Transformed(pf.to_local);
+    tri->AddNormals();
+    for (std::size_t i = 0; i < n; ++i) {
+        const int at = static_cast<int>(i) + 1;
+        tri->SetNode(at, pf.nodes[i].Transformed(pf.to_local));
+        tri->SetUVNode(at, uv[i]);
+        tri->SetNormal(at, normal);
+    }
+    tri->Deflection(params.Deflection);
+    tri->Parameters(new Poly_TriangulationParameters(params.Deflection, params.Angle,
+                                                     params.MinSize));
+    pf.tri = tri;
+    return true;
+}
+
+// Replace the face's triangulation and give its edges their polygons on it.
+void attach_planar_face(const PlanarFace& pf, double lin) {
+    BRep_Builder builder;
+    TopLoc_Location loc;
+    const Handle(Poly_Triangulation) old = BRep_Tool::Triangulation(pf.face, loc);
+    if (!old.IsNull())
+        for (const PlanarFace::LoopEdge& le : pf.edges)
+            builder.UpdateEdge(le.edge, Handle(Poly_PolygonOnTriangulation)(), old, loc);
+    builder.UpdateFace(pf.face, pf.tri);
+    for (const PlanarFace::LoopEdge& le : pf.edges) {
+        const int m = static_cast<int>(le.nodes.size());
+        TColStd_Array1OfInteger idx(1, m);
+        TColStd_Array1OfReal prm(1, m);
+        for (int k = 0; k < m; ++k) {
+            idx.SetValue(k + 1, le.nodes[static_cast<std::size_t>(k)] + 1);
+            prm.SetValue(k + 1, le.prm[static_cast<std::size_t>(k)]);
+        }
+        Handle(Poly_PolygonOnTriangulation) poly = new Poly_PolygonOnTriangulation(idx, prm);
+        poly->Deflection(lin);
+        builder.UpdateEdge(le.edge, poly, pf.tri, pf.face.Location());
+    }
+}
+
+// Mesh `shape` for display, doing work only for the faces that need it. BRepMesh keeps
+// a triangulation that already matches, but still rebuilds its model of every face and
+// edge to find that out; on a body with hundreds of faces that walk alone costs as much
+// as an edit. So faces meshed by this exact request are left alone, the heavy planar
+// ones take the fast path, and BRepMesh gets the rest together with the already-meshed
+// faces they share an edge with (whose edge nodes it then reuses).
+void mesh_changed_faces(const TopoDS_Shape& shape, const IMeshTools_Parameters& params) {
+    std::vector<TopoDS_Face> heavy, rest;
+    TopTools_MapOfShape visited, current;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        if (!visited.Add(ex.Current())) continue;
+        const TopoDS_Face face = TopoDS::Face(ex.Current());
+        TopLoc_Location loc;
+        if (meshed_as_requested(BRep_Tool::Triangulation(face, loc), params))
+            current.Add(face);
+        else if (BRepAdaptor_Surface(face, Standard_False).GetType() == GeomAbs_Plane &&
+                 estimate_boundary_nodes(face, params.Angle) >= kPlanarFastPathMinNodes)
+            heavy.push_back(face);
+        else
+            rest.push_back(face);
+    }
+    if (heavy.empty() && current.IsEmpty()) {
+        BRepMesh_IncrementalMesh mesher(shape, params);
+        return;
+    }
+
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    auto brepmesh = [&](const std::vector<TopoDS_Face>& faces, bool free_edges) {
+        BRep_Builder builder;
+        TopoDS_Compound part;
+        builder.MakeCompound(part);
+        bool any = false;
+        TopTools_MapOfShape neighbours;
+        for (const TopoDS_Face& face : faces) {
+            builder.Add(part, face);
+            any = true;
+            for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next()) {
+                if (!edge_faces.Contains(ex.Current())) continue;
+                for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromKey(ex.Current()));
+                     it.More(); it.Next())
+                    if (current.Contains(it.Value()) && neighbours.Add(it.Value()))
+                        builder.Add(part, it.Value());
+            }
+        }
+        // Edges outside any face (imported reference curves) carry their own polygon.
+        for (TopExp_Explorer ex(shape, TopAbs_EDGE, TopAbs_FACE); free_edges && ex.More(); ex.Next()) {
+            TopLoc_Location loc;
+            if (!BRep_Tool::Polygon3D(TopoDS::Edge(ex.Current()), loc).IsNull()) continue;
+            builder.Add(part, ex.Current());
+            any = true;
+        }
+        if (any) BRepMesh_IncrementalMesh mesher(part, params);
+    };
+    // The other faces first: they fix the nodes of the edges the planar faces share.
+    brepmesh(rest, true);
+    if (heavy.empty()) return;
+
+    std::vector<PlanarFace> planar(heavy.size());
+    std::vector<char> ready(heavy.size(), 0);
+    EdgeNodeCache fresh;
+    TopTools_MapOfShape pending;
+    for (const TopoDS_Face& face : heavy) pending.Add(face);
+    for (std::size_t i = 0; i < heavy.size(); ++i) {
+        try {
+            ready[i] = gather_planar_face(heavy[i], edge_faces, pending, fresh, params, planar[i]);
+        } catch (const Standard_Failure&) {
+        }
+    }
+    OSD_Parallel::For(0, static_cast<int>(heavy.size()), [&](int i) {
+        const std::size_t at = static_cast<std::size_t>(i);
+        if (!ready[at]) return;
+        try {
+            ready[at] = triangulate_planar_face(planar[at], params);
+        } catch (...) {
+            ready[at] = 0;
+        }
+    }, heavy.size() < 2);
+    std::vector<TopoDS_Face> declined;
+    for (std::size_t i = 0; i < heavy.size(); ++i) {
+        if (ready[i]) {
+            attach_planar_face(planar[i], params.Deflection);
+            current.Add(heavy[i]);
+        } else {
+            declined.push_back(heavy[i]);
+        }
+    }
+    brepmesh(declined, false);
+}
+
 }  // namespace
 
 // Size-relative default linear deflection. A fixed
@@ -254,11 +672,8 @@ DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection, d
         params.MinSize = min_size;
         params.AdjustMinSize = Standard_True;
     }
-    // BRepMesh is face-incremental: already matching triangulations are retained.
-    // The shape-taking constructor performs the mesh; a second Perform repeats
-    // topology/deflection validation even when every triangulation is reusable.
     const auto start = std::chrono::steady_clock::now();
-    BRepMesh_IncrementalMesh mesher(shape, params);
+    mesh_changed_faces(shape, params);
     g_tess_mesh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
     ++g_tess_bodies;

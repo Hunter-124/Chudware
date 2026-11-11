@@ -23,6 +23,7 @@ WORKDIR /src
 COPY core/ ./core/
 COPY host/ ./host/
 COPY services/ ./services/
+COPY extern/mapbox/ ./extern/mapbox/
 # core's CMake labels its tests from the suite manifest (cmake/ChudwareTestSuites.cmake).
 COPY cmake/ ./cmake/
 COPY scripts/test_suites.json ./scripts/test_suites.json
@@ -62,6 +63,7 @@ COPY core/ ./core/
 COPY host/ ./host/
 COPY services/ ./services/
 COPY extern/glad/ ./extern/glad/
+COPY extern/mapbox/ ./extern/mapbox/
 COPY assets/ ./assets/
 COPY build.sh ./
 COPY scripts/check_web_parity.py ./scripts/check_web_parity.py

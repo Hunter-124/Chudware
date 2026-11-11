@@ -13,7 +13,7 @@
 #include <set>
 #include <unordered_set>
 
-#include "../../extern/mapbox/earcut.hpp"   // C56c: hole-aware region triangulation
+#include "../../../extern/mapbox/earcut.hpp"   // C56c: hole-aware region triangulation
 
 #include "../core/app_state.h"
 #include "../core/sketch_consumers.h"

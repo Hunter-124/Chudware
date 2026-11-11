@@ -31,7 +31,7 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | [`assets/fonts/LICENSE-DejaVu.txt`](assets/fonts/LICENSE-DejaVu.txt) | `assets/fonts/CADSymbols.ttf` (DejaVu, Bitstream Vera and Arev notices) |
 | [`assets/dict/LICENSE-SCOWL.txt`](assets/dict/LICENSE-SCOWL.txt) | `assets/dict/en_US.txt` (SCOWL and the sources it incorporates) |
 | [`extern/glad/LICENSE`](extern/glad/LICENSE) | glad-generated OpenGL loader and `KHR/khrplatform.h` |
-| [`host/extern/mapbox/LICENSE`](host/extern/mapbox/LICENSE) | `earcut.hpp` |
+| [`extern/mapbox/LICENSE`](extern/mapbox/LICENSE) | `earcut.hpp` |
 | [`vendor/omp/OMP-LICENSE`](vendor/omp/OMP-LICENSE), [`vendor/omp/OMP-THIRD-PARTY-NOTICES.txt`](vendor/omp/OMP-THIRD-PARTY-NOTICES.txt) | Official OMP agent runtime and its bundled dependencies |
 | `core/firmware/renode/TimedSTM32CAN.cs`, `core/firmware/templates_embedded.cpp` | Renode-derived material (MIT text inline) |
 | `services/civil/data/epanet_net1.inp` | EPANET, WNTR and NumPy notices (inline) |
@@ -64,7 +64,7 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | stb | commit `2c980bb59875b0d32144a71867fbdebb2f77cd20` | MIT OR Unlicense | fetched at build | https://github.com/nothings/stb |
 | glad (generated OpenGL 3.3 core loader) | glad 2.0.8 | (WTFPL OR CC0-1.0) AND Apache-2.0 | vendored (`extern/glad/`) | https://github.com/Dav1dde/glad |
 | Khronos `KHR/khrplatform.h` | as emitted by glad 2.0.8 | Khronos MIT-style license (text in `extern/glad/LICENSE`) | vendored (`extern/glad/include/KHR/`) | https://github.com/KhronosGroup/EGL-Registry |
-| earcut.hpp | not recorded in the vendored file | ISC | vendored (`host/extern/mapbox/`) | https://github.com/mapbox/earcut.hpp |
+| earcut.hpp | not recorded in the vendored file | ISC | vendored (`extern/mapbox/`) | https://github.com/mapbox/earcut.hpp |
 | TweetNaCl | not recorded in the vendored file | LicenseRef-PublicDomain | vendored (`core/util/tweetnacl.{c,h}`) | https://tweetnacl.cr.yp.to/ |
 | Chromium Embedded Framework (CEF) | 149.0.6+g0d0eeb6 | BSD-3-Clause | prebuilt, fetched at build; native desktop builds only | https://bitbucket.org/chromiumembedded/cef |
 | Chromium (inside CEF) | 149.0.7827.201 | BSD-3-Clause, plus the licenses listed in the CEF distribution's `CREDITS.html` | prebuilt, fetched at build with CEF | https://www.chromium.org/ |

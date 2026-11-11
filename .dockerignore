@@ -16,9 +16,6 @@
 !host/src/**
 !host/cmake/
 !host/cmake/**
-!host/extern/
-!host/extern/mapbox/
-!host/extern/mapbox/**
 !host/tests/
 !host/tests/**
 !host/wasm/
@@ -42,6 +39,8 @@
 !extern/
 !extern/glad/
 !extern/glad/**
+!extern/mapbox/
+!extern/mapbox/**
 !scripts/
 !scripts/check_web_parity.py
 !scripts/test_suites.json

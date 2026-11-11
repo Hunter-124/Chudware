@@ -7,4 +7,4 @@ websockets==16.1
 httpx==0.28.1              # fastapi.testclient transport for the test suite
 python-multipart==0.0.32   # >=0.0.30 fixes CVE-2026-53537/8/9
 anyio==4.14.2
-cryptography==49.0.0       # Cloudflare Access JWT (RS256) verification in web/demo
+cryptography==50.0.0       # Cloudflare Access JWT (RS256) verification in web/demo

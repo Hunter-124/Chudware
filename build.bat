@@ -135,6 +135,11 @@ if /i "%MODE%"=="full" (
 )
 
 rem --- default / app: refresh the dist payload in place ----------------------
+rem Resolve the core DLL source here, outside any ( ... ) block, so %CORE_BIN_STAGE% is
+rem already set when the staging block below is parsed.
+set "CORE_BIN_STAGE="
+if exist "%ROOT%\build\windows-occt\bin\libchudware.dll" set "CORE_BIN_STAGE=%ROOT%\build\windows-occt\bin"
+if not defined CORE_BIN_STAGE if exist "%ROOT%\core\build-occt\bin\Release\libchudware.dll" set "CORE_BIN_STAGE=%ROOT%\core\build-occt\bin\Release"
 echo [build] syncing dist\Chudware\ ...
 if not exist "%DIST%" mkdir "%DIST%"
 
@@ -170,9 +175,7 @@ if /i not "%MODE%"=="app" (
   )
 
   rem Stage C++ core DLLs + hostd next to the exe (in-process engine).
-  set "CORE_BIN_STAGE="
-  if exist "%ROOT%\build\windows-occt\bin\libchudware.dll" set "CORE_BIN_STAGE=%ROOT%\build\windows-occt\bin"
-  if not defined CORE_BIN_STAGE if exist "%ROOT%\core\build-occt\bin\Release\libchudware.dll" set "CORE_BIN_STAGE=%ROOT%\core\build-occt\bin\Release"
+  rem CORE_BIN_STAGE is resolved ABOVE this block: %VAR% inside ( ... ) expands at parse time.
   if defined CORE_BIN_STAGE (
     echo [build] staging C++ core DLLs from %CORE_BIN_STAGE% ...
     robocopy "%CORE_BIN_STAGE%" "%DIST%" *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul

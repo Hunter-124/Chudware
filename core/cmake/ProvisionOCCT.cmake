@@ -79,8 +79,15 @@ if(WIN32)
 
   # Deploy the release DLLs next to a target's exe (for the shipped host later).
   function(chudware_occt_copy_dlls tgt)
+    # _if_different: unchanged toolkit DLLs are skipped, so a running engine (MCP server,
+    # hostd) that has them loaded no longer fails every rebuild with "Permission denied".
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+      set(_occt_copy copy_directory_if_different)
+    else()
+      set(_occt_copy copy_directory)
+    endif()
     add_custom_command(TARGET ${tgt} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_directory "${OCCT_DLL_DIR}" "$<TARGET_FILE_DIR:${tgt}>"
+      COMMAND ${CMAKE_COMMAND} -E ${_occt_copy} "${OCCT_DLL_DIR}" "$<TARGET_FILE_DIR:${tgt}>"
       COMMENT "[occt] copying toolkit DLLs next to ${tgt}")
     foreach(_bd ${OCCT_3RDPARTY_BINS})
       file(GLOB _dlls "${_bd}/*.dll")

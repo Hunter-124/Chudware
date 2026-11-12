@@ -36,3 +36,31 @@ def test_default_python_uses_posix_runtime_layout(tmp_path: Path, monkeypatch):
     assert register_mcp.default_python() == tmp_path / "venv" / "bin" / "python"
     monkeypatch.setattr(register_mcp.sys, "platform", "linux")
     assert register_mcp.default_python() == tmp_path / "venv" / "bin" / "python"
+
+
+def test_store_build_configs_are_targeted(tmp_path: Path, monkeypatch):
+    local = tmp_path / "Local"
+    relocated = local / "Claude-Data" / "claude_abc"
+    relocated.mkdir(parents=True)
+    moved = local / "Packages" / "Claude_abc" / "LocalCache" / "Roaming" / "Claude"
+    moved.mkdir(parents=True)
+    (moved / ".user-data-left.claude_abc").write_text("")
+    legacy = local / "Packages" / "Claude_old" / "LocalCache" / "Roaming" / "Claude"
+    legacy.mkdir(parents=True)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(register_mcp.Path, "home", lambda: tmp_path)
+
+    found = register_mcp.config_paths()
+
+    assert found == {
+        "desktop": tmp_path / "Roaming" / "Claude" / "claude_desktop_config.json",
+        "desktop:claude_abc": relocated / "claude_desktop_config.json",
+        "desktop:Claude": legacy / "claude_desktop_config.json",
+        "code": tmp_path / ".claude.json",
+    }
+    result = register_mcp.apply(tmp_path / "python", tmp_path, ["desktop"],
+                                dry_run=False, unregister=False)
+    assert set(result) == {"desktop", "desktop:claude_abc", "desktop:Claude"}
+    cfg = json.loads((relocated / "claude_desktop_config.json").read_text())
+    assert cfg["mcpServers"]["chudware"]["command"] == str(tmp_path / "python")

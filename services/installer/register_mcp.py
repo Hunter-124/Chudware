@@ -2,7 +2,9 @@
 
 Adds a "chudware" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
 in place on register — existing tooling references it — and removed on --unregister):
-  * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json
+  * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json, plus the Microsoft Store
+                     build's own config (%LOCALAPPDATA%/Claude-Data/claude_<id>/ or the
+                     package's virtualized %APPDATA%) when that build is installed
   * Claude Code     : ~/.claude.json
 
 Idempotent and non-destructive: backs up each file before writing and only writes when the
@@ -41,13 +43,33 @@ def adjacent_mcp_bin(cwd: Path) -> Path:
     return (cwd.expanduser().resolve() / name).resolve()
 
 
+DESKTOP_CONFIG = "claude_desktop_config.json"
+
+
+def store_desktop_configs(localappdata: Path) -> list[Path]:
+    """Config files of Microsoft Store (MSIX) Claude Desktop installs, which never read
+    %APPDATA%/Claude. Current builds keep user data in %LOCALAPPDATA%/Claude-Data/claude_<id>;
+    older builds use the package's virtualized %APPDATA% unless the app left a
+    ``.user-data-left*`` marker there after moving the data to Claude-Data."""
+    found = sorted(d / DESKTOP_CONFIG for d in (localappdata / "Claude-Data").glob("claude_*")
+                   if d.is_dir())
+    for d in sorted((localappdata / "Packages").glob("Claude_*")):
+        roaming = d / "LocalCache" / "Roaming" / "Claude"
+        if roaming.is_dir() and not any(roaming.glob(".user-data-left*")):
+            found.append(roaming / DESKTOP_CONFIG)
+    return found
+
+
 def config_paths() -> dict[str, Path]:
+    """Config file per target; Store installs add ``desktop:<dir>`` keys (target "desktop")."""
     home = Path.home()
     appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
-    return {
-        "desktop": appdata / "Claude" / "claude_desktop_config.json",
-        "code": home / ".claude.json",
-    }
+    localappdata = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    out = {"desktop": appdata / "Claude" / DESKTOP_CONFIG}
+    for path in store_desktop_configs(localappdata):
+        out[f"desktop:{path.parent.name}"] = path
+    out["code"] = home / ".claude.json"
+    return out
 
 
 def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None,
@@ -94,7 +116,7 @@ def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
     entry = server_entry(python_exe, cwd, hostd_bin, mcp_bin)
     out: dict = {}
     for name, path in config_paths().items():
-        if name not in targets:
+        if name.split(":", 1)[0] not in targets:
             continue
         cfg = _load(path)
         if cfg is None:

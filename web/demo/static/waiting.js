@@ -77,14 +77,10 @@
     $('load').textContent = s.state === 'queued' || s.state === 'starting'
       ? s.active_sessions + ' of ' + s.max_sessions + ' sessions running, ' + s.queue_length + ' waiting'
       : '';
-    const free = s.free_ai_available ? 'Free models are available without a limit.' : '';
-    if (s.claude_available) {
-      $('ai').textContent = 'Claude Opus, Sonnet and Haiku 5.5 are available, with a per-visitor limit. ' + free;
-    } else if (free) {
-      $('ai').textContent = free;
-    } else {
-      $('ai').textContent = 'AI is not enabled on this server right now.';
-    }
+    // Live availability only; the page text already describes the models and limits.
+    const ai = [s.claude_available && 'Claude models', s.free_ai_available && 'free models'].filter(Boolean);
+    $('ai').textContent = ai.length ? 'Right now: ' + ai.join(' and ') + ' available.'
+      : 'Right now: AI is not enabled on this server.';
     if (s.state === 'queued') {
       if (!queuedAt) {
         queuedAt = performance.now();

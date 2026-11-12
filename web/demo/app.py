@@ -51,9 +51,12 @@ STATIC_TYPES = {
     "waiting.css": "text/css; charset=utf-8",
     "admin.js": "application/javascript; charset=utf-8",
     "admin.css": "text/css; charset=utf-8",
+    "logo.svg": "image/svg+xml",
+    "Rubik-VF.woff2": "font/woff2",
+    "JetBrainsMono-Regular.woff2": "font/woff2",
 }
 # The front door's own pages carry no inline script/style and load nothing off-origin.
-PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+PAGE_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; "
             "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 REFUSAL_STATUS_TEXT = {
     "queue_full": "The queue is full.", "ip_limit": "Another session from this network is active or queued.",

@@ -4,20 +4,34 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="theme-color" content="#111310">
 <title>Chudware live demo</title>
+<link rel="icon" href="/demo/static/logo.svg" type="image/svg+xml">
+<link rel="preload" href="/demo/static/Rubik-VF.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/demo/static/waiting.css">
 </head>
 <body>
-<main>
-  <h1>Chudware live demo</h1>
-  <p class="lead">A free, public, shared demo of the Chudware CAD workspace running in your
-    browser. Everyone gets a private sandbox; only a few can run at once, so
-    visitors wait in line.</p>
+<header class="bar">
+  <div class="wrap bar-inner">
+    <span class="brand"><img src="/demo/static/logo.svg" width="28" height="28" alt=""><span>CHUDWARE</span></span>
+    <span class="tag"><span class="live-dot" aria-hidden="true"></span>Live demo</span>
+  </div>
+</header>
 
-  <section id="panel" aria-live="polite">
+<main class="wrap">
+  <div class="hero">
+    <p class="eyebrow">Public browser demo</p>
+    <h1>The full Chudware workspace, in your browser.</h1>
+    <p class="lead">A free, shared demo of the real CAD workspace. Everyone gets a private
+      sandbox with no install and no account. Only a few people can run at once, so if it
+      is busy you wait in line for a slot.</p>
+  </div>
+
+  <section id="panel" class="panel" aria-live="polite">
     <div id="intro" hidden>
       <p id="notice" class="notice" hidden></p>
-      <button id="join" type="button">Start the demo</button>
+      <button id="join" type="button" class="primary">Start the demo <span aria-hidden="true">&rarr;</span></button>
+      <p class="muted small">Usually ready in under a minute.</p>
       <p id="error" class="error" role="alert" hidden></p>
     </div>
     <div id="queue" hidden>
@@ -29,42 +43,48 @@
       <button id="leave" type="button" class="secondary">Leave the line</button>
     </div>
     <div id="starting" hidden>
-      <p class="position">Starting your workspace&hellip;</p>
+      <p class="position"><span class="spinner" aria-hidden="true"></span>Starting your workspace&hellip;</p>
       <p class="muted">This usually takes under a minute.</p>
     </div>
     <div id="sleeping" hidden>
       <p class="position">Your workspace is saved on this server.</p>
       <p id="sleeping-detail" class="muted"></p>
-      <p><button id="resume" type="button">Resume my workspace</button>
-         <button id="delete-workspace" type="button" class="secondary">Delete my saved files</button></p>
+      <div class="buttons">
+        <button id="resume" type="button" class="primary">Resume my workspace</button>
+        <button id="delete-workspace" type="button" class="secondary">Delete my saved files</button>
+      </div>
       <p id="sleeping-error" class="error" role="alert" hidden></p>
     </div>
-    <p id="load" class="muted"></p>
+    <p id="load" class="load"></p>
   </section>
 
-  <section>
-    <h2>Before you start</h2>
+  <section class="facts" aria-labelledby="before">
+    <h2 id="before">Before you start</h2>
     <ul>
-      <li><strong>Your files persist.</strong> Your workspace is saved on the server and the same
-        browser reopens it next time. There is no total time limit; after 15 minutes without
-        activity the workspace goes to sleep (its container stops) and resuming starts it again.
-        Download a copy of anything important anyway.</li>
-      <li><strong>Running limits.</strong> Up to <span id="max-sessions">3</span> people at a time, and
-        each saved workspace is capped at 1 GiB. A workspace over the cap is put to sleep, not deleted.</li>
-      <li><strong>AI models.</strong> The AI assistant offers Claude Opus, Sonnet and Haiku 5.5 with a
-        per-visitor allowance that can run out, plus free models with no demo limit (their provider
-        may still ask you to wait a minute when it is busy).
-        <span id="ai"></span> Modeling works without it.</li>
-      <li><strong>Privacy.</strong> No account is needed. A cookie (kept for a year) identifies your
-        workspace in this browser only — clearing cookies or using another browser starts a new,
-        empty one, and the old one cannot be recovered. Your IP address, timestamps and
-        per-session request counts are logged for abuse prevention; your files and prompts are
-        not logged. Use <em>Delete my saved files</em> above to erase your workspace.</li>
-      <li>Experimental software: results may be wrong. Do not upload confidential or personal data.</li>
+      <li><strong>Your files persist</strong>
+        <span>Your workspace is saved on the server and the same browser reopens it next time.
+        There is no total time limit; after 15 minutes without activity the workspace goes to
+        sleep (its container stops) and resuming starts it again. Download a copy of anything
+        important anyway.</span></li>
+      <li><strong>Running limits</strong>
+        <span>Up to <span id="max-sessions">3</span> people at a time, and each saved workspace is
+        capped at 1 GiB. A workspace over the cap is put to sleep, not deleted.</span></li>
+      <li><strong>AI models</strong>
+        <span>The AI assistant offers Claude Opus, Sonnet and Haiku 5.5 with a per-visitor
+        allowance that can run out, plus free models with no demo limit (their provider may
+        still ask you to wait a minute when it is busy). Modeling works without AI.</span>
+        <span id="ai" class="status"></span></li>
+      <li><strong>Privacy</strong>
+        <span>No account is needed. A cookie (kept for a year) identifies your workspace in this
+        browser only: clearing cookies or using another browser starts a new, empty one, and the
+        old one cannot be recovered. Your IP address, timestamps and per-session request counts
+        are logged for abuse prevention; your files and prompts are not logged. Use
+        <em>Delete my saved files</em> above to erase your workspace.</span></li>
     </ul>
+    <p class="caveat">Experimental software: results may be wrong. Do not upload confidential or personal data.</p>
   </section>
 </main>
 <script src="/demo/static/waiting.js"></script>
-<noscript><p class="notice">This page needs JavaScript to join the queue.</p></noscript>
+<noscript><p class="notice wrap">This page needs JavaScript to join the queue.</p></noscript>
 </body>
 </html>

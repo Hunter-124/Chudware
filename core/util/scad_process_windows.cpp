@@ -527,6 +527,11 @@ Result execute(const Request& request, const fs::path& exe, const fs::path& proj
     env += L"SystemRoot="; env += windows_dir.data(); env.push_back(L'\0');
     env += L"TEMP=" + project.native(); env.push_back(L'\0');
     env += L"TMP=" + project.native(); env.push_back(L'\0');
+    // CreateProcess fails with ERROR_ENVVAR_NOT_FOUND for an AppContainer when this is
+    // absent: it rebases LOCALAPPDATA, TEMP and TMP to <LOCALAPPDATA>\Packages\<profile>\AC.
+    // Rooting it in the project keeps the user's profile path out of the child; the
+    // rebased directories do not exist there, so the renderer gains nothing writable.
+    env += L"LOCALAPPDATA=" + project.native(); env.push_back(L'\0');
     env.push_back(L'\0');
     STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;

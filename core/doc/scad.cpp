@@ -188,6 +188,50 @@ WinHandle win_relative(HANDLE parent, const fs::path& component, ACCESS_MASK acc
     }
     return opened;
 }
+// Renames an open file to `name` inside the directory `root`, replacing any existing
+// file. The NT call takes the root-relative name as given; the Win32 wrapper resolves it
+// as a DOS path and rejects it. POSIX semantics let the replace succeed while a scanner
+// or indexer holds the old file open; volumes that reject the flag get the classic rename.
+bool win_rename_in(HANDLE file, HANDLE root, const fs::path& name) {
+    using NtSetInformationFileFn = NTSTATUS (NTAPI *)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+    static auto set_information = reinterpret_cast<NtSetInformationFileFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile"));
+    if (!set_information) return false;
+    // FILE_RENAME_INFORMATION; its first field is a BOOLEAN for the classic class.
+    struct RenameInfo { ULONG flags; HANDLE root; ULONG length; WCHAR name[1]; };
+    constexpr ULONG kFileRenameInformation = 10, kFileRenameInformationEx = 65;
+    constexpr ULONG kReplaceIfExists = 0x1, kPosixSemantics = 0x2;
+    const auto& native = name.native();
+    const std::size_t bytes = offsetof(RenameInfo, name) + native.size() * sizeof(wchar_t);
+    std::vector<std::max_align_t> storage((bytes + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t));
+    auto* info = reinterpret_cast<RenameInfo*>(storage.data());
+    info->root = root;
+    info->length = static_cast<ULONG>(native.size() * sizeof(wchar_t));
+    std::copy(native.begin(), native.end(), info->name);
+    IO_STATUS_BLOCK status{};
+    info->flags = kReplaceIfExists | kPosixSemantics;
+    NTSTATUS result = set_information(file, &status, info, static_cast<ULONG>(bytes), kFileRenameInformationEx);
+    constexpr NTSTATUS kInvalidParameter = static_cast<NTSTATUS>(0xC000000D);
+    constexpr NTSTATUS kNotSupported = static_cast<NTSTATUS>(0xC00000BB);
+    constexpr NTSTATUS kInvalidInfoClass = static_cast<NTSTATUS>(0xC0000003);
+    ULONG info_class = kFileRenameInformationEx;
+    if (result == kInvalidParameter || result == kNotSupported || result == kInvalidInfoClass) {
+        info->flags = TRUE;
+        info_class = kFileRenameInformation;
+        result = set_information(file, &status, info, static_cast<ULONG>(bytes), info_class);
+    }
+    // On-access antivirus briefly opens a just-closed file without FILE_SHARE_DELETE,
+    // which blocks replacing it; retry for a moment before failing.
+    constexpr NTSTATUS kAccessDenied = static_cast<NTSTATUS>(0xC0000022);
+    constexpr NTSTATUS kSharingViolation = static_cast<NTSTATUS>(0xC0000043);
+    for (DWORD delay_ms = 10, waited_ms = 0;
+         (result == kAccessDenied || result == kSharingViolation) && waited_ms < 2000;
+         waited_ms += delay_ms, delay_ms = std::min<DWORD>(delay_ms * 2, 250)) {
+        Sleep(delay_ms);
+        result = set_information(file, &status, info, static_cast<ULONG>(bytes), info_class);
+    }
+    return result >= 0;
+}
 std::string win_read(HANDLE file, std::size_t limit) {
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) || size.QuadPart < 0 || static_cast<unsigned long long>(size.QuadPart) > limit)
@@ -827,15 +871,7 @@ json export_project(const json& params, const std::string& path, const std::map<
     cleanup.track(target.value);
     win_write(target.value, text);
     if (!FlushFileBuffers(target.value)) fail("cannot flush SCAD source export");
-    auto filename = output.filename().native();
-    const std::size_t bytes = offsetof(FILE_RENAME_INFO, FileName) + filename.size() * sizeof(wchar_t);
-    std::vector<std::max_align_t> storage((bytes + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t));
-    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-    rename->ReplaceIfExists = TRUE; rename->RootDirectory = root.value;
-    rename->FileNameLength = static_cast<DWORD>(filename.size() * sizeof(wchar_t));
-    std::copy(filename.begin(), filename.end(), rename->FileName);
-    if (!SetFileInformationByHandle(target.value, FileRenameInfo, rename, static_cast<DWORD>(bytes)))
-        fail("cannot publish source export");
+    if (!win_rename_in(target.value, root.value, output.filename())) fail("cannot publish source export");
     cleanup.committed = true;
 #else
     struct Cleanup {

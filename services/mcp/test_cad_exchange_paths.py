@@ -214,6 +214,7 @@ def test_export_part_tilde_destination_expands(exchange, tmp_path, monkeypatch):
     """'~/x.step' must expand to $HOME — abspath alone would yield '<cwd>/~/x.step'."""
     tools_fn, calls = exchange
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows expands '~' from here
     worker = tmp_path / "worker"
     worker.mkdir()
     monkeypatch.chdir(worker)
@@ -580,6 +581,20 @@ def test_export_relative_destination_refuses_without_project_root(
     assert not (tmp_path / f"base.{fmt}").exists()
 
 
+def _link_directory_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        pass
+    if sys.platform == "win32":
+        # Symlinks need Developer Mode or elevation; a junction redirects the same way.
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    pytest.skip("this platform does not allow creating test symlinks")
+
+
 @pytest.mark.parametrize("fmt", ["step", "step+", "draw+"])
 def test_export_refuses_symlinked_credential_destination(
         exchange, monkeypatch, tmp_path, fmt):
@@ -588,7 +603,7 @@ def test_export_refuses_symlinked_credential_destination(
     project.mkdir()
     secrets = tmp_path / ".ssh"
     secrets.mkdir()
-    (project / "output").symlink_to(secrets, target_is_directory=True)
+    _link_directory_or_skip(project / "output", secrets)
     monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
 
     refused = json.loads(tools["export_part"](

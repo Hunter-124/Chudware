@@ -287,6 +287,49 @@ struct NativeStage {
     }
 };
 
+#if defined(_WIN32)
+// Renames the open staged file onto `destination`; returns 0 or the Win32 error.
+// POSIX semantics let a replace succeed while a scanner or indexer briefly holds the
+// old destination open (with FILE_SHARE_DELETE); the classic rename refuses that with
+// ERROR_ACCESS_DENIED. Volumes without POSIX rename (FAT, some network shares) reject
+// the flag, and they get the classic rename.
+static DWORD rename_open_file(HANDLE file, const std::filesystem::path& destination, bool replace) {
+    // FILE_RENAME_INFO with its Flags member, independent of the SDK's NTDDI gates.
+    struct RenameInfo { DWORD flags; HANDLE root; DWORD length; WCHAR name[1]; };
+    constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+    constexpr DWORD kReplaceIfExists = 0x1, kPosixSemantics = 0x2;
+    const auto path = std::filesystem::absolute(destination).make_preferred().native();
+    const auto bytes = path.size() * sizeof(wchar_t);
+    // Win32 resolves the name as a NUL-terminated path despite its length field.
+    std::vector<unsigned char> buffer(offsetof(RenameInfo, name) + bytes + sizeof(wchar_t));
+    auto* info = reinterpret_cast<RenameInfo*>(buffer.data());
+    info->length = static_cast<DWORD>(bytes);
+    std::memcpy(info->name, path.data(), bytes);
+    const auto size = static_cast<DWORD>(buffer.size());
+    info->flags = (replace ? kReplaceIfExists : 0) | kPosixSemantics;
+    if (SetFileInformationByHandle(file, kFileRenameInfoEx, info, size)) return 0;
+    const DWORD error = GetLastError();
+    if (error != ERROR_INVALID_PARAMETER && error != ERROR_NOT_SUPPORTED &&
+        error != ERROR_INVALID_FUNCTION) return error;
+    info->flags = replace ? 1 : 0;  // FileRenameInfo reads a BOOLEAN ReplaceIfExists
+    return SetFileInformationByHandle(file, FileRenameInfo, info, size) ? 0 : GetLastError();
+}
+
+// On-access antivirus scans a file when its writer closes it, and a scanner that opens
+// without FILE_SHARE_DELETE blocks even a POSIX rename for that moment. A save that
+// replaces a file it just wrote lands in the window, so retry briefly before failing.
+static DWORD publish_open_file(HANDLE file, const std::filesystem::path& destination, bool replace) {
+    DWORD error = rename_open_file(file, destination, replace);
+    for (DWORD delay_ms = 10, waited_ms = 0;
+         (error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED) && waited_ms < 2000;
+         waited_ms += delay_ms, delay_ms = std::min<DWORD>(delay_ms * 2, 250)) {
+        Sleep(delay_ms);
+        error = rename_open_file(file, destination, replace);
+    }
+    return error;
+}
+#endif
+
 static bool sync_stage(NativeStage& stage) {
     if (std::fflush(stage.stream) != 0) return false;
 #if defined(_WIN32)
@@ -732,22 +775,9 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
             throw OpError("disk_changed", "doc_save: destination changed during publication");
     }
 #if defined(_WIN32)
-    const auto destination = fs::absolute(out_path).make_preferred().native();
-    const auto bytes = destination.size() * sizeof(wchar_t);
-    // Win32 resolves FileName as a NUL-terminated path despite FileNameLength.
-    std::vector<unsigned char> rename_buffer(
-        offsetof(FILE_RENAME_INFO, FileName) + bytes + sizeof(wchar_t));
-    auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_buffer.data());
-    rename_info->ReplaceIfExists = !exclusive;
-    rename_info->RootDirectory = nullptr;
-    rename_info->FileNameLength = static_cast<DWORD>(bytes);
-    std::memcpy(rename_info->FileName, destination.data(), bytes);
     const HANDLE file_handle = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stage.stream)));
-    if (!SetFileInformationByHandle(file_handle, FileRenameInfo, rename_info,
-                                   static_cast<DWORD>(rename_buffer.size()))) {
-        const DWORD error = GetLastError();
+    if (const DWORD error = publish_open_file(file_handle, out_path, !exclusive))
         io_error("doc_save: cannot publish archive (Windows error " + std::to_string(error) + ")");
-    }
     stage.published = true;
 #else
     const int result = exclusive
@@ -1997,21 +2027,9 @@ BuildStateWriteback stepplus_write_build_state(const std::string& path,
     std::lock_guard<std::mutex> publish(g_native_publish_mtx);
     if (!(stepplus_file_stamp(path) == expected)) return abandon("file_changed");
 #if defined(_WIN32)
-    const auto destination = fs::absolute(target).make_preferred().native();
-    const auto bytes = destination.size() * sizeof(wchar_t);
-    // Include the terminator required by Win32 path resolution.
-    std::vector<unsigned char> buffer(
-        offsetof(FILE_RENAME_INFO, FileName) + bytes + sizeof(wchar_t));
-    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
-    rename->ReplaceIfExists = TRUE;
-    rename->FileNameLength = static_cast<DWORD>(bytes);
-    std::memcpy(rename->FileName, destination.data(), bytes);
-    if (!SetFileInformationByHandle(stage.handle, FileRenameInfo, rename,
-                                   static_cast<DWORD>(buffer.size()))) {
-        const DWORD error = GetLastError();
+    if (const DWORD error = publish_open_file(stage.handle, target, true))
         return abandon("io_error: cannot publish build state (Windows error " +
                        std::to_string(error) + ")");
-    }
     stage.published = true;
 #else
     if (::renameat(stage.directory_fd, "container.tmp", AT_FDCWD, target.c_str()) != 0)

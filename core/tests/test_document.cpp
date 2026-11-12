@@ -362,7 +362,7 @@ TEST_CASE("solid feature modes preserve independent bodies and merge only contac
     CHECK(volume(invalid.shapes.front()) == doctest::Approx(1000));
 }
 
-TEST_CASE("rollback compiles and caches only the active feature prefix") {
+TEST_CASE("rollback compiles the active prefix without wiping suffix checkpoints") {
     using namespace chudware::doc;
     json doc;
     doc["features"] = json::array();
@@ -384,32 +384,147 @@ TEST_CASE("rollback compiles and caches only the active feature prefix") {
             CHECK(r.statuses[i].rolled_back == (i >= active));
         }
     };
-    check(compile_document(doc, env, cache.get()), 4);
+    CompileResult full = compile_document(doc, env, cache.get());
+    check(full, 4);
     doc["rollback_after"] = "f2";
     CompileResult prefix = compile_document(doc, env, cache.get());
     check(prefix, 2);
+    CHECK(prefix.features_executed == 0);
     check(compile_document(doc, env), 2); // no incremental cache
-    check(compile_document(doc, env, cache.get()), 2); // full-result cache hit
+    CompileResult prefix_hit = compile_document(doc, env, cache.get());
+    check(prefix_hit, 2); // prefix reuse; truncated compiles do not publish last_result
+    CHECK(prefix_hit.features_executed == 0);
 
     json report;
     const auto quality = ::geom::DisplayQuality::Fine;
+    // Encode while rolled back: suffix snaps are preserved in memory so the
+    // complete chain can be written. The rolled-back AICM is not the full result.
     const std::string blob = compile_cache_encode(*cache, doc, env, quality,
                                                   "test-engine", "test-doc", 100000000, report);
     REQUIRE_FALSE(blob.empty());
-    CHECK(report.at("full_result").get<bool>());
+    CHECK(report.at("checkpoints_written").get<int>() >= 2);
+    CHECK_FALSE(report.at("full_result").get<bool>());
     const std::string aicm(prefix.aicm.begin(), prefix.aicm.end());
     auto restored = compile_cache_decode(blob, doc, env, quality, "test-engine", &aicm, report);
     REQUIRE(restored);
-    CHECK(report.at("full_result").get<bool>());
+    CHECK_FALSE(report.at("full_result").get<bool>());
     check(compile_document(doc, env, restored.get()), 2);
     doc.erase("rollback_after");
-    check(compile_document(doc, env, restored.get()), 4);
+    // Suffix checkpoints survived the truncated compile — roll-forward is a reuse.
+    CompileResult rolled_forward = compile_document(doc, env, restored.get());
+    check(rolled_forward, 4);
+    CHECK(rolled_forward.features_executed == 0);
+    CHECK(rolled_forward.features_reused == 4);
+    // Live session cache: sketch-style truncate then roll forward stays warm.
     doc["rollback_after"] = "f1";
     check(compile_document(doc, env, cache.get()), 1);
     doc["rollback_after"] = "f3";
     check(compile_document(doc, env, cache.get()), 3);
     doc["rollback_after"] = nullptr;
-    check(compile_document(doc, env, cache.get()), 4);
+    CompileResult warm = compile_document(doc, env, cache.get());
+    check(warm, 4);
+    CHECK(warm.features_executed == 0);
+}
+
+TEST_CASE("truncated compile keeps independent mode=new solids reusable") {
+    using namespace chudware::doc;
+    json doc;
+    doc["features"] = json::array({
+        {{"id", "a"}, {"type", "box"}, {"name", "A"},
+         {"length", 10.0}, {"width", 10.0}, {"height", 10.0},
+         {"at", {0.0, 0.0, 0.0}}, {"mode", "new"}},
+        {{"id", "b"}, {"type", "box"}, {"name", "B"},
+         {"length", 10.0}, {"width", 10.0}, {"height", 10.0},
+         {"at", {30.0, 0.0, 0.0}}, {"mode", "new"}},
+        {{"id", "c"}, {"type", "box"}, {"name", "C"},
+         {"length", 10.0}, {"width", 10.0}, {"height", 10.0},
+         {"at", {60.0, 0.0, 0.0}}, {"mode", "new"}},
+    });
+    const json env = json::object();
+    auto cache = make_compile_cache();
+    CompileResult initial = compile_document(doc, env, cache.get());
+    REQUIRE(initial.ok);
+    REQUIRE(initial.shapes.size() == 3);
+
+    // Simulate an interactive sketch session stopping at the first body.
+    doc["rollback_after"] = "a";
+    CompileResult through = compile_document(doc, env, cache.get());
+    REQUIRE(through.ok);
+    CHECK(through.body_count == 1);
+    CHECK(through.features_executed == 0);
+
+    // Edit the early feature, then roll the history forward. Only A re-executes;
+    // independent B and C reuse their preserved checkpoints and tessellation.
+    doc.erase("rollback_after");
+    doc["features"][0]["height"] = 12.0;
+    const auto before = compile_cache_stats();
+    CompileResult after_edit = compile_document(doc, env, cache.get());
+    const auto after = compile_cache_stats();
+    REQUIRE(after_edit.ok);
+    CHECK(after_edit.body_count == 3);
+    CHECK(after_edit.features_executed == 1);
+    CHECK(after_edit.features_reused == 2);
+    CHECK(after["bodies_tessellated"].get<uint64_t>() -
+          before["bodies_tessellated"].get<uint64_t>() == 1);
+    CHECK(after["bodies_reused"].get<uint64_t>() -
+          before["bodies_reused"].get<uint64_t>() == 2);
+    CHECK(after_edit.shapes[1].IsSame(initial.shapes[1]));
+    CHECK(after_edit.shapes[2].IsSame(initial.shapes[2]));
+    const auto cold = compile_document(doc, env);
+    REQUIRE(cold.ok);
+    CHECK(after_edit.aicm == cold.aicm);
+    CHECK(after_edit.volume == doctest::Approx(cold.volume));
+}
+
+TEST_CASE("returning to a recent parameter value restores its branch checkpoints") {
+    using namespace chudware::doc;
+    json doc;
+    doc["features"] = json::array({
+        {{"id", "a"}, {"type", "box"}, {"name", "A"},
+         {"length", 10.0}, {"width", 10.0}, {"height", 10.0}},
+        {{"id", "b"}, {"type", "box"}, {"name", "B"},
+         {"length", 4.0}, {"width", 4.0}, {"height", 4.0}, {"at", {0.0, 0.0, 10.0}}},
+        {{"id", "c"}, {"type", "box"}, {"name", "C"},
+         {"length", 2.0}, {"width", 2.0}, {"height", 2.0}, {"at", {0.0, 0.0, 14.0}}},
+    });
+    const json env = json::object();
+    auto cache = make_compile_cache();
+    const CompileResult original = compile_document(doc, env, cache.get());
+    REQUIRE(original.ok);
+    doc["features"][0]["height"] = 12.0;
+    const CompileResult edited = compile_document(doc, env, cache.get());
+    REQUIRE(edited.ok);
+    CHECK(edited.features_executed == 3);
+
+    // Back to the previous value: every state comes from the branch pool.
+    doc["features"][0]["height"] = 10.0;
+    const CompileResult back = compile_document(doc, env, cache.get());
+    REQUIRE(back.ok);
+    CHECK(back.features_executed == 0);
+    CHECK(back.features_reused == 3);
+    CHECK(back.volume == doctest::Approx(original.volume));
+    CHECK(back.aicm == compile_document(doc, env).aicm);
+
+    // A rolled-back preview of a new value, then Cancel back to the committed one.
+    doc["features"][0]["height"] = 14.0;
+    doc["rollback_after"] = "a";
+    const CompileResult preview = compile_document(doc, env, cache.get());
+    REQUIRE(preview.ok);
+    CHECK(preview.features_executed == 1);
+    doc.erase("rollback_after");
+    doc["features"][0]["height"] = 10.0;
+    const CompileResult cancelled = compile_document(doc, env, cache.get());
+    REQUIRE(cancelled.ok);
+    CHECK(cancelled.features_executed == 0);
+    CHECK(cancelled.volume == doctest::Approx(original.volume));
+
+    // The saved cache carries only the current history, never branch states.
+    json report;
+    const auto quality = ::geom::DisplayQuality::Fine;
+    const std::string blob = compile_cache_encode(*cache, doc, env, quality, "test-engine",
+                                                  "test-doc", 100000000, report);
+    REQUIRE_FALSE(blob.empty());
+    CHECK(report.at("checkpoints_written").get<int>() == 3);
 }
 
 TEST_CASE("independent pipes retain feature and persisted display caches after deletion") {
@@ -4312,6 +4427,84 @@ TEST_CASE("unsaved part edits push current geometry to direct and nested assembl
     const json reopened = doc_open(displayed_path.string());
     documents.push_back(reopened.at("doc_id"));
     check_mesh(doc_activate(reopened.at("doc_id")), 10.0);
+}
+
+TEST_CASE("a rolled-back part preview does not rebuild dependent assemblies") {
+    using namespace chudware::doc;
+    const std::string part = doc_new("part", "PreviewSource").at("doc_id");
+    const auto dir = std::filesystem::temp_directory_path() / (part + "-preview-assembly");
+    std::filesystem::create_directories(dir);
+    std::vector<std::string> documents{part};
+    struct Cleanup {
+        std::filesystem::path dir;
+        std::vector<std::string>& documents;
+        ~Cleanup() {
+            set_cache_refresh_sink({});
+            for (auto it = documents.rbegin(); it != documents.rend(); ++it)
+                for (int attempt = 0; attempt < 3000; ++attempt) {
+                    try { doc_close(*it); break; }
+                    catch (const OpError& e) {
+                        if (e.code != "doc_busy") break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                }
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir, documents};
+    const json built = doc_apply_ops(part, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 10.0}}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Later"},
+            {"params", {{"length", 2.0}, {"width", 2.0}, {"height", 2.0},
+                        {"at", {0.0, 0.0, 10.0}}}}}}}
+    }), false);
+    const std::string feature = built.at("id_map").at("$0");
+    const auto part_path = dir / "source.step+";
+    doc_save(part, part_path.string());
+    const std::string assembly = doc_new("assembly", "PreviewAssembly", false, dir.string()).at("doc_id");
+    documents.push_back(assembly);
+    doc_apply_ops(assembly, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", "./source.step+"}}}, {"fixed", true}}
+    }), false);
+    doc_activate(assembly);
+    struct Pushes {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::vector<json> events;
+    };
+    const auto pushes = std::make_shared<Pushes>();
+    set_cache_refresh_sink([pushes, assembly](const std::string& id, const json& response) {
+        if (id != assembly) return;
+        {
+            std::lock_guard<std::mutex> lock(pushes->mutex);
+            pushes->events.push_back(response);
+        }
+        pushes->changed.notify_all();
+    });
+    auto wait_push = [pushes](std::size_t n, std::chrono::milliseconds limit) -> json {
+        std::unique_lock<std::mutex> lock(pushes->mutex);
+        if (!pushes->changed.wait_for(lock, limit, [&] { return pushes->events.size() >= n; }))
+            return json();
+        return pushes->events[n - 1];
+    };
+    const json edit = json::array({
+        {{"op", "edit_feature"}, {"id", feature}, {"params", {{"length", 20.0}}}}});
+    // A property-manager preview stops at the edited feature: no assembly work.
+    const json preview = doc_apply_ops(part, -1, edit, false, true, false, 0, false, feature);
+    REQUIRE(preview.at("rebuild").at("doc_status").at("rolled_back_to") == feature);
+    CHECK_FALSE(wait_push(1, std::chrono::milliseconds(750)).is_object());
+    // OK commits the same parameters with a complete build, which the assembly reuses.
+    doc_apply_ops(part, -1, edit, true, true, false, 0, false);
+    const json pushed = wait_push(1, std::chrono::seconds(30));
+    REQUIRE(pushed.is_object());
+    render::DocMesh mesh;
+    std::string error;
+    REQUIRE_MESSAGE(render::loadAicmFile(pushed.at("tess").at("aicm_path"), mesh, error), error);
+    REQUIRE_FALSE(mesh.bodies.empty());
+    double lo[3], hi[3];
+    bbox(mesh.bodies[0], lo, hi);
+    CHECK(hi[0] - lo[0] == doctest::Approx(20.0));
 }
 
 TEST_CASE("assembly source refresh is asynchronous, coalesced, and fresh on reads") {

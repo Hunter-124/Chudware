@@ -930,6 +930,12 @@ void capture_assembly_source(Session& s, std::vector<std::string>& changed_paths
         return;
     }
     if (path.empty()) return;
+    // A rolled-back view (PM preview_through, interactive sketch stop) is not this
+    // revision's build. Publishing its document made every dependent assembly compile
+    // the complete part itself for each preview; keep the last complete publication
+    // until a complete compile of this revision exists.
+    if (s.sketch_prefix && s.sketch_prefix_rev == s.revision &&
+        !(s.compiled && s.compiled_rev == s.revision)) return;
     if (s.published_source && s.published_source_revision == s.revision &&
         s.published_source->unsaved == s.dirty &&
         s.published_source->unverified == (s.cache_trust == "unverified")) return;
@@ -945,7 +951,8 @@ void capture_assembly_source(Session& s, std::vector<std::string>& changed_paths
     snapshot->unverified = s.cache_trust == "unverified";
     if (!content_changed) {
         snapshot->document = s.published_source->document;
-        snapshot->part = s.published_source->part;
+        snapshot->part = !s.is_assembly() && s.compiled && s.compiled_rev == s.revision
+            ? s.compiled : s.published_source->part;
     } else {
         snapshot->document = std::make_shared<const json>(s.doc);
         if (!s.is_assembly() && s.compiled && s.compiled_rev == s.revision)

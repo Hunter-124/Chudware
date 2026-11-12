@@ -2515,6 +2515,7 @@ FilletResult fillet_selected(const TopoDS_Shape& shape, double requested,
         result.covered_edges = result.selected_edges;
         result.failure = FilletFailure::none;
         result.reason.clear();
+        result.document_validated = validate.policy == FilletValidationPolicy::document_solid;
         if (op_history_recording()) op_provenance_record(shape, result.shape, best.provenance);
         return result;
     };

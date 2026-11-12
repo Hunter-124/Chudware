@@ -21,6 +21,8 @@
 #include "doc/scad.h"
 
 #include <algorithm>
+#include <deque>
+#include <unordered_set>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -310,6 +312,14 @@ struct CompileCkpt {
     // Incremental owner maps — face/edge attribution per solid id.
     OwnerTopoMap face_owners;
     OwnerTopoMap edge_owners;
+    // Non-chained hash of the feature JSON that produced this checkpoint. Independent
+    // reuse after a changed prefix compares against this instead of the chain seed,
+    // which cascades when an earlier feature edits.
+    uint64_t feature_content_hash = 0;
+    // Content address: the chain hash of the state this checkpoint holds (chain[i]) and
+    // of the state before its last feature (chain[i-1]). The chain folds every earlier
+    // input, so a hash match alone proves the checkpoint reusable.
+    uint64_t chain_hash = 0, parent_hash = 0;
 };
 
 // FNV-1a over a string, chainable through `seed` (h[i+1] = fnv(feature_json, h[i])).
@@ -461,7 +471,22 @@ struct CompileCache {
     // Process-unique contents stamp (compile_cache_stamp): renewed on every commit and
     // restore, copied with the struct, so an encoding of unchanged contents is reusable.
     uint64_t stamp = 0;
+    // Checkpoints of recently left history branches (a previous parameter value, the
+    // suffix past a rolled-back preview), addressed by chain hash. snaps[i] always
+    // belongs to chain[i]; these are found only by hash, so going back to a recent
+    // state (Cancel, undo, retyping an earlier value) restores instead of rebuilding.
+    // Bounded by count, oldest dropped first; memory only, never persisted.
+    std::unordered_map<uint64_t, std::shared_ptr<const CompileCkpt>> branch_snaps;
+    std::deque<uint64_t> branch_order;
 };
+
+namespace {
+// One alternate history's worth of states: enough to return to the last value of an
+// edited feature without a second full copy of a long history per edit.
+std::size_t cc_branch_capacity(std::size_t n_features) {
+    return std::clamp<std::size_t>(n_features, 16, 256);
+}
+}  // namespace
 
 std::shared_ptr<CompileCache> make_compile_cache() { return std::make_shared<CompileCache>(); }
 
@@ -3265,6 +3290,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     g_cc_compiles.fetch_add(1, std::memory_order_relaxed);
     std::vector<uint64_t> chain;
     std::size_t start_at = 0;
+    // Content-addressed checkpoint lookup over the current history and its branch pool.
+    std::unordered_map<uint64_t, std::shared_ptr<const CompileCkpt>> snap_by_hash;
+    if (use_cache) {
+        for (const auto& snap : cache->snaps)
+            if (snap && snap->chain_hash) snap_by_hash.emplace(snap->chain_hash, snap);
+        for (const auto& [hash, snap] : cache->branch_snaps) snap_by_hash.emplace(hash, snap);
+    }
+    auto find_snap = [&](uint64_t hash) -> std::shared_ptr<const CompileCkpt> {
+        auto it = snap_by_hash.find(hash);
+        return it == snap_by_hash.end() ? nullptr : it->second;
+    };
+    std::shared_ptr<const CompileCkpt> known_snap;
     if (use_cache) {
         chain = cc_chain(doc, features, env_json, result.active_configuration, quality,
                          with_display, with_owners);
@@ -3284,17 +3321,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             g_cc_features_reused.fetch_add(active_features, std::memory_order_relaxed);
             return out;
         }
-        // (b) PREFIX match — longest i with chain[i] equal and a live checkpoint.
+        // (b) PREFIX match — the deepest i whose state chain[i] has a checkpoint, on the
+        // current history or a recently left branch. The chain hash folds every earlier
+        // input, so one equality proves the whole prefix.
         std::size_t match = 0;
-        const std::size_t lim = std::min({chain.size(), cache->chain.size(), active_features + 1});
-        for (std::size_t i = 0; i < lim; ++i) {
-            if (chain[i] != cache->chain[i]) break;
-            match = i;  // chain[i] matched => the state after i features is reusable
+        for (std::size_t i = std::min(chain.size() - 1, active_features); i > 0; --i) {
+            if ((known_snap = find_snap(chain[i]))) {
+                match = i;
+                break;
+            }
         }
-        while (match > 0 && (match >= cache->snaps.size() || !cache->snaps[match]))
-            --match;
         if (match > 0) {
-            const CompileCkpt& ck = *cache->snaps[match];
+            const CompileCkpt& ck = *known_snap;
             results = ck.results;  // shared_ptr map — O(entries) pointer copies
             consumed = ck.consumed;
             superseded_by = ck.superseded_by;
@@ -3328,11 +3366,20 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     }
     // Checkpoints for THIS compile: the reused prefix is carried forward by pointer;
     // each executed feature appends its own snapshot at the end of its iteration.
+    // A truncated compile (rollback_after / compile_through) must also KEEP suffix
+    // snaps past the bar: interactive sketch sessions otherwise wipe every
+    // independent downstream checkpoint, and sketch_exit rebuilds them cold.
     std::vector<std::shared_ptr<const CompileCkpt>> new_snaps;
     if (use_cache) {
-        new_snaps.resize(n_features + 1);
-        for (std::size_t i = 1; i <= start_at && i < cache->snaps.size(); ++i)
-            new_snaps[i] = cache->snaps[i];
+        const std::size_t snap_slots = n_features + 1;
+        new_snaps.resize(snap_slots);
+        for (std::size_t i = 1; i <= start_at && i < chain.size(); ++i)
+            new_snaps[i] = find_snap(chain[i]);
+        // A truncated compile keeps every known state of the unchanged suffix, so a
+        // roll-forward restores it instead of rebuilding it.
+        if (active_features < n_features)
+            for (std::size_t i = active_features + 1; i <= n_features && i < chain.size(); ++i)
+                new_snaps[i] = find_snap(chain[i]);
     }
     // Feature order for "the earliest feature wins" when several source faces merge into one
     // (UnifySameDomain). A split piece "<fid>#k" ranks as its feature.
@@ -3479,20 +3526,31 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         ck->sheet_metal_flat = result.sheet_metal_flat;
         ck->face_owners = face_owners;
         ck->edge_owners = edge_owners;
+        if (after_idx > 0 && after_idx - 1 < n_features)
+            ck->feature_content_hash = cc_hash_feature(features[after_idx - 1], 0);
+        if (after_idx < chain.size()) {
+            ck->chain_hash = chain[after_idx];
+            ck->parent_hash = chain[after_idx - 1];
+        }
         new_snaps[after_idx] = std::move(ck);
     };
     // A changed prefix does not imply that every later feature depends on it.
-    // Index the old checkpoints by feature id, but replay only the small set below
-    // whose complete inputs and side effects are known. The chain seed must still
+    // Index the old checkpoints by feature id, but replay only features whose
+    // complete inputs and side effects are known: sketches/planes, mode=new
+    // solids (sweep/extrude/revolve/loft/primitives). The chain seed must still
     // match (environment, configuration, quality and compile mode).
-    std::unordered_map<std::string, std::size_t> old_feature_index;
+    // Index known states by their last feature id: the current history first, then
+    // recently left branches (the suffix past a rolled-back preview of an earlier edit).
+    std::unordered_map<std::string, const CompileCkpt*> old_feature_index;
     if (use_cache && !cache->chain.empty() && chain.front() == cache->chain.front()) {
-        for (std::size_t i = 1; i < cache->snaps.size() && i < cache->chain.size(); ++i) {
-            const auto& snap = cache->snaps[i];
-            if (!snap || snap->statuses.size() != i) continue;
-            const std::string& fid = snap->statuses.back()->id;
-            auto [it, inserted] = old_feature_index.emplace(fid, i - 1);
-            if (!inserted) it->second = std::numeric_limits<std::size_t>::max();
+        auto index = [&](const std::shared_ptr<const CompileCkpt>& snap) {
+            if (!snap || snap->statuses.empty()) return;
+            old_feature_index.emplace(snap->statuses.back()->id, snap.get());
+        };
+        for (std::size_t i = 1; i < cache->snaps.size(); ++i) index(cache->snaps[i]);
+        for (auto it = cache->branch_order.rbegin(); it != cache->branch_order.rend(); ++it) {
+            auto snap = cache->branch_snaps.find(*it);
+            if (snap != cache->branch_snaps.end()) index(snap->second);
         }
     }
     result.features_reused = static_cast<int>(start_at);
@@ -3501,15 +3559,22 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     auto reuse_independent = [&](const json& raw, const json& feat,
                                  const std::string& id, const std::string& type) {
         auto ix = old_feature_index.find(id);
-        if (ix == old_feature_index.end()) return false;
-        const std::size_t i = ix->second;
-        if (i >= cache->chain.size() - 1 || i + 1 >= cache->snaps.size() ||
-            !cache->snaps[i + 1] || (i > 0 && !cache->snaps[i]) ||
-            cc_hash_feature(raw, cache->chain[i]) != cache->chain[i + 1] ||
-            results.count(id)) return false;
-        const CompileCkpt* before = i ? cache->snaps[i].get() : nullptr;
-        const CompileCkpt& after = *cache->snaps[i + 1];
-        if (after.statuses.size() != i + 1 || !after.statuses.back()->ok ||
+        if (ix == old_feature_index.end() || results.count(id)) return false;
+        const CompileCkpt& after = *ix->second;
+        const std::size_t i = after.statuses.size() - 1;
+        std::shared_ptr<const CompileCkpt> before_snap;
+        if (i > 0) {
+            before_snap = find_snap(after.parent_hash);
+            if (!before_snap || before_snap->statuses.size() != i) return false;
+        }
+        const CompileCkpt* before = before_snap.get();
+        // Prefer the snap's own content hash (survives a changed prefix). Fall back
+        // to the chained hash for checkpoints restored from older cache.ckpt blobs.
+        const uint64_t content = cc_hash_feature(raw, 0);
+        const bool content_ok = after.feature_content_hash != 0
+            ? after.feature_content_hash == content
+            : cc_hash_feature(raw, after.parent_hash) == after.chain_hash;
+        if (!content_ok || !after.statuses.back()->ok ||
             after.statuses.back()->rolled_back || !after.results.count(id)) return false;
         const std::string fname = raw.value("name", id);
         auto same_input = [&](const std::string& input) {
@@ -3521,7 +3586,15 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         };
         const FeatureResultPtr& saved = after.results.at(id);
         if (!saved) return false;
+        const std::size_t tools_before = before ? before->tool_recs.size() : 0;
+        auto standalone_solid = [&]() {
+            return std::holds_alternative<SolidResult>(*saved) &&
+                   !after.source_of.count(id) &&
+                   after.tool_recs.size() == tools_before + 1 &&
+                   after.tool_recs.back().feature_id == id;
+        };
         bool eligible = false;
+        bool restore_solid = false;
         if (type == "sketch3d") {
             eligible = std::holds_alternative<Sketch3DResult>(*saved);
         } else if (type == "plane" && feat.value("method", std::string("offset")) == "point_normal") {
@@ -3535,21 +3608,43 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             eligible = plane != feat.end() && plane->is_string() &&
                        same_input(plane->get<std::string>()) &&
                        std::holds_alternative<SketchResult>(*saved);
-        } else if (type == "sweep" && feat.value("mode", std::string("boss")) == "new") {
+        } else if (type == "sweep" && solid_mode(feat, "boss") == "new") {
             auto path = feat.find("path");
             auto profile = feat.find("profile");
             eligible = before && path != feat.end() && profile != feat.end() &&
                        same_input(selector_owner_id(*path)) &&
                        same_input(profile_sketch_id(*profile)) &&
-                       std::holds_alternative<SolidResult>(*saved) &&
-                       !after.source_of.count(id) && after.tool_body_of.count(id) &&
-                       after.feature_op_of.count(id) &&
-                       after.tool_recs.size() == before->tool_recs.size() + 1 &&
-                       after.tool_recs.back().feature_id == id;
+                       standalone_solid() && after.tool_body_of.count(id) &&
+                       after.feature_op_of.count(id);
             auto guides = feat.find("guides");
             if (eligible && guides != feat.end() && guides->is_array())
                 for (const json& guide : *guides)
                     if (!same_input(selector_owner_id(guide))) eligible = false;
+            restore_solid = eligible;
+        } else if ((type == "extrude" || type == "revolve") && solid_mode(feat, "new") == "new") {
+            auto profile = feat.find("profile");
+            eligible = before && profile != feat.end() &&
+                       same_input(profile_sketch_id(*profile)) &&
+                       standalone_solid() && after.tool_body_of.count(id) &&
+                       after.feature_op_of.count(id);
+            if (eligible && type == "revolve" && feat.contains("axis") && feat["axis"].is_string())
+                eligible = same_input(feat["axis"].get<std::string>());
+            restore_solid = eligible;
+        } else if (type == "loft" && solid_mode(feat, "new") == "new") {
+            auto sections = feat.find("sections");
+            eligible = before && sections != feat.end() && sections->is_array() &&
+                       sections->size() >= 2 && standalone_solid() &&
+                       after.tool_body_of.count(id) && after.feature_op_of.count(id);
+            if (eligible)
+                for (const json& section : *sections)
+                    if (!same_input(selector_owner_id(section))) eligible = false;
+            restore_solid = eligible;
+        } else if ((type == "box" || type == "cylinder" || type == "sphere" ||
+                    type == "cone" || type == "torus") &&
+                   solid_mode(feat, "boss") == "new") {
+            // Standalone primitives have no upstream geometry inputs.
+            eligible = standalone_solid();
+            restore_solid = eligible;
         }
         if (!eligible) return false;
         FeatureStatus reused = *after.statuses.back();
@@ -3573,10 +3668,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
         results.put_shared(id, saved);
         if (!fname.empty()) seen_names.insert(fname);
-        if (type == "sweep") {
+        if (restore_solid) {
             solid_order.push_back(id);
-            tool_body_of[id] = after.tool_body_of.at(id);
-            feature_op_of[id] = after.feature_op_of.at(id);
+            if (after.tool_body_of.count(id)) tool_body_of[id] = after.tool_body_of.at(id);
+            if (after.feature_op_of.count(id)) feature_op_of[id] = after.feature_op_of.at(id);
             result.tool_recs.push_back(after.tool_recs.back());
             auto fo = after.face_owners.find(id);
             if (fo != after.face_owners.end()) face_owners[id] = fo->second;
@@ -6698,9 +6793,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     st.warning = buf;
                 }
 
-                // Final independent validation applies even to a fillet candidate
-                // already checked during search. Surface sources remain exempt from
-                // solid closure checks, as does the chamfer-only pass-through.
+                // Final validation for every dress result. A fillet whose returned
+                // shape already passed validate_fillet_solid skips the repeated
+                // whole-body self-intersection check (the dominant cost of a long
+                // fillet history). Surface sources remain exempt from solid closure
+                // checks, as does the chamfer-only pass-through.
                 {
                     auto bk_src = body_kinds.find(body_id);
                     const bool src_is_surface =
@@ -6715,7 +6812,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             type == "fillet" ? "radius" : "distance");
                         throw std::runtime_error(obuf);
                     }
-                    if (!src_is_surface && !sub_tolerance) {
+                    if (!src_is_surface && !sub_tolerance &&
+                        !(fillet_result && fillet_result->document_validated)) {
                         const std::string rejection = dress_geometry_rejection(out);
                         if (!rejection.empty())
                             throw std::runtime_error(
@@ -10682,16 +10780,23 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
         st.ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - _feat_t0).count();
+        const bool feature_ok = st.ok;
         status_ptrs.push_back(std::make_shared<const FeatureStatus>(st));
         result.statuses.push_back(std::move(st));
         // Attribute owners only for solids THIS feature produced (the
         // reused prefix already carries face_owners/edge_owners from its checkpoint).
         // A plain geometry-only component compilation never consumes picking ownership.
-        if (attribute_owners && st.ok) {
+        if (attribute_owners && feature_ok) {
             for (std::size_t k = solids_before; k < solid_order.size(); ++k)
                 update_owners_for(solid_order[k], op_histories.histories());
         }
-        capture_ckpt(_fi + 1);
+        // Never checkpoint after a failure in the status chain: restoring such a
+        // snap would replay the recorded failure over a later repair of that feature.
+        const bool clean_prefix = feature_ok && std::all_of(
+            status_ptrs.begin(), status_ptrs.end(),
+            [](const std::shared_ptr<const FeatureStatus>& s) { return s && s->ok; });
+        if (clean_prefix) capture_ckpt(_fi + 1);
+        else if (use_cache && _fi + 1 < new_snaps.size()) new_snaps[_fi + 1].reset();
     }
     g_cc_features_reused.fetch_add(result.features_reused, std::memory_order_relaxed);
     g_cc_features_executed.fetch_add(result.features_executed, std::memory_order_relaxed);
@@ -10879,7 +10984,18 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             // A tessellation failure must not crash the rebuild; skip this body.
         }
     }
-    if (bc) bc->body_cache = std::move(new_body_cache);
+    if (bc) {
+        // Truncated compiles (rollback_after / compile_through) only tessellate the
+        // active prefix. Merge those bodies into the prior cache so independent
+        // downstream meshes survive for the next full rebuild; a full compile still
+        // replaces wholesale so discarded bodies free their meshes.
+        if (active_features < n_features) {
+            for (auto& kv : new_body_cache)
+                bc->body_cache.insert_or_assign(kv.first, std::move(kv.second));
+        } else {
+            bc->body_cache = std::move(new_body_cache);
+        }
+    }
 
     result.body_count = static_cast<int>(with_display ? bodies.size() : result.shapes.size());
     const auto _write_t0 = std::chrono::steady_clock::now();
@@ -11004,16 +11120,60 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
     // Commit this compile's chain, checkpoints and full result. Stored statuses
     // are scrubbed of `reused` so a later compile marks its own cache hits.
+    // Truncated compiles must not publish their rolled-back mesh as last_result
+    // or reindex body_cache from it — that is what made sketch_exit rebuild cold.
     if (use_cache) {
-        auto stored = std::make_shared<CompileResult>(result);
-        for (FeatureStatus& fst : stored->statuses) fst.reused = false;
-        stored->features_reused = 0;
-        stored->features_executed = static_cast<int>(active_features);
+        const bool truncated = active_features < n_features;
+        if (truncated) {
+            // Never publish a rolled-back mesh as the full-doc last_result.
+            cache->last_result.reset();
+            cache->full_key = 0;
+        } else if (result.ok) {
+            auto stored = std::make_shared<CompileResult>(result);
+            for (FeatureStatus& fst : stored->statuses) fst.reused = false;
+            stored->features_reused = 0;
+            stored->features_executed = static_cast<int>(active_features);
+            cache->full_key = cc_full_key(doc, chain.back());
+            cache->last_result = std::move(stored);
+        } else {
+            // A failed full compile must not become a full-hit source for a later
+            // repair of the same tree shape.
+            cache->last_result.reset();
+            cache->full_key = 0;
+        }
+        // States this compile left behind move to the branch pool; states it kept or
+        // restored leave it. The pool then drops its oldest entries past capacity.
+        // Branches of another environment, configuration or tier are not revisited.
+        if (!cache->chain.empty() && cache->chain.front() != chain.front()) {
+            cache->branch_snaps.clear();
+            cache->branch_order.clear();
+        }
+        std::unordered_set<uint64_t> kept;
+        for (const auto& snap : new_snaps)
+            if (snap && snap->chain_hash) kept.insert(snap->chain_hash);
+        for (const auto& snap : cache->snaps) {
+            if (!snap || !snap->chain_hash || kept.count(snap->chain_hash)) continue;
+            if (cache->branch_snaps.emplace(snap->chain_hash, snap).second)
+                cache->branch_order.push_back(snap->chain_hash);
+        }
+        for (uint64_t hash : kept) cache->branch_snaps.erase(hash);
+        const std::size_t capacity = cc_branch_capacity(n_features);
+        while (!cache->branch_order.empty() &&
+               (cache->branch_snaps.size() > capacity ||
+                !cache->branch_snaps.count(cache->branch_order.front()))) {
+            cache->branch_snaps.erase(cache->branch_order.front());
+            cache->branch_order.pop_front();
+        }
+        if (cache->branch_order.size() > 2 * capacity) {
+            std::deque<uint64_t> live;
+            std::unordered_set<uint64_t> seen;
+            for (auto it = cache->branch_order.rbegin(); it != cache->branch_order.rend(); ++it)
+                if (cache->branch_snaps.count(*it) && seen.insert(*it).second) live.push_front(*it);
+            cache->branch_order = std::move(live);
+        }
         cache->chain = std::move(chain);
         cache->snaps = std::move(new_snaps);
-        cache->full_key = cc_full_key(doc, cache->chain.back());
-        cache->last_result = std::move(stored);
-        if (bc) {
+        if (!truncated && bc) {
             // Rebase slices on this result so a few surviving bodies do not pin
             // an older, much larger AICM packet.
             try { cc_index_body_cache(*cache, doc, quality); }
@@ -11464,8 +11624,11 @@ public:
         return slot;
     }
 
-    std::shared_ptr<const CompileCkpt> snap(const json& e) {
+    std::shared_ptr<const CompileCkpt> snap(const json& e, uint64_t chain_hash,
+                                            uint64_t parent_hash) {
         auto ck = std::make_shared<CompileCkpt>();
+        ck->chain_hash = chain_hash;
+        ck->parent_hash = parent_hash;
         auto pairs_into = [&](const json& a, std::map<std::string, std::string>& m) {
             for (const json& kv : a) m.emplace(str(kv.at(0)), str(kv.at(1)));
         };
@@ -11826,7 +11989,7 @@ std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob, cons
         for (const json& e : root.at("snaps")) {
             const std::size_t i = e.at("i").get<std::size_t>();
             if (i == 0 || i > m) continue;
-            cache->snaps[i] = rd.snap(e);
+            cache->snaps[i] = rd.snap(e, chain[i], chain[i - 1]);
             ++restored;
         }
         cache->chain = std::move(chain);

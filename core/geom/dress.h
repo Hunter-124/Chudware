@@ -104,6 +104,10 @@ struct FilletResult {
     double tolerance_mm = 0.0;
     FilletFailure failure = FilletFailure::none;
     std::string reason;
+    // The returned shape itself passed the document_solid validator (in process, or in
+    // the isolated worker on the exact BinTools copy returned), so callers need not
+    // re-run that whole-body check.
+    bool document_validated = false;
 };
 
 // On the requested-radius fast path exactly one build is attempted. Otherwise a

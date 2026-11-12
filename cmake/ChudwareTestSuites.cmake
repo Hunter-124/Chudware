@@ -21,14 +21,6 @@ function(chudware_apply_test_suites tree)
   string(JSON _overrides ERROR_VARIABLE _no_overrides GET "${_json}" "${tree}_targets")
   get_property(_registered DIRECTORY PROPERTY TESTS)
 
-  # ctest refuses to start outside a container or CI runner (scripts/testbox_guard.py):
-  # host runs collide with the developer's live app. Use scripts/testbox.py.
-  find_program(CHUDWARE_GUARD_PYTHON NAMES python3 python REQUIRED)
-  get_filename_component(_guard "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../scripts/testbox_guard.py"
-                         ABSOLUTE)
-  file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
-       "set(CTEST_CUSTOM_PRE_TEST \"\\\"${CHUDWARE_GUARD_PYTHON}\\\" \\\"${_guard}\\\"\")\n")
-
   # Every declared suite gets a target in every tree, so `tests-<suite>` builds
   # (possibly nothing) in any configured tree. A combined root build configures
   # core and host into one project; both trees then add to the same target.

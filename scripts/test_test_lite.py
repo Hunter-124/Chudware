@@ -22,7 +22,6 @@ def put(root: Path, name: str, content: str = '') -> Path:
 
 @pytest.fixture(autouse=True)
 def isolated_test_environment(monkeypatch):
-    monkeypatch.setattr(lite.testbox_guard, 'isolated', lambda: True)
     for name in ('CMAKE_BUILD_PARALLEL_LEVEL', 'CHUDWARE_LIBCHUDWARE', 'CHUDWARE_HOSTD_BIN'):
         monkeypatch.delenv(name, raising=False)
     # Serial by default, so command-shape tests do not depend on this host's CPU count
@@ -460,19 +459,10 @@ def test_suite_keeps_runtime_guard_for_each_core_tree(tmp_path, monkeypatch, cap
     assert 'core build was skipped' in capsys.readouterr().out
     assert not (tmp_path / lite.STAMP).exists()
 
-@pytest.mark.parametrize('args', [[], ['--suite', 'sketch'], ['--files', 'missing.py']])
-def test_runner_refuses_host_before_discovery(tmp_path, monkeypatch, capsys, args):
-    monkeypatch.setattr(lite, 'ROOT', tmp_path)
-    monkeypatch.setattr(lite.testbox_guard, 'isolated', lambda: False)
-    monkeypatch.setattr(lite.test_suites, 'load', lambda *args: pytest.fail('loaded manifest on host'))
-    assert lite.main(args) == 3
-    assert capsys.readouterr().err == lite.testbox_guard.MESSAGE + '\n'
-
 
 def test_host_can_list_suites_and_preview_without_running_tests(tmp_path, monkeypatch, capsys):
     suite_root(tmp_path)
     monkeypatch.setattr(lite, 'ROOT', tmp_path)
-    monkeypatch.setattr(lite.testbox_guard, 'isolated', lambda: False)
     monkeypatch.setattr(lite, 'run_command', lambda *args: pytest.fail('host ran a command'))
     assert lite.main(['--list-suites']) == 0
     assert 'sketch: Sketch tests' in capsys.readouterr().out

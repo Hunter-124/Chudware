@@ -22,18 +22,6 @@ if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
 
-def pytest_configure(config):
-    # Tests run only in a container or on CI (scripts/testbox_guard.py).
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_chudware_testbox_guard", WEB_DIR.parent / "scripts" / "testbox_guard.py")
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
-    if not guard.isolated():
-        pytest.exit(guard.MESSAGE, returncode=3)
-
-
 # web/conftest.py normally did this first (see there); this covers a run rooted in web/gateway.
 if "CHUDWARE_WEB_TEST_ENV" not in os.environ:
     os.environ["CHUDWARE_WEB_TEST_ENV"] = "1"

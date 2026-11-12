@@ -51,10 +51,12 @@ git config core.hooksPath scripts/hooks
 
 ## Running tests
 
-Tests run in isolated containers to protect a live app's daemon, build trees, ports,
-data and CPU. Pytest, CTest, `scripts/test_lite.py` and `scripts/gate.sh` refuse
-developer-host execution (exit 3); GitHub Actions and Podman/Docker containers pass
-the guard. Listing suites and dry runs are allowed on the host.
+Tests may run directly on a developer host, including native Windows
+(`scripts/test_lite.py --suite <name>`), or isolated in a container through
+`scripts/testbox.py`. The root `conftest.py` points data roots at temp directories either
+way, but a host run still shares the build trees, loopback ports and CPU with a live app:
+use `CHUDWARE_ENGINE_DAEMON=0` (or a private daemon) for engine tests, and prefer testbox
+for long or parallel runs.
 
 Verify a change with the suite(s) for the area you touched (`--suite <name>[,<name>]`),
 or let `scripts/testbox.py` select tests from your changes. Each suite stays under five

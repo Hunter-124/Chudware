@@ -28,10 +28,6 @@ else:
 
 
 ROOT = Path(__file__).resolve().parent.parent
-_guard_spec = importlib.util.spec_from_file_location(
-    '_chudware_testbox_guard', Path(__file__).with_name('testbox_guard.py'))
-testbox_guard = importlib.util.module_from_spec(_guard_spec)
-_guard_spec.loader.exec_module(testbox_guard)
 STAMP = Path('.cache/test_lite.stamp')
 TIMINGS = Path('.cache/test_lite_times.json')
 CPP_SUFFIXES = {'.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx', '.inl', '.ipp', '.inc', '.tpp'}
@@ -663,9 +659,6 @@ def main(argv: list[str] | None = None) -> int:
                              'that triggers a split warning')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
-    if not (args.list_suites or args.dry_run) and not testbox_guard.isolated():
-        print(testbox_guard.MESSAGE, file=sys.stderr)
-        return 3
     if not (args.suite or args.list_suites) and not 0 < args.budget < float('inf'):
         parser.error('--budget must be a positive finite number of seconds')
     started_ns = time.time_ns()

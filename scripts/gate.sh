@@ -43,7 +43,6 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-python3 "$REPO/scripts/testbox_guard.py" || exit 3
 
 # Per-run temp dir for stage logs. Stage output used to go to fixed paths under
 # /tmp (gate_check.out, gate_host_build.out, …), so two gate runs on one box (e.g. a

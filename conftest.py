@@ -275,15 +275,6 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "_chudware_testbox_guard", os.path.join(_ROOT, "scripts", "testbox_guard.py"))
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
-    if not guard.isolated():
-        _pytest.exit(guard.MESSAGE, returncode=3)
-
     # pytest-xdist: the controller runs no tests and owns every worker, which install
     # their own guard on import (each over its own worker + daemon tree). Left running,
     # the controller's guard sums all workers into one single-process budget and aborts

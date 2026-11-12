@@ -1,0 +1,77 @@
+---
+/** Prominent call to the public browser demo. Facts mirror app.chudware.com's own "Before you start". */
+interface Props { compact?: boolean }
+const { compact = false } = Astro.props;
+---
+
+<section class:list={['demo-band', { 'demo-band-compact': compact }]} aria-labelledby="demo-band-title">
+  <div class="wrap">
+    <div class="demo-panel">
+      <div class="demo-copy">
+        <p class="demo-live"><span class="live-dot" aria-hidden="true"></span>Live now · app.chudware.com</p>
+        <h2 id="demo-band-title">Open the full workspace in your browser.</h2>
+        <p class="lede">Sketch, model, assemble, and brief the AI copilot in the real Chudware workspace. Nothing to install and no account to make.</p>
+        <div class="actions">
+          <a class="button button-demo" href="https://app.chudware.com/">Launch the live demo <span aria-hidden="true">→</span></a>
+          {!compact && <a class="button button-secondary" href="/gallery/">See real projects</a>}
+        </div>
+      </div>
+      <ul class="demo-facts" aria-label="About the demo">
+        <li><strong>Your workspace persists</strong><span>The same browser reopens it next time. Idle workspaces sleep after 15 minutes and resume.</span></li>
+        <li><strong>Claude models included</strong><span>Claude Opus, Sonnet, and Haiku 5.5 with a per-visitor allowance, plus free models with no demo limit.</span></li>
+        <li><strong>Shared and free</strong><span>Up to three people run at once; if it is busy, you wait in line for a slot.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<style>
+  @layer pages {
+    .demo-band { padding-block: clamp(var(--s7), 7vw, var(--s9)); border-top: var(--border) solid var(--line); background: var(--bg); }
+    .demo-band-compact { padding-block: var(--s8); }
+    .demo-panel {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(18rem, .85fr);
+      gap: clamp(var(--s6), 5vw, var(--s9));
+      align-items: center;
+      padding: clamp(var(--s6), 5vw, var(--s8));
+      border: var(--border) solid rgba(255, 138, 61, .45);
+      border-radius: calc(var(--radius) * 1.6);
+      background:
+        radial-gradient(60rem 30rem at 0% 0%, rgba(255, 138, 61, .16), transparent 60%),
+        radial-gradient(40rem 26rem at 100% 100%, rgba(83, 214, 181, .12), transparent 60%),
+        var(--surface);
+      box-shadow: 0 0 0 1px rgba(255, 138, 61, .08), 0 2.5rem 6rem rgba(255, 138, 61, .1), var(--shadow);
+      overflow: hidden;
+      isolation: isolate;
+    }
+    .demo-panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      background-image: linear-gradient(var(--grid-line) 1px, transparent 1px), linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+      background-size: 2.5rem 2.5rem;
+      mask-image: radial-gradient(circle at 20% 30%, #000, transparent 70%);
+    }
+    .demo-copy { display: grid; gap: var(--s5); }
+    .demo-copy h2 { max-width: 16ch; font-size: var(--step-3); }
+    .demo-copy .lede { max-width: 46ch; }
+    .demo-live { display: inline-flex; align-items: center; gap: var(--s2); width: fit-content; padding: var(--s1) var(--s3); border: var(--border) solid rgba(83, 214, 181, .4); border-radius: 999px; background: var(--technical-wash); color: var(--technical-hi); font: var(--step--1)/1.4 var(--mono); }
+    .demo-facts { display: grid; gap: var(--s4); list-style: none; }
+    .demo-facts li { display: grid; gap: var(--s1); padding: var(--s4) var(--s5); border: var(--border) solid var(--line); border-radius: var(--radius); background: rgba(12, 14, 12, .55); }
+    .demo-facts strong { font-weight: 640; }
+    .demo-facts span { color: var(--muted); font-size: var(--step--1); line-height: 1.55; }
+  }
+
+  @layer responsive {
+    @media (max-width: 900px) {
+      .demo-panel { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .demo-panel { padding: var(--s5); }
+      .demo-facts li { padding: var(--s3) var(--s4); }
+    }
+  }
+</style>

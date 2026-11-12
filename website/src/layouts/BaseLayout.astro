@@ -95,14 +95,14 @@ const active = (href: string) => href === '/' ? path === '/' : path.startsWith(h
         </nav>
         <div class="header-actions">
           <a class="button button-small button-secondary" href="/download/">Get started</a>
-          <a class="button button-small" href="https://app.chudware.com/">Try the demo</a>
+          <a class="button button-small button-live" href="https://app.chudware.com/"><span class="live-dot" aria-hidden="true"></span>Live demo</a>
         </div>
         <details class="mobile-nav">
           <summary class="tap"><Icon name="menu" /><span>Menu</span></summary>
           <nav aria-label="Mobile primary">
             {nav.map((item) => <a class="tap" href={item.href} aria-current={active(item.href) ? 'page' : undefined}>{item.label}</a>)}
             <a class="tap" href="/download/">Get started</a>
-            <a class="tap mobile-download" href="https://app.chudware.com/">Try the demo</a>
+            <a class="tap mobile-download" href="https://app.chudware.com/">Launch the live demo</a>
           </nav>
         </details>
       </div>

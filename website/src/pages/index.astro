@@ -2,6 +2,7 @@
 import BaseLayout from '../layouts/BaseLayout.astro';
 import TesseractHero from '../components/TesseractHero.astro';
 import Showcase from '../components/Showcase.astro';
+import DemoBand from '../components/DemoBand.astro';
 import { HERO_STAGES } from '../scripts/hero-timeline';
 import { MACHINING_OPS } from '../scripts/machining-timeline';
 ---
@@ -15,11 +16,11 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
         <p class="eyebrow">MIT-licensed parametric CAD · Desktop and browser demo</p>
         <h1>AI-first CAD for engineers.</h1>
         <p class="lede">Describe the change you want. A team of agents works across your workspace — sketching, features, measurement, simulation, CAM — and leaves behind a human-editable feature history: fully defined sketches, named relations, and the critical dimensions you specified.</p>
-        <p class="supporting-copy">Try it in your browser: the free public demo runs a few sessions at a time with free AI models, and deletes your work when the session ends. The desktop copilot uses your own provider account or API key.</p>
         <div class="actions">
-          <a class="button" href="https://app.chudware.com/">Try the live demo</a>
+          <a class="button button-demo" href="https://app.chudware.com/"><span class="live-dot" aria-hidden="true"></span>Launch the live demo <span aria-hidden="true">→</span></a>
           <a class="button button-secondary" href="/download/">Get started</a>
         </div>
+        <p class="supporting-copy">The browser demo needs no install or account. The desktop copilot uses your own provider account or API key.</p>
         <ul class="home-hero-facts" aria-label="Fundamentals">
           <li>Exact B-rep solids</li>
           <li>Dimension-driven models</li>
@@ -31,21 +32,7 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
     </div>
   </header>
 
-  <section class="section home-ai" aria-labelledby="ai-title">
-    <div class="wrap split">
-      <header class="section-heading">
-        <p class="eyebrow">AI in the engineering loop</p>
-        <h2 id="ai-title">Describe the change. A team of agents does the work.</h2>
-        <p class="lede">Brief the copilot like you'd brief a group of engineers. The agents split the job — one sketches, one builds features, one measures and checks — using the same tools you use by hand, in the document you have open. Everything they build lands in your feature tree, fully defined and yours to edit.</p>
-        <div class="actions"><a class="button button-secondary" href="/docs/ai-copilot/">Read the AI copilot guide</a></div>
-      </header>
-      <ol class="home-ai-steps" aria-label="AI copilot workflow">
-        <li><span>1</span><div><strong>Connect</strong><p>Sign in with your AI provider account, or paste an API key. Usage runs on your provider account under its terms.</p></div></li>
-        <li><span>2</span><div><strong>Describe</strong><p>Name the part, the change, the critical dimensions, and what must not move.</p></div></li>
-        <li><span>3</span><div><strong>Review</strong><p>Open the feature tree. Every sketch is fully defined, every relation is named, every critical dimension is the one you asked for. Save a revision, or send it back.</p></div></li>
-      </ol>
-    </div>
-  </section>
+  <DemoBand />
 
   <Showcase
     kind="hero"
@@ -105,27 +92,40 @@ import { MACHINING_OPS } from '../scripts/machining-timeline';
     <div class="wrap">
       <header class="section-heading home-work-heading">
         <div>
-          <p class="eyebrow">Gallery</p>
-          <h2 id="work-title">What the workspaces look like.</h2>
+          <p class="eyebrow">Gallery · real projects</p>
+          <h2 id="work-title">Built in Chudware, then built for real.</h2>
         </div>
         <a class="text-link" href="/gallery/">Open the gallery</a>
       </header>
-      <div class="home-work-grid">
-        <figure>
-          <a href="/gallery/#modeling"><img src="/images/modeling.png" width="1600" height="900" loading="lazy" alt="Chudware modeling workspace showing a parametric enclosure and its editable feature tree" /></a>
-          <figcaption><span><strong>Modeling</strong> · Editable feature history</span><a href="/gallery/#modeling">Request and result</a></figcaption>
-        </figure>
-        <figure>
-          <a href="/gallery/#cam"><img src="/images/cam.png" width="1600" height="900" loading="lazy" alt="Chudware manufacturing workspace with a CAM job, operations, and toolpath simulation" /></a>
-          <figcaption><span><strong>CAM</strong> · Operations and toolpath simulation</span><a href="/gallery/#cam">View full image</a></figcaption>
-        </figure>
-        <figure>
-          <a href="/gallery/#simulation"><img src="/images/fea.png" width="1600" height="900" loading="lazy" alt="Chudware simulation workspace with a static stress result, legend, and result summary" /></a>
-          <figcaption><span><strong>Simulation</strong> · Static stress result</span><a href="/gallery/#simulation">View full image</a></figcaption>
-        </figure>
+      <div class="home-projects">
+        <a class="home-project home-project-lead" href="/gallery/#rover">
+          <video data-autoplay muted loop playsinline preload="none" poster="/gallery/rover/rover.webp" width="1280" height="592" aria-label="Turntable of the human-powered rover assembly"><source src="/gallery/rover/rover.mp4" type="video/mp4" /></video>
+          <span class="home-project-label"><strong>Human-powered rover</strong><span>Senior design assembly, motion, FEA</span></span>
+        </a>
+        <a class="home-project home-project-contain" href="/gallery/#roboarm6">
+          <video data-autoplay muted loop playsinline preload="none" poster="/gallery/robo/motion.webp" width="760" height="602" aria-label="Motion study of the six-axis robot arm"><source src="/gallery/robo/motion.mp4" type="video/mp4" /></video>
+          <span class="home-project-label"><strong>RoboArm6</strong><span>Six-axis arm, DFM checks, built</span></span>
+        </a>
+        <a class="home-project" href="/gallery/#tbot">
+          <video data-autoplay muted loop playsinline preload="none" poster="/gallery/tbot/splat.webp" width="640" height="360" aria-label="Gaussian splat flythrough from a phone scan"><source src="/gallery/tbot/splat.mp4" type="video/mp4" /></video>
+          <span class="home-project-label"><strong>TBOT</strong><span>Phone scan to CAD and harness</span></span>
+        </a>
       </div>
     </div>
   </section>
+
+<script>
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches && 'IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const v = e.target as HTMLVideoElement;
+        if (e.isIntersecting) v.play().catch(() => {});
+        else v.pause();
+      }
+    }, { threshold: 0.15 });
+    document.querySelectorAll<HTMLVideoElement>('video[data-autoplay]').forEach((v) => io.observe(v));
+  }
+</script>
 
 
   <section class="section cta-band">

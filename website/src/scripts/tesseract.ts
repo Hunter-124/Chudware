@@ -13,9 +13,8 @@
  * Why analytic glow ribbons instead of a bloom pass: 32 edges and 16 vertices
  * are the whole figure. A ribbon whose fragment alpha is a bright core plus a
  * gaussian shoulder IS a one-pass bloom for line art — no FBO, no blur
- * kernel, no dependency, and it stays sharp at any DPR. The armillary rings
- * and dust are the same pipeline fed different instances, so the whole stage
- * is two programs and three draws.
+ * kernel, no dependency, and it stays sharp at any DPR. The dust is a
+ * second, sprite program, so the whole stage is two programs and three draws.
  *
  * Verified invariants (Python port, 60k-sample trajectory sweep with full
  * camera wobble + pointer range): d4 - max|w| = 0.891 (projection can never
@@ -68,15 +67,8 @@ for (let i = 0; i < 16; i++) {
   for (const b of [1, 2, 4, 8]) if ((i ^ b) > i) EDGES.push([i, i ^ b] as const);
 }
 
-// Three armillary rings around the figure, each 96 segments. Generated in the
-// xy plane at a radius a touch wider than the figure's 3D reach; the shader
-// gives each ring its own fixed tilt and slow independent spin.
-const RING_R = 4.15;
-const RING_SEGMENTS = 96;
-const RING_COUNT = 3;
-
 const RIBBON_VERTS = 4; // triangle strip per instance
-const EDGE_INSTANCE_COUNT = EDGES.length + RING_COUNT * RING_SEGMENTS;
+const EDGE_INSTANCE_COUNT = EDGES.length;
 
 // ---- shaders ---------------------------------------------------------------
 
@@ -84,7 +76,6 @@ const RIBBON_VERT = `#version 300 es
 layout(location = 0) in vec2 aCorner; // x: along 0..1, y: side -1..1
 layout(location = 1) in vec4 aA;
 layout(location = 2) in vec4 aB;
-layout(location = 3) in float aKind;  // 0 = tesseract edge, 1..3 = ring index
 
 uniform vec2 uPhase;   // (xy phase, zw phase)
 uniform vec2 uCam;     // yaw, pitch
@@ -92,12 +83,10 @@ uniform vec2 uRes;
 uniform vec2 uShift;   // px: where the figure's centre sits on stage
 uniform float uRadius; // px: model unit box -> pixels
 uniform float uWidth;  // px: core stroke width at mid depth
-uniform float uTime;
 
 out float vSide;
 out float vAlong;
 out float vN01;
-out float vKind;
 
 vec4 rotate4(vec4 p, float xy, float zw) {
   float c = cos(xy), s = sin(xy);
@@ -106,45 +95,14 @@ vec4 rotate4(vec4 p, float xy, float zw) {
   return vec4(p.x, p.y, p.z * c - p.w * s, p.z * s + p.w * c);
 }
 
-// Per-ring pose: a fixed tilt plus a slow spin in one plane, each ring its own
-// rate and axis mix so the cage never looks mechanical.
-vec3 ringPose(vec3 p, float kind, float t) {
-  float c, s;
-  if (kind < 1.5) {
-    c = cos(t * 0.10); s = sin(t * 0.10);
-    p = vec3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
-  } else if (kind < 2.5) {
-    c = cos(1.08); s = sin(1.08); // fixed tilt about x
-    p = vec3(p.x, p.y * c - p.z * s, p.y * s + p.z * c);
-    c = cos(t * 0.07); s = sin(t * 0.07);
-    p = vec3(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
-  } else {
-    c = cos(-0.84); s = sin(-0.84);
-    p = vec3(p.x, p.y * c - p.z * s, p.y * s + p.z * c);
-    c = cos(0.61); s = sin(0.61);
-    p = vec3(p.x * c + p.z * s, p.y, -p.x * s + p.z * c);
-    c = cos(t * -0.085); s = sin(t * -0.085);
-    p = vec3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
-  }
-  return p;
-}
-
 void main() {
-  vec4 a = aA;
-  vec4 b = aB;
-  if (aKind < 0.5) {
-    a = rotate4(a, uPhase.x, uPhase.y);
-    b = rotate4(b, uPhase.x, uPhase.y);
-  }
-  // 4D -> 3D perspective. Rings sit at w = 0 with k = 1 by construction.
+  vec4 a = rotate4(aA, uPhase.x, uPhase.y);
+  vec4 b = rotate4(aB, uPhase.x, uPhase.y);
+  // 4D -> 3D perspective.
   float ka = ${D4.toFixed(5)} / (${D4.toFixed(5)} - a.w);
   float kb = ${D4.toFixed(5)} / (${D4.toFixed(5)} - b.w);
   vec3 pa = a.xyz * ka;
   vec3 pb = b.xyz * kb;
-  if (aKind > 0.5) {
-    pa = ringPose(pa, aKind, uTime);
-    pb = ringPose(pb, aKind, uTime);
-  }
   // camera: yaw about +y, then pitch about +x; +z points into the screen
   float cy = cos(uCam.x), sy = sin(uCam.x);
   float cp = cos(uCam.y), sp = sin(uCam.y);
@@ -170,15 +128,13 @@ void main() {
   vec2 normal = vec2(-delta.y, delta.x) / len;
 
   // Near edges draw heavier, far edges hairline — the logo's own ramp.
-  float ring = step(0.5, aKind);
-  float core = uWidth * mix(0.78 + 0.5 * n01, 0.62, ring);
-  float half_ = core * mix(4.6, 2.6, ring) * 0.5; // halo shoulder extent
+  float core = uWidth * (0.78 + 0.5 * n01);
+  float half_ = core * 4.6 * 0.5; // halo shoulder extent
   vec2 px = along + normal * aCorner.y * half_ + uShift;
 
   vSide = aCorner.y;
   vAlong = aCorner.x;
   vN01 = n01;
-  vKind = aKind;
   vec2 clip = vec2(px.x / uRes.x, -px.y / uRes.y) * 2.0;
   gl_Position = vec4(clip, 0.0, 1.0);
 }`;
@@ -189,11 +145,9 @@ precision highp float;
 in float vSide;
 in float vAlong;
 in float vN01;
-in float vKind;
 
 uniform vec3 uNear;   // teal hi
 uniform vec3 uFar;    // teal dk
-uniform vec3 uRing;   // warm accent for the cage
 
 out vec4 outColor;
 
@@ -206,10 +160,9 @@ void main() {
   float halo = exp(-s * s * 3.2) * 0.38;
   // Soften segment joints; the vertex dots cap the real edges.
   float cap = smoothstep(0.0, 0.06, vAlong) * (1.0 - smoothstep(0.94, 1.0, vAlong));
-  float ring = step(0.5, vKind);
-  vec3 col = mix(mix(uFar, uNear, vN01), uRing, ring);
-  float energy = mix(core * 1.25 + halo, core * 0.9 + halo * 0.6, ring);
-  float alpha = energy * mix(1.0, 0.22, ring) * cap;
+  vec3 col = mix(uFar, uNear, vN01);
+  float energy = core * 1.25 + halo;
+  float alpha = energy * cap;
   // Alpha carries the accumulated intensity: with additive blending into a
   // premultiplied canvas, a constant 1.0 alpha would composite as opaque
   // black wherever the glow falls to nothing.
@@ -324,7 +277,6 @@ const TEAL_HI: readonly [number, number, number] = [66 / 255, 236 / 255, 206 / 2
 const TEAL_DK: readonly [number, number, number] = [16 / 255, 128 / 255, 115 / 255];
 // The site's warm accent, kept faint: the cage should read as instrumentation,
 // not as a second brand colour.
-const RING_COL: readonly [number, number, number] = [255 / 255 * 0.85, 138 / 255 * 0.85, 61 / 255 * 0.85];
 const DUST_COL: readonly [number, number, number] = [0.55, 0.95, 0.85];
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader | null {
@@ -382,7 +334,7 @@ export function createTesseract(
     for (const n of names) out[n] = gl.getUniformLocation(prog, n);
     return out;
   };
-  const uRib = uniforms(ribbonProg, ['uPhase', 'uCam', 'uRes', 'uShift', 'uRadius', 'uWidth', 'uTime', 'uNear', 'uFar', 'uRing'] as const);
+  const uRib = uniforms(ribbonProg, ['uPhase', 'uCam', 'uRes', 'uShift', 'uRadius', 'uWidth', 'uNear', 'uFar'] as const);
   const uSpr = uniforms(spriteProg, ['uPhase', 'uCam', 'uRes', 'uShift', 'uRadius', 'uWidth', 'uNear', 'uFar'] as const);
   const uDst = uniforms(dustProg, ['uCam', 'uRes', 'uRadius', 'uTime', 'uDust'] as const);
 
@@ -396,43 +348,23 @@ export function createTesseract(
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-  // Instance table: 32 edges, then 3 x 96 ring segments. (aA, aB, aKind)
-  const inst = new Float32Array(EDGE_INSTANCE_COUNT * 9);
+  // Instance table: 32 edges. (aA, aB)
+  const inst = new Float32Array(EDGE_INSTANCE_COUNT * 8);
   let o = 0;
   for (const [ia, ib] of EDGES) {
     for (let k = 0; k < 4; k++) inst[o + k] = VERTS[ia * 4 + k];
     for (let k = 0; k < 4; k++) inst[o + 4 + k] = VERTS[ib * 4 + k];
-    inst[o + 8] = 0;
-    o += 9;
-  }
-  for (let ring = 0; ring < RING_COUNT; ring++) {
-    for (let seg = 0; seg < RING_SEGMENTS; seg++) {
-      const a0 = (seg / RING_SEGMENTS) * Math.PI * 2;
-      const a1 = ((seg + 1) / RING_SEGMENTS) * Math.PI * 2;
-      inst[o] = Math.cos(a0) * RING_R;
-      inst[o + 1] = Math.sin(a0) * RING_R;
-      inst[o + 2] = 0;
-      inst[o + 3] = 0;
-      inst[o + 4] = Math.cos(a1) * RING_R;
-      inst[o + 5] = Math.sin(a1) * RING_R;
-      inst[o + 6] = 0;
-      inst[o + 7] = 0;
-      inst[o + 8] = ring + 1;
-      o += 9;
-    }
+    o += 8;
   }
   const instBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
   gl.bufferData(gl.ARRAY_BUFFER, inst, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(1);
-  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 36, 0);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0);
   gl.vertexAttribDivisor(1, 1);
   gl.enableVertexAttribArray(2);
-  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 36, 16);
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16);
   gl.vertexAttribDivisor(2, 1);
-  gl.enableVertexAttribArray(3);
-  gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 36, 32);
-  gl.vertexAttribDivisor(3, 1);
 
   const spriteVao = gl.createVertexArray();
   gl.bindVertexArray(spriteVao);
@@ -582,8 +514,8 @@ export function createTesseract(
     }
 
     // The compact frame has no copy column or HUD to clear: keep the mark
-    // centered and leave enough room for the armillary rings.
-    const radius = Math.min(width, height) * 0.44;
+    // centered with room for the glow.
+    const radius = Math.min(width, height) * 0.5;
     const shiftX = 0;
     const shiftY = 0;
     const coreWidth = Math.max(1.4, Math.min(4.0, Math.min(width, height) * 0.0052));
@@ -612,10 +544,8 @@ export function createTesseract(
     gl2.uniform2f(uRib.uShift, shiftX, shiftY);
     gl2.uniform1f(uRib.uRadius, radius);
     gl2.uniform1f(uRib.uWidth, coreWidth);
-    gl2.uniform1f(uRib.uTime, elapsed);
     gl2.uniform3f(uRib.uNear, TEAL_HI[0], TEAL_HI[1], TEAL_HI[2]);
     gl2.uniform3f(uRib.uFar, TEAL_DK[0], TEAL_DK[1], TEAL_DK[2]);
-    gl2.uniform3f(uRib.uRing, RING_COL[0], RING_COL[1], RING_COL[2]);
     gl2.bindVertexArray(ribbonVao);
     gl2.drawArraysInstanced(gl2.TRIANGLE_STRIP, 0, RIBBON_VERTS, EDGE_INSTANCE_COUNT);
 

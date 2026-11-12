@@ -1365,6 +1365,12 @@ add_custom_command(TARGET Chudware POST_BUILD
           "${CMAKE_CURRENT_SOURCE_DIR}/../assets"
           "$<TARGET_FILE_DIR:Chudware>/assets"
   COMMENT "Copying assets next to chudware.exe")
+# The native SolidWorks/Parasolid reader (core/doc/sldprt_native.cpp looks for <exe dir>/sldprt).
+add_custom_command(TARGET Chudware POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/sldprt"
+          "$<TARGET_FILE_DIR:Chudware>/sldprt"
+  COMMENT "Copying the native SolidWorks reader next to chudware.exe")
 
 
 endif()  # NOT EMSCRIPTEN (native tests + asset copy)

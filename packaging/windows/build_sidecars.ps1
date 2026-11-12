@@ -201,6 +201,7 @@ function Assert-SourceFreePayload([string]$RootPath) {
             continue
         }
         if ($item.FullName -eq (Join-Path $RootPath "omp_extension.ts")) { continue }
+        if ($item.FullName.StartsWith((Join-Path $RootPath "sldprt") + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { continue }
         if (($forbiddenExtensions -contains $item.Extension.ToLowerInvariant()) -or
             $item.Name.StartsWith("test_", [StringComparison]::OrdinalIgnoreCase) -or
             $item.Name -match "_test\.[^.]+$") {
@@ -305,6 +306,12 @@ Build-PythonSidecar "worker_main" "chudware-worker"
 Build-PythonSidecar "mcp.server" "chudware-mcp"
 Stage-OMP (Join-Path $OutputDir "omp.exe")
 Copy-Item -LiteralPath (Join-Path $Root "services\agent\omp_extension.ts") -Destination (Join-Path $OutputDir "omp_extension.ts") -Force
+# Native SolidWorks/Parasolid reader, run by omp as Bun (core/doc/sldprt_native.cpp).
+$SldprtOut = Join-Path $OutputDir "sldprt"
+New-Item -ItemType Directory -Force -Path $SldprtOut | Out-Null
+foreach ($name in @("src", "chudware_driver.js", "LICENSE", "NOTICE", "SLDPRT_ARTIFACT.lock")) {
+    Copy-Item -LiteralPath (Join-Path $Root "vendor\sldprt\$name") -Destination $SldprtOut -Recurse -Force
+}
 Copy-Item -LiteralPath (Join-Path $Root "services\agent\prompts\omp_cad_system.md") -Destination (Join-Path $OutputDir "omp_cad_system.md") -Force
 Assert-SourceFreePayload $OutputDir
 

@@ -226,7 +226,8 @@ def apply_preference_tools(allowed, preferences, *, mode=None):
                   | {"task_list", "advise", "verify_battery", "render_part", "ask_user"})
         tools -= set(MUTATING_TOOLS) | set(_MUTATING_TOOLS) | {
             "new_part", "new_assembly", "close_part", "save_part", "import_part",
-            "export_part", "fs_write", "fs_edit", "run_shell", "mission_start",
+            "export_part", "export_solidworks", "fs_write", "fs_edit", "run_shell",
+            "mission_start",
             "delegate", "run_dag",
         }
     if preferences.delegation_depth == 0:

@@ -2102,8 +2102,9 @@ const std::vector<FormatInfo>& format_registry() {
         // ACIS solids (AutoCAD ACISIN/ACISOUT, Inventor, SpaceClaim...): .sat text / .sab
         // binary in; ACIS 7.0 .sat out.
         {"sat",    "ACIS SAT",            {".sat", ".sab"},  "brep",        true,  true},
-        // Proprietary — import is experimental (SolidWorks COM -> STEP); we never write
-        // these, so can_export is false (export STEP instead).
+        // Proprietary — imported through resolve_solidworks_source (sldprt_native.h): the
+        // native Parasolid reader, SolidWorks COM, or saved tessellation. Never written here;
+        // export_solidworks rebuilds a part in SolidWorks instead.
         {"sldprt", "SolidWorks part",     {".sldprt"},       "proprietary", true,  false},
         {"sldasm", "SolidWorks assembly", {".sldasm"},       "proprietary", true,  false},
         {"x_t",    "Parasolid (text)",    {".x_t"},          "proprietary", true,  false},
@@ -4289,7 +4290,7 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(
     }
     throw OpError("import_failed",
                   "import format '" + fmt + "' is not supported by the C++ core "
-                  "(Parasolid x_t/x_b must be converted through SolidWorks COM -> STEP)",
+                  "(Parasolid x_t/x_b import through resolve_solidworks_source)",
                   {{"format", fmt}, {"reason", "unsupported format"}});
 }
 

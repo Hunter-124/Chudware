@@ -50,6 +50,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "close_part",
         "import_part",
         "export_part",
+        "export_solidworks",
         "inspect_native_files",
         "read_native_file",
         "scad_status",

@@ -285,7 +285,7 @@ audit_production_payload() {
     local root="$1" bad
     bad="$(find "$root" \( -type l -o -type f \( \
         -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o \( -name '*.ts' ! -path "$root/usr/bin/omp_extension.ts" \) -o -name '*.tsx' \
-        -o -name '*.js' -o -name '*.jsx' -o -name '*.map' -o -name '*.pdb' \
+        -o \( -name '*.js' ! -path "$root/usr/bin/sldprt/*" \) -o -name '*.jsx' -o -name '*.map' -o -name '*.pdb' \
         -o -name 'test_*' -o -name '*_test.*' \) -o -type d \( \
         -name '__pycache__' -o -name 'node_modules' -o -name '.git' -o -name '.github' \
         -o -name '.svn' -o -name '*.dSYM' \) \) -print -quit)"
@@ -591,6 +591,10 @@ build_python_sidecar worker_main "$APPDIR/usr/bin/chudware-worker"
 build_python_sidecar mcp.server "$APPDIR/usr/bin/chudware-mcp"
 stage_omp "$APPDIR/usr/bin/omp"
 cp "$REPO/services/agent/omp_extension.ts" "$APPDIR/usr/bin/omp_extension.ts"
+# Native SolidWorks/Parasolid reader, run by omp as Bun (core/doc/sldprt_native.cpp).
+mkdir -p "$APPDIR/usr/bin/sldprt"
+cp -R "$REPO/vendor/sldprt/src" "$REPO/vendor/sldprt/chudware_driver.js" "$REPO/vendor/sldprt/LICENSE" \
+    "$REPO/vendor/sldprt/NOTICE" "$REPO/vendor/sldprt/SLDPRT_ARTIFACT.lock" "$APPDIR/usr/bin/sldprt/"
 cp "$REPO/services/agent/prompts/omp_cad_system.md" "$APPDIR/usr/bin/omp_cad_system.md"
 
 

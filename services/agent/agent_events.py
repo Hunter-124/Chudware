@@ -347,7 +347,7 @@ def _error_text(result: Any) -> str:
 # panel. Every name below is verified against the live tool_registry catalog.
 _ARTIFACT_PRODUCER_TOOLS = frozenset({
     # CAD file/export deliverables
-    "export_part", "save_part", "export_drawing", "make_drawing",
+    "export_part", "export_solidworks", "save_part", "export_drawing", "make_drawing",
     # CAD render deliverables (the artifacts field's original 2026-07-17
     # purpose: expand render/export rows inline)
     "render_part", "render_views", "contact_sheet", "doc_sketch_contact_sheet",

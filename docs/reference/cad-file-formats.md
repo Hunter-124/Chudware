@@ -221,3 +221,37 @@ faceted. Arbitrary SCAD does not reconstruct native feature history: only suppor
 managed native projections can round-trip their preserved graph, and changed source
 or unsupported options are refused. Conversion and rebuild failure roll back the
 transaction. See `contracts/doc_ops.md` §36 and `cad_guide('scad')`.
+
+## SolidWorks and Parasolid interop
+
+**Import** (`doc_import_file`, File > Open, `import_part`; lane order in `core/doc/sldprt_native.cpp`):
+
+| Source | Lane, best first | `import_fidelity` |
+|---|---|---|
+| `.sldprt` (SolidWorks 2011 OLE2 and 2015+) | native read of the part's stored Parasolid body → exact STEP → B-rep import; then SolidWorks COM → STEP; then the saved display tessellation | `exact_native_brep` / `solidworks_com_step` / `saved_display_tessellation` |
+| `.x_t`, `.x_b` | native Parasolid read; then SolidWorks COM | `exact_native_brep` / `solidworks_com_step` |
+| `.sldasm` | SolidWorks COM → STEP; then the saved display tessellation | `solidworks_com_step` / `saved_display_tessellation` |
+
+The native reader is the vendored [sldprt](https://github.com/blussyya/solidworks-converters)
+converter (`vendor/sldprt/`, Apache-2.0, pinned in `SLDPRT_ARTIFACT.lock`, upstream files
+unmodified), run out of process by `vendor/sldprt/chudware_driver.js`. The JavaScript runtime is
+found in this order: `CHUDWARE_JS_RUNTIME` (a node or bun executable), `CHUDWARE_OMP_BIN` or the
+`omp` beside Chudware (run with `BUN_BE_BUN=1`), then `node`, `bun`, `omp` on `PATH`. The
+converter tree is `CHUDWARE_SLDPRT_ROOT`, `<exe dir>/sldprt` (staged by the host build and every
+release package), or the checkout's `vendor/sldprt`. `CHUDWARE_SLDPRT_TIMEOUT_S` (default 300)
+bounds a conversion. Every lane skipped is named in the reply's `warnings`; `solidworks_source`
+records the saving release and the surface census.
+
+`import_part(resolve_features=True)` first tries the SolidWorks COM feature-tree import
+(`services/sw_import/`). Without SolidWorks, or when COM fails, an exact native part import is
+handed to Recon (`reverse_engineer`). The recognized tree replaces the exact body only at
+`match_pct >= 99.9`; otherwise `feature_recovery` reports the partial rebuild.
+
+**Export** (`export_solidworks`, `services/sw_export/`): the part's feature tree becomes one
+SolidWorks build plan (`plan.py`, model coordinates; engine `(x, y, z)` is SolidWorks
+`(x, z, -y)`). The plan is replayed through SolidWorks COM (`com_build.py`, saves `.SLDPRT` and
+compares volume and centre of mass), or written as a `.swb` VBA macro (`macro.py`) that a
+teammate runs in their own SolidWorks, which then saves the part in that release and runs
+the same check. SolidWorks' `SaveAs` has no older-release target (`swSaveAsVersion_e`), so the
+macro is how a part reaches an older SolidWorks. Features without an exact mapping refuse the
+export; `allow_body_fallback` sends the exact STEP as one imported body instead.

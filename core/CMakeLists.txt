@@ -219,6 +219,7 @@ add_library(chudware_util STATIC
   util/thread_pool.cpp
   util/platform_paths.cpp
   util/parent_death.cpp
+  util/subprocess.cpp
   security/integrity.cpp
   util/randombytes.cpp
   util/tweetnacl.c)
@@ -383,7 +384,6 @@ add_library(chudware_ecad STATIC
   ecad/kicad_write.cpp
   ecad/kicad_libs.cpp
   ecad/kicad_cli.cpp
-  util/subprocess.cpp
   ecad/session.cpp)
 target_include_directories(chudware_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # chudware_miniz is the ZIP read/write lib (shared with the .step+ container) — the
@@ -391,7 +391,8 @@ target_include_directories(chudware_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # chudware_sim provides the SPICE circuit builder + MNA simulator that ecad_simulate
 # (session.cpp) drives (schematic netlist -> SPICE circuit -> run). chudware_sim is
 # pure-JSON and does NOT depend on chudware_ecad, so this introduces no cycle.
-target_link_libraries(chudware_ecad PUBLIC nlohmann_json::nlohmann_json chudware_miniz chudware_sim)
+target_link_libraries(chudware_ecad PUBLIC nlohmann_json::nlohmann_json chudware_miniz chudware_sim
+  chudware_util)  # util/subprocess.cpp (kicad-cli)
 if(WIN32)
   target_link_libraries(chudware_ecad PUBLIC advapi32)
 endif()
@@ -1661,6 +1662,7 @@ if(CHUDWARE_WITH_OCCT)
     doc/op_registry.cpp
     doc/formats.cpp
     doc/solidworks_tessellation.cpp
+    doc/sldprt_native.cpp
     doc/dxf.cpp
     doc/dwg.cpp
     doc/dwg_write.cpp

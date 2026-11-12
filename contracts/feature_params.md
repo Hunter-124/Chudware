@@ -945,3 +945,19 @@ A successful swept fillet reports `effective == requested` and `adjustment: "non
 validated like any other fillet result. Its face provenance chains through the recorded
 boolean and face-merge histories. [`blend_sweep.cpp`](../core/geom/blend_sweep.cpp) owns the
 construction.
+
+## SolidWorks / Parasolid import lanes (append-only, 2026-11-11)
+
+Amends the `import` feature for `sldprt`, `sldasm`, `x_t` and `x_b` sources
+(`core/doc/sldprt_native.h`, `resolve_solidworks_source`):
+
+- `.sldprt`, `.x_t`, `.x_b` MUST first try the native reader (the part's own Parasolid body
+  written as exact STEP by the vendored `vendor/sldprt` converter), then SolidWorks COM → STEP;
+  `.sldasm` starts at COM. Modern `.sldprt`/`.sldasm` then fall back to the saved display
+  tessellation; Parasolid with no working lane fails with `import_failed` naming every lane.
+- `params.import_fidelity` records the lane: `"exact_native_brep"`, `"solidworks_com_step"`, or
+  (unchanged) `"saved_display_tessellation"` with `editable_as: "baked_brep"`. `source_path` is
+  the intermediate STEP for the first two; the geometry is baked in `embedded_brep` as before.
+- The `doc_import_file` response carries the same `import_fidelity`, `feature_resolved: false`,
+  `solidworks_source` (native lane: `{reader, saved:{version, release, created, container},
+  uncertaintyMM, faces, bodies, surfaces}`) and one `warnings` entry per lane that was skipped.

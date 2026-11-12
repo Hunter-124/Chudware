@@ -32,6 +32,7 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | [`assets/dict/LICENSE-SCOWL.txt`](assets/dict/LICENSE-SCOWL.txt) | `assets/dict/en_US.txt` (SCOWL and the sources it incorporates) |
 | [`extern/glad/LICENSE`](extern/glad/LICENSE) | glad-generated OpenGL loader and `KHR/khrplatform.h` |
 | [`extern/mapbox/LICENSE`](extern/mapbox/LICENSE) | `earcut.hpp` |
+| [`vendor/sldprt/LICENSE`](vendor/sldprt/LICENSE), [`vendor/sldprt/NOTICE`](vendor/sldprt/NOTICE) | sldprt native SolidWorks reader |
 | [`vendor/omp/OMP-LICENSE`](vendor/omp/OMP-LICENSE), [`vendor/omp/OMP-THIRD-PARTY-NOTICES.txt`](vendor/omp/OMP-THIRD-PARTY-NOTICES.txt) | Official OMP agent runtime and its bundled dependencies |
 | `core/firmware/renode/TimedSTM32CAN.cs`, `core/firmware/templates_embedded.cpp` | Renode-derived material (MIT text inline) |
 | `services/civil/data/epanet_net1.inp` | EPANET, WNTR and NumPy notices (inline) |
@@ -64,6 +65,7 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | stb | commit `2c980bb59875b0d32144a71867fbdebb2f77cd20` | MIT OR Unlicense | fetched at build | https://github.com/nothings/stb |
 | glad (generated OpenGL 3.3 core loader) | glad 2.0.8 | (WTFPL OR CC0-1.0) AND Apache-2.0 | vendored (`extern/glad/`) | https://github.com/Dav1dde/glad |
 | Khronos `KHR/khrplatform.h` | as emitted by glad 2.0.8 | Khronos MIT-style license (text in `extern/glad/LICENSE`) | vendored (`extern/glad/include/KHR/`) | https://github.com/KhronosGroup/EGL-Registry |
+| sldprt (solidworks-converters) | 0.5.0 (commit `b0568c01ae28`) | Apache-2.0 | vendored unmodified (`vendor/sldprt/`), bundled as `sldprt/`, run out of process | https://github.com/blussyya/solidworks-converters |
 | earcut.hpp | not recorded in the vendored file | ISC | vendored (`extern/mapbox/`) | https://github.com/mapbox/earcut.hpp |
 | TweetNaCl | not recorded in the vendored file | LicenseRef-PublicDomain | vendored (`core/util/tweetnacl.{c,h}`) | https://tweetnacl.cr.yp.to/ |
 | Chromium Embedded Framework (CEF) | 149.0.6+g0d0eeb6 | BSD-3-Clause | prebuilt, fetched at build; native desktop builds only | https://bitbucket.org/chromiumembedded/cef |

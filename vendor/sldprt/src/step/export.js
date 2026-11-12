@@ -1,0 +1,35 @@
+/* Exact STEP from a parsed Parasolid body: native -> resolve -> split -> write.
+ *
+ *   toSTEP(parsed, opts) -> {text, report}
+ *   fromNative(N, opts)  -> {text, report}     N as src/brep/native.js builds it
+ *
+ * parsed is src/parasolid/xt.js output (readBrep(...).parsed). opts as src/step/write.js, plus
+ * tolerance (m, default 1e-8) for fitted geometry. The file's uncertainty is 1e-5 mm, or the
+ * largest fit error or tolerant-edge gap when that is bigger, rounded up to 1, 2 or 5 x 10^n.
+ * A fit error over opts.maxError (m, default 1e-6) throws instead: that is our approximation
+ * failing, not the model's own tolerance, and the file would not be the part (EXP-085).
+ *
+ * Isomorphic: loads in Node and as a plain browser script (global SLDPRTStepExport).
+ */
+(function(root,factory){
+  if(typeof module==='object'&&module.exports)module.exports=factory(require('../brep/native'),require('../brep/procedural'),require('../brep/split'),require('./write'));
+  else root.SLDPRTStepExport=factory(root.SLDPRTNative,root.SLDPRTProcedural,root.SLDPRTSplit,root.SLDPRTStepWrite);
+})(typeof self!=='undefined'?self:this,function(Native,Procedural,Split,Write){
+'use strict';
+function toSTEP(parsed,opts){return fromNative(Native.build(parsed),opts);}
+/* The same from a neutral model as src/brep/native.js builds it. */
+function fromNative(N,opts){
+  opts=opts||{};
+  const R=Procedural.resolve(N,opts),M=Split.split(R);
+  const limit=opts.maxError===undefined?1e-6:opts.maxError;
+  if(R.report.maxError>limit)throw Error('exact STEP: fitted geometry is '+(R.report.maxError*1000).toPrecision(3)+' mm off the exact (limit '+limit*1000+' mm)');
+  const fitMM=R.report.maxError*1000,gapMM=R.report.maxEdgeGap*1000;
+  const uncertainty=Math.max(opts.uncertainty||1e-5,niceUp(fitMM),niceUp(gapMM));
+  const text=Write.write(M,{...opts,uncertainty});
+  const st={};for(const f of M.faces)st[f.surface.type]=(st[f.surface.type]||0)+1;
+  return {text,report:{...R.report,uncertaintyMM:uncertainty,nativeFaces:N.faces.length,faces:M.faces.length,surfaces:st,edges:M.edges.size,vertices:M.vertices.size,bodies:M.bodies.length,split:M.splitStats}};
+}
+/* 1, 2 or 5 times a power of ten, at or above x */
+function niceUp(x){if(!(x>0))return 0;const e=Math.pow(10,Math.floor(Math.log10(x)));for(const m of [1,2,5,10])if(m*e>=x*(1-1e-12))return m*e;return 10*e;}
+return {toSTEP,fromNative,niceUp};
+});

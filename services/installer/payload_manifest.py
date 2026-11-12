@@ -219,7 +219,11 @@ def reject_forbidden_customer_files(root: Path) -> None:
             "omp_extension.ts", "usr/bin/omp_extension.ts",
             "Contents/MacOS/omp_extension.ts",
         }
-        if (suffix in _SOURCE_SUFFIXES_FOLDED and not trusted_omp_extension) or any(
+        # The vendored native SolidWorks reader (vendor/sldprt) runs as plain .js under omp.
+        trusted_sldprt_reader = suffix == ".js" and relative.startswith(
+            ("sldprt/", "usr/bin/sldprt/", "Contents/MacOS/sldprt/"))
+        if (suffix in _SOURCE_SUFFIXES_FOLDED
+                and not (trusted_omp_extension or trusted_sldprt_reader)) or any(
             part.endswith(".dsym") for part in folded_parts
         ):
             raise PayloadManifestError(

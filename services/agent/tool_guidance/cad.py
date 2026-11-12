@@ -503,6 +503,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "not an independent mesh reimport."
         ),
     },
+    "export_solidworks": {
+        "prompt_note": (
+            "For SolidWorks users: rebuilds the part's features in SolidWorks (method='com' "
+            "here, or method='macro' for a teammate to run in their own, possibly older, "
+            "SolidWorks). Read `verified`/`unsupported`; never claim an editable SolidWorks "
+            "tree when fidelity='imported_body'. cad_guide('solidworks')."
+        ),
+    },
     "export_flat_dxf": {
         "prompt_note": (
             "Add sm_flat_pattern first, then export DXF/DWG with OUTLINE, BEND and CUTS "

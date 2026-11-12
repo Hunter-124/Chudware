@@ -451,7 +451,8 @@
       "services/mcp/test_office_oxide.py",
       "services/mcp/test_office_tools.py",
       "services/mcp/test_sw_feature_import.py",
-      "services/sim/test_aicm.py"
+      "services/sim/test_aicm.py",
+      "services/sw_export"
     ],
     "render": [
       "services/mcp/test_animation_tools.py",

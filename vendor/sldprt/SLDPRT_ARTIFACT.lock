@@ -1,0 +1,11 @@
+{
+  "schema": "chudware-vendor-lock-v1",
+  "name": "sldprt (solidworks-converters)",
+  "repository": "https://github.com/blussyya/solidworks-converters",
+  "repository_commit": "b0568c01ae28ccfe9ac90f5bdf4a580a36b2a51d",
+  "version": "0.5.0",
+  "license": "Apache-2.0",
+  "vendored_paths": ["LICENSE", "NOTICE", "README.md", "package.json", "bin/", "src/"],
+  "local_files": ["chudware_driver.js", "SLDPRT_ARTIFACT.lock"],
+  "modifications": "none; upstream files are byte-identical to the pinned commit"
+}

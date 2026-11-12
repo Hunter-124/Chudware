@@ -378,6 +378,143 @@ def test_solidworks_without_com_falls_through_to_portable_native_import(
     assert "SolidWorks COM automation is unavailable" in out["feature_fallback_reason"]
     assert [method for method, _ in calls if method == "import_file"] == ["import_file"]
 
+def _native_exact_core(calls):
+    def core(method, params):
+        calls.append((method, dict(params)))
+        if method == "doc_list":
+            return {"docs": []}
+        if method == "import_file":
+            return {"doc_id": "doc-exact", "import_fidelity": "exact_native_brep",
+                    "feature_resolved": False,
+                    "solidworks_source": {"saved": {"release": "SolidWorks 2025"}}}
+        return {}
+    return core
+
+
+@pytest.mark.parametrize("match, resolved", [(100.0, True), (93.5, False)])
+def test_solidworks_native_exact_import_adopts_only_a_matching_recognition(
+        exchange, tmp_path, monkeypatch, match, resolved):
+    """Without SolidWorks the exact native body is recognized; the rebuild replaces it only
+    when it reproduces the source solid, otherwise the exact body stays current."""
+    tools, calls = exchange
+    source = tmp_path / "bracket.SLDPRT"
+    source.write_bytes(b"modern-solidworks-fixture")
+    from services.sw_import.sw_feature_import import SolidWorksUnavailable
+    from services.sw_import import sw_translate
+    from services.mcp import reveng_common
+
+    def unavailable(_path):
+        raise SolidWorksUnavailable("SolidWorks COM automation is unavailable")
+
+    monkeypatch.setattr(sw_translate, "resolve", unavailable)
+    monkeypatch.setattr(M.cb, "call", _native_exact_core(calls))
+    seen = []
+    monkeypatch.setattr(reveng_common, "_call_reverse_engineer",
+                        lambda src, name=None, hints=None: seen.append((src, name)) or {
+                            "ok": True, "doc_id": "doc-rebuilt", "match_pct": match,
+                            "features": [{"type": "extrude"}]})
+    out = json.loads(tools["import_part"](str(source)))
+    assert out["ok"] is True, out
+    assert seen == [("doc-exact", "bracket-features")]
+    assert out["import_fidelity"] == "exact_native_brep"
+    assert out["feature_recovery"]["ref_doc_id"] == "doc-exact"
+    assert out["feature_recovery"]["match_pct"] == match
+    assert out["feature_resolved"] is resolved
+    assert out["doc_id"] == ("doc-rebuilt" if resolved else "doc-exact")
+    assert M._CUR["doc_id"] == out["doc_id"]
+
+
+def test_solidworks_com_failure_continues_to_native_import(exchange, tmp_path, monkeypatch):
+    """A registered but broken SolidWorks must not block the file."""
+    tools, calls = exchange
+    source = tmp_path / "bracket.SLDPRT"
+    source.write_bytes(b"modern-solidworks-fixture")
+    from services.sw_import import sw_translate
+    from services.mcp import reveng_common
+
+    def broken(_path):
+        raise RuntimeError("Server execution failed")
+
+    monkeypatch.setattr(sw_translate, "resolve", broken)
+    monkeypatch.setattr(M.cb, "call", _native_exact_core(calls))
+    monkeypatch.setattr(reveng_common, "_call_reverse_engineer",
+                        lambda *a, **k: {"ok": False, "error": "no features recognized"})
+    out = json.loads(tools["import_part"](str(source), resolve_features=True))
+    assert out["ok"] is True, out
+    assert out["doc_id"] == "doc-exact"
+    assert out["feature_resolved"] is False
+    assert "Server execution failed" in out["feature_recovery"]["solidworks_com"]
+
+
+def test_solidworks_native_import_without_resolution_skips_recognition(
+        exchange, tmp_path, monkeypatch):
+    tools, calls = exchange
+    source = tmp_path / "bracket.SLDPRT"
+    source.write_bytes(b"modern-solidworks-fixture")
+    from services.mcp import reveng_common
+    monkeypatch.setattr(M.cb, "call", _native_exact_core(calls))
+    monkeypatch.setattr(reveng_common, "_call_reverse_engineer",
+                        lambda *a, **k: pytest.fail("recognition must not run"))
+    out = json.loads(tools["import_part"](str(source), resolve_features=False))
+    assert out["ok"] is True and out["doc_id"] == "doc-exact"
+    assert "feature_recovery" not in out
+
+
+def _sw_export_core(calls, features):
+    def core(method, params):
+        calls.append((method, dict(params)))
+        if method == "doc_list":
+            return {"docs": [{"doc_id": "doc-live", "revision": 3}]}
+        if method == "doc_tree":
+            return {"tree": {"schema": "aicad.part/1", "name": "block", "features": features}}
+        if method == "eval_mass":
+            return {"volume_mm3": 8000.0, "com": [10, 5, 2.5]}
+        if method == "export_file":
+            Path(params["path"]).write_text("ISO-10303-21;")
+            return {"path": params["path"]}
+        return {}
+    return core
+
+
+_BLOCK = [
+    {"id": "f1", "type": "sketch", "name": "Sketch1", "refs": {"plane": "plane.top"},
+     "params": {"constraints": [], "entities": [
+         {"id": "e1", "type": "line", "p1": [0, 0], "p2": [20, 0]},
+         {"id": "e2", "type": "line", "p1": [20, 0], "p2": [20, 10]},
+         {"id": "e3", "type": "line", "p1": [20, 10], "p2": [0, 10]},
+         {"id": "e4", "type": "line", "p1": [0, 10], "p2": [0, 0]}]}},
+    {"id": "f2", "type": "extrude", "name": "Boss1",
+     "params": {"mode": "boss", "end": "blind", "depth": {"value": 5, "expr": None}},
+     "refs": {"profile": [{"kind": "region", "sketch": "f1"}]}},
+]
+
+
+def test_export_solidworks_macro_writes_a_feature_macro(exchange, tmp_path, monkeypatch):
+    tools, calls = exchange
+    monkeypatch.setattr(M.cb, "call", _sw_export_core(calls, _BLOCK))
+    out = json.loads(tools["export_solidworks"](path=str(tmp_path / "block.swb"),
+                                                method="macro"))
+    assert out["ok"] is True, out
+    assert out["fidelity"] == "feature_tree" and out["steps"] == 2
+    text = Path(out["path"]).read_text(encoding="cp1252")
+    assert "FM.FeatureExtrusion3(" in text and "(Chudware 8000)" in text
+
+
+def test_export_solidworks_refuses_unsupported_features_unless_body_fallback(
+        exchange, tmp_path, monkeypatch):
+    tools, calls = exchange
+    features = _BLOCK + [{"id": "f3", "type": "hole", "params": {}, "refs": {}}]
+    monkeypatch.setattr(M.cb, "call", _sw_export_core(calls, features))
+    refused = json.loads(tools["export_solidworks"](path=str(tmp_path / "block.swb"),
+                                                    method="macro"))
+    assert refused["ok"] is False and [u["id"] for u in refused["unsupported"]] == ["f3"]
+    assert not (tmp_path / "block.swb").exists()
+    body = json.loads(tools["export_solidworks"](path=str(tmp_path / "block.swb"),
+                                                 method="macro", allow_body_fallback=True))
+    assert body["ok"] is True and body["fidelity"] == "imported_body"
+    assert (tmp_path / "block.step").exists() and (tmp_path / "block.swb").exists()
+
+
 def test_solidworks_sidecar_save_refusal_retains_component(exchange, tmp_path, monkeypatch):
     from services.sw_import import sw_translate
     tools, calls = exchange

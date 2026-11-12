@@ -121,6 +121,22 @@ def _runtime_file_allowed(relative: Path) -> bool:
     )
 
 
+# The native SolidWorks/Parasolid reader (vendor/sldprt, run by omp as Bun from
+# core/doc/sldprt_native.cpp). Its JavaScript is the one trusted script tree in the payload;
+# payload_manifest.py admits exactly this directory.
+SLDPRT_PAYLOAD = ("src", "chudware_driver.js", "LICENSE", "NOTICE", "SLDPRT_ARTIFACT.lock")
+
+
+def stage_sldprt_reader(dst: Path) -> None:
+    root = REPO / "vendor" / "sldprt"
+    for name in SLDPRT_PAYLOAD:
+        source = root / name
+        if source.is_dir():
+            shutil.copytree(source, dst / name, dirs_exist_ok=True)
+        else:
+            _copy_required(source, dst / name, "native SolidWorks reader")
+
+
 def stage_compiled_payload(
     dst: Path,
     *,
@@ -174,6 +190,7 @@ def stage_compiled_payload(
     shutil.copy2(pin_omp.DEFAULT_LOCK, dst / "OMP_ARTIFACT.lock")
     _copy_required(REPO / "services" / "agent" / "omp_extension.ts",
                    dst / "omp_extension.ts", "trusted OMP extension")
+    stage_sldprt_reader(dst / "sldprt")
     _copy_required(
         uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper"
     )

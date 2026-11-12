@@ -26,6 +26,126 @@ from .cad_common import (
     cb,
 )
 
+# A recognized rebuild of a natively imported SolidWorks part replaces the exact body only when
+# it reproduces the source solid (Recon's match_pct = common volume / max volume, in %).
+_RECOGNIZED_MATCH_PCT = 99.9
+
+
+def _recover_native_features(payload: dict, ref_doc: str, path: str,
+                             com_reason: Optional[str]) -> dict:
+    """Recon feature recognition over an exact native SolidWorks import (no SolidWorks).
+
+    The exact import stays the reference. A rebuild that matches it becomes current
+    (feature_resolved=True); a partial one is reported under ``feature_recovery`` so the
+    caller can inspect or finish it, never silently swapped in."""
+    from services.mcp.reveng_common import _call_reverse_engineer  # noqa: PLC0415
+    stem = os.path.splitext(os.path.basename(path))[0]
+    # The exact import keeps the file's name; a trailing-digit stem would otherwise be
+    # renumbered by the engine's unique document naming.
+    res = _call_reverse_engineer(ref_doc, name=f"{stem}-features")
+    rec = {"ok": bool(res.get("ok")), "ref_doc_id": ref_doc}
+    for k in ("doc_id", "match_pct", "features", "rejected", "unexplained", "error"):
+        if k in res:
+            rec[k] = res[k]
+    if com_reason:
+        rec["solidworks_com"] = com_reason
+    out = {**payload, "feature_recovery": rec}
+    match = res.get("match_pct")
+    rebuilt = res.get("doc_id")
+    if res.get("ok") and rebuilt and isinstance(match, (int, float)) \
+            and match >= _RECOGNIZED_MATCH_PCT:
+        _CUR["doc_id"] = rebuilt
+        _publish_current(rebuilt)
+        out.update({"doc_id": rebuilt, "feature_resolved": True,
+                    "feature_source": "recognized"})
+    else:
+        _publish_current(ref_doc)
+        out["feature_resolved"] = False
+    return out
+
+
+def _feature_edge_points(doc_id: str):
+    """doc_feature_edges `mid` points of a fillet/chamfer's edges; [] if any element misses."""
+    def points(fid: str) -> list:
+        try:
+            r = cb.call("doc_feature_edges", {"doc_id": doc_id, "feature_id": fid})
+        except CoreError:
+            return []
+        out = []
+        for row in r.get("refs") or []:
+            if row.get("error"):
+                return []
+            for e in row.get("edges") or []:
+                poly = e.get("points") or []
+                p = e.get("mid") or (poly[len(poly) // 2] if poly else None)
+                if p is None:
+                    return []
+                out.append(p)
+        return out
+    return points
+
+
+def _solidworks_export(d: str, path: Optional[str], method: str,
+                       allow_body_fallback: bool) -> dict:
+    from services.formats.formats_solidworks import solidworks_available  # noqa: PLC0415
+    from services.sw_export.plan import build_plan  # noqa: PLC0415
+    from services.sw_import.sw_feature_import import SolidWorksUnavailable  # noqa: PLC0415
+
+    method = (method or "auto").lower()
+    if method not in ("auto", "com", "macro"):
+        raise ValueError("method must be 'auto', 'com' or 'macro'")
+    tree = cb.call("doc_tree", {"doc_id": d}).get("tree") or {}
+    if tree.get("schema") != "aicad.part/1":
+        raise ValueError("SolidWorks export takes a part document (export assemblies per part)")
+    name = str(tree.get("name") or "Part")
+    try:
+        expected = cb.call("eval_mass", {"doc_id": d})
+    except CoreError:
+        expected = None
+    plan = build_plan(tree.get("features") or [], name=name,
+                      edge_points=_feature_edge_points(d), expected=expected).as_dict()
+    if method == "auto":
+        method = "com" if solidworks_available() else "macro"
+    ext = ".swb" if method == "macro" else ".SLDPRT"
+    out = (_sanitize_output_path(os.path.expanduser(path)) if path
+           else _default_deliverable_path(d, ext))
+    if not out.lower().endswith(ext.lower()):
+        out = os.path.splitext(out)[0] + ext
+    summary = {"doc_id": d, "method": method, "path": out, "steps": len(plan["steps"]),
+               "unsupported": plan["unsupported"], "degraded": plan["degraded"]}
+    if plan["unsupported"] and not allow_body_fallback:
+        return {"ok": False, **summary,
+                "error": f"{len(plan['unsupported'])} feature(s) cannot be rebuilt as "
+                         "SolidWorks features yet",
+                "hint": "allow_body_fallback=True sends the exact solid as one imported "
+                        "SolidWorks body instead (no feature tree)."}
+    body_only = bool(plan["unsupported"])
+    if body_only:
+        step = os.path.splitext(out)[0] + ".step"
+        cb.call("export_file", {"doc_id": d, "path": step, "format": "step"})
+        summary["fidelity"] = "imported_body"
+        summary["step"] = step
+        if method == "macro":
+            from services.sw_export.macro import write_body_macro  # noqa: PLC0415
+            return {"ok": True, **summary, "path": write_body_macro(name, step, out)}
+        from services.sw_export.com_build import import_body  # noqa: PLC0415
+        return {**import_body(step, out), **summary}
+    summary["fidelity"] = "feature_tree"
+    if method == "macro":
+        from services.sw_export.macro import write_macro  # noqa: PLC0415
+        return {"ok": True, **summary, "path": write_macro(plan, out),
+                "verified": None,
+                "next_step": "Run the macro in SolidWorks (Tools > Macro > Run). It saves "
+                             f"{name}.SLDPRT beside itself, in that SolidWorks version, and "
+                             "reports whether its volume and centre of mass match Chudware's."}
+    from services.sw_export.com_build import build  # noqa: PLC0415
+    try:
+        return {**summary, **build(plan, out)}
+    except SolidWorksUnavailable as e:
+        return {"ok": False, **summary, "error": str(e),
+                "hint": "method='macro' writes a macro a SolidWorks user can run instead."}
+
+
 def register_cad_exchange_tools(mcp: FastMCP) -> None:
     """CAD import/export + standard-parts MCP tools (split out of cad_tools.py): export_part, import_part, list_standard_parts, make_standard_part."""
 
@@ -260,6 +380,38 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
+    def export_solidworks(path: Optional[str] = None, doc_id: Optional[str] = None,
+                          method: str = "auto", allow_body_fallback: bool = False) -> str:
+        """Send a part to SolidWorks users as a native, editable SolidWorks part.
+
+        The part's feature tree (sketches on Top/Front/Right or an offset of one or a
+        principal-facing face; extrude/cut blind, mid-plane, through-all and two-direction;
+        revolve about the sketch centerline; constant fillet; equal chamfer; shell; linear
+        pattern along X/Y/Z; circular pattern about a world axis; feature mirror across a
+        default plane) is rebuilt feature by feature IN SolidWorks:
+
+          method="com"   (needs SolidWorks on this machine) SolidWorks builds and saves
+                         `<path>.SLDPRT`; the reply compares its volume and centre of mass with
+                         Chudware's (`verified`, `volume_rel_error`, `com_error_mm`).
+          method="macro" writes a SolidWorks VBA macro (`.swb`). A teammate runs it (Tools >
+                         Macro > Run) and THEIR SolidWorks writes the .SLDPRT in their own
+                         release (2014 or newer), then reports the same match check. Use this
+                         for teammates on an older SolidWorks than yours: SolidWorks cannot
+                         save to an older release.
+          method="auto"  com when SolidWorks is installed, else macro.
+
+        Strict fidelity: a feature it cannot rebuild exactly is listed in `unsupported` and the
+        export is refused; `allow_body_fallback=True` sends the exact solid instead as one
+        imported SolidWorks body (STEP beside the file; `fidelity="imported_body"`).
+        `degraded` lists what is exact in geometry but carries less intent (sketch relations and
+        dimensions are not re-created yet). Part documents only.
+        """
+        try:
+            return _dumps(_solidworks_export(_doc(doc_id), path, method, allow_body_fallback))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
                     resolve_features: bool = True, keep_bodies: Optional[list] = None,
                     exclude_bodies: Optional[list] = None, resume: bool = False,
@@ -295,15 +447,20 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         `dwg2dxf` (PATH or `python3 scripts/provision_libredwg.py`); without it only the 3D
         solids/surfaces import, with that hint as a warning. SAT/SAB (ACIS) files import too.
 
-        SOLIDWORKS (.sldprt/.sldasm): with `resolve_features=True` (default), Chudware first
-        asks an installed SolidWorks COM server to reconstruct sketches/features into a fully
-        parametric native tree. If SolidWorks is unavailable, modern (2015+) files fall back to
-        their saved display tessellation: the watertight triangle strips are sewn into baked
-        native B-rep bodies, assembly hierarchy/transforms are preserved, and the result can be
-        edited, exported, saved as STEP+, and simulated. That portable path is approximate and
-        reports `import_fidelity="saved_display_tessellation"`; use feature resolution or STEP
-        when exact analytic surfaces are required. `resolve_features=False` skips feature-tree
-        extraction but still prefers exact COM→STEP when SolidWorks is installed.
+        SOLIDWORKS (.sldprt/.sldasm) and PARASOLID (.x_t/.x_b): with `resolve_features=True`
+        (default), Chudware first asks an installed SolidWorks COM server to reconstruct
+        sketches/features into a fully parametric native tree. Without SolidWorks, a part
+        (SolidWorks 2011 OLE2 or 2015+) or Parasolid file imports its OWN Parasolid body as an
+        exact B-rep (`import_fidelity="exact_native_brep"`, no SolidWorks needed; provenance in
+        `solidworks_source`: saved/created release, surface census). For a part, Recon feature
+        recognition then rebuilds an editable tree from that solid; the rebuild becomes the
+        current document only when it matches the source volume (`feature_recovery.match_pct`
+        >= 99.9, `feature_resolved=true`, `feature_source="recognized"`). Otherwise the exact
+        body stays current and `feature_recovery` names the rebuilt doc and what it missed.
+        Assemblies without SolidWorks, or parts the native reader rejects, fall back to the
+        saved display tessellation (`import_fidelity="saved_display_tessellation"`, sewn into
+        baked B-rep bodies, hierarchy/transforms kept; approximate). `resolve_features=False`
+        skips feature-tree extraction and recognition and imports the exact body.
 
         TIP: pair with the `transform` feature (in add_features) to POSITION each imported body
         into a shared coordinate frame — translate:[x,y,z] and/or angle:<deg> with rotate:[ax,ay,az].
@@ -356,8 +513,10 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                     plan = None
                     portable_fallback_reason = str(e)
                 except Exception as e:  # noqa: BLE001
-                    return _dumps({"ok": False, "error":
-                                   f"SolidWorks feature extraction failed: {e}"})
+                    # A registered but failing SolidWorks (license prompt, hung instance) must
+                    # not block the file: continue to the exact native import, reported.
+                    plan = None
+                    portable_fallback_reason = f"SolidWorks feature extraction failed: {e}"
                 if plan is not None and plan["blocking"]:
                     # Strict-fidelity contract: refuse rather than import a quietly-wrong model.
                     return _dumps({
@@ -368,7 +527,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         "degraded": plan["degraded"],
                         "hint": "These features need importer support before this part can be "
                                 "rebuilt faithfully. Use import_part(resolve_features=False) to "
-                                "fall back to a single-body COM→STEP import in the meantime."})
+                                "import the part's exact solid body in the meantime."})
                 if plan is not None and plan.get("is_assembly"):
                     # Build each DISTINCT component part once -> save a .step+ (keeps its editable
                     # feature tree) -> place every instance in an ASSEMBLY doc via
@@ -494,6 +653,11 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                        "into": into}
             if portable_fallback_reason and r.get("import_fidelity") == "saved_display_tessellation":
                 payload["feature_fallback_reason"] = portable_fallback_reason
+            if (resolve_features and not into and new_id
+                    and r.get("import_fidelity") == "exact_native_brep"
+                    and path_abs.lower().endswith(".sldprt")):
+                payload = _recover_native_features(payload, new_id, path_abs,
+                                                   portable_fallback_reason)
             return _dumps(payload)
         except Exception as e:  # noqa: BLE001
             return _err(e)

@@ -158,6 +158,7 @@
 #include "doc/document.h"
 #include "doc/recon.h"    // C1/C2 WS-C reverse-engineering kernel primitives
 #include "doc/formats.h"
+#include "doc/sldprt_native.h"
 #include "doc/dwg.h"     // libredwg_tool: a written DWG is re-read through dwg2dxf
 #include "doc/picks.h"
 #include "doc/selectors.h"
@@ -23211,26 +23212,17 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
         return resp;
     }
 
-    // Prefer SolidWorks COM -> exact STEP when it is available.  Modern SLDPRT/SLDASM files
-    // also carry a portable saved-display tessellation, so a missing/broken COM server falls
-    // back to that lane instead of making the file unusable on Linux. Parasolid still needs
-    // SolidWorks because it has no saved display stream.
+    // SolidWorks / Parasolid: the most exact lane that works here (sldprt_native.h) — the
+    // part's own Parasolid body read natively, SolidWorks COM -> STEP, or the saved display
+    // tessellation (modern SLDPRT/SLDASM only).
     std::string import_path_ = path;
     bool solidworks_tessellation = false;
-    if (f == "sldprt" || f == "sldasm") {
-        if (solidworks_available()) {
-            try {
-                import_path_ = sw_export_step(path);
-                f = "step";
-            } catch (const OpError&) {
-                solidworks_tessellation = true;
-            }
-        } else {
-            solidworks_tessellation = true;
-        }
-    } else if (f == "x_t" || f == "x_b") {
-        import_path_ = sw_export_step(path);
-        f = "step";
+    std::optional<SolidWorksSource> sw_source;
+    if (f == "sldprt" || f == "sldasm" || f == "x_t" || f == "x_b") {
+        sw_source = resolve_solidworks_source(path, f);
+        import_path_ = sw_source->path;
+        f = sw_source->format;
+        solidworks_tessellation = sw_source->fidelity == "saved_display_tessellation";
     }
 
     json params = {{"source_path", native_policy::authored_reference(import_path_)},
@@ -23238,6 +23230,8 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     if (solidworks_tessellation) {
         params["import_fidelity"] = "saved_display_tessellation";
         params["editable_as"] = "baked_brep";
+    } else if (sw_source) {
+        params["import_fidelity"] = sw_source->fidelity;
     }
     if (as_solid) params["as_solid"] = true;
     apply_body_select(params);
@@ -23318,6 +23312,12 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
             import_warnings.push_back(stale.at("message").get<std::string>());
             resp["stale_export"] = std::move(stale);
         }
+    }
+    if (sw_source) {
+        for (const std::string& n : sw_source->notes) import_warnings.push_back(n);
+        resp["import_fidelity"] = sw_source->fidelity;
+        resp["feature_resolved"] = false;
+        if (!sw_source->provenance.empty()) resp["solidworks_source"] = sw_source->provenance;
     }
     if (!import_warnings.empty()) resp["warnings"] = import_warnings;
     if (solidworks_tessellation) {
@@ -23417,24 +23417,14 @@ json doc_vendor_part_insert(const std::string& into, const std::string& supplier
                                 : (rec.value("supplier", std::string()) + " " +
                                    rec.value("part_number", std::string()));
     std::string fmt = rec.value("cad_format", std::string());
-    // Prefer COM -> exact STEP, but keep modern SLDPRT/SLDASM on their native format when COM
-    // is absent or fails so the portable saved-display tessellation importer can recover them.
+    // Same SolidWorks / Parasolid lane order as doc_import_file (sldprt_native.h).
     std::string import_path_ = cad_path;
     bool solidworks_tessellation = false;
-    if (fmt == "sldprt" || fmt == "sldasm") {
-        if (solidworks_available()) {
-            try {
-                import_path_ = sw_export_step(cad_path);
-                fmt = "step";
-            } catch (const OpError&) {
-                solidworks_tessellation = true;
-            }
-        } else {
-            solidworks_tessellation = true;
-        }
-    } else if (fmt == "x_t" || fmt == "x_b") {
-        import_path_ = sw_export_step(cad_path);
-        fmt = "step";
+    if (fmt == "sldprt" || fmt == "sldasm" || fmt == "x_t" || fmt == "x_b") {
+        const SolidWorksSource sw = resolve_solidworks_source(cad_path, fmt);
+        import_path_ = sw.path;
+        fmt = sw.format;
+        solidworks_tessellation = sw.fidelity == "saved_display_tessellation";
     }
     const std::string original = rec.value("description", std::string()).empty()
                                      ? feat_name

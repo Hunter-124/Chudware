@@ -1,146 +1,289 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
+import DemoBand from '../components/DemoBand.astro';
+
+type Tile = {
+  kind: 'video' | 'image';
+  src: string;
+  poster?: string;
+  w: number;
+  h: number;
+  tag: string;
+  title: string;
+  caption: string;
+  alt: string;
+  size?: 'lead' | 'wide' | 'tall';
+  fit?: 'cover' | 'contain';
+  light?: boolean;
+};
+type Project = {
+  id: string;
+  index: string;
+  name: string;
+  kicker: string;
+  summary: string;
+  stats: { value: string; label: string }[];
+  note?: string;
+  tiles: Tile[];
+};
+
+const g = (p: string) => `/gallery/${p}`;
+
+const projects: Project[] = [
+  {
+    id: 'roboarm6',
+    index: '01',
+    name: 'RoboArm6',
+    kicker: 'Six-axis desktop robot arm · Designed, printed, wired, and running',
+    summary: 'A six-axis arm with a gear-driven parallel gripper, modeled end to end in Chudware: printed parts, servo layout, an interference-checked motion study, FDM manufacturability reviews, and the firmware simulator that drives it. Then it was printed, wired, and built.',
+    stats: [
+      { value: '36', label: 'assembled bodies' },
+      { value: '630/630', label: 'body pairs checked, zero interference' },
+      { value: '17', label: 'unique printed parts' },
+    ],
+    tiles: [
+      { kind: 'video', src: g('robo/motion.mp4'), poster: g('robo/motion.webp'), w: 760, h: 602, size: 'lead', tag: 'Motion study', title: 'Every joint through its range', caption: 'Assembly motion study, rendered from the native document.', alt: 'Animated motion study of the six-axis arm moving through its joint range' },
+      { kind: 'video', src: g('robo/real-arm.mp4'), poster: g('robo/real-arm.webp'), w: 540, h: 960, size: 'tall', tag: 'Built', title: 'The physical arm', caption: 'Phone video of the printed and wired arm running its demo program.', alt: 'Phone video of the physical printed robot arm moving on a table', fit: 'cover' },
+      { kind: 'image', src: g('robo/dfm-thin-floor.webp'), w: 1028, h: 772, tag: 'DFM', title: 'Thin-wall check', caption: 'Thin floors on the forearm flagged in red, with face IDs and part bounds.', alt: 'Four section views of the forearm with thin floor regions highlighted in red' },
+      { kind: 'image', src: g('robo/dfm-roof-rails.webp'), w: 1028, h: 772, tag: 'DFM', title: 'Unsupported roofs', caption: 'Bridging roofs on the upper arm marked for reinforcement before printing.', alt: 'Four views of the upper arm with unsupported roof faces highlighted in red and yellow' },
+      { kind: 'image', src: g('robo/gripper-review.webp'), w: 1028, h: 772, tag: 'Assembly', title: 'Gripper section review', caption: 'Section views through the gear-driven parallel gripper and its servo.', alt: 'Four section views of the gripper assembly with colored components' },
+      { kind: 'image', src: g('robo/servo-map.webp'), w: 545, h: 1600, size: 'tall', tag: 'Assembly', title: 'Servo layout', caption: 'MG996R and MG90S placement highlighted across the stack.', alt: 'Robot arm render with servos highlighted in orange and blue', fit: 'contain' },
+      { kind: 'image', src: g('robo/firmware-sil.webp'), w: 2000, h: 764, size: 'wide', tag: 'Firmware', title: 'Software-in-the-loop run', caption: 'Every servo output from the firmware simulator during the test program, including the soft power-up ramp.', alt: 'Charts of servo pulse widths over time from the firmware simulator', fit: 'cover' },
+      { kind: 'image', src: g('robo/final-iso.webp'), w: 1077, h: 1400, tag: 'Assembly', title: 'Final assembly', caption: 'The finished arm assembly at its home pose.', alt: 'Render of the finished six-axis arm assembly in tan and white', fit: 'contain' },
+      { kind: 'image', src: g('robo/dfm-support-access.webp'), w: 1028, h: 772, tag: 'DFM', title: 'Support access', caption: 'Wrist faces that need print support, checked for tool access to remove it.', alt: 'Four views of the wrist part with faces needing support highlighted' },
+      { kind: 'image', src: g('robo/build.webp'), w: 1050, h: 1400, tag: 'Built', title: 'Finished build', caption: 'The assembled arm on the bench.', alt: 'Photo of the finished robot arm on a desk', fit: 'cover' },
+    ],
+  },
+  {
+    id: 'rover',
+    index: '02',
+    name: 'Human-powered rover',
+    kicker: 'ME 489/490 senior design · NASA HERC-style rover',
+    summary: 'A two-person, pedal-driven rover for a university senior design team: frame, fold hinge, steering, wheel ends, and drivetrain organized into one Chudware project, with motion studies, exploded views, labeled drawings, and stress results on the actual parts.',
+    stats: [
+      { value: '710', label: 'native files organized' },
+      { value: '1,878', label: 'part references verified' },
+      { value: '22/22', label: 'assembly roots reopen cleanly' },
+    ],
+    note: 'Review and continuation models; the team\'s design of record moved to other tools after September 2026.',
+    tiles: [
+      { kind: 'video', src: g('rover/rover.mp4'), poster: g('rover/rover.webp'), w: 1280, h: 592, size: 'lead', tag: 'Assembly', title: 'The full vehicle', caption: 'Turntable of the complete rover assembly.', alt: 'Animated turntable of the full rover assembly with four wooden wheels and two seats', fit: 'cover' },
+      { kind: 'video', src: g('rover/exploded.mp4'), poster: g('rover/exploded.webp'), w: 1440, h: 936, size: 'wide', tag: 'Exploded view', title: 'Exploded assembly', caption: 'Frame, seats, drivetrain, steering, and wheel ends pulling apart and back together.', alt: 'Animated exploded view of the rover assembly on a white background', light: true },
+      { kind: 'video', src: g('rover/fold.mp4'), poster: g('rover/fold.webp'), w: 1280, h: 678, tag: 'Motion', title: 'Fold hinge', caption: 'The frame folding about its hinge for transport.', alt: 'Animation of the rover frame folding at its center hinge' },
+      { kind: 'video', src: g('rover/steer.mp4'), poster: g('rover/steer.webp'), w: 1000, h: 814, tag: 'Motion', title: 'Steering sweep', caption: 'Top view of the steering linkage through its travel.', alt: 'Top-down animation of the rover steering the front wheels' },
+      { kind: 'video', src: g('rover/wheel-stress.mp4'), poster: g('rover/wheel-stress.webp'), w: 1440, h: 780, tag: 'FEA', title: 'Wheel under braking', caption: 'Mesh to von Mises stress on the drive wheel under a braking load case.', alt: 'Animation from mesh to von Mises stress contour on a wheel disc' },
+      { kind: 'video', src: g('rover/topology.mp4'), poster: g('rover/topology.webp'), w: 900, h: 414, tag: 'Topology', title: 'Topology-optimized bracket', caption: 'A bracket generated by topology optimization, shown turning.', alt: 'Animation of a lattice-like topology-optimized bracket' },
+      { kind: 'image', src: g('rover/wheel-end.webp'), w: 2000, h: 1125, size: 'wide', tag: 'Drawing', title: 'Wheel end, exploded and labeled', caption: 'Front-left wheel end: spindle, bearings, steering upright, hub, brake rotor, and wheel, with balloons.', alt: 'Labeled exploded view of the front-left wheel end with sixteen numbered components' },
+      { kind: 'image', src: g('rover/material.webp'), w: 1600, h: 1000, tag: 'Render', title: 'Material concept', caption: 'Review assembly with a material concept applied.', alt: 'Render of the rover with dark frame and wooden wheels on a light floor', size: 'wide', fit: 'cover' },
+      { kind: 'image', src: g('rover/merge.webp'), w: 1800, h: 1013, tag: 'Assembly', title: 'Subsystems by color', caption: 'Merged vehicle with each subsystem colored to show ownership.', alt: 'Rover assembly with frame, wheels, and seats each in a distinct color', size: 'wide', fit: 'cover' },
+    ],
+  },
+  {
+    id: 'tbot',
+    index: '03',
+    name: 'TBOT',
+    kicker: 'Clay-shooting module · Phone scan to CAD to wiring harness',
+    summary: 'A vision module for clay shooting that clamps under a shotgun barrel, with a trigger set that only acts while the shooter holds an arming button. The gun was captured with an iPhone on a ChArUco mat, turned into a splat and a scaled mesh, registered into the gun frame, and the mounts and wiring harness were designed around it.',
+    stats: [
+      { value: '407', label: 'phone frames registered' },
+      { value: '≈1.4–1.8 mm', label: 'scale RMS from two ChArUco boards' },
+      { value: '4', label: 'harness drawing sheets' },
+    ],
+    tiles: [
+      { kind: 'video', src: g('tbot/splat.mp4'), poster: g('tbot/splat.webp'), w: 640, h: 360, size: 'lead', tag: 'Scan', title: 'Gaussian splat of the phone capture', caption: 'Flythrough of the splat trained from the iPhone video; Chudware turns it into a scaled mesh.', alt: 'Video flythrough of a photorealistic Gaussian splat of a shotgun on a ChArUco calibration mat', fit: 'cover' },
+      { kind: 'image', src: g('tbot/scan-vs-body.webp'), w: 1500, h: 432, size: 'wide', tag: 'Reverse engineering', title: 'Scan mesh against the model', caption: 'Side and plan silhouettes of the scan mesh against the modeled gun body.', alt: 'Side and plan silhouettes comparing a scanned mesh with the modeled gun body' },
+      { kind: 'image', src: g('tbot/front-module.webp'), w: 512, h: 384, tag: 'Assembly', title: 'Front module on the barrel', caption: 'Camera module and hose-clamp mounts placed on the gun body model.', alt: 'Render of a grey box-shaped module clamped under a shotgun barrel', fit: 'cover' },
+      { kind: 'image', src: g('tbot/registration.webp'), w: 1050, h: 770, tag: 'Reverse engineering', title: 'Scan registered to the gun frame', caption: 'Scan points (black) over the reference body (red), before and after registration.', alt: 'Side and plan plots of scan points registered over a red reference gun body' },
+      { kind: 'image', src: g('tbot/harness-routing.webp'), w: 2000, h: 1414, tag: 'Harness', title: 'Routed harness, projected', caption: 'Front-module harness routed in 3D and projected to plan and side views.', alt: 'Drawing sheet of routed wire paths in plan and side views', size: 'wide' },
+      { kind: 'image', src: g('tbot/harness-schematic.webp'), w: 2000, h: 1414, tag: 'Harness', title: 'Wiring schematic', caption: 'Generated wiring schematic for the camera, IMU, power, and actuator.', alt: 'Wiring schematic drawing sheet', size: 'wide' },
+    ],
+  },
+];
 ---
 
 <BaseLayout
   title="Gallery"
-  description="Explore Chudware modeling, CAM, and simulation examples, with requests, results, and full-size screenshots."
+  description="Real projects built in Chudware: a six-axis robot arm, a human-powered senior design rover, and a scan-to-CAD clay-shooting module. Assemblies, motion studies, DFM checks, FEA, and scans."
 >
   <header class="page-hero gallery-hero">
-    <div class="wrap">
+    <div class="wrap gallery-hero-inner">
       <p class="eyebrow">Gallery</p>
-      <h1>Start with the request. Inspect the result.</h1>
-      <p class="lede">See the request, the result, and the tools used to inspect it. Open any image at full size to read the feature tree, copilot, and study details.</p>
-      <p class="gallery-disclosure">Modeling includes a recorded demo response. CAM and simulation use scripted examples; their requests describe those scenarios rather than quote a conversation. Every image is an unedited capture from the desktop app.</p>
+      <h1>Real projects, built in Chudware.</h1>
+      <p class="lede">Assemblies, motion studies, manufacturability checks, stress results, and scans from three real engineering projects. Some of them were printed, wired, and built.</p>
+      <nav class="project-index" aria-label="Projects">
+        {projects.map((p) => (
+          <a href={`#${p.id}`}>
+            <span class="pi-num">{p.index}</span>
+            <span class="pi-name">{p.name}</span>
+            <span class="pi-kicker">{p.kicker.split(' · ')[0]}</span>
+          </a>
+        ))}
+      </nav>
+      <p class="gallery-disclosure">Renders, animations, and checks are Chudware output from each project's native documents. Photos and phone video show the physical builds. Click any tile to view it full size.</p>
     </div>
   </header>
 
-  <section class="section gallery-section" aria-label="Chudware examples">
-    <div class="wrap gallery-stack">
-      <article class="gallery-case" id="modeling" aria-labelledby="modeling-title">
-        <header class="case-heading">
-          <div>
-            <p class="eyebrow">01 / Model</p>
-            <h2 id="modeling-title">Build the tray. Leave every feature human-editable.</h2>
+  {projects.map((p) => (
+    <section class="section project" id={p.id} aria-labelledby={`${p.id}-title`}>
+      <div class="wrap">
+        <header class="project-head">
+          <div class="project-title">
+            <p class="eyebrow">{p.index} / {p.kicker.split(' · ')[0]}</p>
+            <h2 id={`${p.id}-title`}>{p.name}</h2>
           </div>
-          <p>A small tray with box, fillet, and shell features preserved as a dimension-driven, human-editable history.</p>
+          <div class="project-copy">
+            <p class="project-kicker">{p.kicker.split(' · ')[1]}</p>
+            <p>{p.summary}</p>
+            <dl class="project-stats">
+              {p.stats.map((s) => (<div><dt>{s.label}</dt><dd>{s.value}</dd></div>))}
+            </dl>
+            {p.note && <p class="project-note">{p.note}</p>}
+          </div>
         </header>
-        <div class="request-result">
-          <section class="evidence-card request-card" aria-labelledby="modeling-request">
-            <p class="evidence-label" id="modeling-request">Public demo request <span>(task excerpt)</span></p>
-            <blockquote>&ldquo;Create a 60 &times; 40 &times; 10&nbsp;mm open-top tray. Fillet two vertical outside edges to 4&nbsp;mm, then shell it to a 2&nbsp;mm wall by removing the top face.&rdquo;</blockquote>
-            <p class="evidence-note">Recorded in a new demo workspace. The screenshot includes the assistant's response.</p>
-          </section>
-          <section class="evidence-card result-card" aria-labelledby="modeling-result">
-            <p class="evidence-label" id="modeling-result">Observed result</p>
-            <p>The agents created one solid with editable box, fillet, and shell features; measured a 1.998&nbsp;mm minimum wall; passed its geometry verification; and saved the native <code>.step+</code> document. The deterministic capture reproduces the same feature sequence in the viewport.</p>
-          </section>
-        </div>
-        <figure class="capture">
-          <a class="capture-link" href="/images/modeling.png" aria-label="Open the full-size modeling capture">
-            <img src="/images/modeling.png" width="1600" height="900" fetchpriority="high" alt="Chudware modeling workspace showing an open-top tray in the 3D viewport, an ordered Box1, Fillet1, and Shell1 feature tree on the left, and the full Copilot panel and composer on the right" />
-          </a>
-          <figcaption>
-            <span>Modeling workspace · recorded demo response</span>
-            <a class="text-link" href="/images/modeling.png">Open full size</a>
-          </figcaption>
-        </figure>
-      </article>
+        <ul class="bento" role="list">
+          {p.tiles.map((t) => (
+            <li class:list={['tile', t.size && `tile-${t.size}`, t.fit === 'contain' && 'tile-contain', t.fit === 'cover' && 'tile-cover', t.light && 'tile-light']}>
+              <button type="button" class="tile-open" data-full={t.src} data-kind={t.kind} data-poster={t.poster} data-title={t.title} data-caption={t.caption} data-alt={t.alt} aria-label={`Open full size: ${t.title}`}>
+                {t.kind === 'video'
+                  ? <video data-autoplay muted loop playsinline preload="none" poster={t.poster} width={t.w} height={t.h} aria-label={t.alt}><source src={t.src} type="video/mp4" /></video>
+                  : <img src={t.src} width={t.w} height={t.h} loading="lazy" decoding="async" alt={t.alt} />}
+                <span class="tile-tag">{t.kind === 'video' && <span class="tile-play" aria-hidden="true"></span>}{t.tag}</span>
+              </button>
+              <div class="tile-caption"><strong>{t.title}</strong><span>{t.caption}</span></div>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  ))}
 
-      <article class="gallery-case" id="cam" aria-labelledby="cam-title">
-        <header class="case-heading">
-          <div>
-            <p class="eyebrow">02 / Manufacture</p>
-            <h2 id="cam-title">Generate a milling job, then review the path.</h2>
-          </div>
-          <p>The CAM state stays explicit: stock, post, operations, tools, removal settings, and playhead are all visible before anything reaches a machine.</p>
-        </header>
-        <div class="request-result">
-          <section class="evidence-card request-card" aria-labelledby="cam-request">
-            <p class="evidence-label" id="cam-request">Example request</p>
-            <blockquote>&ldquo;Prepare an 80 &times; 60 &times; 15&nbsp;mm plate with four &Oslash;5&nbsp;mm through-holes for a Fanuc mill. Generate the operations and pause the simulation halfway through.&rdquo;</blockquote>
-            <p class="evidence-note">Suggested request for the scripted example below.</p>
-          </section>
-          <section class="evidence-card result-card" aria-labelledby="cam-result">
-            <p class="evidence-label" id="cam-result">Observed result</p>
-            <p>The job contains face, contour, and drill operations using a 10&nbsp;mm flat end mill and a 5&nbsp;mm drill. The viewport is paused at 50% (0:47 of 1:35), and the job remains visibly marked <strong>UNVERIFIED</strong>.</p>
-          </section>
-        </div>
-        <figure class="capture">
-          <a class="capture-link" href="/images/cam.png" aria-label="Open the full-size CAM capture">
-            <img src="/images/cam.png" width="1600" height="900" loading="lazy" alt="Chudware Manufacture workspace showing a four-hole plate with toolpaths in the native viewport, face, contour, and drill operations in the Job Manager, a 50 percent simulation playhead, and the full Copilot panel and composer" />
-          </a>
-          <figcaption>
-            <span>CAM workspace · scripted example</span>
-            <a class="text-link" href="/images/cam.png">Open full size</a>
-          </figcaption>
-        </figure>
-      </article>
+  <DemoBand compact />
 
-      <article class="gallery-case" id="simulation" aria-labelledby="simulation-title">
-        <header class="case-heading">
-          <div>
-            <p class="eyebrow">03 / Simulate</p>
-            <h2 id="simulation-title">Define the load case. Read the result with its mesh.</h2>
-          </div>
-          <p>Inspect the stress contour alongside displacement, factor of safety, and mesh counts.</p>
-        </header>
-        <div class="request-result">
-          <section class="evidence-card request-card" aria-labelledby="simulation-request">
-            <p class="evidence-label" id="simulation-request">Example request</p>
-            <blockquote>&ldquo;Run a static study on a 60 &times; 40 &times; 10&nbsp;mm steel block. Fix the &minus;X end face, apply 100&nbsp;N in &minus;Z to the +X end face, and show von Mises stress and displacement.&rdquo;</blockquote>
-            <p class="evidence-note">Suggested request for the scripted example below.</p>
-          </section>
-          <section class="evidence-card result-card" aria-labelledby="simulation-result">
-            <p class="evidence-label" id="simulation-result">Observed result</p>
-            <p>The captured study reports its stress scale, peak displacement, minimum factor of safety, and node, element, and equation counts beside the contour. It is one scripted study result, not a benchmark or design sign-off.</p>
-          </section>
-        </div>
-        <figure class="capture">
-          <a class="capture-link" href="/images/fea.png" aria-label="Open the full-size simulation capture">
-            <img src="/images/fea.png" width="1600" height="900" loading="lazy" alt="Chudware Simulate workspace showing a completed static study with a von Mises stress contour and scale, numeric stress, displacement, factor-of-safety, mesh and solver results, and the full Copilot panel and composer" />
-          </a>
-          <figcaption>
-            <span>Static stress study · scripted example</span>
-            <span><a class="text-link" href="/images/fea.png">Open full size</a> &middot; <a class="text-link" href="/product/simulation/">Simulation details</a></span>
-          </figcaption>
-        </figure>
-      </article>
-    </div>
-  </section>
+  <dialog class="lightbox" aria-label="Full-size view">
+    <form method="dialog"><button class="lightbox-close" aria-label="Close">×</button></form>
+    <div class="lightbox-media"></div>
+    <p class="lightbox-caption"></p>
+  </dialog>
 </BaseLayout>
 
 <style>
-  .gallery-hero h1 { max-width: 12ch; }
-  .gallery-disclosure { max-width: 76ch; margin-top: var(--s5); padding-left: var(--s4); border-left: var(--border-strong) solid var(--technical); color: var(--faint); font: var(--step--1)/1.6 var(--mono); }
-  .gallery-stack { display: grid; gap: clamp(var(--s9), 12vw, calc(var(--s10) * 1.5)); }
-  .gallery-case { min-width: 0; scroll-margin-top: calc(var(--header-height) + var(--s5)); }
-  .case-heading { display: grid; grid-template-columns: minmax(0, .95fr) minmax(18rem, .55fr); gap: clamp(var(--s5), 6vw, var(--s9)); align-items: end; padding-top: var(--s5); border-top: var(--border-strong) solid var(--line-hi); }
-  .case-heading > div { display: grid; gap: var(--s3); }
-  .case-heading h2 { max-width: 18ch; }
-  .case-heading > p { max-width: 48ch; color: var(--muted); }
-  .request-result { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: var(--s6); border: var(--border) solid var(--line); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
-  .evidence-card { display: grid; align-content: start; gap: var(--s3); min-width: 0; padding: clamp(var(--s4), 3vw, var(--s6)); }
-  .evidence-card + .evidence-card { border-left: var(--border) solid var(--line); }
-  .request-card { box-shadow: inset var(--border-strong) 0 var(--accent); }
-  .result-card { box-shadow: inset var(--border-strong) 0 var(--technical); }
-  .evidence-label { color: var(--faint); font: 400 var(--step--2)/1.4 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
-  blockquote { color: var(--text); font-size: var(--step-1); line-height: 1.55; text-wrap: pretty; }
-  .result-card > p:last-child { color: var(--muted); }
-  .result-card strong { color: var(--text); font-weight: 650; }
-  .evidence-note { color: var(--faint); font: var(--step--2)/1.55 var(--mono); }
-  .capture { margin-top: var(--s5); padding: var(--s2); border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
-  .capture-link { display: block; border-radius: var(--radius-sm); background: var(--bg-deep); overflow: hidden; }
-  .capture img { width: 100%; height: auto; border-radius: var(--radius-sm); }
-  .capture figcaption { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: var(--s2) var(--s5); padding: var(--s3) var(--s2) var(--s1); color: var(--faint); font: var(--step--1)/1.5 var(--mono); }
-  .capture figcaption .text-link { font-family: var(--sans); }
+  .gallery-hero-inner { display: grid; gap: var(--s5); }
+  .gallery-hero h1 { max-width: 14ch; }
+  .gallery-hero .lede { max-width: 60ch; }
+  .project-index { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); margin-top: var(--s3); }
+  .project-index a { display: grid; gap: var(--s1); padding: var(--s4) var(--s5); border: var(--border) solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); text-decoration: none; transition: border-color .18s var(--ease), background .18s var(--ease), transform .18s var(--ease); }
+  .project-index a:hover { border-color: var(--accent); background: var(--surface-hi); transform: translateY(-2px); }
+  .pi-num { color: var(--accent); font: var(--step--2)/1 var(--mono); letter-spacing: .12em; }
+  .pi-name { font-size: var(--step-1); font-weight: 650; }
+  .pi-kicker { color: var(--faint); font-size: var(--step--1); }
+  .gallery-disclosure { max-width: 76ch; padding-left: var(--s4); border-left: var(--border-strong) solid var(--technical); color: var(--faint); font: var(--step--1)/1.6 var(--mono); }
 
-  @media (max-width: 760px) {
-    .case-heading, .request-result { grid-template-columns: 1fr; }
-    .case-heading { align-items: start; gap: var(--s4); }
-    .case-heading > p { max-width: var(--measure); }
-    .evidence-card + .evidence-card { border-top: var(--border) solid var(--line); border-left: 0; }
-    .capture { margin-inline: calc(var(--gutter) * -.5); padding: var(--s1); }
-    .capture figcaption { align-items: flex-start; flex-direction: column; padding-inline: var(--s3); }
+  .project { scroll-margin-top: var(--header-height); }
+  .project:nth-of-type(even) { background: var(--bg-deep); }
+  .project-head { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: clamp(var(--s5), 5vw, var(--s9)); align-items: start; margin-bottom: var(--s7); }
+  .project-title { display: grid; gap: var(--s3); }
+  .project-title h2 { font-size: var(--step-4); line-height: .98; letter-spacing: -.02em; }
+  .project-copy { display: grid; gap: var(--s5); }
+  .project-kicker { color: var(--accent-hi); font-weight: 600; }
+  .project-copy > p:nth-child(2) { color: var(--muted); font-size: var(--step-0); max-width: 62ch; }
+  .project-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); margin: 0; }
+  .project-stats > div { display: flex; flex-direction: column-reverse; gap: var(--s1); padding-top: var(--s3); border-top: var(--border) solid var(--line-hi); }
+  .project-stats dd { margin: 0; color: var(--text); font-size: var(--step-2); font-weight: 650; line-height: 1.05; font-variant-numeric: tabular-nums; }
+  .project-stats dt { color: var(--faint); font-size: var(--step--1); line-height: 1.4; }
+  .project-note { color: var(--faint); font: var(--step--2)/1.55 var(--mono); }
+
+  .bento { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-rows: clamp(11rem, 17vw, 15rem); grid-auto-flow: dense; gap: var(--s4); list-style: none; }
+  .tile { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: var(--s2); min-width: 0; grid-row: span 1; }
+  .tile-lead { grid-column: span 2; grid-row: span 2; }
+  .tile-wide { grid-column: span 2; }
+  .tile-tall { grid-row: span 2; }
+  .tile-open { position: relative; display: block; width: 100%; height: 100%; min-height: 0; padding: 0; border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: #f4f4f2; overflow: hidden; cursor: zoom-in; transition: border-color .18s var(--ease), box-shadow .18s var(--ease); }
+  .tile-open:hover { border-color: var(--accent); box-shadow: 0 1rem 3rem rgba(255, 138, 61, .14); }
+  .tile-open img, .tile-open video { width: 100%; height: 100%; object-fit: contain; transition: transform .5s var(--ease); }
+  .tile-open:hover img, .tile-open:hover video { transform: scale(1.03); }
+  .tile-cover .tile-open img, .tile-cover .tile-open video { object-fit: cover; }
+  .tile-open:has(video) { background: #0c0e10; }
+  .tile-cover .tile-open { background: var(--bg-deep); }
+  .tile-light .tile-open { background: #fff; }
+  .tile-tag { position: absolute; top: var(--s2); left: var(--s2); display: inline-flex; align-items: center; gap: var(--s2); padding: var(--s1) var(--s2); border-radius: var(--radius-sm); background: rgba(12, 14, 12, .82); color: var(--text); font: var(--step--2)/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; backdrop-filter: blur(6px); }
+  .tile-play { width: 0; height: 0; border-block: .3rem solid transparent; border-left: .45rem solid var(--accent); }
+  .tile-caption { display: grid; gap: 2px; padding-inline: var(--s1); }
+  .tile-caption strong { font-size: var(--step--1); font-weight: 620; }
+  .tile-caption span { color: var(--faint); font-size: var(--step--2); line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+  .lightbox { width: min(96vw, 110rem); max-height: 94vh; padding: var(--s3); border: var(--border) solid var(--line-hi); border-radius: var(--radius); background: var(--bg-deep); color: var(--text); }
+  .lightbox::backdrop { background: rgba(6, 8, 6, .86); backdrop-filter: blur(4px); }
+  .lightbox-media { display: grid; place-items: center; }
+  .lightbox-media img, .lightbox-media video { max-width: 100%; max-height: calc(94vh - 6rem); width: auto; height: auto; border-radius: var(--radius-sm); background: #f4f4f2; }
+  .lightbox-media video { background: #0c0e10; }
+  .lightbox-caption { padding: var(--s3) var(--s2) var(--s1); color: var(--muted); font: var(--step--1)/1.5 var(--mono); }
+  .lightbox-caption strong { color: var(--text); font-family: var(--sans); }
+  .lightbox form { position: absolute; top: var(--s2); right: var(--s2); z-index: 1; }
+  .lightbox-close { width: var(--touch); height: var(--touch); border: var(--border) solid var(--line-hi); border-radius: 50%; background: rgba(12, 14, 12, .85); color: var(--text); font-size: 1.5rem; line-height: 1; cursor: pointer; }
+  .lightbox-close:hover { border-color: var(--accent); }
+
+  @media (max-width: 1000px) {
+    .project-head { grid-template-columns: 1fr; }
+    .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: clamp(10rem, 30vw, 14rem); }
+  }
+  @media (max-width: 640px) {
+    .project-index { grid-template-columns: 1fr; }
+    .project-stats { grid-template-columns: 1fr; }
+    .bento { grid-template-columns: 1fr; grid-auto-rows: 14rem; }
+    .tile-lead, .tile-wide { grid-column: auto; }
+    .tile-lead { grid-row: span 1; }
+    .tile-tall { grid-row: span 2; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .tile-open img, .tile-open video { transition: none; }
+    .tile-open:hover img, .tile-open:hover video { transform: none; }
   }
 </style>
+
+<script>
+  const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Tiles play only while on screen, and never for reduced-motion visitors.
+  const videos = document.querySelectorAll<HTMLVideoElement>('video[data-autoplay]');
+  if (!still && 'IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const v = e.target as HTMLVideoElement;
+        if (e.isIntersecting) v.play().catch(() => {});
+        else v.pause();
+      }
+    }, { rootMargin: '120px 0px', threshold: 0.15 });
+    videos.forEach((v) => io.observe(v));
+  }
+
+  const dialog = document.querySelector<HTMLDialogElement>('.lightbox');
+  const media = dialog?.querySelector<HTMLElement>('.lightbox-media');
+  const caption = dialog?.querySelector<HTMLElement>('.lightbox-caption');
+  if (dialog && media && caption) {
+    document.querySelectorAll<HTMLButtonElement>('.tile-open').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const d = btn.dataset;
+        media.replaceChildren();
+        if (d.kind === 'video') {
+          const v = document.createElement('video');
+          v.src = d.full ?? '';
+          if (d.poster) v.poster = d.poster;
+          v.muted = true; v.loop = true; v.playsInline = true; v.controls = true; v.autoplay = !still;
+          v.setAttribute('aria-label', d.alt ?? '');
+          media.append(v);
+        } else {
+          const img = document.createElement('img');
+          img.src = d.full ?? '';
+          img.alt = d.alt ?? '';
+          media.append(img);
+        }
+        const strong = document.createElement('strong');
+        strong.textContent = d.title ?? '';
+        caption.replaceChildren(strong, document.createTextNode(` · ${d.caption ?? ''}`));
+        dialog.showModal();
+      });
+    });
+    dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
+    dialog.addEventListener('close', () => media.replaceChildren());
+  }
+</script>

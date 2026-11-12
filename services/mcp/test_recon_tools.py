@@ -146,10 +146,12 @@ def test_reverse_engineer_plate_recovers_hole_pattern_and_base():
     assert len(pats) == 1 and pats[0]["type"] == "circular_pattern", feats
     assert pats[0]["count"] == 4 and pats[0]["seed"] == holes[0]["id"], pats
 
-    # The 4 corner fillets: applied features + fillet candidates must account for all 4.
+    # The 4 corner fillets: applied fillet edges + fillet candidates must account for all 4
+    # (same-radius blends go in as one feature over all their edges).
     fillets = [f for f in feats if f["type"] == "fillet"]
     fillet_cands = [c for c in re_res["candidates"] if c.get("kind") == "fillet"]
-    assert len(fillets) + len(fillet_cands) >= 4, (fillets, fillet_cands)
+    applied_edges = sum(f.get("edge_count", 1) for f in fillets)
+    assert applied_edges + len(fillet_cands) >= 4, (fillets, fillet_cands)
     for f in fillets:
         assert abs(f["radius"] - 3.0) < 0.01, f
 

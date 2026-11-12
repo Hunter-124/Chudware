@@ -28,21 +28,33 @@ THE ONE-CALL PATH
   the source. The new part is made current; the imported source doc stays open as the reference.
 
   What the recognizer can claim deterministically:
+  * split cylinders — a native SolidWorks/Parasolid (or seam-split STEP) cylinder arrives as
+    two half faces; they are merged back into one cylinder by axis, radius and span (each
+    half's sweep is recovered from its centroid offset) before any pass reads them.
   * prismatic base — largest planar face + its antiparallel partner at distance d, with the
-    perpendicular/parallel lateral faces explaining >=80% of the remaining area. The profile is
+    perpendicular/parallel lateral faces explaining >=80% of the remaining area (blend faces
+    and shell walls are explained by their own features and don't count). The profile is
     traced from the face's boundary wires; corner arcs that match a detected fillet radius are
-    un-rounded first so the fillet stays a SEPARATE editable feature instead of being baked in.
+    un-rounded, and cap edges pulled in by an edge blend are pushed back onto their wall, so
+    the blend stays a SEPARATE editable feature instead of being baked in.
+  * shell — a constant-wall hollow of an axis-aligned box (inner walls = the outer faces offset
+    by one thickness t, the faces without an inner wall are the openings) rebuilds as the sharp
+    prism + a `shell` {thickness=t, remove=openings}.
   * turned body — every curved face coaxial on a principal axis through the origin: the revolve
     profile is computed ANALYTICALLY from the cylinder radii + spans (area/(2*pi*r)) — no
-    sectioning, no tessellation.
+    sectioning, no tessellation. Coaxial bores are the profile's inner edge (a tube is one
+    revolve of an annulus).
   * holes — bore-concavity cylinders become real `hole` features {d=2r, blind depth | through},
     entered from the planar cap the bore opens onto.
   * patterns — same-radius hole groups at uniform angular spacing become ONE seed hole + a
-    circular_pattern (collinear equal spacing → linear_pattern). Editing the seed re-drives
-    every instance.
+    circular_pattern (collinear equal spacing → linear_pattern). The ring centre is fitted
+    exactly, so a pattern about an axis off the origin uses an explicit axis line. Editing the
+    seed re-drives every instance.
   * fillets/chamfers — small convex cylinders/tori and 45°±2° planar bridges are CANDIDATES:
     applied only when a plain-word edge query resolves on the rebuilt body AND the match does
     not regress; otherwise they are returned under `candidates` for you to apply by hand.
+    Same-size blends go in as ONE feature over all their edges (`edge_count`), so corner
+    spheres/triangles come out as the source had them; per-edge is only the fallback.
 
 READING THE RESULT
   match_pct     common_volume / max(volume) of the two solids. 100 ≈ identical. null means the

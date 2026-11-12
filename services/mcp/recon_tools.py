@@ -16,17 +16,21 @@ every applied batch is verified against the source solid (regression -> revert -
 
 The recognizer (`_recognize`) runs 5 deterministic passes over the doc_query face cards
 (sid/surf/side/normal/concavity/radius/centroid/area) + doc_adjacency + doc_bbox:
+  0. split cylinders — seam-split halves (native SolidWorks/Parasolid) merge back into one
+                       cylinder card per axis/radius/span before any pass reads them.
   1. prismatic base  — largest planar face + antiparallel partner at distance d, with
                        perpendicular/parallel laterals explaining >=80% of the remaining area;
                        profile pulled from doc_face_wires (outer wire, fillet arcs un-rounded
-                       back to sharp corners so dress-ups stay separate features).
+                       and blend-setback cap edges pushed back onto their walls so dress-ups
+                       stay separate features). A constant-wall box hollow adds a shell.
   2. turned body     — every curved face coaxial on a principal axis through the origin ->
                        ANALYTIC revolve profile from the face params (radius + span from
                        area/(2*pi*r)); no sectioning.
   3. holes           — bore-concavity cylinders -> hole {d=2r, depth|through} entered from the
                        planar cap the bore opens onto.
-  4. patterns        — gsl_tools._axis_order over same-radius hole groups -> ONE seed hole +
-                       circular pattern (a collinear equal-spacing fallback -> linear pattern).
+  4. patterns        — an exact ring fit (any axis line) over same-radius hole groups -> ONE
+                       seed hole + circular pattern (a collinear equal-spacing fallback ->
+                       linear pattern).
   5. fillet/chamfer  — CANDIDATES only: small convex cylinders/tori (fillets) and 45 deg +/- 2
                        planar bridges (chamfers). Applied only when a plain-word edge query
                        resolves on the REBUILT body AND the match does not regress; otherwise
@@ -273,6 +277,276 @@ def _dim(v: float) -> dict:
     return {"value": round(float(v), 6), "expr": None}
 
 
+# ---------------------------------------------------------------- split-cylinder merging
+# A Parasolid/SolidWorks B-rep (and many STEP writers) splits every full cylinder at its seam
+# into two half-cylinder faces. Each half's centroid then sits OFF the axis by 2r/pi and
+# carries half the area, which defeats every pass that reads a cylinder card as "the bore"
+# (hole centre = centroid, depth = area/(2 pi r)). The angular sweep of a rectangular
+# cylinder patch is recoverable exactly from its card: centroid offset d = r sin(s/2)/(s/2)
+# for sweep s, so faces that share an axis line, radius, concavity and axial span merge
+# back into one logical cylinder whose sweeps add up.
+_FULL_SWEEP_TOL = math.radians(1.0)
+
+
+def _sweep_from_offset(d: float, r: float) -> float:
+    """Invert d/r = sin(s/2)/(s/2) for the sweep s in [0, 2 pi] (monotone; bisection)."""
+    q = max(0.0, min(1.0, d / r)) if r > 0 else 0.0
+    lo, hi = 0.0, 2.0 * math.pi
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if (math.sin(mid / 2.0) / (mid / 2.0) if mid > 1e-12 else 1.0) > q:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _cyl_patch(f: dict) -> Optional[dict]:
+    """Axis line, sweep and axial span of one cylinder face card, or None."""
+    if f.get("surf") != "cylinder":
+        return None
+    r = float(f.get("radius") or 0.0)
+    area = float(f.get("area_or_len") or 0.0)
+    c, ax, ap = _f3(f, "centroid"), _f3(f, "axis"), _f3(f, "axis_point")
+    if r <= 0 or area <= 0 or c is None or ax is None or ap is None:
+        return None
+    a = _unit(ax)
+    if max(a, key=abs) < 0:
+        a = _scale(a, -1.0)  # canonical direction so antiparallel cards group together
+    off = _perp(_sub(c, ap), a)
+    sweep = _sweep_from_offset(_norm(off), r)
+    h = area / (r * sweep) if sweep > 1e-9 else 0.0
+    t = _dot(c, a)
+    return {"a": a, "ap": ap, "r": r, "sweep": sweep, "h": h, "t0": t - h / 2.0,
+            "t1": t + h / 2.0, "off": off}
+
+
+def _merge_split_cylinders(faces: list) -> list:
+    """Collapse seam-split cylinder halves into one logical card per cylinder.
+
+    A merged card keeps the first member's sid, lists every source sid under `member_sids`,
+    sums `area_or_len`, records `sweep_deg`, and (when the sweeps close the circle) moves its
+    centroid onto the axis — the card a single unsplit cylinder face would have had. Faces
+    that are not cylinders, or whose patch can't be derived, pass through untouched."""
+    out: list = []
+    groups: list = []  # [(patch, [face, ...])]
+    for f in faces:
+        p = _cyl_patch(f)
+        if p is None:
+            out.append(f)
+            continue
+        tol = max(1e-3, 1e-5 * p["r"])
+        for gp, members in groups:
+            if (abs(gp["r"] - p["r"]) <= tol and abs(_dot(gp["a"], p["a"]) - 1.0) < 1e-6 and
+                    f.get("concavity") == members[0].get("concavity") and
+                    _norm(_perp(_sub(p["ap"], gp["ap"]), gp["a"])) <= tol and
+                    abs(gp["t0"] - p["t0"]) <= 1e-2 and abs(gp["t1"] - p["t1"]) <= 1e-2):
+                members.append(f)
+                gp["sweep"] += p["sweep"]
+                break
+        else:
+            groups.append((dict(p), [f]))
+            out.append(None)  # placeholder keeps the first member's position
+    it = iter(groups)
+    merged_out = []
+    for f in out:
+        if f is not None:
+            merged_out.append(f)
+            continue
+        gp, members = next(it)
+        card = dict(members[0])
+        card["sweep_deg"] = round(math.degrees(min(gp["sweep"], 2.0 * math.pi)), 4)
+        if len(members) > 1:
+            card["member_sids"] = [m.get("sid") for m in members]
+            card["area_or_len"] = sum(float(m.get("area_or_len") or 0.0) for m in members)
+        if abs(gp["sweep"] - 2.0 * math.pi) <= _FULL_SWEEP_TOL * len(members):
+            tm = 0.5 * (gp["t0"] + gp["t1"])
+            ap = gp["ap"]
+            card["centroid"] = list(_add(_perp(ap, gp["a"]), _scale(gp["a"], tm)))
+        elif len(members) > 1:
+            wsum = sum(float(m.get("area_or_len") or 0.0) for m in members)
+            card["centroid"] = [sum(_f3(m, "centroid")[k] * float(m.get("area_or_len") or 0.0)
+                                    for m in members) / wsum for k in range(3)]
+        merged_out.append(card)
+    return merged_out
+
+
+def _is_full_cylinder(f: dict) -> bool:
+    """True unless the card's sweep is known and falls short of a full revolution."""
+    s = f.get("sweep_deg")
+    return s is None or s >= 359.0
+
+
+def _blend_edge_point(f: dict) -> Optional[tuple]:
+    """The SHARP edge a fillet cylinder replaced, at the fillet's axial midpoint: on the
+    sweep bisector at r / cos(sweep/2) from the fillet axis (r*sqrt(2) for a 90 deg blend)."""
+    p = _cyl_patch(f)
+    if p is None or _norm(p["off"]) < 1e-9 or p["sweep"] >= math.pi - 1e-6:
+        return None
+    bis = _unit(p["off"])
+    tm = 0.5 * (p["t0"] + p["t1"])
+    base = _add(_perp(p["ap"], p["a"]), _scale(p["a"], tm))
+    return _add(base, _scale(bis, p["r"] / math.cos(p["sweep"] / 2.0)))
+
+
+def _unset_cap_profile(prof: list, laterals2d: list, setbacks: list,
+                       tol: float = 1e-3) -> list:
+    """Push cap-profile LINES that a dress-up set back from the cap's sharp outline back onto
+    their lateral wall plane, then re-intersect the corners.
+
+    When an edge between the cap and a lateral wall is filleted/chamfered, the cap face's
+    outline sits `setback` inside the wall (a box with every edge rounded r3 shows a cap
+    6 mm smaller). Each line is moved outward only onto a parallel lateral plane at exactly
+    a detected dress-up setback, so the base stays the SHARP prism and the blend stays a
+    separate feature. `laterals2d` = [(n2 (unit, outward), d)] with the wall at n2 . p = d.
+    Arcs between two moved lines (a corner blend seen edge-on) are dropped."""
+    if not setbacks or not laterals2d:
+        return prof
+    ents = [dict(e) for e in prof]
+    moved = [False] * len(ents)
+    for i, e in enumerate(ents):
+        if e.get("type") != "line":
+            continue
+        p1, p2 = e["p1"], e["p2"]
+        dv = (p2[0] - p1[0], p2[1] - p1[1])
+        ln = math.hypot(*dv)
+        if ln < 1e-9:
+            continue
+        best = None
+        for n2, d in laterals2d:
+            if abs(n2[0] * dv[0] + n2[1] * dv[1]) > 1e-3 * ln:
+                continue
+            s = d - (n2[0] * p1[0] + n2[1] * p1[1])
+            if abs(s) <= tol:
+                best = None  # the line already lies on a wall: it is sharp, keep it
+                break
+            if s > tol and any(abs(s - sb) <= max(tol, 1e-3 * sb) for sb in setbacks):
+                if best is None or s < best[0]:
+                    best = (s, n2)
+        if best is not None:
+            s, n2 = best
+            e["p1"] = [p1[0] + n2[0] * s, p1[1] + n2[1] * s]
+            e["p2"] = [p2[0] + n2[0] * s, p2[1] + n2[1] * s]
+            moved[i] = True
+    if not any(moved):
+        return prof
+    n = len(ents)
+    keep = [True] * n
+    for i in range(n):
+        if ents[i].get("type") == "arc" and moved[(i - 1) % n] and moved[(i + 1) % n]:
+            keep[i] = False
+    idx = [i for i in range(n) if keep[i]]
+    for k, i in enumerate(idx):
+        j = idx[(k + 1) % len(idx)]
+        a, b = ents[i], ents[j]
+        if a.get("type") != "line" or b.get("type") != "line" or not (moved[i] or moved[j]):
+            continue
+        p1, p2, q1, q2 = a["p1"], a["p2"], b["p1"], b["p2"]
+        da = (p2[0] - p1[0], p2[1] - p1[1])
+        db = (q2[0] - q1[0], q2[1] - q1[1])
+        den = da[0] * db[1] - da[1] * db[0]
+        if abs(den) < 1e-9 * (math.hypot(*da) * math.hypot(*db) + 1e-12):
+            continue
+        s = ((q1[0] - p1[0]) * db[1] - (q1[1] - p1[1]) * db[0]) / den
+        x = [p1[0] + s * da[0], p1[1] + s * da[1]]
+        a["p2"], b["p1"] = list(x), list(x)
+    return [ents[i] for i in idx]
+
+
+def _detect_shell(planar: list, bbox: dict) -> Optional[dict]:
+    """A constant-wall hollow of an axis-aligned box: every planar face is axis-aligned; the
+    OUTER faces lie on the bounding box; every INNER face is an antiparallel copy of one outer
+    face at the same wall thickness t; the outer faces with no inner partner are the OPEN
+    faces, and no open face is opposite another (two opposed openings are a tube/L-profile,
+    which a plain extrude explains). Returns {thickness, inner_sids, open} or None."""
+    lo, hi = bbox.get("min"), bbox.get("max")
+    if not lo or not hi or len(planar) < 7:
+        return None
+    outer, inner = [], []
+    for f in planar:
+        n, c = _f3(f, "normal"), _f3(f, "centroid")
+        letter = _principal_axis(n) if n else None
+        if letter is None or c is None:
+            return None
+        k = "xyz".index(letter)
+        sgn = 1 if n[k] > 0 else -1
+        ext = hi[k] if sgn > 0 else lo[k]
+        (outer if abs(c[k] - ext) < 1e-4 else inner).append((f, k, sgn, c[k]))
+    if len(inner) < 3:
+        return None
+    t = None
+    partnered = set()
+    for f, k, sgn, pos in inner:
+        part = [o for o in outer if o[1] == k and o[2] == -sgn]
+        if len(part) != 1:
+            return None
+        o = part[0]
+        tt = abs(pos - o[3])
+        if t is None:
+            t = tt
+        elif abs(tt - t) > 1e-4:
+            return None
+        if o[0].get("sid") in partnered:
+            return None
+        partnered.add(o[0].get("sid"))
+    open_ = [o for o in outer if o[0].get("sid") not in partnered]
+    if not open_ or not t or t <= 0:
+        return None
+    for o in open_:
+        if any(p[1] == o[1] and p[2] == -o[2] for p in open_):
+            return None
+    dims = [hi[i] - lo[i] for i in range(3)]
+    if t >= 0.5 * min(dims):
+        return None
+    mid = [0.5 * (lo[i] + hi[i]) for i in range(3)]
+    opens = []
+    for f, k, sgn, pos in open_:
+        near = list(mid)
+        near[k] = pos  # the open face's plane, centred on the box: inside its full outline
+        opens.append({"sid": f.get("sid"), "near": [round(x, 4) for x in near],
+                      "normal": list(_f3(f, "normal"))})
+    return {"thickness": round(t, 6), "inner_sids": [f.get("sid") for f, *_ in inner],
+            "open": opens}
+
+
+def _ring_fit(centers: list, axis) -> Optional[dict]:
+    """Exact circular-pattern fit: hole centres on ONE circle in the plane normal to their
+    common axis, at uniform 360/n spacing. The pattern axis need not be a principal datum or
+    pass through the origin (a SolidWorks pattern about a face/edge rarely does). Returns
+    {point, axis, radius} with the axis line through the circle centre, or None."""
+    n = len(centers)
+    if n < 3:
+        return None
+    a = _unit(axis)
+    ref = (1.0, 0.0, 0.0) if abs(a[0]) < 0.9 else (0.0, 1.0, 0.0)
+    e1 = _unit(_perp(ref, a))
+    e2 = (a[1] * e1[2] - a[2] * e1[1], a[2] * e1[0] - a[0] * e1[2],
+          a[0] * e1[1] - a[1] * e1[0])
+    pts = [(_dot(c, e1), _dot(c, e2)) for c in centers]
+    t_ax = [_dot(c, a) for c in centers]
+    if max(t_ax) - min(t_ax) > 1e-3:
+        return None  # not coplanar across the axis
+    # circumcentre of three well-spread members
+    (x1, y1), (x2, y2), (x3, y3) = pts[0], pts[n // 3], pts[(2 * n) // 3]
+    den = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    if abs(den) < 1e-9:
+        return None
+    s1, s2, s3 = x1 * x1 + y1 * y1, x2 * x2 + y2 * y2, x3 * x3 + y3 * y3
+    ux = (s1 * (y2 - y3) + s2 * (y3 - y1) + s3 * (y1 - y2)) / den
+    uy = (s1 * (x3 - x2) + s2 * (x1 - x3) + s3 * (x2 - x1)) / den
+    radii = [math.hypot(x - ux, y - uy) for x, y in pts]
+    r = sum(radii) / n
+    if r < 1e-6 or max(abs(q - r) for q in radii) > max(1e-4, 1e-5 * r):
+        return None
+    angs = sorted(math.degrees(math.atan2(y - uy, x - ux)) % 360.0 for x, y in pts)
+    step = 360.0 / n
+    if any(abs(((angs[(i + 1) % n] - angs[i]) % 360.0) - step) > 0.05 for i in range(n)):
+        return None
+    point = _add(_add(_scale(e1, ux), _scale(e2, uy)), _scale(a, t_ax[0]))
+    return {"point": [round(x, 6) for x in point], "axis": [round(x, 9) for x in a],
+            "radius": round(r, 6)}
+
+
 # ---------------------------------------------------------------- the 5-pass recognizer
 
 def _recognize(ref_doc_id: str) -> dict:
@@ -281,10 +555,11 @@ def _recognize(ref_doc_id: str) -> dict:
     Returns a PLAN (no geometry is written): {kind, base, holes, patterns, fillet_candidates,
     chamfer_candidates, claimed, unclaimed, notes}. Heuristics never suppress data — every
     source face lands either in `claimed` (with the pass that owns it) or in `unclaimed`."""
-    faces = cb.call("doc_query", {"doc_id": ref_doc_id,
-                                  "query": {"of": "face"}}).get("matches", [])
-    if not faces:
+    raw_faces = cb.call("doc_query", {"doc_id": ref_doc_id,
+                                      "query": {"of": "face"}}).get("matches", [])
+    if not raw_faces:
         raise ValueError(f"document {ref_doc_id!r} has no solid bodies to recognize")
+    faces = _merge_split_cylinders(raw_faces)
     try:
         adj = cb.call("doc_adjacency", {"doc_id": ref_doc_id})
     except Exception:  # noqa: BLE001
@@ -295,10 +570,10 @@ def _recognize(ref_doc_id: str) -> dict:
     dims = sorted(float(s) for s in size)
     diag = _norm(size)
 
-    plan: dict = {"kind": None, "base": None, "holes": [], "patterns": [],
+    plan: dict = {"kind": None, "base": None, "shell": None, "holes": [], "patterns": [],
                   "fillet_candidates": [], "chamfer_candidates": [],
                   "claimed": {}, "unclaimed": [], "notes": [],
-                  "face_count": len(faces), "bbox_mm": [round(s, 3) for s in size]}
+                  "face_count": len(raw_faces), "bbox_mm": [round(s, 3) for s in size]}
     claimed = plan["claimed"]
 
     planar = [f for f in faces if f.get("surf") == "plane"]
@@ -316,11 +591,16 @@ def _recognize(ref_doc_id: str) -> dict:
             continue
         if f.get("concavity") == "bore":
             continue  # concave/bore cylinders are the hole pass's material
+        if surf == "cylinder" and f.get("sweep_deg") is not None and _is_full_cylinder(f):
+            continue  # a full revolution is a boss/pin, never an edge blend
         c, ax = _f3(f, "centroid"), _f3(f, "axis")
         if c is None:
             continue
         near = list(c)
-        if surf == "cylinder" and ax is not None:
+        edge_pt = _blend_edge_point(f) if surf == "cylinder" else None
+        if edge_pt is not None:
+            near = list(edge_pt)
+        elif surf == "cylinder" and ax is not None:
             out = _unit(_perp(_sub(c, center), _unit(ax)))
             near = [c[i] + out[i] * 0.6 * float(r) for i in range(3)]
         plan["fillet_candidates"].append({
@@ -334,7 +614,7 @@ def _recognize(ref_doc_id: str) -> dict:
     adj_faces = adj.get("faces") or []
     neighbors = {af.get("ord"): af.get("neighbors") or [] for af in adj_faces
                  if isinstance(af, dict)}
-    for i, f in enumerate(faces):
+    for i, f in enumerate(raw_faces):
         if f.get("surf") != "plane":
             continue
         n_i = _f3(f, "normal")
@@ -342,9 +622,9 @@ def _recognize(ref_doc_id: str) -> dict:
             continue  # axis-aligned planes are base/lateral material, not chamfer bridges
         bridged = []
         for j in neighbors.get(i, []):
-            if not (0 <= j < len(faces)) or faces[j].get("surf") != "plane":
+            if not (0 <= j < len(raw_faces)) or raw_faces[j].get("surf") != "plane":
                 continue
-            n_j = _f3(faces[j], "normal")
+            n_j = _f3(raw_faces[j], "normal")
             if n_j is None:
                 continue
             angle = math.degrees(math.acos(max(-1.0, min(1.0, abs(_dot(_unit(n_i),
@@ -352,7 +632,8 @@ def _recognize(ref_doc_id: str) -> dict:
             if abs(angle - 45.0) <= 2.0:
                 bridged.append(j)
         if len(bridged) >= 2:
-            na, nb = _f3(faces[bridged[0]], "normal"), _f3(faces[bridged[1]], "normal")
+            na, nb = (_f3(raw_faces[bridged[0]], "normal"),
+                      _f3(raw_faces[bridged[1]], "normal"))
             if na is None or nb is None or abs(_dot(_unit(na), _unit(nb))) > 5e-2:
                 continue  # the two bridged planes must be perpendicular to each other
             width = None
@@ -368,12 +649,43 @@ def _recognize(ref_doc_id: str) -> dict:
             except Exception:  # noqa: BLE001
                 width = None
             c = _f3(f, "centroid")
+            length = width * math.cos(math.radians(45.0)) if width else None
+            if c is not None and length:
+                # the sharp edge the 45 deg bridge replaced sits length/sqrt(2) out along
+                # the bridge's normal from its midline
+                c = _add(c, _scale(_unit(n_i), length / math.sqrt(2.0)))
             plan["chamfer_candidates"].append({
                 "kind": "chamfer", "sids": [f.get("sid")],
-                "length": round(width * math.cos(math.radians(45.0)), 4) if width else None,
+                "length": round(length, 4) if length else None,
                 "near": [round(x, 4) for x in c] if c else None,
             })
             claimed[f.get("sid")] = "chamfer_candidate"
+
+    # Corner blends: where three blended edges meet, the kernel closes the corner with a
+    # sphere (fillets) or a small non-axis-aligned triangle (chamfers). They are produced by
+    # the blend feature itself, so they belong to it — not to the base, not unexplained.
+    fillet_rs = sorted({fc["radius"] for fc in plan["fillet_candidates"]})
+    for f in faces:
+        if f.get("surf") == "sphere" and f.get("sid") not in claimed and any(
+                abs(float(f.get("radius") or 0.0) - rr) <= 1e-3 for rr in fillet_rs):
+            claimed[f.get("sid")] = "fillet_corner"
+    chamfer_sids = {cc["sids"][0] for cc in plan["chamfer_candidates"]}
+    if chamfer_sids:
+        for i, f in enumerate(raw_faces):
+            if f.get("surf") != "plane" or f.get("sid") in claimed:
+                continue
+            n_i = _f3(f, "normal")
+            nb_sids = {raw_faces[j].get("sid") for j in neighbors.get(i, [])
+                       if 0 <= j < len(raw_faces)}
+            if n_i is not None and _principal_axis(n_i, 5e-2) is None and                     len(nb_sids) >= 3 and nb_sids <= chamfer_sids:
+                claimed[f.get("sid")] = "chamfer_corner"
+    # Setback of each blend from the sharp edge it replaced (fillet r; symmetric chamfer
+    # length): the distance the cap outline is pulled in from its lateral walls.
+    blend_setbacks = fillet_rs + sorted({cc["length"] for cc in plan["chamfer_candidates"]
+                                         if cc.get("length")})
+    dressup_sids = {sid for sid, tag in claimed.items()
+                    if tag in ("fillet_candidate", "chamfer_candidate", "fillet_corner",
+                               "chamfer_corner")}
 
     fillet_radii_by_axis: dict = defaultdict(list)
     for fc in plan["fillet_candidates"]:
@@ -405,9 +717,9 @@ def _recognize(ref_doc_id: str) -> dict:
 
     if turned_axis:
         w = _AXES[turned_axis]
-        segs = []
+        segs, bores = [], []
         for f in curved:
-            if f.get("surf") != "cylinder" or f.get("concavity") == "bore":
+            if f.get("surf") != "cylinder" or not _is_full_cylinder(f):
                 continue
             r = float(f.get("radius") or 0.0)
             area = float(f.get("area_or_len") or 0.0)
@@ -416,9 +728,10 @@ def _recognize(ref_doc_id: str) -> dict:
                 continue
             h = area / (2.0 * math.pi * r)
             tc = _dot(c, w)
-            segs.append({"t0": tc - h / 2.0, "t1": tc + h / 2.0, "r": r,
-                         "sid": f.get("sid")})
+            (bores if f.get("concavity") == "bore" else segs).append(
+                {"t0": tc - h / 2.0, "t1": tc + h / 2.0, "r": r, "sid": f.get("sid")})
         segs.sort(key=lambda s: s["t0"])
+        bores.sort(key=lambda s: s["t0"])
         cap_ts = sorted({round(_dot(_f3(f, "centroid"), w), 3) for f in planar
                          if _f3(f, "centroid")})
         if segs and cap_ts:
@@ -445,12 +758,18 @@ def _recognize(ref_doc_id: str) -> dict:
                     a["t1"], b["t0"] = mid, mid
             merged[0]["t0"] = min(merged[0]["t0"], cap_ts[0])
             merged[-1]["t1"] = max(merged[-1]["t1"], cap_ts[-1])
+            # Coaxial bores are the profile's INNER boundary (a tube is ONE revolve of an
+            # annulus, not a solid plus a hole). Spans snap to the caps like the outer ones.
+            for s in bores:
+                s["t0"], s["t1"] = snap(s["t0"]), snap(s["t1"])
             plan["kind"] = "turned"
             plan["base"] = {"type": "revolve", "axis": turned_axis, "segments": [
                 {"t0": round(s["t0"], 6), "t1": round(s["t1"], 6), "r": round(s["r"], 6)}
-                for s in merged]}
+                for s in merged], "bore_segments": [
+                {"t0": round(s["t0"], 6), "t1": round(s["t1"], 6), "r": round(s["r"], 6)}
+                for s in bores]}
             for f in curved:
-                if f.get("surf") == "cylinder" and f.get("concavity") != "bore":
+                if f.get("surf") == "cylinder" and _is_full_cylinder(f):
                     claimed[f.get("sid")] = "base"
             for f in planar:
                 claimed.setdefault(f.get("sid"), "base")
@@ -466,8 +785,14 @@ def _recognize(ref_doc_id: str) -> dict:
                                  "build a profile from")
 
     # ---- pass 1: prismatic base (when the turned pass didn't claim the body).
-    if plan["kind"] is None and planar:
-        f_base = max(planar, key=lambda f: float(f.get("area_or_len") or 0.0))
+    # A constant-wall hollow (shell) hides the prism behind its inner walls: the largest
+    # face's nearest antiparallel partner is the cavity floor, not the far cap. Recognize the
+    # SHARP outer prism from the outer faces alone and carry the hollow as a shell feature.
+    shell = _detect_shell(planar, bbox) if plan["kind"] is None and not curved else None
+    inner_sids = set(shell["inner_sids"]) if shell else set()
+    base_planar = [p for p in planar if p.get("sid") not in inner_sids]
+    if plan["kind"] is None and base_planar:
+        f_base = max(base_planar, key=lambda f: float(f.get("area_or_len") or 0.0))
         n_base = _f3(f_base, "normal")
         letter = _principal_axis(n_base) if n_base else None
         if letter is None:
@@ -476,7 +801,7 @@ def _recognize(ref_doc_id: str) -> dict:
         else:
             nb = _unit(n_base)
             partners = []
-            for p in planar:
+            for p in base_planar:
                 np_ = _f3(p, "normal")
                 if np_ is None or _dot(_unit(np_), nb) > -0.999:
                     continue
@@ -490,8 +815,11 @@ def _recognize(ref_doc_id: str) -> dict:
                 partners.sort(key=lambda pd: (-float(pd[0].get("area_or_len") or 0.0),
                                               -pd[1]))
                 f_part, depth = partners[0]
+                # blend faces (fillets/chamfers and their corners) and the shell's inner
+                # walls are explained by their own features, not by the extrude's laterals
                 rest = [f for f in faces if f.get("sid") not in
-                        (f_base.get("sid"), f_part.get("sid"))]
+                        (f_base.get("sid"), f_part.get("sid")) and
+                        f.get("sid") not in dressup_sids and f.get("sid") not in inner_sids]
                 rest_area = sum(float(f.get("area_or_len") or 0.0) for f in rest)
                 lateral = []
                 for f in rest:
@@ -525,6 +853,16 @@ def _recognize(ref_doc_id: str) -> dict:
                                                   fillet_radii_by_axis.get(letter, []))
                             res = _RESERVED[letter]
                             prof2 = _entities_to_reserved(prof, frame, res)
+                            if prof2 is not None and blend_setbacks:
+                                walls = []
+                                for f in lateral:
+                                    n, c = _f3(f, "normal"), _f3(f, "centroid")
+                                    if f.get("surf") != "plane" or n is None or c is None:
+                                        continue
+                                    n = _unit(n)
+                                    walls.append(((_dot(n, res["u"]), _dot(n, res["v"])),
+                                                  _dot(n, c)))
+                                prof2 = _unset_cap_profile(prof2, walls, blend_setbacks)
                             if prof2 is None:
                                 plan["notes"].append("base profile contains trimmed-ellipse "
                                                      "edges — not re-authorable exactly; base "
@@ -551,13 +889,26 @@ def _recognize(ref_doc_id: str) -> dict:
                                 claimed.setdefault(f_base.get("sid"), "base")
                                 claimed.setdefault(f_part.get("sid"), "base")
                                 for f in lateral:
-                                    if f.get("surf") == "plane":
+                                    # planar walls, and convex curved walls (a disc's rim):
+                                    # the profile's outer wire sweeps both. Bores stay the
+                                    # hole pass's material.
+                                    if f.get("surf") == "plane" or                                             f.get("concavity") == "boss":
                                         claimed.setdefault(f.get("sid"), "base")
+                                if shell:
+                                    plan["shell"] = shell
+                                    for sid in inner_sids:
+                                        claimed[sid] = "shell"
 
     # ---- pass 3: holes — bore-concavity cylinders entered from a planar cap.
     caps = [(f, _unit(_f3(f, "normal"))) for f in planar if _f3(f, "normal")]
     for f in curved:
         if f.get("surf") != "cylinder" or f.get("concavity") != "bore":
+            continue
+        if f.get("sid") in claimed:
+            continue  # a coaxial bore the turned profile already carries
+        if not _is_full_cylinder(f):
+            plan["notes"].append(f"bore {f.get('sid')} sweeps only {f.get('sweep_deg'):g} deg "
+                                 "— not a drilled hole; left unclaimed")
             continue
         r = float(f.get("radius") or 0.0)
         area = float(f.get("area_or_len") or 0.0)
@@ -616,6 +967,19 @@ def _recognize(ref_doc_id: str) -> dict:
         if len(idxs) < 3:
             continue
         members = [plan["holes"][i]["face"] for i in idxs]
+        ring = _ring_fit([tuple(plan["holes"][i]["center"]) for i in idxs],
+                         plan["holes"][idxs[0]]["axis"])
+        if ring is not None:
+            letter = _principal_axis(ring["axis"])
+            on_datum = letter is not None and _norm(_perp(tuple(ring["point"]),
+                                                          _AXES[letter])) < 1e-4
+            plan["patterns"].append({"type": "circular",
+                                     "axis": letter if on_datum else None,
+                                     "axis_line": {"point": ring["point"],
+                                                   "axis": ring["axis"]},
+                                     "radius": ring["radius"],
+                                     "count": len(idxs), "holes": idxs, "seed": idxs[0]})
+            continue
         rot = _axis_order(members)
         if rot and rot.get("order") == len(idxs):
             plan["patterns"].append({"type": "circular", "axis": rot["axis"],
@@ -641,6 +1005,12 @@ def _recognize(ref_doc_id: str) -> dict:
 
     # ---- always report what nothing claimed (the §3.4 rule: heuristics never suppress the
     # raw face list).
+    for f in faces:  # a merged split cylinder's claim covers every source half
+        tag = claimed.get(f.get("sid"))
+        if tag:
+            for m in f.get("member_sids") or ():
+                claimed.setdefault(m, tag)
+    faces = raw_faces
     plan["unclaimed"] = [
         {"sid": f.get("sid"), "surf": f.get("surf"), "side": f.get("side"),
          "concavity": f.get("concavity"), "radius": f.get("radius"),
@@ -683,6 +1053,10 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
         pts = [p for e in fw.get("entities", []) for p in
                (e.get("p1"), e.get("p2"), e.get("center"))
                if isinstance(p, list) and len(p) >= 2]
+        for e in fw.get("entities", []):  # a circle/arc spans its radius, not its centre
+            c, rr = e.get("center"), e.get("radius")
+            if isinstance(c, list) and len(c) >= 2 and rr:
+                pts += [[c[0] - rr, c[1] - rr], [c[0] + rr, c[1] + rr]]
         if not pts:
             return None
         half = min(max(p[0] for p in pts) - min(p[0] for p in pts),
@@ -1205,11 +1579,12 @@ def register_recon_tools(mcp: FastMCP) -> None:
                  approximate fit or one in reconstruction units is not evidence of metric
                  accuracy; obtain a confirmed scale before relying on any rebuilt dimension.
 
-        Pipeline: import -> deterministic recognition (prismatic/turned base, holes, patterns,
-        fillet/chamfer candidates) -> rebuild in batches (base -> holes -> patterns -> dress-
-        ups), running eval_compare against the source after EVERY batch; a batch that fails to
-        build or makes the match WORSE is reverted and listed under `rejected`. Dress-ups are
-        applied only when a plain-word edge query resolves on the rebuilt body; otherwise they
+        Pipeline: import -> deterministic recognition (prismatic/turned base, shell, holes,
+        patterns, fillet/chamfer candidates) -> rebuild in batches (base -> shell -> holes ->
+        patterns -> dress-ups), running eval_compare against the source after EVERY batch; a
+        batch that fails to build or makes the match WORSE is reverted and listed under
+        `rejected`. Dress-ups are applied only when a plain-word edge query resolves on the
+        rebuilt body (same-size blends as ONE feature over all their edges); otherwise they
         stay in `candidates` for you to try by hand.
 
         Returns {ok, doc_id, ref_doc_id, match_pct, features, rejected, candidates,
@@ -1381,11 +1756,23 @@ def register_recon_tools(mcp: FastMCP) -> None:
                 letter = base["axis"]
                 segs = base["segments"]
                 t_lo, t_hi = segs[0]["t0"], segs[-1]["t1"]
-                pts = [(0.0, t_lo)]
+                # inner boundary: the coaxial bores, with the axis (r=0) filling any span no
+                # bore covers — a solid shaft is the special case of no bores at all
+                inner, t_at = [], t_lo
+                for s in base.get("bore_segments") or []:
+                    if s["t0"] > t_at + 1e-9:
+                        inner.append({"t0": t_at, "t1": s["t0"], "r": 0.0})
+                    inner.append(s)
+                    t_at = max(t_at, s["t1"])
+                if t_at < t_hi - 1e-9:
+                    inner.append({"t0": t_at, "t1": t_hi, "r": 0.0})
+                pts = []
                 for s in segs:
                     pts.append((s["r"], s["t0"]))
                     pts.append((s["r"], s["t1"]))
-                pts.append((0.0, t_hi))
+                for s in reversed(inner):
+                    pts.append((s["r"], s["t1"]))
+                    pts.append((s["r"], s["t0"]))
                 # (radius, axis-position) -> sketch (u, v) on the reserved plane CONTAINING
                 # the axis: z -> plane.front (u=r along +X, v=t along +Z); x -> plane.front
                 # (u=t, v=r); y -> plane.top (u=r along +X, v=t along +Y).
@@ -1400,10 +1787,13 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                "p2": [round(b[0], 6), round(b[1], 6)]}
                               for a, b in zip(uv, uv[1:] + uv[:1])
                               if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-9])
-                r_min = min(s["r"] for s in segs)
-                mid = 0.5 * (t_lo + t_hi)
-                cen = ((r_min / 2.0, mid) if letter == "z" else
-                       (mid, r_min / 2.0) if letter == "x" else (r_min / 2.0, mid))
+                # region pick: mid-wall of the longest outer span
+                s_pick = max(segs, key=lambda s: s["t1"] - s["t0"])
+                mid = 0.5 * (s_pick["t0"] + s_pick["t1"])
+                r_in = next((s["r"] for s in inner if s["t0"] <= mid <= s["t1"]), 0.0)
+                r_mid = 0.5 * (r_in + s_pick["r"])
+                cen = ((r_mid, mid) if letter == "z" else
+                       (mid, r_mid) if letter == "x" else (r_mid, mid))
                 ops = [
                     {"op": "add_feature", "feature": {
                         "type": "sketch", "name": "TurnProfile",
@@ -1427,6 +1817,27 @@ def register_recon_tools(mcp: FastMCP) -> None:
             else:
                 notes.append("no deterministic base recognized — nothing was rebuilt; see "
                              "`recognition` for the raw face evidence")
+
+            # ---------------- batch 1b: shell (hollow the sharp prism, opening its faces)
+            shell = plan.get("shell")
+            if shell and applied:
+                op = {"op": "add_feature", "feature": {
+                    "type": "shell", "name": "Shell",
+                    "params": {"thickness": _dim(shell["thickness"])},
+                    "refs": {"remove": [{"of": "face", "surf": "flat", "near": o["near"],
+                                         "count": 1} for o in shell["open"]]}}}
+                if len(shell["open"]) == 1:  # a lone geometry query is the documented form
+                    op["feature"]["refs"]["remove"] = op["feature"]["refs"]["remove"][0]
+                r = apply_batch(f"shell t{shell['thickness']:g}", [op])
+                if r:
+                    applied.append({"id": (r.get("id_map") or {}).get("$0"), "type": "shell",
+                                    "name": "Shell", "role": "shell",
+                                    "thickness_mm": shell["thickness"],
+                                    "open_faces": len(shell["open"])})
+                else:
+                    candidates.append({"kind": "shell", "thickness": shell["thickness"],
+                                       "open": shell["open"],
+                                       "note": "shell batch was rejected — see rejected"})
 
             # ---------------- batch 2: holes (pattern seeds + singles)
             hole_ids: dict = {}
@@ -1555,7 +1966,8 @@ def register_recon_tools(mcp: FastMCP) -> None:
                         "type": "circular_pattern", "name": "HoleRing",
                         "params": {"count": p["count"], "angle": _dim(360),
                                    "equal_spacing": True},
-                        "refs": {"axis": {"kind": "datum", "feature": f"axis.{p['axis']}"},
+                        "refs": {"axis": ({"kind": "datum", "feature": f"axis.{p['axis']}"}
+                                          if p.get("axis") else p["axis_line"]),
                                  "features": [seed_fid]}}}
                 else:
                     op = {"op": "add_feature", "feature": {
@@ -1576,8 +1988,13 @@ def register_recon_tools(mcp: FastMCP) -> None:
 
             # ---------------- batch 4: dress-ups (fillets, then chamfers) — applied only
             # when a plain-word edge query RESOLVES on the rebuilt body (the spec's gate).
+            # Same-size blends go in as ONE feature over all their edges, the way a designer
+            # picks them: blending edges one feature at a time leaves different corner
+            # geometry than one simultaneous blend (the sphere/triangle corners of a box with
+            # every edge broken), so the per-edge form is only the fallback.
             for group, feat_type, param_key in (("fillet_candidates", "fillet", "radius"),
                                                 ("chamfer_candidates", "chamfer", "length")):
+                by_size: dict = {}
                 for cand in plan[group]:
                     val = cand.get(param_key)
                     near = cand.get("near")
@@ -1594,32 +2011,47 @@ def register_recon_tools(mcp: FastMCP) -> None:
                         resolved = em[0] if em else None
                     except Exception:  # noqa: BLE001
                         resolved = None
-                    if resolved and feat_type == "fillet" and cand.get("axis") and \
-                            resolved.get("surf") == "line":
+                    if resolved and feat_type == "fillet" and cand.get("axis") and                             resolved.get("surf") == "line":
                         eax = _f3(resolved, "axis")
-                        if eax is not None and \
-                                abs(abs(_dot(_unit(eax), _unit(cand["axis"]))) - 1.0) > 1e-2:
+                        if eax is not None and                                 abs(abs(_dot(_unit(eax), _unit(cand["axis"]))) - 1.0) > 1e-2:
                             resolved = None  # resolved a stray edge, not the sharp corner
                     if not resolved:
                         candidates.append({**{k: v for k, v in cand.items() if k != "axis"},
                                            "note": "edge query did not resolve on the "
                                                    "rebuilt body — try applying by hand"})
                         continue
-                    op = {"op": "add_feature", "feature": {
+                    if any(x.get("sid") == resolved.get("sid") and x.get("sid")
+                           for _c, _q, x in by_size.get(round(val, 4), [])):
+                        continue  # two blend faces (a split fillet) over the same edge
+                    by_size.setdefault(round(val, 4), []).append((cand, edge_q, resolved))
+
+                def blend_op(val: float, qs: list) -> dict:
+                    return {"op": "add_feature", "feature": {
                         "type": feat_type, "name": f"{feat_type.capitalize()}"
                                                    f"{len(applied) + 1}",
-                        "params": {param_key: _dim(val)}, "refs": {"edges": edge_q}}}
-                    r = apply_batch(f"{feat_type} r{val:g}", [op])
-                    if r:
-                        applied.append({"id": (r.get("id_map") or {}).get("$0"),
-                                        "type": feat_type,
-                                        "name": op["feature"]["name"], "role": "dressup",
-                                        param_key: val, "edge": resolved.get("sid")})
-                    else:
-                        candidates.append({**{k: v for k, v in cand.items()
-                                              if k != "axis"},
-                                           "note": "applied but the match regressed — "
-                                                   "reverted (see rejected)"})
+                        "params": {param_key: _dim(val)},
+                        "refs": {"edges": qs[0] if len(qs) == 1 else qs}}}
+
+                for val, items in by_size.items():
+                    tries = [items] if len(items) == 1 else [items] + [[it] for it in items]
+                    for k, chunk in enumerate(tries):
+                        op = blend_op(val, [q for _c, q, _r in chunk])
+                        r = apply_batch(f"{feat_type} {param_key[0]}{val:g}"
+                                        f" x{len(chunk)}", [op])
+                        if r:
+                            applied.append({"id": (r.get("id_map") or {}).get("$0"),
+                                            "type": feat_type,
+                                            "name": op["feature"]["name"], "role": "dressup",
+                                            param_key: val, "edge_count": len(chunk),
+                                            "edges": [x.get("sid") for _c, _q, x in chunk]})
+                            if k == 0:
+                                break  # the grouped blend held: no per-edge fallback
+                        else:
+                            for cand, _q, _r in chunk if (k > 0 or len(items) == 1) else ():
+                                candidates.append(
+                                    {**{kk: v for kk, v in cand.items() if kk != "axis"},
+                                     "note": "applied but the build failed or the match "
+                                             "regressed — reverted (see rejected)"})
 
             # ---------------- batch 5 (RE-14): fitted-primitive HINTS.
             # Cylinder fits the frozen passes could not recover are authored AFTER the

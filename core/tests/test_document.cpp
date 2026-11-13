@@ -527,6 +527,47 @@ TEST_CASE("returning to a recent parameter value restores its branch checkpoints
     CHECK(report.at("checkpoints_written").get<int>() == 3);
 }
 
+TEST_CASE("moving a sketch dimension label reuses every checkpoint after the sketch") {
+    using namespace chudware::doc;
+    json doc;
+    doc["features"] = json::array({
+        {{"id", "base"}, {"type", "box"}, {"name", "Base"},
+         {"length", 40.0}, {"width", 40.0}, {"height", 10.0}},
+        {{"id", "holes"}, {"type", "sketch"}, {"name", "Holes"}, {"refs", {{"plane", "plane.top"}}},
+         {"params", {
+             {"entities", json::array({{{"id", "e1"}, {"type", "circle"},
+                                        {"center", {5.0, 5.0}}, {"radius", 2.0}}})},
+             {"constraints", json::array({{{"id", "c1"}, {"type", "radius"}, {"refs", {"e1"}},
+                                           {"value", {{"value", 2.0}}},
+                                           {"placement", {9.0, 9.0}}}})}}}},
+        {{"id", "cut"}, {"type", "extrude"}, {"name", "Cut"},
+         {"params", {{"depth", 5.0}, {"end", "blind"}, {"mode", "cut"}}},
+         {"refs", {{"profile", json::array({{{"kind", "region"}, {"sketch", "holes"}}})}}}},
+        {{"id", "top"}, {"type", "box"}, {"name", "Top"},
+         {"length", 4.0}, {"width", 4.0}, {"height", 4.0}, {"at", {0.0, 0.0, 10.0}}},
+    });
+    const json env = json::object();
+    auto cache = make_compile_cache();
+    const CompileResult original = compile_document(doc, env, cache.get());
+    REQUIRE(original.ok);
+
+    json& placement = doc["features"][1]["params"]["constraints"][0]["placement"];
+    placement = {30.0, -12.5};
+    const CompileResult moved = compile_document(doc, env, cache.get());
+    REQUIRE(moved.ok);
+    CHECK(moved.features_executed == 0);
+    CHECK(moved.features_reused == 4);
+    CHECK(moved.volume == doctest::Approx(original.volume));
+
+    // The radius is geometry: changing it still rebuilds the sketch and what follows.
+    doc["features"][1]["params"]["constraints"][0]["value"]["value"] = 3.0;
+    doc["features"][1]["params"]["entities"][0]["radius"] = 3.0;
+    const CompileResult resized = compile_document(doc, env, cache.get());
+    REQUIRE(resized.ok);
+    CHECK(resized.features_executed == 3);
+    CHECK(resized.volume < original.volume);
+}
+
 TEST_CASE("independent pipes retain feature and persisted display caches after deletion") {
     using namespace chudware::doc;
     json doc = {{"features", json::array()}};

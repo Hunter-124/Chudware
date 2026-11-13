@@ -2186,8 +2186,10 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
         st.addLog("[sketch] " + msg);
         st.toast(ui::ToastLevel::Warn, msg);
     }
-    // Resync the mirror revision (sketch_exit bumps it server-side).
-    resyncMirror(st);
+    // The exit reply is the complete build: its tree, revision and feature statuses replace the
+    // session's rolled-back view. doc_tree carries no statuses, so resyncing alone would leave
+    // every feature after the sketch marked rolled back.
+    if (!exited || !st.docMirror.ingestTreeResponse(res)) resyncMirror(st);
     // Empty-sketch cleanup: Finish removes empty sketches; Cancel removes only a new empty sketch.
     // If dependents exist, keep the feature and warn rather than cascading their deletion.
     if (st.docMirror.docId() == docId_ && cancelRevision_ >= 0 &&

@@ -332,10 +332,31 @@ static uint64_t cc_fnv1a(const std::string& s, uint64_t seed = 14695981039346656
     return h;
 }
 
-// `fillet_effective` is persisted derived output, not a feature input. Use the
-// same canonical hash for both prefix and suffix dependencies, so a refresh of
-// that record cannot invalidate geometry checkpoints.
+// A sketch constraint's `placement` only positions its dimension label on screen; no
+// compile reads it. True when the sketch's constraints (params or flat) carry one.
+static bool placed_sketch_constraints(const json& feature) {
+    if (!feature.is_object() || feature.value("type", std::string()) != "sketch") return false;
+    const auto params = feature.find("params");
+    const json& owner = params != feature.end() && params->is_object() ? *params : feature;
+    const auto constraints = owner.find("constraints");
+    if (constraints == owner.end() || !constraints->is_array()) return false;
+    return std::any_of(constraints->begin(), constraints->end(),
+                       [](const json& c) { return c.is_object() && c.contains("placement"); });
+}
+
+// `fillet_effective` is persisted derived output, not a feature input, and a sketch
+// dimension's label `placement` is presentation. Use the same canonical hash for both
+// prefix and suffix dependencies, so neither can invalidate geometry checkpoints; a
+// feature without them hashes byte-for-byte as before, keeping saved caches valid.
 uint64_t cc_hash_feature(const json& feature, uint64_t seed) {
+    if (placed_sketch_constraints(feature)) {
+        json input = feature;
+        const auto params = input.find("params");
+        json& owner = params != input.end() && params->is_object() ? *params : input;
+        for (json& c : owner["constraints"])
+            if (c.is_object()) c.erase("placement");
+        return cc_fnv1a(input.dump(), seed);
+    }
     auto data = feature.is_object() ? feature.find("data") : feature.end();
     if (feature.is_object() && feature.value("type", std::string()) == "fillet" &&
         data != feature.end() && data->is_object() &&

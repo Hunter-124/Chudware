@@ -67,14 +67,14 @@ class SiteMetrics:
                 "SELECT toDate(timestamp) AS day, count() AS requests, "
                 f"sumIf(1, {_PAGEVIEW}) AS pageviews, "
                 "countIf(double1 = 404) AS not_found, "
-                f"uniqExact(blob4) AS unique_ips FROM chudware_requests "
+                f"count(DISTINCT blob4) AS unique_ips FROM chudware_requests "
                 "WHERE timestamp > now() - INTERVAL '30' DAY GROUP BY day ORDER BY day")
             paths = await self._query(
                 "SELECT blob2 AS path, count() AS hits FROM chudware_requests "
                 f"WHERE timestamp > now() - INTERVAL '7' DAY AND {_PAGEVIEW} "
                 "GROUP BY path ORDER BY hits DESC LIMIT 15")
             statuses = await self._query(
-                "SELECT toString(double1) AS status, count() AS hits FROM chudware_requests "
+                "SELECT double1 AS status, count() AS hits FROM chudware_requests "
                 "WHERE timestamp > now() - INTERVAL '7' DAY GROUP BY status ORDER BY hits DESC")
         except (httpx.HTTPError, ValueError) as exc:
             return {"configured": True, "error": type(exc).__name__}
@@ -85,6 +85,7 @@ class SiteMetrics:
         self._cache = {"configured": True, "today": today, "daily": rows,
                        "top_paths_7d": [{"path": r.get("path", ""), "hits": int(r.get("hits", 0))}
                                         for r in paths],
-                       "statuses_7d": {str(r.get("status", "")): int(r.get("hits", 0)) for r in statuses}}
+                       "statuses_7d": {str(int(float(r.get("status", 0)))): int(r.get("hits", 0))
+                                       for r in statuses}}
         self._cache_at = now
         return self._cache

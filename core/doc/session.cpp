@@ -2046,6 +2046,7 @@ thread_local Session* apply_session = nullptr;
 // rolled-back view the reply displays.
 thread_local const std::string* apply_interactive_stop = nullptr;
 bool inc_rebuild_enabled();
+std::size_t history_position(const json& doc, const std::string& fid);
 chudware::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat,
                                                   const CompileResult* pre);
 chudware::geom::SketchPlane cached_external_sketch_plane(
@@ -2761,7 +2762,32 @@ void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, j
                       {{"reason", "feature_failed"}});
     auto& context = apply_session->external_projection_cache;
     const auto plane = cached_external_sketch_plane(doc, sk, pre, context);
-    json res = project_external_refs(doc, plane, refs, &pre, false, &context);
+    json res;
+    try {
+        res = project_external_refs(doc, plane, refs, &pre, false, &context);
+    } catch (const OpError&) {
+        // An interactive session resolves sources on the history through this sketch. A
+        // source made by a LATER feature does not exist there; name that instead of the
+        // generic "selector does not match live geometry".
+        if (apply_interactive_stop) {
+            const std::size_t sketch_pos = history_position(doc, sk.value("id", std::string()));
+            for (const json& ref : refs) {
+                const json* sel = ref.is_object() && ref.contains("selector") ? &ref["selector"] : nullptr;
+                if (!sel || !sel->is_object() || !(*sel).contains("owner_feature") ||
+                    !(*sel)["owner_feature"].is_string()) continue;
+                const std::string owner = (*sel)["owner_feature"].get<std::string>();
+                const std::size_t owner_pos = history_position(doc, owner);
+                if (owner_pos != std::string::npos && owner_pos > sketch_pos)
+                    throw OpError("invalid_op",
+                                  "sketch_convert: the selected geometry is made by feature '" +
+                                      owner + "', which comes after this sketch in the history; a "
+                                      "sketch can only reference geometry built before it. Move the "
+                                      "sketch below '" + owner + "' or pick earlier geometry.",
+                                  {{"reason", "future reference"}, {"owner_feature", owner}});
+            }
+        }
+        throw;
+    }
     const bool constr = op.value("construction", true);
     const bool fix = op.value("fix", true);
     const bool assoc = op.value("associative", true);
@@ -6666,6 +6692,18 @@ const CompileResult& sketch_session_compiled(Session& s, const std::string& sket
                           {{"sketch", sketch_fid}});
         return *s.sketch_prefix;
     }
+    return ensure_compiled(s);
+}
+
+// The build the viewport is drawing. An interactive sketch session shows its rolled-back
+// view (respond_through), so a clicked topo_id indexes THAT build's topology; resolving it
+// against the complete history named a different edge/face (often one a later feature
+// made) and the sketch_convert that followed, which reads the same rolled-back view,
+// rejected the selector as dangling. ensure_compiled would also discard the view.
+const CompileResult& displayed_compiled(Session& s) {
+    if (s.sketch_prefix && s.sketch_prefix_rev == s.revision &&
+        !(s.compiled && s.compiled_rev == s.revision))
+        return *s.sketch_prefix;
     return ensure_compiled(s);
 }
 // Model-history analysis deliberately inspects authored JSON only. It is not a
@@ -12331,7 +12369,7 @@ json doc_resolve_pick(const std::string& doc_id, int body_id, const std::string&
     Session& s = require_session(doc_id);
     if (s.is_assembly())
         return resolve_pick_assembly(s, body_id, kind, topo_id);
-    json sel = resolve_pick(ensure_compiled(s), body_id, kind, topo_id);
+    json sel = resolve_pick(displayed_compiled(s), body_id, kind, topo_id);
     if (!sel.is_object())
         throw OpError("invalid_op", "No live " + kind + " " + std::to_string(topo_id) +
                       " on body " + std::to_string(body_id) + "; select the geometry again.",
@@ -12345,7 +12383,7 @@ json doc_face_edges(const std::string& doc_id, int body_id, int face_topo_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) return json{{"edges", json::array()}};  // not supported for assemblies
-    std::vector<int> e = face_edges(ensure_compiled(s), body_id, face_topo_id);
+    std::vector<int> e = face_edges(displayed_compiled(s), body_id, face_topo_id);
     return json{{"edges", e}};
 }
 

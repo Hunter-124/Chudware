@@ -1380,3 +1380,53 @@ TEST_CASE("bulk edits promote auto dimensions and change existing explicit inten
               .at("params").at("constraints") == second);
     chudware::doc::doc_close(doc);
 }
+
+// While a sketch is edited the viewport draws the history only through that sketch, so a
+// clicked topo_id indexes THAT build. doc_resolve_pick used to resolve it against the complete
+// history, naming a different edge (here: one the later cut makes), and the sketch_convert that
+// followed — which reads the rolled-back view — refused it as "does not match live geometry".
+TEST_CASE("convert: a pick in a rolled-back sketch session resolves on the displayed build") {
+    using chudware::doc::doc_resolve_pick;
+    const std::string doc = make_box("RolledBackPick", 40, 30, 20);
+    const std::string sketch = add_projection_sketch(doc, 50);
+    const json cut = doc_apply_ops(doc, -1, json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "box"}, {"name", "Notch"},
+             {"params", {{"length", 10}, {"width", 10}, {"height", 10}, {"at", {20, 15, 20}},
+                         {"mode", "cut"}}}}}}}), false);
+    const std::string notch = cut.at("id_map").at("$0").get<std::string>();
+    for (const auto& status : cut.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+
+    // A cut edge picked from the complete model refuses as a reference to LATER geometry.
+    const json notch_edge = doc_query(doc, {{"of", "edge"}, {"near", {20, 15, 20}}, {"count", 1}});
+    REQUIRE(notch_edge.at("count").get<int>() == 1);
+    REQUIRE(notch_edge.at("matches").front().at("owner_feature") == notch);
+    const auto session = doc_sketch_enter(doc, sketch).at("session_id").get<std::uint64_t>();
+    bool refused = false;
+    try {
+        doc_apply_ops(doc, -1, json::array({json{{"op", "sketch_convert"}, {"sketch", sketch},
+            {"refs", json::array({json{{"kind", "edge"},
+                                       {"selector", notch_edge.at("matches").front()}}})}}}),
+            false, true, false, session, false);
+    } catch (const chudware::doc::OpError& error) {
+        refused = true;
+        CHECK(error.detail.at("reason") == "future reference");
+        CHECK(error.detail.at("owner_feature") == notch);
+    }
+    CHECK(refused);
+
+    // An in-session edit switches the display to the rolled-back view (box only, 12 edges).
+    const json edit = doc_apply_ops(doc, -1, json::array({json{{"op", "sketch_add_entity"},
+        {"sketch", sketch}, {"entity", line("e90", 0, -5, 1, -5)}}}), false, true, false, session, false);
+    REQUIRE(edit.at("rebuild").at("doc_status").at("rolled_back_to") == sketch);
+    CHECK_THROWS_AS(doc_resolve_pick(doc, 1, "edge", 13), chudware::doc::OpError);
+    for (int i = 1; i <= 12; ++i) {
+        const json selector = doc_resolve_pick(doc, 1, "edge", i).at("selector");
+        CHECK(selector.at("owner_feature") != notch);
+        const json converted = doc_apply_ops(doc, -1, json::array({json{{"op", "sketch_convert"},
+            {"sketch", sketch}, {"refs", json::array({json{{"kind", "edge"}, {"selector", selector}}})}}}),
+            false, true, false, session, false);
+        CHECK(converted.at("rebuild").at("doc_status").at("rolled_back_to") == sketch);
+    }
+    chudware::doc::doc_close(doc);
+}

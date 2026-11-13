@@ -800,8 +800,59 @@ void drain_tracked_background_tasks() {
         // A task can enqueue descendants; collect them on the next pass.
     }
 }
-// Serializes lookup-or-open with every native path binding save.
-std::mutex g_open_path_mtx;
+// Serializes lookup-or-open, close and path-binding saves of the SAME file, so reuse-open
+// can neither miss a session being bound nor select one being closed. Per file, not global:
+// one global mutex made a cached open wait out an unrelated part's full rebuild/write-back.
+// A file is keyed by its canonical spelling plus, when it exists, its device/inode identity
+// (hard-link aliases share that key, matching find_open_by_path_except's fs::equivalent).
+// Locks are taken in sorted key order; never nest two PathLocks on one thread.
+std::mutex g_path_locks_mtx;
+std::map<std::string, std::weak_ptr<std::mutex>> g_path_locks;
+
+class PathLocks {
+public:
+    explicit PathLocks(std::initializer_list<std::string> paths) {
+        std::vector<std::string> keys;
+        for (const std::string& path : paths) {
+            if (path.empty()) continue;
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            fs::path canon = fs::weakly_canonical(fs::u8path(path), ec);
+            if (ec) canon = fs::absolute(fs::u8path(path), ec).lexically_normal();
+            keys.push_back("p:" + native_policy::path_utf8(canon));
+            const NativeFileStamp stamp = stepplus_file_stamp(path);
+            if (stamp.valid)
+                keys.push_back("i:" + std::to_string(stamp.device) + ":" +
+                               std::to_string(stamp.ino));
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        {
+            std::lock_guard<std::mutex> registry(g_path_locks_mtx);
+            for (const std::string& key : keys) {
+                std::shared_ptr<std::mutex> m = g_path_locks[key].lock();
+                if (!m) g_path_locks[key] = m = std::make_shared<std::mutex>();
+                held_.emplace_back(key, std::move(m));
+            }
+        }
+        for (auto& entry : held_) entry.second->lock();
+    }
+    ~PathLocks() {
+        for (auto it = held_.rbegin(); it != held_.rend(); ++it) it->second->unlock();
+        std::lock_guard<std::mutex> registry(g_path_locks_mtx);
+        for (auto& [key, m] : held_) {
+            m.reset();
+            auto it = g_path_locks.find(key);
+            if (it != g_path_locks.end() && it->second.expired()) g_path_locks.erase(it);
+        }
+    }
+    PathLocks(const PathLocks&) = delete;
+    PathLocks& operator=(const PathLocks&) = delete;
+
+private:
+    std::vector<std::pair<std::string, std::shared_ptr<std::mutex>>> held_;
+};
+
 // Leaf lock for Session::path_index; never held while taking another lock.
 std::mutex g_path_index_mtx;
 
@@ -11914,7 +11965,8 @@ json doc_asm_bom_components(const std::string& doc_id) {
     return out;
 }
 
-// The caller holds g_open_path_mtx so reuse-open cannot select a closing session.
+// The caller holds the PathLocks of the doc's bound file so reuse-open cannot select a
+// closing session.
 static bool doc_close_with_path_lock(const std::string& doc_id) {
     // Pin the session WITHOUT erasing it yet — the erase only happens once we know the
     // session isn't mid-operation (see try_lock below).
@@ -11975,9 +12027,28 @@ static bool doc_close_with_path_lock(const std::string& doc_id) {
     return true;
 }
 
+// The doc's bound file, or "" for an unknown/unbound doc (path_index, never `mtx`, so a
+// long op on the doc cannot stall this read).
+static std::string session_bound_path(const std::string& doc_id) {
+    std::shared_ptr<Session> pin;
+    {
+        std::lock_guard<std::mutex> reg(g_registry_mtx);
+        auto it = g_sessions.find(doc_id);
+        if (it == g_sessions.end()) return {};
+        pin = it->second;
+    }
+    std::lock_guard<std::mutex> index(g_path_index_mtx);
+    return pin->path_index;
+}
+
 bool doc_close(const std::string& doc_id) {
-    std::lock_guard<std::mutex> paths(g_open_path_mtx);
-    return doc_close_with_path_lock(doc_id);
+    // A save-as can rebind the doc between the read and the lock: retry on the new file.
+    for (;;) {
+        const std::string bound = session_bound_path(doc_id);
+        PathLocks paths({bound});
+        if (session_bound_path(doc_id) != bound) continue;
+        return doc_close_with_path_lock(doc_id);
+    }
 }
 
 json doc_list() {
@@ -24199,7 +24270,15 @@ static json save_recovery_snapshot(const std::string& doc_id, const std::string&
 
 json doc_save(const std::string& doc_id, const std::string& path, bool preserve_path, bool force,
               bool overwrite_changed, const json& expected_disk_stamp) {
-    std::lock_guard<std::mutex> paths(g_open_path_mtx);
+    // Lock both the destination and the doc's current file (a save-as rebinds it away);
+    // a concurrent rebind between the read and the lock retries on the new file.
+    std::optional<PathLocks> paths;
+    for (;;) {
+        const std::string bound = session_bound_path(doc_id);
+        paths.emplace(std::initializer_list<std::string>{path.empty() ? bound : path, bound});
+        if (session_bound_path(doc_id) == bound) break;
+        paths.reset();
+    }
     std::string target = path;
     if (target.empty()) {
         DocLock lock;
@@ -25319,7 +25398,9 @@ static json doc_open_impl(const std::string& path, bool as_solid, bool detach_pa
     // through the import lane, which mints a new part doc with the file's geometry baked in.
     if (!path.empty() && !is_stepplus_path(path))
         return doc_import_file(path, "", as_solid, "");
-    std::lock_guard<std::mutex> paths(g_open_path_mtx);
+    // Held for the whole open (rebuild + write-back included) but only against this file:
+    // opening, closing or saving any other document proceeds in parallel.
+    PathLocks paths({path, recovered && detach_path ? recovery_original_path : std::string()});
     if (recovered && detach_path && !recovery_original_path.empty()) {
         if (native_policy::rooted()) native_policy::authored_reference(recovery_original_path);
         const std::string other = find_open_by_path_except(recovery_original_path, {});

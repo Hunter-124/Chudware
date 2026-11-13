@@ -11350,6 +11350,69 @@ TEST_CASE("reuse-open of one file never waits on another busy document") {
     CHECK(again.at("doc_id") == opened.at("doc_id"));
 }
 
+TEST_CASE("open and close of one file never wait on another file's open or save") {
+    // Path binding is serialized per file. A save (or a cache-missing rebuild inside doc_open)
+    // of one part held a process-wide lock, so opening/closing any other part waited it out.
+    using namespace chudware::doc;
+    using Clock = std::chrono::steady_clock;
+    const std::string busy = doc_new("part", "BusySave").at("doc_id");
+    const std::string seed = doc_new("part", "FreeTarget").at("doc_id");
+    const auto dir = std::filesystem::temp_directory_path() / (seed + "-busy-save");
+    std::filesystem::create_directories(dir);
+    const auto busy_path = dir / "busy.step+";
+    const auto path = dir / "target.step+";
+    std::vector<std::string> ids{busy};
+    struct Cleanup {
+        std::filesystem::path dir;
+        std::vector<std::string>& ids;
+        ~Cleanup() {
+            for (const auto& id : ids) try { doc_close(id); } catch (...) {}
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{dir, ids};
+    doc_save(busy, busy_path.string());
+    doc_save(seed, path.string());
+    REQUIRE(doc_close(seed));
+
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    std::pair<std::atomic<bool>*, std::atomic<bool>*> flags_ctx{&held, &release};
+    std::thread holder([&] {
+        with_doc_lock_for_testing(busy, [](void* context) {
+            auto& flags = *static_cast<std::pair<std::atomic<bool>*, std::atomic<bool>*>*>(context);
+            const auto deadline = Clock::now() + std::chrono::seconds(10);
+            flags.first->store(true, std::memory_order_release);
+            while (!flags.second->load(std::memory_order_acquire) && Clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }, &flags_ctx);
+    });
+    std::thread saver;
+    struct Join {
+        std::atomic<bool>& release;
+        std::thread& holder;
+        std::thread& saver;
+        ~Join() {
+            release.store(true, std::memory_order_release);
+            if (holder.joinable()) holder.join();
+            if (saver.joinable()) saver.join();
+        }
+    } join{release, holder, saver};
+    const auto ready_deadline = Clock::now() + std::chrono::seconds(1);
+    while (!held.load(std::memory_order_acquire) && Clock::now() < ready_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(held.load(std::memory_order_acquire));
+    // The save takes busy.step+'s path lock, then blocks on the held document.
+    saver = std::thread([&] { try { doc_save(busy, busy_path.string()); } catch (...) {} });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    const auto opened_at = Clock::now();
+    const json opened = doc_open(path.string(), false, false, false, true);
+    const std::string opened_id = opened.at("doc_id");
+    CHECK(doc_close(opened_id));
+    CHECK(Clock::now() - opened_at < std::chrono::seconds(5));  // the holder keeps it 10 s
+}
+
 TEST_CASE("native path reuse, guarded save and in-place cached reload") {
     using namespace chudware::doc;
     const std::string seed = doc_new("part", "ReuseSeed").at("doc_id");

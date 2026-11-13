@@ -83,6 +83,10 @@ scripts/testbox.py --gate                                        # full Linux ga
 - C++17 baseline; the mesh, manufacturing, twin, and print layers (and a few tests) require
   C++20 via `cxx_std_20`. CUDA is an optional LBM backend (`CHUDWARE_WITH_CUDA`, default OFF).
   MSVC builds use `/utf-8 /MP`.
+- Separate projects, experiments, and design workspaces (anything with its own runtime
+  dirs, nested git checkout, or bulk generated exports) live outside this checkout, e.g.
+  `~/Repositories/<name>`, and reach Chudware via `PYTHONPATH`/env. Never leave
+  generated JSON/Gerber/SVG dumps, tool logs, or runtime state in the repo tree.
 - Keep changes minimal and scoped; a bug fix does not clean up unrelated code. Build only
   what the change needs: no speculative options, single-implementation interfaces, or
   unused parameters. Delete dead code rather than keeping it "just in case".

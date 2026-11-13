@@ -58,6 +58,12 @@ node_modules/
 
 # Scratch and runtime output
 scratch/
+# Stray tool logs at the repo root (OpenMVS, solvers, etc.)
+/*.log
+# Per-user Claude Code settings
+/.claude/settings.local.json
+# Separate project workspaces belong outside this checkout (see AGENTS.md)
+/wallhack_rf/
 /preflight_events.jsonl
 /runs/
 /reports/

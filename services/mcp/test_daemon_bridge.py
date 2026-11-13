@@ -28,6 +28,27 @@ from services.mcp.daemon_bridge import (
 )
 
 HOSTD = daemon_bridge.resolve_hostd_bin()
+# Windows has no SIGKILL; os.kill() there is TerminateProcess for any other signal.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def _alive(pid: int) -> bool:
+    """Liveness probe. os.kill(pid, 0) is POSIX-only: on Windows it TerminateProcess()es."""
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+    k32.CloseHandle(h)
+    return bool(ok) and code.value == 259  # STILL_ACTIVE
 
 
 
@@ -47,7 +68,7 @@ def scratch_daemon(monkeypatch):
     yield pids
     for pid in pids:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, _SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -84,7 +105,7 @@ def test_reconnect_after_daemon_sigkill(scratch_daemon):
     c = DaemonClient()
     c.connect()
     pid = _pid(c)
-    os.kill(pid, signal.SIGKILL)
+    os.kill(pid, _SIGKILL)
     time.sleep(0.3)
     # The failed call is never replayed. A later explicit request can reconnect.
     with pytest.raises(DaemonSessionLost) as lost:
@@ -106,9 +127,7 @@ def test_idle_exit_under_a_parked_client_reconnects_cleanly(scratch_daemon):
     pid = _pid(c)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _alive(pid):
             break
         time.sleep(0.2)
     else:

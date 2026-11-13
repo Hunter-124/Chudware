@@ -206,6 +206,13 @@ def _hostd_candidates() -> list[Path]:
     if dist := os.environ.get("CHUDWARE_DIST"):
         out.append(Path(dist) / exe)
     if sys.platform == "win32":
+        # The staged payload FIRST: it is the hostd beside the GUI executable, so MCP
+        # agents and the GUI share one daemon (the instance key is the binary path) and
+        # agents run the engine that was last restaged. host/build-win used to lead and
+        # is an older tree: HERC rover agents ran a 4-day-old engine on a daemon of
+        # their own while the GUI used dist/Chudware.
+        out.append(root / "dist" / "Chudware" / exe)
+        out.append(root / "build" / "windows-occt" / "bin" / exe)  # windows-occt preset
         out.append(root / "host" / "build-win" / "bin" / exe)
         out.append(root / "core" / "build" / "bin" / exe)  # build.bat / MSVC preset dir
     elif sys.platform == "darwin":
@@ -373,7 +380,11 @@ def _spawn_hostd_detached(hostd: Path) -> "subprocess.Popen":
     (PermissionError / ERROR_ACCESS_DENIED), retry contained with a loud
     warning: autosave bounds the loss and the next client respawns."""
     if sys.platform == "win32":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # CREATE_DEFAULT_ERROR_MODE: Claude Code (libuv) runs with SEM_NOGPFAULTERRORBOX,
+        # which children inherit; with it a hostd crash leaves no WER event, no dump and
+        # no log line — the daemon just vanishes. The daemon gets the default mode.
+        flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                 | subprocess.CREATE_DEFAULT_ERROR_MODE)
         CREATE_BREAKAWAY_FROM_JOB = 0x01000000
         try:
             p = subprocess.Popen([str(hostd)], creationflags=flags | CREATE_BREAKAWAY_FROM_JOB,
@@ -410,6 +421,14 @@ class DaemonClient:
     # short enough that a user who fixes the cause isn't locked out for long.
     SPAWN_COOLDOWN_S = 5.0
     SPAWN_COOLDOWN_MAX_S = 60.0
+    # How long a live spawned daemon may take to bind its endpoint before the rendezvous
+    # counts as broken. On Windows the startup payload integrity check hashes every
+    # executable/library (~800 MB) under Defender's on-read scan BEFORE the pipe binds:
+    # measured 5.8-6.4 s cold on the dev box (2026-11-13), so the old 5 s bound failed
+    # every cold spawn ("hostd rendezvous broken", then a spawn cooldown) — the
+    # "chudware-hostd failed to start" errors the HERC rover agents hit.
+    SPAWN_BIND_GRACE_S = 25.0 if sys.platform == "win32" else 5.0
+    CONNECT_BUDGET_S = 30.0 if sys.platform == "win32" else 15.0
 
     def __init__(self, *, writer_group: str = "", agent_run_scope: str = "") -> None:
         self.writer_group = writer_group
@@ -433,9 +452,9 @@ class DaemonClient:
 
     # ---------------------------------------------------------------- connect
 
-    def connect(self, spawn: bool = True, budget_s: float = 15.0) -> None:
+    def connect(self, spawn: bool = True, budget_s: Optional[float] = None) -> None:
         try:
-            self._connect(spawn, budget_s)
+            self._connect(spawn, self.CONNECT_BUDGET_S if budget_s is None else budget_s)
         except DaemonDraining:
             # Nothing was dispatched and the refusal names its cause: never relabel it as
             # a lost session or a plain transport failure (core_bridge must not fall back).
@@ -528,17 +547,20 @@ class DaemonClient:
                         # our spawn EXITED (lost the flock race) and the incumbent's
                         # socket still refuses after a 2 s grace, or our spawn is
                         # ALIVE but stuck waiting on the flock — a healthy cold spawn
-                        # binds its socket well under 5 s (bind precedes OCCT load).
+                        # binds its socket within SPAWN_BIND_GRACE_S (bind precedes
+                        # OCCT load, but not the payload integrity check).
                         now = time.monotonic()
                         exited = child.poll() is not None
                         if exited and not child_gone_at:
                             child_gone_at = now
                         if (exited and now - child_gone_at > 2.0) or (
-                                not exited and now - child_spawned_at > 5.0):
+                                not exited and now - child_spawned_at > self.SPAWN_BIND_GRACE_S):
                             raise DaemonError(
                                 "hostd rendezvous broken: a daemon holds the singleton "
-                                f"lock but its socket is unreachable ({e}). "
-                                "`pkill chudware-hostd` and retry."
+                                f"lock but its socket is unreachable ({e}). The daemon is "
+                                "shared with the GUI and other sessions, so do not kill it "
+                                "from an agent: report this to the user, who can run "
+                                "`chudware-hostd --stop` (or quit it from the tray)."
                             ) from e
                     if time.monotonic() > deadline:
                         raise DaemonError(f"hostd spawn timed out ({e})") from e

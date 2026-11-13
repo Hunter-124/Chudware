@@ -294,7 +294,14 @@ def pytest_configure(config):
     root = Path(_test_directory.name)
     names = (*_TEST_ROOTS, "APPDATA", "CHUDWARE_TEST_WANTS_DAEMON")
     _test_environment = {name: os.environ.get(name) for name in names}
-    os.environ.pop("APPDATA", None)
+    if sys.platform == "win32":
+        # Isolate rather than unset: chudware-hostd's owner-private state dir IS
+        # %APPDATA%\Chudware on Windows, and without APPDATA every daemon a test spawns
+        # exits "no owner-private state directory" before binding its pipe.
+        (root / "appdata").mkdir(mode=0o700, exist_ok=True)
+        os.environ["APPDATA"] = str(root / "appdata")
+    else:
+        os.environ.pop("APPDATA", None)
     os.environ.pop("CHUDWARE_TEST_WANTS_DAEMON", None)
     for name, suffix in _TEST_ROOTS.items():
         directory = root / suffix

@@ -18,6 +18,7 @@ Runs over stdio; the desktop host registers it into the machine's MCP client con
 from __future__ import annotations
 
 import atexit
+import functools
 import os
 import signal
 import sys
@@ -196,6 +197,14 @@ _LITE_INSTRUCTIONS = (
     "(cad_guide('ecad')).\n"
     "ecad_simulate(netlist_source='kicad') uses KiCad-exported SPICE models "
     "with ngspice and never falls back to MNA; inspect the reported backend.\n"
+    "GEOMETRY PITFALLS: box/cylinder primitives are CENTRED on `at` (a cylinder spans "
+    "+-height/2 along `axis`); centered:false puts the base at `at`. mode:'cut' subtracts "
+    "from the CURRENT (last-built) body only - check volume_mm3/body_count after a cut. Sketch "
+    "offsets run along the plane normal: plane.front is -Y, plane.top +Z, plane.right +X. "
+    "asm_add_component at/rotate is a pose, not a fit: check_interference(members=[...]) the "
+    "parts you placed. wait_job returns still_running before the client timeout: call it "
+    "again. A call that timed out may still have applied - read list_parts/get_part(summary=True) "
+    "before resending a mutation.\n"
     "SCAN REFERENCES: cad_guide('scan_reference') covers embedded non-solid scans, "
     "placement, visibility and sampled deviation against the editable part.\n"
     "CONVENTIONS THAT MATTER: prefer STRUCTURED geometry queries such as "
@@ -299,6 +308,14 @@ _FULL_INSTRUCTIONS = (
         "cover FEA/CFD and annotated renders; 'sketch' is the "
         "2D sketch workflow; 'scad' and 'parts' cover OpenSCAD and portable libraries. "
         "Explicit 'ops' returns the full vocabulary.\n"
+        "GEOMETRY PITFALLS: box/cylinder primitives are CENTRED on `at` (a cylinder spans "
+        "+-height/2 along `axis`); centered:false puts the base at `at`. mode:'cut' subtracts "
+        "from the CURRENT (last-built) body only - check volume_mm3/body_count after a cut. Sketch "
+        "offsets run along the plane normal: plane.front is -Y, plane.top +Z, plane.right +X. "
+        "asm_add_component at/rotate is a pose, not a fit: check_interference(members=[...]) the "
+        "parts you placed. wait_job returns still_running before the client timeout: call it "
+        "again. A call that timed out may still have applied - read list_parts/get_part(summary=True) "
+        "before resending a mutation.\n"
         "SCAN REFERENCES: cad_guide('scan_reference') covers embedded non-solid scans, "
         "placement, visibility and sampled deviation against the editable part.\n"
         "MODEL INTENT: edit original features, define critical dimensions and relations, "
@@ -1470,6 +1487,77 @@ if _ARG_TEACHING:
     _install_arg_teaching(mcp)
 
 
+def _client_call_budget_s() -> float:
+    """How long one tool call may block before the client gives up, minus headroom.
+
+    Claude Code times a call out after MCP_TOOL_TIMEOUT ms (60 s by default) and inherits
+    that variable into this process; blocking waits (wait_job) stop 10 s short of it."""
+    try:
+        client_s = float(os.environ.get("MCP_TOOL_TIMEOUT", "") or 60000) / 1000.0
+    except ValueError:
+        client_s = 60.0
+    return max(5.0, client_s - 10.0)
+
+
+# Tools whose body only polls engine/job state: they skip the serial gate so a long
+# wait never holds every other tool hostage, and they never mutate documents.
+_UNGATED_TOOLS = frozenset({"wait_job", "get_job"})
+_TOOL_GATE = threading.Lock()
+
+
+def _install_threaded_dispatch(server) -> None:
+    """Run every synchronous tool on a worker thread instead of the event loop.
+
+    FastMCP calls a sync tool function inline, ON the event loop. A 60 s import_part then
+    stalls the whole stdio session: other calls queue behind it and time out, and the
+    client's notifications/cancelled for the timed-out request cannot be processed — under
+    Claude Code the server then stopped answering and was dropped ("Connection closed"),
+    taking every in-flight call and the hostd connection with it (HERC rover audit,
+    2026-11-13: 38 connection drops, each 2-4 s after a request timeout).
+
+    Bodies still run one at a time behind ``_TOOL_GATE`` (tool code shares per-process
+    state such as the current document), so the semantics stay what they were. A call
+    cancelled while it waits for the gate never runs — a timed-out mutation must not land
+    minutes later behind the client's back. A call cancelled mid-body runs to completion
+    (Python threads cannot be interrupted) and keeps the gate until it does.
+    """
+    import anyio
+
+    manager = getattr(server, "_tool_manager", None)
+    tools = getattr(manager, "_tools", None)
+    if not tools or getattr(manager, "_chudware_threaded", False):
+        return
+
+    def wrap(name, fn):
+        gated = name not in _UNGATED_TOOLS
+
+        @functools.wraps(fn)
+        async def run_off_loop(**kwargs):
+            abandoned = threading.Event()
+
+            def body():
+                if not gated:
+                    return fn(**kwargs)
+                with _TOOL_GATE:
+                    if abandoned.is_set():
+                        return None  # cancelled while queued: never run it
+                    return fn(**kwargs)
+
+            try:
+                return await anyio.to_thread.run_sync(body, abandon_on_cancel=True)
+            except anyio.get_cancelled_exc_class():
+                abandoned.set()
+                raise
+        return run_off_loop
+
+    for name, tool in tools.items():
+        if tool.is_async:
+            continue
+        tool.fn = wrap(name, tool.fn)
+        tool.is_async = True
+    manager._chudware_threaded = True
+
+
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to
     the REAL stdout pipe for the MCP transport.
@@ -1747,6 +1835,8 @@ def main() -> None:
     _install_shutdown_savers()
     _start_orphan_watchdog()  # a dead client must never leave a zombie bridge pinning hostd
     real_stream = _install_clean_stdout()
+    _install_threaded_dispatch(mcp)  # keep the event loop free for cancels/pings
+    os.environ.setdefault("CHUDWARE_MCP_CALL_BUDGET_S", str(_client_call_budget_s()))
     # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
     # never on the protocol pipe.
     threading.Thread(target=_warm_core, name="chudware-warm", daemon=True).start()

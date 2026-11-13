@@ -7734,6 +7734,19 @@ def _model_history_feedback(response: dict) -> Optional[dict]:
     }
 
 
+def _mcp_call_budget_s() -> Optional[float]:
+    """Seconds a blocking tool may take before the MCP client times the call out, or None.
+
+    The stdio server sets CHUDWARE_MCP_CALL_BUDGET_S (derived from the client's
+    MCP_TOOL_TIMEOUT); in-process hosts set nothing and keep their own limits."""
+    raw = os.environ.get("CHUDWARE_MCP_CALL_BUDGET_S", "").strip()
+    try:
+        value = float(raw) if raw else 0.0
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (split out of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 
@@ -9833,7 +9846,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         interrupts only this wait; call wait_job again to retrieve its eventual result.
         A host-supplied wake callable (the user sent a message) ends the wait early with
         woken_by set: read the message first, then decide whether the job still matters.
-        timeout_s is clamped to 0..900 s; still_running:true means the job is still going.
+        timeout_s is clamped to 0..900 s, and to the MCP client's request budget when one
+        is set (CHUDWARE_MCP_CALL_BUDGET_S; ~50 s under Claude Code), so the wait returns
+        still_running:true instead of the client timing the call out. still_running:true
+        means the job is still going: call wait_job again.
 
         Call wait_job as its OWN tool call, not from eval code. An eval cell's timeout counts
         time spent inside tool calls (and the runtime may clamp the timeout you ask for), so
@@ -9846,6 +9862,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         except (TypeError, ValueError):
             raise ValueError("wait_job: timeout_s and poll_s must be numbers of seconds") from None
         timeout_s = max(0.0, min(900.0, timeout_s))
+        budget = _mcp_call_budget_s()
+        clamped_to_budget = budget is not None and timeout_s > budget
+        if clamped_to_budget:
+            timeout_s = budget
         poll_s = max(0.5, min(30.0, poll_s))
         start = time.monotonic()
         deadline = start + timeout_s
@@ -9880,6 +9900,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if snapshot.get("status") == "running":
                     result.update(still_running=True,
                                   hint=f"Call wait_job('{job_id}') again for the result.")
+                    if clamped_to_budget:
+                        result["timeout_clamped_s"] = timeout_s
                 return _dumps(result)
             time.sleep(min(remaining, max(0.0, next_poll - time.monotonic()), 0.1))
 

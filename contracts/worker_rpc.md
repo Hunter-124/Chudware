@@ -3802,3 +3802,18 @@ Worker RPC contract revision 2.6. The wire protocol major remains 2. Two additiv
   presented documents on connect opens only the highest `presented_seq` among documents it did
   not open itself; GUI-origin documents are unaffected. Documents an AI has not edited, and
   edits by a `gui` client, still present nothing.
+
+## Measure pairs report axis components and parallel separation (append-only, 2026-11-13)
+
+Worker RPC contract revision 2.7. The wire protocol major remains 2. Additive `eval_measure`
+fields on a two-reference result (chain results are unchanged):
+
+* `delta:[dx,dy,dz]`: world-axis components (mm) of the minimum-distance vector from the
+  closest point on the first reference to the closest point on the second; present whenever
+  `points` is.
+* `parallel_distance` (mm) and `parallel_points:[[3],[3]]`: present when a planar face is
+  paired with a parallel planar face or a parallel straight edge (1e-6 rad). It is the
+  perpendicular separation of the two carriers, independent of how the bounded faces
+  overlap, whereas `distance` stays the closest-point gap between the bounded elements.
+  `parallel_points` runs from the closest point on one element perpendicular onto the
+  other's plane, for display.

@@ -294,7 +294,17 @@ static MeasureRows measureRows(AppState& st, const nlohmann::json& result) {
             rows.emplace_back(label, format(it->get<double>()));
     };
     auto length = [&](double value) { return evalLen(st, value); };
+    // The separation an engineer usually means comes first: plane-to-plane for parallel
+    // planes, axis-to-axis for two holes/pins; the closest-point gap and its X/Y/Z split follow.
+    number("parallel_distance", "Parallel distance", length);
+    number("axis_distance", "Center distance", length);
     number("distance", "Minimum distance", length);
+    if (const auto it = result.find("delta"); it != result.end() && it->is_array() && it->size() == 3) {
+        const char* axes[] = {"X distance", "Y distance", "Z distance"};
+        for (int i = 0; i < 3; ++i)
+            if ((*it)[i].is_number() && std::isfinite((*it)[i].get<double>()))
+                rows.emplace_back(axes[i], length(std::fabs((*it)[i].get<double>())));
+    }
     number("length", "Length", length);
     number("radius", "Radius", length);
     number("diameter", "Diameter", length);
@@ -329,6 +339,18 @@ static MeasureRows measureRows(AppState& st, const nlohmann::json& result) {
         }
     }
     return rows;
+}
+
+// Result card title: what was measured, from the kernel's result kind and pick count.
+static const char* measureTitle(const nlohmann::json& result, size_t picks) {
+    const std::string kind = result.value("kind", std::string());
+    if (kind == "multi_distance") return "Chain";
+    if (picks >= 2) return "Distance";
+    if (kind == "area") return "Face";
+    if (kind == "length" || kind == "radius") return "Edge";
+    if (kind == "point") return "Vertex";
+    if (kind == "volume") return "Body";
+    return "Measurement";
 }
 
 static std::string measureReadingText(AppState& st, const nlohmann::json& result) {
@@ -1027,6 +1049,16 @@ void EvaluateDialogs::rebuildMeasureOverlays(AppState& st) {
         // Ensure at least one label uses the reported distance (more accurate than recompute).
         if (!overlayLabels_.empty())
             overlayLabels_.back().second = evalLen(st, result_["distance"].get<double>());
+    }
+    // Parallel planes: also draw the perpendicular separation the panel leads with.
+    float pa[3], pb[3];
+    if (result_.contains("parallel_points") && result_["parallel_points"].is_array() &&
+        result_["parallel_points"].size() == 2 && result_.contains("parallel_distance") &&
+        result_["parallel_distance"].is_number() && readXYZ(result_["parallel_points"][0], pa) &&
+        readXYZ(result_["parallel_points"][1], pb)) {
+        pushSeg(pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
+        midLabel(pa[0], pa[1], pa[2], pb[0], pb[1], pb[2],
+                 evalLen(st, result_["parallel_distance"].get<double>()));
     }
 
     // ---- Color-coded per-ref highlights + callouts ----
@@ -1948,16 +1980,16 @@ void EvaluateDialogs::drawMeasure(AppState& st) {
                         "picks: two measure a distance, three to eight measure a chain.");
     } else if (measureResolving_) {
         kit::spinner("Resolving selection…");
-        kit::dimText("Waiting for every selected item. No partial reading is shown.");
+        kit::dimText("Waiting for every selected item. No partial result is shown.");
     } else if (pending_) {
         kit::spinner("Computing measurement…");
     } else if (measureDirty_) {
         kit::spinner("Waiting for the selection to settle…");
     } else {
-        // One copy affordance per reading: the header copies every row at once.
-        if (kit::cardBegin("reading", "Reading", "measure")) {
+        // One copy affordance per result: the header copies every row at once.
+        if (kit::cardBegin("reading", measureTitle(result_, items.size()), "measure")) {
             kit::cardHeaderRight(ImGui::GetFrameHeight());
-            if (kit::iconButton("copy", "copy", "Copy this reading")) {
+            if (kit::iconButton("copy", "copy", "Copy these values")) {
                 const auto text = measureReadingText(st, result_);
                 ImGui::SetClipboardText(text.c_str());
             }
@@ -2026,11 +2058,11 @@ void EvaluateDialogs::drawMeasure(AppState& st) {
 
     if (!measureLog_.empty()) {
         // Newest first, one wrapped line each (never elided in a key/value column); the header
-        // copies the whole list, the same single copy affordance the Reading card uses.
-        const std::string title = "Recent readings (" + std::to_string(measureLog_.size()) + ")";
+        // copies the whole list, the same single copy affordance the result card uses.
+        const std::string title = "Recent measurements (" + std::to_string(measureLog_.size()) + ")";
         if (kit::cardBegin("history", title.c_str(), "history", &measureHistoryOpen_)) {
             kit::cardHeaderRight(ImGui::GetFrameHeight());
-            if (kit::iconButton("copy", "copy", "Copy every recent reading")) {
+            if (kit::iconButton("copy", "copy", "Copy every recent measurement")) {
                 std::string all;
                 for (size_t i = measureLog_.size(); i-- > 0;)
                     all += std::to_string(i + 1) + ". " + measureLog_[i] + "\n";

@@ -1741,7 +1741,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         When BOTH are cylindrical faces or circular edges (two holes, two pins) it also returns
         axis_distance — the distance between the two AXES, i.e. the hole pitch / centre spacing —
         with axes_parallel and axis_angle. `distance` stays the surface-to-surface gap, which
-        differs from the pitch by the radii.
+        differs from the pitch by the radii. Every pair also returns delta [dx,dy,dz], the
+        world X/Y/Z components of the minimum-distance vector (a -> b). A planar face paired with
+        a PARALLEL planar face or straight edge also returns parallel_distance — the
+        perpendicular plane-to-plane separation (a step height, a wall thickness), which
+        `distance` only equals when the two faces overlap in plan.
 
         Each query must resolve to EXACTLY ONE face/edge. Several matches are an error that
         lists their sids, even when the query carries pick/count/index: a tied pick (the four
@@ -1805,6 +1809,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 parts = []
                 if "distance" in res:
                     parts.append(f"distance {res['distance']:.4g} mm")
+                if "parallel_distance" in res:
+                    parts.append(f"parallel (plane-to-plane) distance "
+                                 f"{res['parallel_distance']:.4g} mm")
+                if "delta" in res:
+                    dx, dy, dz = (abs(v) for v in res["delta"])
+                    parts.append(f"X/Y/Z components {dx:.4g} / {dy:.4g} / {dz:.4g} mm")
                 if "angle" in res:
                     parts.append(f"angle {res['angle']:.4g} deg")
                 if "axis_distance" in res:

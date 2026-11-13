@@ -17299,6 +17299,30 @@ std::optional<gp_Lin> eval_axis_line(const TopoDS_Shape& sh) {
 }
 
 
+// The plane of a planar face (nullopt for any other element).
+std::optional<gp_Pln> eval_plane(const TopoDS_Shape& sh) {
+    try {
+        if (sh.ShapeType() == TopAbs_FACE) {
+            BRepAdaptor_Surface sa(TopoDS::Face(sh));
+            if (sa.GetType() == GeomAbs_Plane) return sa.Plane();
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return std::nullopt;
+}
+
+// The carrier line of a straight edge (nullopt for any other element).
+std::optional<gp_Lin> eval_straight_line(const TopoDS_Shape& sh) {
+    try {
+        if (sh.ShapeType() == TopAbs_EDGE) {
+            BRepAdaptor_Curve ca(TopoDS::Edge(sh));
+            if (ca.GetType() == GeomAbs_Line) return ca.Line();
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return std::nullopt;
+}
+
 // engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius+diameter+length (circle)
 // or length; FACE -> area+perimeter; VERTEX -> point; else volume.
 json eval_measure_single(const TopoDS_Shape& raw) {
@@ -17404,6 +17428,7 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     }
 
     try {
+    std::optional<gp_Pnt> near_a, near_b;  // closest points, when the extrema solved
         BRepExtrema_DistShapeShape dss(a, b);
         if (dss.IsDone()) {
             result["distance"] = dss.Value();
@@ -17416,6 +17441,10 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
                 result["points"] = pts;
                 result["path"] = pts;  // path mirrors extrema points when distance solved
             }
+                // World-axis components of the minimum-distance vector (a -> b).
+                result["delta"] = {p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z()};
+                near_a = p1;
+                near_b = p2;
         }
     } catch (const Standard_Failure&) {
     }
@@ -17442,6 +17471,41 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
         }
     }
     // Per-element enrichment for the two resolved refs (anchor/polyline on a/b).
+    // A plane paired with a parallel plane or a parallel straight edge: the PERPENDICULAR
+    // separation of the two, independent of how the bounded faces overlap. The minimum
+    // distance above is the closest-point gap between the bounded elements and reads as a
+    // diagonal whenever the faces do not overlap in plan. parallel_points is that separation
+    // drawn from the closest point on one element straight onto the plane of the other.
+    if (near_a && near_b) {
+        constexpr double kParallelTol = 1e-6;  // rad
+        const auto pa = eval_plane(a), pb = eval_plane(b);
+        std::optional<double> sep;
+        gp_Pnt from = *near_a, to = *near_b;
+        auto foot = [](const gp_Pln& pl, const gp_Pnt& p) {
+            const gp_Vec n(pl.Axis().Direction());
+            return p.Translated(-n * gp_Vec(pl.Location(), p).Dot(n));
+        };
+        if (pa && pb) {
+            if (pa->Axis().Direction().IsParallel(pb->Axis().Direction(), kParallelTol)) {
+                sep = pb->Distance(pa->Location());
+                to = foot(*pb, *near_a);
+            }
+        } else if (pa || pb) {
+            const gp_Pln& pl = pa ? *pa : *pb;
+            if (const auto ln = eval_straight_line(pa ? b : a)) {
+                if (ln->Direction().IsNormal(pl.Axis().Direction(), kParallelTol)) {
+                    sep = pl.Distance(ln->Location());
+                    if (pa) from = foot(pl, *near_b);
+                    else to = foot(pl, *near_a);
+                }
+            }
+        }
+        if (sep) {
+            result["parallel_distance"] = *sep;
+            result["parallel_points"] = json::array({json::array({from.X(), from.Y(), from.Z()}),
+                                                     json::array({to.X(), to.Y(), to.Z()})});
+        }
+    }
     json ea = json::object();
     eval_measure_enrich(ea, a);
     json eb = json::object();

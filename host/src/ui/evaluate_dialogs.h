@@ -247,7 +247,7 @@ private:
     bool geometryDiscontinuities_ = false;
     bool geometryLimitsOpen_ = false;          // "Limits used" card (collapsed by default)
     bool geometryKindOpen_[7] = {true, true, true, true, true, true, true};  // findings cards
-    bool measureHistoryOpen_ = false;          // "Recent readings" card
+    bool measureHistoryOpen_ = false;          // "Recent measurements" card
     bool massTensorOpen_ = false;              // "Mass inertia tensor" card
     // Symmetry plane: 0 front, 1 top, 2 right.
     int symmetryPlane_ = 0;

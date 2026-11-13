@@ -1902,6 +1902,18 @@ class TestRefSlotMigration:
         assert feat["params"] == {"length": 10, "width": 5, "height": 2}
         assert not feat.get("refs")
 
+    def test_weld_member_profile_stays_a_param(self):
+        """weld_member's profile is the stock section param (validate.cpp), not a
+        region selector; migrating it failed every weld_member batch with
+        'params.profile: required' + 'refs.profile: unknown ref slot'."""
+        from services.mcp.cad_doc_tools import _migrate_ref_slots
+        ops = [{"op": "add_feature", "feature": {
+            "type": "weld_member", "refs": {"sketch": "f1"},
+            "params": {"profile": "square_tube", "size": 40}}}]
+        feat = _migrate_ref_slots(ops, [])[0]["feature"]
+        assert feat["params"]["profile"] == "square_tube"
+        assert "profile" not in feat["refs"]
+
 
 class TestEnumDimUnwrap:
     def test_mode_wrapped_as_a_dimension_is_unwrapped(self):

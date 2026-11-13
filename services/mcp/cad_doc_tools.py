@@ -6005,6 +6005,9 @@ _REFS_ONLY_SLOTS_TYPE_EXCLUDE = {
     "plane": frozenset({"sketch", "sketch3d"}),
     "features": frozenset({"boolean"}),
     "bodies": frozenset({"boolean"}),
+    # weld_member's `profile` is the stock cross-section PARAM (square_tube, …), not a
+    # region selector; moving it to refs made every weld_member batch fail validation.
+    "profile": frozenset({"weld_member"}),
 }
 
 

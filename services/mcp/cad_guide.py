@@ -2588,7 +2588,7 @@ def cad_guide_text(topic: str = "") -> str:
             "  Decision procedure: cad_skill('piping-design')."
         )
     if topic in ("hydraulic", "hydraulics", "iso1219", "hydraulic_circuit",
-                 "hydraulic_new", "cylinder", "pump", "fluid_power", "hpu", "power_unit",
+                 "hydraulic_new", "hydraulic_cylinder", "pump", "fluid_power", "hpu", "power_unit",
                  "hydraulic_simulate", "hydraulic_motor", "pump_drive"):
         return (
             "HYDRAULIC — ISO 1219 fluid power: circuit, sizing, electric drive, transient\n"

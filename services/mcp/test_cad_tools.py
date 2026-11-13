@@ -5674,6 +5674,9 @@ def test_dogfood_guidance_is_truthful():
     assert all(s in relief for s in ("no dedicated sm_relief", "through-cut", "sm_flat_pattern",
                                      "export_flat_dxf", "OUTLINE", "BEND", "CUTS"))
     assert "export_flat_dxf" in cad_guide_text("sheetmetal")
+    # "cylinder" is the primitive cheatsheet, not the ISO 1219 hydraulic guide.
+    assert cad_guide_text("cylinder").startswith("CYLINDER primitive")
+    assert cad_guide_text("hydraulic_cylinder").startswith("HYDRAULIC")
 
     sketch3d = cad_guide_text("sketch3d")
     assert "midpoint (point + line/arc)" in sketch3d

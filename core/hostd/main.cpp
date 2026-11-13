@@ -28,6 +28,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -43,7 +44,10 @@
 #include <windows.h>
 
 #include <cwctype>  // towlower — pidfile image-name validation in stopViaPidfile
+#include <dbghelp.h>  // MiniDumpWriteDump — crash reports (installCrashReport)
+#include <exception>
 #include <process.h>  // _getpid
+#pragma comment(lib, "dbghelp.lib")
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -65,6 +69,126 @@
 #include "util/platform_paths.h"  // executablePath / processAlive (one spelling per OS)
 #include "security/integrity.h"
 #include "worker_bridge.h"
+
+#ifdef _WIN32
+// Crash reports. A hostd spawned under Claude Code inherits SEM_NOGPFAULTERRORBOX from
+// libuv, so a crash used to leave nothing: no WER event, no dump, no log line — the
+// HERC rover sessions lost the daemon ~20 times in two days with hostd.log showing a
+// fresh "starting" and no exit. The filter writes logs/hostd-crash-<pid>.txt (code,
+// faulting module+offset, raw frames) and a minidump; the next daemon start copies the
+// report into hostd.log. It runs on the crashing thread, so it allocates nothing and
+// takes no lock the crash may already hold.
+static wchar_t g_crashBase[MAX_PATH] = L"";  // <logs>\hostd-crash-<pid> (no extension)
+
+static void crashWrite(HANDLE f, const char* text) {
+    DWORD n = 0;
+    WriteFile(f, text, (DWORD)std::strlen(text), &n, nullptr);
+}
+
+static void crashModuleOf(DWORD64 addr, char* out, size_t cap, DWORD64& base) {
+    HMODULE mod = nullptr;
+    base = 0;
+    std::snprintf(out, cap, "?");
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(addr), &mod) && mod) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(mod, path, MAX_PATH)) {
+            const char* s = std::strrchr(path, '\\');
+            std::snprintf(out, cap, "%s", s ? s + 1 : path);
+        }
+        base = reinterpret_cast<DWORD64>(mod);
+    }
+}
+
+static void crashReport(const char* what, EXCEPTION_POINTERS* ep) {
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1) != 0 || !g_crashBase[0]) return;
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s.txt", g_crashBase);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char line[512];
+    std::snprintf(line, sizeof line, "hostd %s crashed: %s pid=%lu thread=%lu",
+                  CHUDWARE_HOSTD_BUILD_ID, what, GetCurrentProcessId(), GetCurrentThreadId());
+    crashWrite(f, line);
+    if (ep && ep->ExceptionRecord) {
+        const DWORD64 at = reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress);
+        char mod[MAX_PATH];
+        DWORD64 base = 0;
+        crashModuleOf(at, mod, sizeof mod, base);
+        std::snprintf(line, sizeof line, " code=0x%08lX at %s+0x%llX\n",
+                      ep->ExceptionRecord->ExceptionCode, mod,
+                      (unsigned long long)(at - base));
+        crashWrite(f, line);
+    } else {
+        crashWrite(f, "\n");
+    }
+    // Raw frames (module+offset), symbolized later against the build's PDBs.
+    void* frames[48];
+    const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < n; ++i) {
+        char mod[MAX_PATH];
+        DWORD64 base = 0;
+        crashModuleOf(reinterpret_cast<DWORD64>(frames[i]), mod, sizeof mod, base);
+        std::snprintf(line, sizeof line, "  #%02u %s+0x%llX\n", (unsigned)i, mod,
+                      (unsigned long long)(reinterpret_cast<DWORD64>(frames[i]) - base));
+        crashWrite(f, line);
+    }
+    CloseHandle(f);
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s.dmp", g_crashBase);
+    HANDLE d = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (d != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), ep, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), d,
+                          MINIDUMP_TYPE(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory),
+                          ep ? &mei : nullptr, nullptr, nullptr);
+        CloseHandle(d);
+    }
+}
+
+static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
+    crashReport("unhandled exception", ep);
+    return EXCEPTION_CONTINUE_SEARCH;  // still let WER see it when the error mode allows
+}
+
+// Copy reports left by crashed predecessors into hostd.log once, then mark them read.
+static void reportPreviousCrashes(const std::string& logDir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(logDir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("hostd-crash-", 0) != 0 || e.path().extension() != ".txt") continue;
+        FILE* f = std::fopen(e.path().string().c_str(), "rb");
+        if (!f) continue;
+        char buf[2048];
+        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+        std::fclose(f);
+        buf[n] = '\0';
+        if (char* nl = std::strchr(buf, '\n')) *nl = '\0';
+        hostd::log().line("previous daemon crash (%s): %s", name.c_str(), buf);
+        fs::path seen = e.path();
+        seen.replace_extension(".reported.txt");
+        fs::rename(e.path(), seen, ec);
+    }
+}
+
+static void installCrashReport(const std::string& logDir) {
+    reportPreviousCrashes(logDir);
+    const std::wstring dir = std::filesystem::path(logDir).wstring();
+    _snwprintf_s(g_crashBase, MAX_PATH, _TRUNCATE, L"%s\\hostd-crash-%lu", dir.c_str(),
+                 GetCurrentProcessId());
+    SetUnhandledExceptionFilter(crashFilter);
+    // Uncaught C++ exceptions and abort() never reach the SEH filter.
+    std::set_terminate([] {
+        crashReport("std::terminate (uncaught C++ exception)", nullptr);
+        std::abort();
+    });
+    std::signal(SIGABRT, [](int) { crashReport("abort()", nullptr); });
+}
+#endif
 
 static hostd::Server* g_server = nullptr;
 // Termination requested from outside the app (SIGTERM/SIGINT, Windows console close /
@@ -576,6 +700,9 @@ int main(int argc, char** argv) {
     }
 
     hostd::log().open(state + "/logs");
+#ifdef _WIN32
+    installCrashReport(state + "/logs");
+#endif
 
     // 1. Single instance. Losing the race is SUCCESS for a spawn-on-demand
     //    daemon: the winner serves everyone; exit 0 so the spawner's retry

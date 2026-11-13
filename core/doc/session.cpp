@@ -20724,9 +20724,17 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     // their bbox gap ("approx": true) so narration callers don't pay the all-pairs exact
     // distance pass on large assemblies. Fuzzy fallback volumes are marked approximate.
     const bool quick = params.contains("quick") && params["quick"].is_boolean() &&
+    // overlap_mesh is the viewport's red overlap preview (GUI evaluate dialog). Agents
+    // read volumes and bboxes, and the meshes were ~290 KB of a 628 KB reply on a
+    // 22-part assembly, so MCP passes include_overlap_mesh:false (and skips the
+    // tessellation). Default stays true for the GUI.
+    const bool include_overlap_mesh = !params.contains("include_overlap_mesh") ||
+                                      !params["include_overlap_mesh"].is_boolean() ||
+                                      params["include_overlap_mesh"].get<bool>();
                        params["quick"].get<bool>();
     json report = interference_report(members, include_coincident, min_clearance_mm, quick,
-                                      component_ids, true, clearance_mode == "threshold");
+                                      component_ids, include_overlap_mesh,
+                                      clearance_mode == "threshold");
     report["scope"] = std::move(scope);
     if (!source_failures.empty()) {
         report["ok"] = false;

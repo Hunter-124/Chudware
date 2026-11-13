@@ -2095,11 +2095,18 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         refusal = component_key_refusal(d, member, "check_interference")
                         if refusal:
                             raise ValueError(refusal)
+            # No overlap_mesh: it is the GUI's red preview geometry, and on a 22-part
+            # assembly it was ~290 KB of a 628 KB reply, past the client's result cap —
+            # so the one complete check that clears placement_unverified was unreadable.
             params = {"doc_id": d, "include_coincident": include_coincident,
-                      "min_clearance_mm": min_clearance_mm, "clearance_mode": clearance_mode}
+                      "min_clearance_mm": min_clearance_mm, "clearance_mode": clearance_mode,
+                      "include_overlap_mesh": False}
             if members is not None:
                 params["members"] = members
             res = cb.call("eval_interference", params)
+            for row in res.get("interferences") or []:
+                if isinstance(row, dict):
+                    row.pop("overlap_mesh", None)  # an engine that predates the flag
             # Only a complete document-wide check verifies transform placement.
             if not members and res.get("complete", False):
                 note_interference_check(d)

@@ -651,6 +651,16 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 _publish_current(new_id)
             payload = {**r, "ok": True, "doc_id": new_id, "imported_from": path,
                        "into": into}
+            # The engine echoes the WHOLE document tree, and an import feature's params
+            # carry the embedded source B-rep as base64: 430 KB of a 455 KB reply in the
+            # HERC rover runs, so import_part(into=...) overflowed the client's result cap
+            # (29x) and the agent could not tell whether the import landed. Name the
+            # features instead; get_part(feature_ids=[...]) reads one in full.
+            tree = payload.pop("tree", None)
+            if isinstance(tree, dict) and isinstance(tree.get("features"), list):
+                payload["features"] = [
+                    {k: f.get(k) for k in ("id", "name", "type") if k in f}
+                    for f in tree["features"] if isinstance(f, dict)]
             if portable_fallback_reason and r.get("import_fidelity") == "saved_display_tessellation":
                 payload["feature_fallback_reason"] = portable_fallback_reason
             if (resolve_features and not into and new_id

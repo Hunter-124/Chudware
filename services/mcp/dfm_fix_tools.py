@@ -398,7 +398,8 @@ def reinforce(doc_id: str, process: Optional[str] = None, target_wall_mm: Option
             spacing = num((study.get("measurement_basis") or {}).get("spacing_mm")) or 0
             padding = max(2 * spacing, target - float(item["before_mm"]) + 0.1)
             value, samples = _local_field_min(fields, original, padding)
-            interference = cb.call("eval_interference", {"doc_id": which_doc})
+            interference = cb.call("eval_interference", {"doc_id": which_doc,
+                                                         "include_overlap_mesh": False})
             if not isinstance(interference, dict) or not interference.get("complete"):
                 raise ValueError("Body interference evaluation incomplete")
             pairs = sorted(tuple(sorted((str(p.get("a")), str(p.get("b")))))

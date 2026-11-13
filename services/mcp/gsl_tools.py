@@ -1415,7 +1415,8 @@ def _describe_assembly_text(doc_id: str) -> str:
         if_r = cb.call("eval_interference", {"doc_id": doc_id,
                                             "include_coincident": False,
                                             "min_clearance_mm": 0.0,
-                                            "clearance_mode": "threshold"})
+                                            "clearance_mode": "threshold",
+                                            "include_overlap_mesh": False})
     except Exception as e:  # noqa: BLE001
         return _err(e)
     if if_r.get("code") == "engine_connection_lost":

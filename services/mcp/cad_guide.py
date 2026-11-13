@@ -3290,7 +3290,7 @@ def cad_guide_text(topic: str = "") -> str:
             "  1. check_interference(doc_id?)  — pairwise clash/clearance over bodies\n"
             "     (assemblies: world-placed components). Response includes\n"
             "     ok (the check completed), clear (the verdict: no interference),\n"
-            "     interferences[{a,b,volume,overlap_volume_mm3,overlap_bbox,overlap_mesh}],\n"
+            "     interferences[{a,b,volume,overlap_volume_mm3,overlap_bbox}],\n"
             "     clearances[{a,b,distance}], contacts, parts[{name,bbox,volume}].\n"
             "     A pair with method=fallback_fuzzy_* has approximate=true and reports\n"
             "     fuzzy_tolerance_mm: its overlap classification/volume are approximate.\n"

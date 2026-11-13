@@ -592,7 +592,8 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                     ir = cb.call("eval_interference",
                                  {"doc_id": clone, "include_coincident": False,
                                   "min_clearance_mm": min_clearance_mm,
-                                  "clearance_mode": "threshold"}) or {}
+                                  "clearance_mode": "threshold",
+                                  "include_overlap_mesh": False}) or {}
                 except Exception as exc:  # noqa: BLE001 — retain the valid pose
                     if getattr(exc, "code", None) == "engine_connection_lost":
                         raise

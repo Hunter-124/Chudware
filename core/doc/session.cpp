@@ -17472,8 +17472,8 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
         }
     }
 
-    try {
     std::optional<gp_Pnt> near_a, near_b;  // closest points, when the extrema solved
+    try {
         BRepExtrema_DistShapeShape dss(a, b);
         if (dss.IsDone()) {
             result["distance"] = dss.Value();
@@ -17485,11 +17485,11 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
                                         json::array({p2.X(), p2.Y(), p2.Z()})});
                 result["points"] = pts;
                 result["path"] = pts;  // path mirrors extrema points when distance solved
-            }
                 // World-axis components of the minimum-distance vector (a -> b).
                 result["delta"] = {p2.X() - p1.X(), p2.Y() - p1.Y(), p2.Z() - p1.Z()};
                 near_a = p1;
                 near_b = p2;
+            }
         }
     } catch (const Standard_Failure&) {
     }

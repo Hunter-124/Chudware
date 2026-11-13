@@ -1598,7 +1598,12 @@ def _warm_core() -> None:
         pass
     try:
         from services.mcp import core_bridge
-        core_bridge.available()
+        # Only the in-process engine benefits from a warm DLL. In daemon mode (the default)
+        # loading it pinned a private copy of the whole engine in every MCP server and
+        # kept dist\Chudware\libchudware.dll locked, so restaging failed while any
+        # agent session was open (eight servers held it on 2026-11-13).
+        if not core_bridge._daemon_mode():
+            core_bridge.available()
         # Recover any docs auto-saved before a previous restart so a client-timeout kill doesn't
         # permanently drop the user's open parts (they reload with fresh ids; list_parts shows them).
         try:

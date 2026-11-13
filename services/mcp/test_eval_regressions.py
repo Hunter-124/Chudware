@@ -121,3 +121,47 @@ def test_measure_rejects_multiple_matches_and_reports_cylinder_axes():
         assert pair["distance"] == pytest.approx(34, abs=1e-5)
     finally:
         cb.call("doc_close", {"doc_id": doc})
+
+
+@needs_engine
+def test_measure_reports_parallel_plane_distance_and_axis_components():
+    doc = call("new_part", name="eval_regression_step")["doc_id"]
+    try:
+        ops = [cb.feat("box", "Low", {"length": 10, "width": 10, "height": 10,
+                                        "at": [0, 0, 0], "mode": "new"}),
+               cb.feat("box", "High", {"length": 10, "width": 10, "height": 30,
+                                         "at": [40, 0, 0], "mode": "new"})]
+        built = call("add_features", doc_id=doc, ops=ops)
+        assert built["ok"], built
+        planes = call("query_geometry", doc_id=doc,
+                      query={"of": "face", "surf": "plane"})["matches"]
+
+        def top(x_min, x_max):
+            rows = [r for r in planes if x_min <= r["centroid"][0] <= x_max]
+            return max(rows, key=lambda r: r["centroid"][2])
+
+        low, high = top(-20, 20), top(20, 80)
+        step = high["centroid"][2] - low["centroid"][2]
+        gap = high["centroid"][0] - low["centroid"][0] - 10  # 10 mm wide boxes
+        pair = call("measure_between", doc_id=doc, a_query=low["sid"], b_query=high["sid"])
+        assert pair["ok"], pair
+        # The faces do not overlap in plan: the closest-point gap is the diagonal, the
+        # parallel distance is the step height, and delta splits the diagonal into X/Y/Z.
+        assert pair["parallel_distance"] == pytest.approx(step, abs=1e-6)
+        assert pair["distance"] == pytest.approx((gap ** 2 + step ** 2) ** 0.5, abs=1e-6)
+        dx, dy, dz = pair["delta"]
+        assert abs(dx) == pytest.approx(gap, abs=1e-6)
+        assert dy == pytest.approx(0, abs=1e-6)
+        assert dz == pytest.approx(step, abs=1e-6)
+        assert len(pair["parallel_points"]) == 2
+        assert "plane-to-plane" in pair["summary"]
+
+        # A vertical side of the tall box: neither its top nor its bottom face.
+        tall = [r for r in planes if r["centroid"][0] > 20]
+        z_lo = min(r["centroid"][2] for r in tall)
+        side = next(r for r in tall if z_lo < r["centroid"][2] < high["centroid"][2])
+        skew = call("measure_between", doc_id=doc, a_query=low["sid"], b_query=side["sid"])
+        assert skew["ok"] and "parallel_distance" not in skew, skew
+        assert skew["angle"] == pytest.approx(90, abs=1e-6)
+    finally:
+        cb.call("doc_close", {"doc_id": doc})

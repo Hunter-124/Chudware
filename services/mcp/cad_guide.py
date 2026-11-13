@@ -3320,6 +3320,8 @@ def cad_guide_text(topic: str = "") -> str:
             "  heed warnings when default density is used. body_id selects one body; inertia\n"
             "  is about its centre of mass. measure_between requires exactly one match per\n"
             "  target; axis_distance measures distance between axes, not surface clearance.\n"
+            "  parallel_distance is the perpendicular plane-to-plane separation of parallel\n"
+            "  planes (distance is the closest-point gap); delta is its X/Y/Z split.\n"
             "  check_symmetry accepts custom planes and body selection. inspect_section covers\n"
             "  the whole plane and rejects target_center. draft_analysis reports threshold-only\n"
             "  results; do not infer an angle field from it.\n\n"

@@ -87,6 +87,7 @@
       "modal",
       "overlay_surface",
       "structural",
+      "supernodal_llt",
       "tet10",
       "tet10_thin_wall",
       "thermal"

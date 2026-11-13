@@ -24,6 +24,7 @@
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
+#include "sim/supernodal_llt.h"
 #ifdef CHUDWARE_WITH_CHOLMOD
 #include <Eigen/CholmodSupport>  // Eigen::CholmodSupernodalLLT (SuiteSparse BLAS3 Cholesky)
 #endif
@@ -586,6 +587,16 @@ ThermalResult fea_thermal_solve(const std::vector<double>& points, const std::ve
         if (chol.info() == Eigen::Success) {
             Tf = chol.solve(f);
             if (chol.info() == Eigen::Success) solved = true;
+        }
+    }
+#else
+    // Without SuiteSparse the in-tree supernodal LLT leads the same ladder.
+    {
+        cap_solver_threads_for_host();
+        SupernodalLLT llt;
+        if (llt.analyze(Kff) && llt.factorize(Kff)) {
+            Tf = f;
+            solved = llt.solve_in_place(Tf.data()) && Tf.allFinite();
         }
     }
 #endif
@@ -1236,10 +1247,16 @@ ThermalTransientResult fea_thermal_transient(
 #else
     constexpr bool use_chol = false;
 #endif
+    SupernodalLLT supernodal;
+    bool use_supernodal = false;
+#ifndef CHUDWARE_WITH_CHOLMOD
+    cap_solver_threads_for_host();
+    use_supernodal = supernodal.analyze(A) && supernodal.factorize(A);
+#endif
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt;
     Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
     bool use_ldlt = false;
-    if (!use_chol) {
+    if (!use_chol && !use_supernodal) {
         ldlt.compute(A);
         if (ldlt.info() == Eigen::Success) {
             use_ldlt = true;
@@ -1306,7 +1323,10 @@ ThermalTransientResult fea_thermal_transient(
                 step_ok = chol.info() == Eigen::Success;
             } else
 #endif
-            if (use_ldlt) {
+            if (use_supernodal) {
+                Tf = rhs;
+                step_ok = supernodal.solve_in_place(Tf.data());
+            } else if (use_ldlt) {
                 Tf = ldlt.solve(rhs);
                 step_ok = ldlt.info() == Eigen::Success;
             } else {

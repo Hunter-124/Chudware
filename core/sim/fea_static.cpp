@@ -2,13 +2,15 @@
 //
 // The reduced free-free system is assembled directly into a fixed sparsity pattern
 // (fixed DOFs mapped out during assembly, no triplet list), then factored down the
-// SPD ladder: CHOLMOD supernodal LLT where SuiteSparse exists, else Eigen
-// SimplicialLDLT(AMD), with SparseLU kept only for the non-positive-pivot case that
-// needs partial pivoting. von Mises stress is recovered per element from the same
-// strain-displacement operator, in chunks, and averaged onto nodes.
+// SPD ladder: a supernodal LLT (CHOLMOD where SuiteSparse exists, else the in-tree
+// SupernodalLLT), then Eigen SimplicialLDLT(AMD), with SparseLU kept only for the
+// non-positive-pivot case that needs partial pivoting. von Mises stress is recovered
+// per element from the same strain-displacement operator, in chunks, and averaged
+// onto nodes.
 
 #include "sim/fea_static.h"
 #include "sim/fea_element.h"
+#include "sim/supernodal_llt.h"
 
 #include "prof/phases.h"
 
@@ -928,6 +930,33 @@ struct SparseLuFactorSolver : FactorSolver {
     const char* label() const override { return "SparseLU(COLAMD)"; }
 };
 
+// DEFAULT in a build without SuiteSparse (Windows and macOS releases): the in-tree
+// supernodal multifrontal LLT (supernodal_llt.h). Same strict-SPD contract as the
+// CHOLMOD rung, so a refusal walks the ladder to LDLT and raises the same verdict.
+// MEASURED end to end (fea_static_solve, assembly + solve + stress recovery) on a
+// 6-core i7-9750H, tet10 Kuhn cantilever beam 200x20x20 mm, Windows/MSVC:
+//
+//    n_dof    SimplicialLDLT(AMD)   SupernodalLLT
+//    19683          2.9 s               0.5 s
+//   139587        278.6 s               6.3 s
+//   265923         (not run)          17.6 s
+//
+// Displacement and stress agree to every printed digit; the equilibrium residual is
+// lower on the supernodal factor.
+struct SupernodalFactorSolver : FactorSolver {
+    SupernodalLLT llt;
+    bool analyze(const Eigen::SparseMatrix<double>& K) override { return llt.analyze(K); }
+    bool factorize(const Eigen::SparseMatrix<double>& K) override { return llt.factorize(K); }
+    Eigen::VectorXd solve(const Eigen::VectorXd& ff) override {
+        Eigen::VectorXd u = ff;
+        if (u.size() != llt.size() || !llt.solve_in_place(u.data())) return {};
+        return u;
+    }
+    bool ok() const override { return llt.factored(); }
+    uint64_t factor_bytes() const override { return llt.factor_bytes(); }
+    const char* label() const override { return "SupernodalLLT"; }
+};
+
 #ifdef CHUDWARE_WITH_CHOLMOD
 // DEFAULT wherever SuiteSparse is present, on measurement (see the table above the
 // LDLT solver): supernodal LLT runs BLAS3 kernels over dense supernodes, which makes
@@ -972,16 +1001,16 @@ struct CholmodFactorSolver : FactorSolver {
 };
 #endif
 
-// Which factorization to try FIRST: the supernodal LLT when SuiteSparse is compiled
-// in, else the pure-Eigen SimplicialLDLT. CHUDWARE_FEA_SOLVER=ldlt|lu|cholmod
-// overrides, which is how the comparison table above was measured.
-enum class SolverKind { Ldlt, Lu, Cholmod };
+// Which factorization to try FIRST: CHOLMOD's supernodal LLT when SuiteSparse is
+// compiled in, else the in-tree one. CHUDWARE_FEA_SOLVER=supernodal|ldlt|lu|cholmod
+// overrides, which is how the comparison tables above were measured.
+enum class SolverKind { Ldlt, Lu, Cholmod, Supernodal };
 
 inline SolverKind default_solver_kind() {
 #ifdef CHUDWARE_WITH_CHOLMOD
     return SolverKind::Cholmod;
 #else
-    return SolverKind::Ldlt;
+    return SolverKind::Supernodal;
 #endif
 }
 
@@ -991,6 +1020,7 @@ inline SolverKind requested_solver_kind() {
     const std::string s = e;
     if (s == "lu" || s == "sparselu") return SolverKind::Lu;
     if (s == "ldlt" || s == "simplicial") return SolverKind::Ldlt;
+    if (s == "supernodal") return SolverKind::Supernodal;
 #ifdef CHUDWARE_WITH_CHOLMOD
     if (s == "cholmod" || s == "llt") return SolverKind::Cholmod;
 #endif
@@ -1001,6 +1031,8 @@ inline std::unique_ptr<FactorSolver> make_solver(SolverKind k) {
     switch (k) {
         case SolverKind::Lu:
             return std::unique_ptr<FactorSolver>(new SparseLuFactorSolver());
+        case SolverKind::Supernodal:
+            return std::unique_ptr<FactorSolver>(new SupernodalFactorSolver());
 #ifdef CHUDWARE_WITH_CHOLMOD
         case SolverKind::Cholmod:
             return std::unique_ptr<FactorSolver>(new CholmodFactorSolver());
@@ -1053,7 +1085,7 @@ inline std::unique_ptr<FactorSolver> factor_and_solve(const Eigen::SparseMatrix<
     if (want != SolverKind::Lu) spd_rejected = true;
     // The supernodal LLT's strict-SPD test rejects a near-singular reduced system that
     // the indefinite-tolerant LDLT still factors, so it gets the next rung.
-    if (want == SolverKind::Cholmod) {
+    if (want == SolverKind::Cholmod || want == SolverKind::Supernodal) {
         if (auto s = try_kind(SolverKind::Ldlt)) {
             label = std::string(s->label()) + " (fallback after " + tried + ")";
             return s;

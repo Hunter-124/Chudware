@@ -242,6 +242,7 @@ endif()
 # later layer on top of these correct CPU cores.
 add_library(chudware_sim STATIC
   sim/fea_static.cpp
+  sim/supernodal_llt.cpp
   sim/fea_modal.cpp
   sim/fea_thermal.cpp
   sim/spice.cpp
@@ -264,8 +265,9 @@ target_link_libraries(chudware_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_
 # Eigen's SimplicialLDLT is scalar + single-threaded; on a bulky 3D solid its fill-in
 # explodes (measured: 300s+, multi-GB RSS, one core pegged). CholmodSupernodalLLT runs
 # BLAS3 kernels on dense supernodes over the threaded system BLAS -> 10-50x faster AND
-# multithreaded. OPTIONAL: chudware_sim still builds pure-Eigen when SuiteSparse is absent
-# (fea_static falls back to SimplicialLDLT at runtime), so the standalone config is intact.
+# multithreaded. OPTIONAL: without SuiteSparse the FEA solvers lead with the in-tree
+# supernodal LLT (sim/supernodal_llt.cpp, Eigen only), so no build is left on the scalar
+# LDLT.
 # OpenMP is linked so fea_static can cap the solver's thread count (leave cores for the GUI).
 option(CHUDWARE_WITH_CHOLMOD "Use SuiteSparse CHOLMOD supernodal Cholesky for FEA (SPD)" ON)
 if(CHUDWARE_WITH_CHOLMOD)
@@ -281,7 +283,7 @@ if(CHUDWARE_WITH_CHOLMOD)
       target_link_libraries(chudware_sim PUBLIC ${SUITESPARSECONFIG_LIBRARY})
     endif()
   else()
-    message(STATUS "chudware_sim: CHOLMOD not found — FEA uses Eigen SimplicialLDLT fallback")
+    message(STATUS "chudware_sim: CHOLMOD not found — FEA uses the in-tree SupernodalLLT")
   endif()
 endif()
 find_package(OpenMP QUIET)
@@ -593,6 +595,15 @@ target_link_libraries(test_tet10 PRIVATE chudware_sim)
 set_target_properties(test_tet10 PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME tet10 COMMAND test_tet10)
+
+# In-tree supernodal Cholesky (the FEA solver ladder's lead rung without SuiteSparse),
+# checked against Eigen's SimplicialLDLT on finite-element patterns.
+add_executable(test_supernodal_llt tests/test_supernodal_llt.cpp)
+target_include_directories(test_supernodal_llt PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_supernodal_llt PRIVATE chudware_sim)
+set_target_properties(test_supernodal_llt PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME supernodal_llt COMMAND test_supernodal_llt)
 
 # Steady-state thermal (heat-conduction) FEA gate — validates the conduction
 # kernel against the closed-form 1D plane-wall (Dirichlet) and wall+convection (Robin)

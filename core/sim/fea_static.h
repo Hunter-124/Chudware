@@ -1,6 +1,6 @@
 // Linear-static FEA on tet4, tet10 and hex8 meshes.
 //
-// The default sparse direct solver follows the CHOLMOD/LDLT/LU ladder. Explicit
+// The default sparse direct solver follows the supernodal-LLT/LDLT/LU ladder. Explicit
 // CHUDWARE_FEA_SOLVER=iccg selects bounded, incomplete-Cholesky preconditioned CG
 // for linear elasticity and frictionless unilateral penalty contact, with no
 // direct fallback. Assembly, material laws and stress/reaction recovery are shared.
@@ -130,8 +130,8 @@ struct FeaStaticResult {
     std::string error;  // non-empty when ok==false
 
     // Which factorization actually produced this answer — "CholmodSupernodalLLT"
-    // normally, "SimplicialLDLT(AMD)" in a build without SuiteSparse or after the
-    // supernodal LLT refused the matrix, "SparseLU(COLAMD)" when only partial
+    // with SuiteSparse, "SupernodalLLT" (the in-tree one) without it,
+    // "SimplicialLDLT(AMD)" after either supernodal LLT refused the matrix, "SparseLU(COLAMD)" when only partial
     // pivoting could carry it; CHUDWARE_FEA_SOLVER forces a specific one. fea_run
     // surfaces it as provenance.solver and as a solver_notes line, so a result
     // always says how it was computed.

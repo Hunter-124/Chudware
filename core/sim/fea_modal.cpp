@@ -27,6 +27,8 @@
 #include <omp.h>
 #endif
 
+#include "sim/supernodal_llt.h"
+
 #include <Spectra/MatOp/SparseSymMatProd.h>
 #include <Spectra/SymGEigsSolver.h>
 #include <Spectra/SymGEigsShiftSolver.h>
@@ -120,6 +122,41 @@ private:
     CholmodTriangularFactor llt_;
 };
 #endif
+
+// The same shift-invert op on the in-tree supernodal LLT, for a build without
+// SuiteSparse. Throws on a factorization failure so the caller falls back to LDLT.
+class SupernodalShiftInvert {
+public:
+    using Scalar = double;
+    SupernodalShiftInvert(const Eigen::SparseMatrix<double>& K,
+                          const Eigen::SparseMatrix<double>& M)
+        : K_(K), M_(M) {}
+    Eigen::Index rows() const { return K_.rows(); }
+    Eigen::Index cols() const { return K_.cols(); }
+    void set_shift(const double& sigma) {
+        Eigen::SparseMatrix<double> A = K_;
+        if (sigma != 0.0) A = K_ - sigma * M_;
+        A.makeCompressed();
+        if (!llt_.analyze(A) || !llt_.factorize(A))
+            throw std::runtime_error("supernodal LLT of (K - sigma*M) failed");
+    }
+    void perform_op(const double* x_in, double* y_out) const {
+        std::copy_n(x_in, K_.rows(), y_out);
+        llt_.solve_in_place(y_out);
+    }
+    void prepare_cholesky() {}
+    void lower_triangular_solve(const double* input, double* output) const {
+        llt_.lower_solve(input, output);
+    }
+    void upper_triangular_solve(const double* input, double* output) const {
+        llt_.upper_solve(input, output);
+    }
+
+private:
+    const Eigen::SparseMatrix<double>& K_;
+    const Eigen::SparseMatrix<double>& M_;
+    SupernodalLLT llt_;
+};
 
 class LdltShiftInvert {
 public:
@@ -368,6 +405,11 @@ bool fea_shift_invert(const Eigen::SparseMatrix<double>& K,
 #ifdef CHUDWARE_WITH_CHOLMOD
     try {
         CholmodShiftInvert op(K, M);
+        if (solve(op)) return true;
+    } catch (const std::exception&) {}
+#else
+    try {
+        SupernodalShiftInvert op(K, M);
         if (solve(op)) return true;
     } catch (const std::exception&) {}
 #endif

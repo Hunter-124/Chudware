@@ -55,7 +55,7 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | miniz | 3.0.2 | MIT | fetched at build | https://github.com/richgel999/miniz |
 | Clipper2 | 1.5.4 | BSL-1.0 | fetched at build | https://github.com/AngusJohnson/Clipper2 |
 | doctest | 2.4.11 | MIT | fetched at build; test binaries only, not shipped | https://github.com/doctest/doctest |
-| Polyhedral-FEA (mesher and mesh advisor model) | commit `a9fe080daf6e15187ab9d31ce7acedb93d6d7fe7` | BSD-3-Clause | fetched at build and statically linked; advisor model files shipped beside the engine | repository URL recorded in `core/cmake/ProvisionPolymesh.cmake` |
+| Polyhedral-FEA (mesher and mesh advisor model) | commit `f7af7700244d9c558cdc5b4293da274d6325273f` | BSD-3-Clause | fetched at build and statically linked; advisor model files shipped beside the engine | repository URL recorded in `core/cmake/ProvisionPolymesh.cmake` |
 | ONNX Runtime | 1.28.0 | MIT | prebuilt, fetched at build; Windows x64 and Linux x86-64 only | https://github.com/microsoft/onnxruntime |
 | openNURBS (from rhino3dm 8.17.0) | commit `6c91d229ab561fe21c92ffdd97934c77ff945e0a` | LicenseRef-openNURBS AND Zlib | fetched at build and statically linked | https://github.com/mcneel/opennurbs |
 | lib3mf | 2.5.0 | BSD-2-Clause | prebuilt, fetched at build; loaded at run time | https://github.com/3MFConsortium/lib3mf |

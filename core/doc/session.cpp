@@ -127,6 +127,7 @@
 #include <GeomAbs_CurveType.hxx>
 #include <ShapeAnalysis_Surface.hxx>
 #include <ShapeFix_Solid.hxx>               // section_props: wrap a closed skin in an oriented solid
+#include <ShapeFix_Shape.hxx>               // export read-back: tolerance repair before judging validity
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
 #include <Geom_Surface.hxx>
@@ -1893,7 +1894,7 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             // structural
             "type", "name", "id", "suppressed", "params", "refs", "folder",
             // placement / boolean options
-            "at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge",
+            "at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge", "body",
             // dimensions (params is merged into the feature, so these may appear either way)
             "length", "width", "height", "radius", "r1", "r2", "major_r", "minor_r",
         };
@@ -1925,7 +1926,7 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             if (is_primitive)
                 msg += ". A " + ftype_early + " accepts: params (length/width/height, radius, "
                        "r1/r2, major_r/minor_r), at, at_offset, axis, centered, mode, merge, "
-                       "plus name/refs/folder/suppressed.";
+                       "body (cut target), plus name/refs/folder/suppressed.";
             msg += " Unknown keys are rejected, never ignored, so a typo can't build "
                    "silently-wrong geometry.";
             throw OpError("invalid_op", msg);
@@ -5883,7 +5884,15 @@ void op_rename(json& doc, const json& op, const json& id_map) {
                       "{\"op\":\"rename\",\"id\":\"f1\",\"name\":\"BasePlate\"}");
     const std::string id = op_target_id(op, id_map, "rename");
     json* f = find_feature(doc, id);
-    if (!f) throw OpError("invalid_op", "rename: no feature '" + id + "'");
+    // An assembly renames its components (k<N>) the same way.
+    if (!f && doc.value("schema", std::string()) == "aicad.asm/1" &&
+        doc.contains("components") && doc["components"].is_array())
+        for (json& c : doc["components"])
+            if (c.is_object() && c.value("id", std::string()) == id) { f = &c; break; }
+    if (!f)
+        throw OpError("invalid_op", "rename: no feature" +
+                      std::string(doc.value("schema", std::string()) == "aicad.asm/1"
+                                      ? " or component" : "") + " '" + id + "'");
     (*f)["name"] = op["name"];
 }
 
@@ -9567,6 +9576,35 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         }
     }
     if (!r.ok) {
+        // Name the CAUSE: a failure in a feature this batch did not touch was broken by an
+        // earlier feature it did (HERC rover: editing fillet f9 was rejected with only
+        // "f10 shell: ..."). Prefix each such error with the batch's upstream changes and
+        // record the pairs in `rejected_cause`.
+        json rejected_cause = json::array();
+        if (!authored_features.empty()) {
+            // A feature that already failed before this batch was not broken by it.
+            std::unordered_set<std::string> failed_before;
+            if (s.compiled && s.compiled_rev == rollback_revision)
+                for (const auto& status : s.compiled->statuses)
+                    if (!status.ok && !status.rolled_back) failed_before.insert(status.id);
+            std::vector<std::string> upstream;
+            for (auto& status : r.statuses) {
+                if (authored_features.count(status.id)) {
+                    upstream.push_back(status.id + " (" + status.type + ")");
+                    continue;
+                }
+                if (status.ok || status.rolled_back || upstream.empty() ||
+                    failed_before.count(status.id))
+                    continue;
+                std::string causes;
+                const std::size_t from = upstream.size() > 3 ? upstream.size() - 3 : 0;
+                for (std::size_t k = from; k < upstream.size(); ++k)
+                    causes += (causes.empty() ? "" : ", ") + upstream[k];
+                rejected_cause.push_back({{"broken", status.id}, {"type", status.type},
+                                          {"changed_upstream", causes}});
+                status.error = "broken by this batch's change to " + causes + ": " + status.error;
+            }
+        }
         // `r` retains the rejected tree's feature failures for the in-band response;
         // restore the live document by move and leave both history stacks untouched.
         json rejected_tree = std::move(s.doc);
@@ -9583,6 +9621,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
                                      showing_view ? s.sketch_prefix.get() : &ensure_compiled(s),
                                      with_exact && !showing_view);
         response["rejected_tree"] = std::move(rejected_tree);
+        if (!rejected_cause.empty()) response["rejected_cause"] = std::move(rejected_cause);
         return response;
     }
     if (!coalesce || !removed_history_tokens.empty()) push_undo_document(s, rollback_doc);
@@ -20430,6 +20469,16 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                       (*tightest)["b"].get<std::string>().c_str(),
                       (*tightest)["distance"].get<double>());
         summary = buf;
+        // A 0.00 mm "gap" is a touching pair, not clearance: say so, since without
+        // include_coincident it stays in `clearances` and `contacts` is empty.
+        std::size_t touching = 0;
+        for (const json& pair : clearances)
+            if (!pair.value("approx", false) && pair.contains("distance") &&
+                pair["distance"].is_number() && pair["distance"].get<double>() <= kCoincidentTol)
+                ++touching;
+        if (touching)
+            summary += "; " + std::to_string(touching) + " pair(s) TOUCH (zero gap) — pass "
+                       "include_coincident:true to list them as contacts";
     } else
         summary = n < 2 ? "No body pairs to check (1 body)." : "No interference detected.";
     if (min_clearance_mm > 0.0) {
@@ -23159,17 +23208,34 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
             // With solids in the export, compare SOLIDS: the re-read splits non-solid remnants
             // (a drawing profile's faces and construction wires) into several bodies, so a
             // body count would reject a correct file. Without solids, compare bodies.
-            std::size_t src_solids = 0;
+            std::size_t src_solids = 0, src_valid = 0;
             for (const TopoDS_Shape& b : shapes)
                 if (!b.IsNull())
-                    for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) ++src_solids;
-            std::size_t got = 0, valid = 0;
+                    for (TopExp_Explorer ex(b, TopAbs_SOLID); ex.More(); ex.Next()) {
+                        ++src_solids;
+                        if (BRepCheck_Analyzer(ex.Current()).IsValid()) ++src_valid;
+                    }
+            std::size_t got = 0, valid = 0, tolerance_fixed = 0;
             if (src_solids > 0) {
                 for (const auto& nb : reread)
                     if (!nb.second.IsNull())
                         for (TopExp_Explorer ex(nb.second, TopAbs_SOLID); ex.More(); ex.Next()) {
                             ++got;
-                            if (BRepCheck_Analyzer(ex.Current()).IsValid()) ++valid;
+                            if (BRepCheck_Analyzer(ex.Current()).IsValid()) {
+                                ++valid;
+                                continue;
+                            }
+                            // A STEP re-read can fail the strict analyzer only through tolerance
+                            // growth on read, which every receiving CAD repairs on import (HERC
+                            // rover: check_geometry_health sound, re-read "1/1 solids (0 valid)",
+                            // and the agent rebuilt a correct part from scratch). Count it valid
+                            // when ShapeFix makes it so, and say that it needed the fix.
+                            ShapeFix_Shape fix(ex.Current());
+                            fix.Perform();
+                            if (BRepCheck_Analyzer(fix.Shape()).IsValid()) {
+                                ++valid;
+                                ++tolerance_fixed;
+                            }
                         }
             } else {
                 got = reread.size();
@@ -23179,12 +23245,19 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
             const std::size_t want = src_solids > 0 ? src_solids : expected_solids;
             meta["solid_count"] = static_cast<int>(got);
             meta["valid_solids"] = static_cast<int>(valid);
-            meta["validated"] = got == want && valid == got && got > 0;
+            // Never fail for validity the source solids did not have (the ACIS branch's rule).
+            const std::size_t need_valid = src_solids > 0 ? std::min(src_valid, got) : got;
+            meta["validated"] = got == want && valid >= need_valid && got > 0;
+            if (tolerance_fixed > 0)
+                meta["readback_tolerance_fixed"] = static_cast<int>(tolerance_fixed);
+            if (src_solids > 0 && src_valid < src_solids)
+                meta["source_invalid_solids"] = static_cast<int>(src_solids - src_valid);
             if (!meta["validated"].get<bool>())
                 throw OpError("export_failed",
                               "export_file: wrote " + out + " but re-reading it recovered " +
                                   std::to_string(got) + "/" + std::to_string(want) + " solids (" +
-                                  std::to_string(valid) + " valid) — the file is incomplete or "
+                                  std::to_string(valid) + " valid, " + std::to_string(src_valid) +
+                                  " valid in the source) — the file is incomplete or "
                                   "malformed and would not open elsewhere",
                               {{"path", out}, {"format", fmt}});
         } catch (const OpError&) {

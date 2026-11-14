@@ -1444,8 +1444,9 @@ bool world_axis_from_ref(const json& ref, Eigen::Vector3d& out) {
         if (s == "axis.x" || s == "x") v = Eigen::Vector3d(1, 0, 0);
         else if (s == "axis.y" || s == "y") v = Eigen::Vector3d(0, 1, 0);
         else if (s == "axis.z" || s == "z") v = Eigen::Vector3d(0, 0, 1);
-        // Datum-plane normals (Z-up: front=XZ→+Y, top=XY→+Z, right=YZ→+X).
-        else if (s == "plane.front" || s == "front") v = Eigen::Vector3d(0, 1, 0);
+        // Datum-plane normals, signed as SketchPlane::front/top/right (front=XZ→-Y,
+        // top=XY→+Z, right=YZ→+X) — the same normals part patterns, sketches and mates use.
+        else if (s == "plane.front" || s == "front") v = Eigen::Vector3d(0, -1, 0);
         else if (s == "plane.top" || s == "top") v = Eigen::Vector3d(0, 0, 1);
         else if (s == "plane.right" || s == "right") v = Eigen::Vector3d(1, 0, 0);
         else return false;

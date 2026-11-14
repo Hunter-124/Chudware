@@ -19,8 +19,9 @@ inline thread_local void* user_data = nullptr;
 inline thread_local std::optional<std::size_t> elements;
 inline thread_local std::chrono::steady_clock::time_point started;
 inline thread_local nlohmann::json probe;
+inline thread_local nlohmann::json body;
 
-// The base sim.progress event: {type, phase, elapsed_s, elements, probe?}. Every
+// The base sim.progress event: {type, phase, elapsed_s, elements, probe?, body?}. Every
 // emitter builds on it, so extensions only ever ADD keys to this shape.
 inline nlohmann::json event(const char* phase, std::optional<std::size_t> count) {
     if (count) elements = count;
@@ -32,6 +33,7 @@ inline nlohmann::json event(const char* phase, std::optional<std::size_t> count)
         {"elements", nullptr}};
     if (elements) out["elements"] = *elements;
     if (!probe.is_null()) out["probe"] = probe;
+    if (!body.is_null()) out["body"] = body;
     return out;
 }
 
@@ -46,8 +48,19 @@ inline void set_progress_sink(void (*sink)(const char*, void*), void* user_data)
     progress_detail::user_data = user_data;
     progress_detail::elements.reset();
     progress_detail::probe = nullptr;
+    progress_detail::body = nullptr;
     if (sink) progress_detail::started = std::chrono::steady_clock::now();
 }
+
+// Which of several separately meshed solids the following events describe
+// (1-based index of total). Each solid runs its own fills, so without this a
+// reader sees fill passes and element counts restart for no visible reason.
+inline void set_progress_body(std::size_t index, std::size_t total) {
+    if (!progress_detail::sink) return;
+    progress_detail::body = {{"index", index}, {"total", total}};
+}
+
+inline void clear_progress_body() { progress_detail::body = nullptr; }
 
 // True while an event sink is armed on this thread. Callers that would build
 // metrics only for progress (per-constraint tables) check this first.

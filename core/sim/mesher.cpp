@@ -4385,7 +4385,13 @@ bool mesh_separate_solids(const std::vector<BodyGroup> &bodies,
   combined.nodes_per_elem = options.order == 2 ? 10 : 4;
   combined.mesh_type_used = options.order == 2 ? "tet10" : "tet4";
   combined.char_len_mm = std::numeric_limits<double>::infinity();
+  // Every solid runs its own probe fills; label them so progress reads as
+  // "solid i of n" instead of counters that restart. Cleared on every return.
+  struct BodyProgressScope {
+    ~BodyProgressScope() { clear_progress_body(); }
+  } body_progress;
   for (size_t i = 0; i < bodies.size(); ++i) {
+    set_progress_body(i + 1, bodies.size());
     const uint64_t ticket = sequence.fetch_add(1, std::memory_order_relaxed);
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const std::filesystem::path path =

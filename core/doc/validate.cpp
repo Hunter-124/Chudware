@@ -1579,6 +1579,8 @@ bool truthy(const json& v) {
     return false;
 }
 
+bool feature_param_known(const string& type, const string& key);  // defined with the params table
+
 vector<string> validate_feature(const json& f, const string& where,
                                 const std::set<string>& earlier_ids,
                                 const std::set<string>& globals_names,
@@ -1939,6 +1941,15 @@ vector<string> validate_feature(const json& f, const string& where,
                              "{\"type\":\"line\",\"p1\":[0,0],\"p2\":[10,0]}"
                            : "; a ref names another feature — inline object "
                              "lists belong in params";
+            }
+            // The slot is a PARAM of this type (transform/heal `body`): say where it goes,
+            // or the model ping-pongs between refs.body and a guessed params value.
+            if (!object_array && feature_param_known(ftype, it.key())) {
+                err += "; '" + it.key() + "' is a param of " + ftype + ": put it in params." +
+                       it.key();
+                if (it.key() == "body")
+                    err += " as the owning feature id of a live body (e.g. \"f3\"), not a "
+                           "b<N> display id";
             }
             errs.push_back(std::move(err));
         }
@@ -2508,7 +2519,10 @@ KeySet join(KeySet base, const KeySet& more) {
 
 // box/cylinder/sphere/cone/torus placement + body policy (document.cpp primitive branch
 // and session.cpp kPrimitiveKeys). `axis_dir` is what normalize_feature writes for refs.axis.
-const KeySet PRIMITIVE_KEYS = {"at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge"};
+// `body` is the explicit mode:"cut" target (document.cpp cut_target), as on the sketched
+// solid features below.
+const KeySet PRIMITIVE_KEYS = {"at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge",
+                               "body"};
 
 // hole and bolt_circle share the bore description. The synonym rows are the ones
 // normalize_feature turns into `diameter` (dia/d/... , a radius, or a fastener
@@ -2540,11 +2554,11 @@ const std::map<string, KeySet> FEATURE_PARAM_KEYS = {
     {"extrude", {"mode", "merge", "end", "depth", "mid_plane", "dir", "flip",
                  "thin", "thin_thickness", "thin_side", "draft", "draft_outward",
                  "start", "start_offset", "offset", "end_offset", "end2", "depth2",
-                 "offset2", "end2_offset"}},
+                 "offset2", "end2_offset", "body"}},
     {"revolve", {"mode", "merge", "angle", "axis_pt", "axis_dir", "thin", "thin_thickness",
-                 "thin_side", "end", "flip", "dir2", "angle2"}},
-    {"sweep", {"mode", "merge", "orientation", "twist_turns", "twist_degrees"}},
-    {"loft", {"mode", "merge", "ruled", "tangency_start", "tangency_end"}},
+                 "thin_side", "end", "flip", "dir2", "angle2", "body"}},
+    {"sweep", {"mode", "merge", "orientation", "twist_turns", "twist_degrees", "body"}},
+    {"loft", {"mode", "merge", "ruled", "tangency_start", "tangency_end", "body"}},
     {"helix", {"pitch", "height", "radius", "turns", "taper", "start_angle", "ccw", "spiral",
                "shape", "start_radius", "pitch_table"}},
     // thread: `face`, `from`, `start_ref`, `start`, `profile` are the compiler's fallback
@@ -2786,6 +2800,11 @@ string param_key_hint(const string& type, const string& key) {
     if (t == hints().end()) return {};
     const auto k = t->second.find(key);
     return k == t->second.end() ? string() : k->second;
+}
+
+bool feature_param_known(const string& type, const string& key) {
+    const auto t = FEATURE_PARAM_KEYS.find(type);
+    return t != FEATURE_PARAM_KEYS.end() && t->second.count(key) != 0;
 }
 
 }  // namespace

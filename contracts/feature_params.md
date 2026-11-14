@@ -961,3 +961,22 @@ Amends the `import` feature for `sldprt`, `sldasm`, `x_t` and `x_b` sources
 - The `doc_import_file` response carries the same `import_fidelity`, `feature_resolved: false`,
   `solidworks_source` (native lane: `{reader, saved:{version, release, created, container},
   uncertaintyMM, faces, bodies, surfaces}`) and one `warnings` entry per lane that was skipped.
+
+## Cut targets and cut warnings (append-only, 2026-11-13)
+
+Amends `extrude`, `revolve`, `sweep`, `loft` and the primitives (`box`, `cylinder`, `sphere`,
+`cone`, `torus`):
+
+- `body: str | sel(body)?` — the body a `mode:"cut"` feature subtracts from: an owning feature
+  id (`"f3"`, `"<fid>#k"`) or `{"kind":"body","owner_feature":"f3"}`. Omitted, a cut subtracts
+  from the current (last-built) body, unchanged. An in-place `transform` source id resolves to
+  its moved descendant. A consumed or unknown id is refused by name (never a fallback to the
+  current body). `body` on a non-cut mode is refused: an add/boss merges into every body it
+  touches.
+- A successful cut (any feature whose tool is recorded with the `cut` role, including
+  `hole`/`bolt_circle`) carries a `warning` (not an error) when it (a) splits its target into
+  more solids than it had, (b) removes less than 0.01 % of the target's volume, or (c) its tool
+  also overlaps another live body that it did not cut (named, at most 3 checked).
+- `transform` errors name the body to target: an unknown `body` lists the live bodies; a
+  consumed `body` names its live owner (the consumer chain, else the newest live body whose
+  bounds hold it).

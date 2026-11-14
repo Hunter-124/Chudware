@@ -1086,3 +1086,32 @@ TEST_CASE("unsaved assembly resolves relative component sources against its proj
     // A relative project folder is a caller error, not a cwd guess.
     CHECK_THROWS(doc::doc_new("assembly", "relative_source_bad", false, "relative/project"));
 }
+
+// HERC rover audit: {"op":"rename","id":"k56",...} failed with "no feature 'k56'".
+TEST_CASE("rename renames an assembly component by its k-id") {
+    const fs::path part_step = tmp("rename_part.step");
+    doc::export_bodies({BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 10.0, 10.0, 10.0).Shape()},
+                       part_step.string(), "step");
+    const std::string did = doc::doc_new("assembly", "rename_component")
+                                .at("doc_id").get<std::string>();
+    json r = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_step.string()}}}}}), false);
+    REQUIRE(!r.contains("code"));
+    const std::string kid = r.value("id_map", json::object()).value("$0", std::string("k1"));
+    r = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "rename"}, {"id", kid}, {"name", "Left wheel"}}}), false);
+    REQUIRE(!r.contains("code"));
+    const json resp = doc::doc_tree(did);
+    const json tree = resp.contains("tree") ? resp["tree"] : resp;
+    bool renamed = false;
+    for (const json& c : tree.at("components"))
+        if (c.value("id", std::string()) == kid) renamed = c.value("name", std::string()) == "Left wheel";
+    CHECK(renamed);
+    std::string missing;
+    try {
+        doc::doc_apply_ops(did, -1, json::array({
+            {{"op", "rename"}, {"id", "k999"}, {"name", "x"}}}), false);
+    } catch (const doc::OpError& e) { missing = e.what(); }
+    CHECK(missing.find("no feature or component 'k999'") != std::string::npos);
+    close_session_when_idle(did);
+}

@@ -2710,11 +2710,35 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         std::vector<std::string> ids;
         TopoDS_Shape shape;
     };
-    auto solid_targets = [&](const TopoDS_Shape& tool, const std::string& mode) {
+    // The body a mode:"cut" solid feature subtracts from: the explicit `body` param (an
+    // owning feature id or body selector, contracts/feature_params.md) or else the current
+    // body. Without `body` a cut never reaches any other body, which is how holes meant for
+    // a frame landed in the last-built hinge barrel. An in-place transform's source id
+    // resolves to its moved descendant, as for `transform` itself.
+    auto cut_target = [&](const json& feat) -> std::string {
+        if (!feat.contains("body")) return current_solid_id();
+        const std::string type = feat.value("type", std::string("feature"));
+        std::string id = selector_owner_id(feat["body"]);
+        std::set<std::string> guard;
+        while (consumed.count(id) && superseded_by.count(id) && guard.insert(id).second)
+            id = superseded_by[id];
+        if (id.empty() || !results.count(id) || consumed.count(id) ||
+            !std::holds_alternative<SolidResult>(*results.at(id)))
+            throw std::runtime_error(type + ": body " + feat["body"].dump() + " is not a "
+                "live body. `body` names the owning feature id of the body to cut (e.g. "
+                "\"f3\"); omit it to cut the current body '" + current_solid_id() + "'");
+        return id;
+    };
+    auto solid_targets = [&](const TopoDS_Shape& tool, const std::string& mode,
+                             const json& feat) {
         BodyTargets targets;
+        if (mode != "cut" && feat.contains("body"))
+            throw std::runtime_error(feat.value("type", std::string("feature")) +
+                ": `body` selects the target of mode:\"cut\" only; an add/boss merges into "
+                "every body it touches (merge:false keeps it a separate body)");
         if (mode == "new") return targets;  // Never even test existing geometry.
         if (mode == "cut") {
-            const std::string id = current_solid_id();
+            const std::string id = cut_target(feat);
             if (!id.empty()) {
                 targets.ids.push_back(id);
                 targets.shape = require_solid(results, id, "target");
@@ -2782,6 +2806,53 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                    "not: " + raw + ">";
         }
         return current_solid_id();
+    };
+    // For a CONSUMED solid id: {the feature that consumed it, the surviving body it now lives
+    // in}. Walks forward through consumers (source_of records a modifying feature's input;
+    // superseded_by an in-place move). A secondary merge operand is recorded in neither, so
+    // its owner falls back to the newest live body whose bounds hold the consumed body's
+    // centre (and its consumer stays unknown). Empty strings when nothing resolves.
+    auto live_owner_of = [&](const std::string& gone) -> std::pair<std::string, std::string> {
+        std::map<std::string, std::vector<std::string>> consumers;
+        for (const auto& kv : source_of) consumers[kv.second].push_back(kv.first);
+        for (const auto& kv : superseded_by) consumers[kv.first].push_back(kv.second);
+        std::string consumer, owner;
+        if (auto c = consumers.find(gone); c != consumers.end() && !c->second.empty())
+            consumer = c->second.front();
+        const std::set<std::string> order(solid_order.begin(), solid_order.end());
+        std::set<std::string> seen;
+        std::vector<std::string> stack{gone};
+        while (!stack.empty()) {
+            const std::string x = stack.back();
+            stack.pop_back();
+            if (!seen.insert(x).second) continue;
+            if (x != gone && order.count(x) && !consumed.count(x)) {
+                owner = x;
+                break;
+            }
+            if (auto c = consumers.find(x); c != consumers.end())
+                stack.insert(stack.end(), c->second.begin(), c->second.end());
+        }
+        auto git = results.find(gone);
+        if (owner.empty() && git != results.end() &&
+            std::holds_alternative<SolidResult>(*git->second)) {
+            Bnd_Box cb;
+            BRepBndLib::Add(std::get<SolidResult>(*git->second).shape, cb);
+            if (!cb.IsVoid()) {
+                double xa, ya, za, xb, yb, zb;
+                cb.Get(xa, ya, za, xb, yb, zb);
+                const gp_Pnt mid((xa + xb) / 2, (ya + yb) / 2, (za + zb) / 2);
+                for (auto it = solid_order.rbegin(); it != solid_order.rend(); ++it) {
+                    if (consumed.count(*it) || !results.count(*it) ||
+                        !std::holds_alternative<SolidResult>(*results.at(*it)))
+                        continue;
+                    Bnd_Box lb;
+                    BRepBndLib::Add(std::get<SolidResult>(*results.at(*it)).shape, lb);
+                    if (!lb.IsVoid() && !lb.IsOut(mid)) { owner = *it; break; }
+                }
+            }
+        }
+        return {consumer, owner};
     };
     // Resolve a pattern/mirror SEED feature to its (tool body, op). Mirrors the oracle's
     // pattern._gather_seeds: a seed must be an earlier feature that contributed
@@ -3748,6 +3819,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // Solid ids already committed before this feature ran — anything pushed past
         // this mark is a body THIS feature produced, validated post-compile (Bug N2).
         const std::size_t solids_before = solid_order.size();
+        const std::size_t tool_recs_before = result.tool_recs.size();  // cut warnings below
         // ALIVE (surviving, not-yet-consumed) solids before this feature ran. Used by the
         // systemic "no silent vanish / null body / emptied document" backstop below (Bug
         // B6 class): a modifying feature (fillet/chamfer/sweep/cut/...) that CONSUMES the
@@ -4681,7 +4753,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }
 
                 const std::string mode = solid_mode(feat, "new");
-                const BodyTargets targets = solid_targets(solid, mode);
+                const BodyTargets targets = solid_targets(solid, mode, feat);
                 TopoDS_Shape out = solid;
                 if (!targets.ids.empty()) {
                     out = mode == "cut" ? ::geom::cut_unify(targets.shape, solid)
@@ -4911,7 +4983,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }
 
                 const std::string pmode = solid_mode(feat, "boss");
-                const BodyTargets targets = solid_targets(solid, pmode);
+                const BodyTargets targets = solid_targets(solid, pmode, feat);
                 const std::string ptgt = targets.ids.empty() ? std::string() : targets.ids.front();
                 if (ptgt.empty()) {
                     if (pmode == "cut")
@@ -5390,7 +5462,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (flip) dir = -dir;
 
                 // For a cut / through_all we size against the current body.
-                const std::string tgt_id = is_cut ? current_solid_id() : std::string();
+                const std::string tgt_id = is_cut ? cut_target(feat) : std::string();
 
                 // --- thin feature: replace each filled profile face with its thin-wall
                 // ring (port of extrude.py::_thin_profile_face). thin_side: one (inside,
@@ -5692,7 +5764,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     feature_op_of[id] = "cut";
                     record_tool(id, "cut", solid);
                 } else {
-                    const BodyTargets targets = solid_targets(solid, mode);
+                    const BodyTargets targets = solid_targets(solid, mode, feat);
                     const std::string mtgt = targets.ids.empty() ? std::string() : targets.ids.front();
                     if (!mtgt.empty()) {
                         const TopoDS_Shape& tgt = targets.shape;
@@ -5937,7 +6009,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 }
 
                 const std::string rmode = solid_mode(feat, "boss");
-                const BodyTargets targets = solid_targets(tool, rmode);
+                const BodyTargets targets = solid_targets(tool, rmode, feat);
                 const std::string rtgt = targets.ids.empty() ? std::string() : targets.ids.front();
 
                 if (rtgt.empty()) {
@@ -6185,7 +6257,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         "radius); verify the geometry";
 
                 const std::string smode = solid_mode(feat, "boss");
-                const BodyTargets targets = solid_targets(solid, smode);
+                const BodyTargets targets = solid_targets(solid, smode, feat);
                 const std::string stgt = targets.ids.empty() ? std::string() : targets.ids.front();
                 if (!stgt.empty()) {
                     const TopoDS_Shape& tgt = targets.shape;
@@ -6350,11 +6422,22 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // common(A, A∪B) = A). Error loudly and tell the caller to keep the operand
                 // separate with merge:false, instead of returning a plausible-but-wrong solid.
                 for (const std::string& opnd : {a_id, b_id})
-                    if (consumed.count(opnd))
+                    if (consumed.count(opnd)) {
+                        // Name the feature to rebuild: the one that merged the operand away
+                        // (and the body it now lives in), not just "that body".
+                        const auto [by, owner] = live_owner_of(opnd);
+                        std::string fix;
+                        if (!by.empty())
+                            fix = "rebuild feature '" + by + "' with \"merge\":false so '" +
+                                  opnd + "' stays a separate solid for the boolean";
+                        else
+                            fix = "rebuild the feature that merged it (the first later "
+                                  "add/boss touching '" + opnd + "') with \"merge\":false";
+                        if (!owner.empty()) fix += "; it currently lives in body '" + owner + "'";
                         throw std::runtime_error(
                             "boolean: operand '" + opnd + "' was already merged into another body "
-                            "(a default primitive fuses with mode:\"boss\") — build that body with "
-                            "\"merge\":false so it stays a separate solid for the boolean");
+                            "(a default primitive fuses with mode:\"boss\") — " + fix);
+                    }
                 const TopoDS_Shape& a = require_solid(results, a_id, "a");
                 const TopoDS_Shape& b = require_solid(results, b_id, "b");
 
@@ -7278,9 +7361,38 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                            guard.insert(eff_id).second)
                         eff_id = superseded_by[eff_id];
                 }
-                if (consumed.count(eff_id))
+                // Name the bodies an agent CAN target: a bare "not found" / "target its live
+                // body owner" left HERC-rover agents guessing between b<N>, $N and refs.body.
+                auto live_bodies = [&]() {
+                    std::string out;
+                    int n = 0;
+                    for (auto it = solid_order.rbegin(); it != solid_order.rend(); ++it) {
+                        if (consumed.count(*it)) continue;
+                        if (n == 12) { out += ", ..."; break; }
+                        out += (n++ ? ", '" : "'") + *it + "'";
+                    }
+                    return out.empty() ? std::string("(none)") : out;
+                };
+                if (!results.count(eff_id))
+                    throw std::runtime_error("transform: body '" + body_id + "' is not a "
+                        "feature id here. params.body takes the OWNING FEATURE id of a live body "
+                        "(e.g. \"f3\", or {\"kind\":\"body\",\"owner_feature\":\"f3\"}), not a "
+                        "b<N> display id or a batch index; transform takes no refs. Live bodies "
+                        "(newest first): " + live_bodies());
+                if (consumed.count(eff_id)) {
+                    const std::string owner = live_owner_of(eff_id).second;
+                    if (owner.empty())
+                        throw std::runtime_error("transform: body '" + body_id +
+                            "' is consumed by a later feature; target its live body owner "
+                            "(params.body = that feature id). Live bodies (newest first): " +
+                            live_bodies());
                     throw std::runtime_error("transform: body '" + body_id +
-                        "' is consumed by a later feature; target its live body owner");
+                        "' is consumed by a later feature; target its live body owner '" +
+                        owner + "': params.body:\"" + owner + "\" (or {\"kind\":\"body\","
+                        "\"owner_feature\":\"" + owner + "\"}). Moving it moves everything "
+                        "merged into it; build with merge:false to keep '" + body_id +
+                        "' a separate body");
+                }
                 const TopoDS_Shape& body = require_solid(results, eff_id, "body");
 
                 Eigen::Vector3d translate(0, 0, 0);
@@ -10758,6 +10870,98 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             }
             st.data = nullptr;
             st.warning.clear();
+        }
+
+        // Cut outcome warnings (contracts/feature_params.md "Cut targets and cut warnings").
+        // A cut subtracts from ONE body. Say when it split that body, barely touched it, or
+        // its tool ran through another live body it left whole: each was a silent wrong-body
+        // cut in the HERC rover runs (5 chain plates became 10 solids; holes meant for the
+        // frame landed in the last-built hinge barrel). Best effort: never fails the feature.
+        if (st.ok && source_of.count(id) && results.count(id) &&
+            std::holds_alternative<SolidResult>(*results.at(id))) {
+            try {
+                std::vector<TopoDS_Shape> cut_tools;
+                for (std::size_t k = tool_recs_before; k < result.tool_recs.size(); ++k)
+                    if (result.tool_recs[k].feature_id == id &&
+                        result.tool_recs[k].role == "cut" && !result.tool_recs[k].tool.IsNull())
+                        cut_tools.push_back(result.tool_recs[k].tool);
+                const std::string tgt = source_of.at(id);
+                auto tit = results.find(tgt);
+                if (!cut_tools.empty() && tit != results.end() &&
+                    std::holds_alternative<SolidResult>(*tit->second)) {
+                    const TopoDS_Shape& before = std::get<SolidResult>(*tit->second).shape;
+                    const TopoDS_Shape& after = std::get<SolidResult>(*results.at(id)).shape;
+                    std::vector<std::string> notes;
+                    auto n_solids = [](const TopoDS_Shape& s) {
+                        int n = 0;
+                        for (TopExp_Explorer e(s, TopAbs_SOLID); e.More(); e.Next()) ++n;
+                        return n;
+                    };
+                    const int nb = n_solids(before), na = n_solids(after);
+                    if (na > nb)
+                        notes.push_back("cut split body '" + tgt + "' into " +
+                                        std::to_string(na) + " separate solids (was " +
+                                        std::to_string(nb) + ") — check it was meant to "
+                                        "divide that body");
+                    // "Barely": against the smaller of body and tool, so a small hole in a
+                    // large plate is not flagged, but a tool that only grazes the body is.
+                    const double vb = heal_volume(before), va = heal_volume(after);
+                    double vt = 0.0;
+                    for (const TopoDS_Shape& t : cut_tools) vt += heal_volume(t);
+                    if (vb > 0.0 && vt > 0.0 && vb - va < 1e-4 * std::min(vb, vt)) {
+                        std::ostringstream os;
+                        os.precision(4);
+                        os << "cut removed only " << (vb - va) << " mm^3 (<0.01%) of body '"
+                           << tgt << "' — the tool barely touches it";
+                        notes.push_back(os.str());
+                    }
+                    // Other live bodies the tool passes through (newest first, at most 3
+                    // bbox candidates and 6 booleans, so a many-body part stays cheap).
+                    Bnd_Box tool_box;
+                    for (const TopoDS_Shape& t : cut_tools) BRepBndLib::Add(t, tool_box);
+                    std::vector<std::string> through;
+                    int candidates = 0, booleans = 0;
+                    // A `boolean` names its own targets and tools (keep_tools leaves the
+                    // tool body live, overlapping its own tool by construction).
+                    for (auto it = solid_order.rbegin();
+                         type != "boolean" && it != solid_order.rend() && candidates < 3; ++it) {
+                        const std::string& sid = *it;
+                        if (sid == id || consumed.count(sid) || !results.count(sid) ||
+                            !std::holds_alternative<SolidResult>(*results.at(sid)))
+                            continue;
+                        const TopoDS_Shape& other = std::get<SolidResult>(*results.at(sid)).shape;
+                        Bnd_Box ob;
+                        BRepBndLib::Add(other, ob);
+                        if (ob.IsVoid() || tool_box.IsOut(ob)) continue;
+                        ++candidates;
+                        const double ov_tol = 1e-6 * std::max(1.0, heal_volume(other));
+                        for (const TopoDS_Shape& t : cut_tools) {
+                            if (booleans >= 6) break;
+                            Bnd_Box tb;
+                            BRepBndLib::Add(t, tb);
+                            if (tb.IsOut(ob)) continue;
+                            ++booleans;
+                            if (heal_volume(::geom::common(other, t)) > ov_tol) {
+                                through.push_back(sid);
+                                break;
+                            }
+                        }
+                    }
+                    if (!through.empty()) {
+                        std::string names;
+                        for (const std::string& s : through)
+                            names += (names.empty() ? "'" : ", '") + s + "'";
+                        notes.push_back("the cut tool also passes through live body " + names +
+                                        ", which it did NOT cut: a cut subtracts from one body "
+                                        "(here '" + tgt + "'); set params.body to choose it, "
+                                        "or add one cut per body");
+                    }
+                    for (const std::string& n : notes)
+                        st.warning = st.warning.empty() ? n : (st.warning + "; " + n);
+                }
+            } catch (...) {
+                // A diagnostic boolean that throws leaves the feature's result untouched.
+            }
         }
 
         // References that re-bound by geometry match instead of reproducing the element they

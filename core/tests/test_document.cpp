@@ -12175,3 +12175,143 @@ TEST_CASE("complex feature reader parameters remain accepted by mutation validat
         }
     }
 }
+
+// ---------------------------------------------------------------- HERC rover audit (body addressing)
+namespace {
+json herc_feat(const char* id, const char* type, json params, json refs = json::object()) {
+    return json{{"id", id}, {"type", type}, {"name", id}, {"suppressed", false},
+                {"params", std::move(params)}, {"refs", std::move(refs)}};
+}
+json herc_doc(json feats) {
+    return json{{"schema", "aicad.part/1"}, {"id", "doc1"}, {"name", "Herc"},
+                {"units", {{"system", "MMGS"}}}, {"features", std::move(feats)}};
+}
+const chudware::doc::FeatureStatus* herc_status(const CompileResult& r, const std::string& id) {
+    for (const auto& s : r.statuses)
+        if (s.id == id) return &s;
+    return nullptr;
+}
+}  // namespace
+
+TEST_CASE("transform names the live owner of a consumed body and lists live bodies") {
+    // f2 fuses into f1 (default merge), consuming it: f1's live owner is f2.
+    const json doc = herc_doc(json::array({
+        herc_feat("f1", "box", {{"length", 20}, {"width", 20}, {"height", 20}}),
+        herc_feat("f2", "box", {{"length", 20}, {"width", 20}, {"height", 20},
+                                {"at", {10, 0, 0}}}),
+        herc_feat("f3", "transform", {{"body", "f1"}, {"translate", {0, 0, 50}}}),
+    }));
+    const CompileResult r = compile_document(doc, json::object());
+    const auto* st = herc_status(r, "f3");
+    REQUIRE(st);
+    CHECK_FALSE(st->ok);
+    INFO(st->error);
+    CHECK(st->error.find("live body owner 'f2'") != std::string::npos);
+    CHECK(st->error.find("params.body:\"f2\"") != std::string::npos);
+
+    json bad = doc;
+    bad["features"][2]["params"]["body"] = "b1";
+    const CompileResult rb = compile_document(bad, json::object());
+    const auto* sb = herc_status(rb, "f3");
+    REQUIRE(sb);
+    CHECK_FALSE(sb->ok);
+    INFO(sb->error);
+    CHECK(sb->error.find("not a feature id") != std::string::npos);
+    CHECK(sb->error.find("Live bodies (newest first): 'f2'") != std::string::npos);
+}
+
+TEST_CASE("refs.body on transform points at params.body") {
+    const json doc = herc_doc(json::array({
+        herc_feat("f1", "box", {{"length", 20}, {"width", 20}, {"height", 20}}),
+        herc_feat("f2", "transform", {{"translate", {5, 0, 0}}}, {{"body", "f1"}}),
+    }));
+    const auto errs = chudware::doc::validate_document(doc);
+    bool hinted = false;
+    for (const auto& e : errs)
+        if (e.find("transform takes no refs") != std::string::npos &&
+            e.find("put it in params.body") != std::string::npos)
+            hinted = true;
+    CHECK(hinted);
+}
+
+TEST_CASE("cut warnings: another body in the tool's path, explicit cut target, splits") {
+    // Two separate cubes on X; a long X-axis rod cut passes through both.
+    auto two_cubes_and_rod = [](json rod_extra) {
+        json rod = {{"radius", 2}, {"height", 100}, {"axis", {1, 0, 0}}, {"at", {20, 0, 0}},
+                    {"mode", "cut"}};
+        for (auto it = rod_extra.begin(); it != rod_extra.end(); ++it) rod[it.key()] = it.value();
+        return herc_doc(json::array({
+            herc_feat("f1", "box", {{"length", 20}, {"width", 20}, {"height", 20}}),
+            herc_feat("f2", "box", {{"length", 20}, {"width", 20}, {"height", 20},
+                                    {"at", {40, 0, 0}}, {"merge", false}}),
+            herc_feat("f3", "cylinder", rod),
+        }));
+    };
+    {
+        const CompileResult r = compile_document(two_cubes_and_rod(json::object()),
+                                                 json::object());
+        const auto* st = herc_status(r, "f3");
+        REQUIRE(st);
+        REQUIRE_MESSAGE(st->ok, st->error);
+        INFO(st->warning);
+        CHECK(st->warning.find("passes through live body 'f1'") != std::string::npos);
+    }
+    {
+        const CompileResult r = compile_document(two_cubes_and_rod({{"body", "f1"}}),
+                                                 json::object());
+        const auto* st = herc_status(r, "f3");
+        REQUIRE(st);
+        REQUIRE_MESSAGE(st->ok, st->error);
+        INFO(st->warning);
+        CHECK(st->warning.find("passes through live body 'f2'") != std::string::npos);
+        CHECK(r.body_count == 2);
+    }
+    {
+        const CompileResult r = compile_document(two_cubes_and_rod({{"body", "f9"}}),
+                                                 json::object());
+        const auto* st = herc_status(r, "f3");
+        REQUIRE(st);
+        CHECK_FALSE(st->ok);
+        CHECK(st->error.find("is not a live body") != std::string::npos);
+    }
+    {
+        // A slab through the middle of a bar divides it into two solids.
+        const json doc = herc_doc(json::array({
+            herc_feat("f1", "box", {{"length", 40}, {"width", 10}, {"height", 10}}),
+            herc_feat("f2", "box", {{"length", 2}, {"width", 50}, {"height", 50},
+                                    {"mode", "cut"}}),
+        }));
+        const CompileResult r = compile_document(doc, json::object());
+        const auto* st = herc_status(r, "f2");
+        REQUIRE(st);
+        REQUIRE_MESSAGE(st->ok, st->error);
+        INFO(st->warning);
+        CHECK(st->warning.find("cut split body 'f1' into 2") != std::string::npos);
+    }
+}
+
+TEST_CASE("a rejected batch names the edited feature that broke a downstream one") {
+    OpvPart p("RejectedCause");
+    // A hole near the +X end of the 40 mm stock...
+    const json added = p.apply(json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Bore"},
+            {"params", {{"radius", 3}, {"height", 100}, {"at", {35, 15, 10}},
+                        {"mode", "cut"}}}}}}}));
+    REQUIRE(added.at("rebuild").at("ok").get<bool>());
+    const std::string bore = added.at("id_map").at("$0").get<std::string>();
+    // ...then shorten the stock so the bore misses; set_units keeps the batch out of
+    // the auto-rollback policy, so it is rejected atomically.
+    const json r = p.apply(json::array({
+        {{"op", "edit_feature"}, {"id", p.box}, {"params", {{"length", 20}}}},
+        {{"op", "set_units"}, {"system", "MMGS"}}}));
+    REQUIRE(r.contains("rejected_tree"));
+    REQUIRE(r.contains("rejected_cause"));
+    CHECK(r["rejected_cause"][0]["broken"] == bore);
+    CHECK(r["rejected_cause"][0]["changed_upstream"].get<std::string>().find(p.box) == 0);
+    bool prefixed = false;
+    for (const json& row : r.at("rebuild").at("feature_status"))
+        if (row.value("id", std::string()) == bore)
+            prefixed = row.value("error", std::string()).find(
+                           "broken by this batch's change to " + p.box) == 0;
+    CHECK(prefixed);
+}

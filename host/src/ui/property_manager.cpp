@@ -20,6 +20,7 @@
 
 #include "property_manager.h"
 #include "property_manager_fields.inl"
+#include "anim.h"
 #include "icons.h"
 #include "widgets/kit_form.h"  // display-only dimension formatting for viewport callouts
 #include "sketch_mode.h"   // C38 (P1f): SketchMode::active() — sketch owns Esc while editing
@@ -36,6 +37,10 @@ namespace ui {
 
 // C37-F: Debounce window for live preview (was 0.40 s; reduced for snappier feel).
 static const double kDebounceSec = 0.25;
+// A continuous drag/wheel resets the debounce every frame, so a pure trailing debounce shows
+// nothing until the pointer rests. Past this age a pending edit previews anyway; with one
+// preview in flight at a time the engine's own rebuild time then paces a live stream.
+static const double kLiveMaxWaitSec = 0.10;
 // A live drag/keystroke preview is disposable: cap its engine round-trip so a pathological or
 // very slow rebuild can't freeze the form — or machine-gun the shared daemon — for the full 120 s
 // default. On timeout the preview drops to an inline error and the GUI stays responsive; the
@@ -1787,6 +1792,8 @@ void PropertyManager::tick(AppState& st) {
         cancelEditsAsync(st);
         return;
     }
+    if (dirty_ && !dirtySeen_) dirtySince_ = ImGui::GetTime();
+    dirtySeen_ = dirty_;
     // Phase 4: keep the daemon edit-hold fresh while the form is open. The
     // daemon already refreshes it on every preview op; this covers an open-but-
     // idle form, rate-limited to once/second.
@@ -1818,7 +1825,11 @@ void PropertyManager::tick(AppState& st) {
         return;
     }
     if (!dirty_ || !readyForPreview(form_, fields_)) return;
-    if (ImGui::GetTime() - lastEditTime_ < kDebounceSec) return;
+    // The idle loop sleeps up to 50 ms between frames; keep drawing until the pending preview
+    // fires so it leaves on its deadline rather than on the next incidental wake.
+    ui::anim::requestFrames();
+    const double now = ImGui::GetTime();
+    if (now - lastEditTime_ < kDebounceSec && now - dirtySince_ < kLiveMaxWaitSec) return;
     applyPreview(st);
 }
 

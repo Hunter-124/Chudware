@@ -59,6 +59,11 @@ std::vector<EdgeBoundaryUses> edge_boundary_uses(const TopoDS_Shape& shape,
 // sphere pole) are ignored. An OCCT failure reads as not watertight.
 bool is_watertight(const TopoDS_Shape& shape);
 
+// Whether a BOPAlgo_CheckerSI self-intersection check of `shape` should run in parallel.
+// Parallel mode gives every thread its own intersection context, so on ordinary part bodies
+// (measured: 34-168 faces) it is 25-40% slower than serial; much larger bodies still gain.
+bool self_check_parallel(const TopoDS_Shape& shape);
+
 enum class FilletFailure {
     none,
     invalid_input,

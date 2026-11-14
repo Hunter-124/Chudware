@@ -1746,7 +1746,10 @@ if(CHUDWARE_WITH_OCCT)
     if(APPLE)
       target_link_options(chudware-shape-build-worker PRIVATE -Wl,-dead_strip)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      target_link_options(chudware-shape-build-worker PRIVATE -Wl,--gc-sections)
+      # Every strict fillet spawns this executable. --as-needed drops the NEEDED entries that
+      # --gc-sections leaves behind (CHOLMOD -> FlexiBLAS/OpenBLAS, CUDA, the visualization and
+      # exchange toolkits); loading and initializing them was most of the worker's start-up.
+      target_link_options(chudware-shape-build-worker PRIVATE -Wl,--gc-sections -Wl,--as-needed)
     endif()
   endif()
 

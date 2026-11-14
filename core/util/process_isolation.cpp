@@ -82,6 +82,43 @@ std::atomic<bool> g_fork_unusable{false};
 // Private to the forked advisory child. Its outer boundary already contains all
 // nested geometry and must never inherit the ordinary blend fallback policy.
 bool g_bounded_task = false;
+
+#if defined(__unix__) || defined(__APPLE__)
+// Sleeps until a spawned child may have exited or `deadline` passes. On Linux a pidfd wakes
+// the parent the moment the build finishes; an escalating nap (up to ~13 ms of dead time per
+// blend) remains the fallback where pidfds are unavailable.
+class ChildWaiter {
+public:
+    explicit ChildWaiter(pid_t pid) {
+#if defined(__linux__) && defined(SYS_pidfd_open)
+        fd_ = static_cast<int>(::syscall(SYS_pidfd_open, pid, 0));
+#else
+        (void)pid;
+#endif
+    }
+    ~ChildWaiter() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    ChildWaiter(const ChildWaiter&) = delete;
+    ChildWaiter& operator=(const ChildWaiter&) = delete;
+
+    void pause(std::chrono::steady_clock::time_point deadline) {
+        if (fd_ >= 0) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count() + 1;
+            struct pollfd pfd = {fd_, POLLIN, 0};
+            ::poll(&pfd, 1, static_cast<int>(std::clamp<long long>(remaining, 0, 250)));
+            return;
+        }
+        ::usleep(nap_);
+        if (nap_ < 10000) nap_ *= 2;
+    }
+
+private:
+    int fd_ = -1;
+    useconds_t nap_ = 200;
+};
+#endif
 }  // namespace
 
 bool shape_isolation_active() {
@@ -206,9 +243,7 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
 
     int status = 0;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    // Escalating wait: a blend can run for seconds, so a fixed 1 ms poll would spin
-    // thousands of times. Start tight (most builds are milliseconds) and back off.
-    useconds_t nap = 200;
+    ChildWaiter waiter(pid);
     for (;;) {
         const pid_t got = ::waitpid(pid, &status, WNOHANG);
         if (got == pid) break;
@@ -231,8 +266,7 @@ IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& bui
             g_fork_unusable.store(true, std::memory_order_relaxed);
             return in_process();
         }
-        ::usleep(nap);
-        if (nap < 10000) nap *= 2;
+        waiter.pause(deadline);
     }
     ::close(fd);
     if (WIFSIGNALED(status)) {
@@ -725,7 +759,7 @@ IsolatedShapeResult ShapeBuildExecSession::run(const FilletWorkerParameters& par
         }
 
         int status = 0;
-        useconds_t nap = 200;
+        ChildWaiter waiter(pid);
         for (;;) {
             const pid_t got = ::waitpid(pid, &status, WNOHANG);
             if (got == pid) break;
@@ -741,8 +775,7 @@ IsolatedShapeResult ShapeBuildExecSession::run(const FilletWorkerParameters& par
                 ::close(output);
                 return {false, {}, Failure::timed_out};
             }
-            ::usleep(nap);
-            if (nap < 10000) nap *= 2;
+            waiter.pause(parameters.deadline);
         }
         if (std::chrono::steady_clock::now() >= parameters.deadline) {
             ::close(output);

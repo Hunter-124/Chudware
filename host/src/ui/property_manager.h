@@ -567,6 +567,8 @@ private:
     bool acceptRequested_ = false; // chrome/Enter, processed after the fields have been drawn
     bool acceptPending_ = false;   // waiting for the latest accepted final-quality apply
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
+    double dirtySince_ = 0.0;      // ImGui::GetTime() when dirty_ last went false -> true
+    bool dirtySeen_ = false;       // dirty_ as of the previous tick (edge detector for dirtySince_)
     bool firstPreviewDone_ = false;
     bool previewInFlight_ = false; // async applyOps in flight (serialize first add_feature)
     bool previewRolledBack_ = false; // the last applied preview rebuilt only up to its feature

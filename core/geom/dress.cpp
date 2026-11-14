@@ -128,6 +128,14 @@ std::vector<EdgeBoundaryUses> edge_boundary_uses(const TopoDS_Shape& shape,
     return uses;
 }
 
+bool self_check_parallel(const TopoDS_Shape& shape) {
+    constexpr int kParallelMinFaces = 128;
+    int faces = 0;
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More() && faces < kParallelMinFaces; ex.Next())
+        ++faces;
+    return faces >= kParallelMinFaces;
+}
+
 // An OCCT blend can report IsDone despite leaving an open B-rep, so every blend result is
 // closure-checked (all-edge fillets and best-effort chamfers alike).
 bool is_watertight(const TopoDS_Shape& shape) {
@@ -976,7 +984,7 @@ std::string fillet_solid_rejection(const TopoDS_Shape& shape,
         checker.SetArguments(args);
         checker.SetLevelOfCheck(9);
         checker.SetNonDestructive(Standard_True);
-        checker.SetRunParallel(Standard_True);
+        checker.SetRunParallel(self_check_parallel(solids(i)) ? Standard_True : Standard_False);
         checker.Perform(budget->Start());
         if (budget->interrupted()) return "fillet self-intersection validation timed out";
         if (checker.HasErrors()) {

@@ -19176,7 +19176,8 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                     ck.SetArguments(one);
                     ck.SetLevelOfCheck(9);
                     ck.SetNonDestructive(Standard_True);
-                    ck.SetRunParallel(Standard_True);
+                    ck.SetRunParallel(::geom::self_check_parallel(constituent) ? Standard_True
+                                                                               : Standard_False);
                     ck.Perform(si_budget->Start());
                     if (si_budget->broke()) {
                         si_reason = "not checked — the self-intersection check hit its " +

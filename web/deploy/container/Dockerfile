@@ -27,8 +27,11 @@ COPY extern/mapbox/ ./extern/mapbox/
 # core's CMake labels its tests from the suite manifest (cmake/ChudwareTestSuites.cmake).
 COPY cmake/ ./cmake/
 COPY scripts/test_suites.json ./scripts/test_suites.json
+# LTO stays on here: the hosted image is rebuilt rarely, so it takes the slower release
+# link that dev trees (CHUDWARE_LTO default OFF, Windows presets) skip.
 RUN cmake -S core -B core/build-occt-linux -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCHUDWARE_LTO=ON \
         -DCHUDWARE_DEVELOPER_BUILD=ON \
         -DCHUDWARE_WITH_OCCT=ON \
         -DCHUDWARE_WITH_CHOLMOD=ON \

@@ -8,6 +8,7 @@
 #include "doc/assembly.h"
 
 #define _USE_MATH_DEFINES
+#include "doc/asm_disk_cache.h"
 #include "util/component_ref.h"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -117,6 +119,12 @@ struct LoadedComponent {
     std::vector<std::string> body_material_keys;  // per body; "" = no material assigned
     std::string error;                          // incomplete source; surviving geometry retained
     nlohmann::json build_state;                 // write-back report when compiled from features
+    // component_cache_key of a complete, trusted load ("" otherwise): a content identity
+    // that persists across processes (asm_disk_cache keys).
+    std::string content_key;
+    // Nested sub-assembly only: each body's own content identity (its component's
+    // mesh_key), aligned with bodies, so a display pass can mesh and cache per body.
+    std::vector<std::string> body_mesh_keys;
 };
 
 // Keyed by resolved path + exact file identity (+ current descendants for native files).
@@ -282,11 +290,103 @@ void append_load_error(std::string& error, const std::string& detail) {
     error += detail;
 }
 
+// A nested sub-assembly's solved state for asm_disk_cache: its placed bodies as ONE
+// compound (BinTools keeps repeated parts shared) plus each body's appearance regions and
+// material key: everything load_bodies returns for a complete nested load.
+std::string encode_nested_bodies(const std::vector<TopoDS_Shape>& bodies,
+                                 const std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
+                                 const std::vector<std::string>& material_keys,
+                                 const std::vector<std::string>& mesh_keys) {
+    TopoDS_Compound compound;
+    BRep_Builder builder;
+    builder.MakeCompound(compound);
+    for (const TopoDS_Shape& body : bodies) builder.Add(compound, body);
+    std::string out = "NST1";
+    auto put_u64 = [&out](std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    };
+    const std::string brep = brep_cache_encode({compound});
+    put_u64(brep.size());
+    out += brep;
+    put_u64(bodies.size());
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        const auto& regions = appearances[i];
+        put_u64(regions.size());
+        if (!regions.empty())
+            out.append(reinterpret_cast<const char*>(regions.data()),
+                       regions.size() * sizeof(aicm::AppearanceRegion));
+        put_u64(material_keys[i].size());
+        out += material_keys[i];
+        put_u64(mesh_keys[i].size());
+        out += mesh_keys[i];
+    }
+    return out;
+}
+
+bool decode_nested_bodies(const std::string& in, std::vector<TopoDS_Shape>& bodies,
+                          std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
+                          std::vector<std::string>& material_keys,
+                          std::vector<std::string>& mesh_keys) {
+    std::size_t pos = 4;
+    auto get_u64 = [&](std::uint64_t& v) {
+        if (pos > in.size() || in.size() - pos < 8) return false;
+        v = 0;
+        for (int i = 0; i < 8; ++i)
+            v |= static_cast<std::uint64_t>(static_cast<unsigned char>(in[pos + i])) << (8 * i);
+        pos += 8;
+        return true;
+    };
+    std::uint64_t brep_len = 0, count = 0;
+    if (in.size() < 4 || in.compare(0, 4, "NST1") != 0 || !get_u64(brep_len) ||
+        brep_len > in.size() - pos) return false;
+    std::vector<TopoDS_Shape> decoded;
+    try {
+        decoded = brep_cache_decode(in.substr(pos, static_cast<std::size_t>(brep_len)));
+    } catch (...) {
+        return false;
+    }
+    pos += static_cast<std::size_t>(brep_len);
+    if (decoded.size() != 1 || decoded[0].ShapeType() != TopAbs_COMPOUND) return false;
+    std::vector<TopoDS_Shape> out_bodies;
+    for (TopoDS_Iterator it(decoded[0]); it.More(); it.Next()) out_bodies.push_back(it.Value());
+    if (!get_u64(count) || count != out_bodies.size() || out_bodies.empty()) return false;
+    std::vector<std::vector<aicm::AppearanceRegion>> out_appearances(out_bodies.size());
+    std::vector<std::string> out_keys(out_bodies.size()), out_mesh_keys(out_bodies.size());
+    auto get_string = [&](std::string& value) {
+        std::uint64_t len = 0;
+        if (!get_u64(len) || len > in.size() - pos) return false;
+        value = in.substr(pos, static_cast<std::size_t>(len));
+        pos += static_cast<std::size_t>(len);
+        return true;
+    };
+    for (std::size_t i = 0; i < out_bodies.size(); ++i) {
+        std::uint64_t regions = 0;
+        if (!get_u64(regions) || regions > (in.size() - pos) / sizeof(aicm::AppearanceRegion))
+            return false;
+        out_appearances[i].resize(static_cast<std::size_t>(regions));
+        if (regions)
+            std::memcpy(out_appearances[i].data(), in.data() + pos,
+                        out_appearances[i].size() * sizeof(aicm::AppearanceRegion));
+        pos += out_appearances[i].size() * sizeof(aicm::AppearanceRegion);
+        if (!get_string(out_keys[i]) || !get_string(out_mesh_keys[i])) return false;
+    }
+    if (pos != in.size()) return false;
+    bodies = std::move(out_bodies);
+    appearances = std::move(out_appearances);
+    material_keys = std::move(out_keys);
+    mesh_keys = std::move(out_mesh_keys);
+    return true;
+}
+
 // Load local-frame solids for a component file (port of assembly.py::_load_bodies).
+// `cache_key` is the load's component_cache_key: a nested sub-assembly's solved bodies
+// persist under it (asm_disk_cache "nested"), so a later process skips the recursive
+// load and mate solve while no descendant changed.
 std::vector<TopoDS_Shape> load_bodies(
-    const std::string& abspath,
+    const std::string& abspath, const std::string& cache_key,
     std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
-    std::vector<std::string>& material_keys, std::string& error, json& build_state,
+    std::vector<std::string>& material_keys, std::vector<std::string>& mesh_keys,
+    bool& identified, std::string& error, json& build_state,
     json& owner_map, const std::shared_ptr<const AssemblyLiveSource>& live,
     std::vector<std::shared_ptr<const void>>& descendant_pins) {
     const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
@@ -304,6 +404,19 @@ std::vector<TopoDS_Shape> load_bodies(
         if (!live) loaded = stepplus_open_component(abspath);
         const json& source_doc = live ? *live->document : loaded.doc;
         if (source_doc.value("schema", std::string()) == "aicad.asm/1") {
+            // A live (open, possibly unsaved) assembly is compiled from its session state;
+            // a verification rebuild must not trust any stored result.
+            const bool persist = !live && !cache_key.empty();
+            if (persist && !native_policy::recomputing_cache) {
+                std::string payload;
+                std::vector<TopoDS_Shape> bodies;
+                if (asm_disk_cache::get("nested", cache_key, payload) &&
+                    decode_nested_bodies(payload, bodies, appearances, material_keys, mesh_keys))
+                    return bodies;
+                appearances.clear();
+                material_keys.clear();
+                mesh_keys.clear();
+            }
             AssemblyResult ar = compile_assembly(
                 source_doc, std::filesystem::path(abspath).parent_path().string());
             descendant_pins = std::move(ar.component_cache_pins);
@@ -336,6 +449,9 @@ std::vector<TopoDS_Shape> load_bodies(
                                             "' did not converge; retained placements are provisional");
             std::vector<TopoDS_Shape> bodies;
             for (const AsmBodyOut& body : ar.bodies) {
+                // A descendant without a content identity (an unverified saved body, a
+                // failed or changing load) leaves this solve without one too.
+                if (body.mesh_key.empty()) identified = false;
                 TopoDS_Shape world = placed_world_shape(body);
                 TopExp_Explorer solids(world, TopAbs_SOLID);
                 if (world.IsNull() || !solids.More()) {
@@ -351,12 +467,35 @@ std::vector<TopoDS_Shape> load_bodies(
                 for (const std::string& k : body.body_material_keys)
                     if (k != key) key.clear();
                 material_keys.push_back(key);
+                // A placement outside the rigid tolerance (a mirror, or a solved rotation a
+                // rounding away from orthonormal) copies the shape: that copy is identified
+                // by its source and the exact transform baked into it.
+                std::string mesh_key = body.mesh_key;
+                if (!mesh_key.empty() && world.TShape() != body.shape_local.TShape()) {
+                    const gp_Trsf baked = placed_world_trsf(body) *
+                                          body.shape_local.Location().Transformation();
+                    mesh_key += "|transformed";
+                    for (int r = 1; r <= 3; ++r)
+                        for (int c = 1; c <= 4; ++c) {
+                            char exact[40];
+                            std::snprintf(exact, sizeof(exact), ":%a", baked.Value(r, c));
+                            mesh_key += exact;
+                        }
+                }
+                mesh_keys.push_back(std::move(mesh_key));
                 bodies.push_back(std::move(world));
             }
             if (bodies.empty())
                 throw OpError("import_failed", error.empty()
                                   ? "assembly '" + abspath + "' produced no solids" : error,
                               {{"path", abspath}});
+            // Only a complete solve of identified, trusted descendants is persisted.
+            if (persist && identified && error.empty() &&
+                !(build_state.is_object() &&
+                  build_state.value("cache_trust", std::string()) == "unverified"))
+                asm_disk_cache::put("nested", cache_key,
+                                    encode_nested_bodies(bodies, appearances, material_keys,
+                                                         mesh_keys));
             return bodies;
         }
         auto resolve_appearances = [&](const std::vector<TopoDS_Shape>& bodies) {
@@ -476,10 +615,11 @@ TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies);  // defined b
 
 // Build the stable local compound and its appearance-face identity map. Analytic
 // descriptions are deferred until a mate selector needs them.
-std::shared_ptr<const LoadedComponent> describe_component(
+std::shared_ptr<LoadedComponent> describe_component(
     std::vector<TopoDS_Shape> bodies,
     const std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
-    std::vector<std::string> material_keys, std::string error, json build_state,
+    std::vector<std::string> material_keys, std::vector<std::string> mesh_keys,
+    std::string error, json build_state,
     json owner_map, std::shared_ptr<const json> source_document, std::string source_path,
     std::vector<std::shared_ptr<const void>> descendant_pins) {
     auto result = std::make_shared<LoadedComponent>();
@@ -487,6 +627,11 @@ std::shared_ptr<const LoadedComponent> describe_component(
     lc.bodies = std::move(bodies);
     lc.body_material_keys = std::move(material_keys);
     lc.body_material_keys.resize(lc.bodies.size());
+    // Per-body meshing applies only to a true compound with every body identified.
+    if (lc.bodies.size() > 1 && mesh_keys.size() == lc.bodies.size() &&
+        std::none_of(mesh_keys.begin(), mesh_keys.end(),
+                     [](const std::string& k) { return k.empty(); }))
+        lc.body_mesh_keys = std::move(mesh_keys);
     lc.error = std::move(error);
     lc.build_state = std::move(build_state);
     lc.owner_map = std::move(owner_map);
@@ -839,7 +984,8 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     }
     auto load = [&] {
         std::vector<std::vector<aicm::AppearanceRegion>> appearances;
-        std::vector<std::string> material_keys;
+        std::vector<std::string> material_keys, mesh_keys;
+        bool identified = true;
         std::string error;
         json build_state;
         json owner_map;
@@ -849,16 +995,21 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
         const std::string disk_stamp = native && !live ? component_file_stamp(abspath) : std::string();
         const auto source_document = native ? (live ? live->document : component_document(abspath))
                                             : std::shared_ptr<const json>{};
-        auto bodies = load_bodies(abspath, appearances, material_keys, error, build_state,
-                                  owner_map, live, descendant_pins);
+        auto bodies = load_bodies(abspath, key, appearances, material_keys, mesh_keys,
+                                  identified, error, build_state, owner_map, live,
+                                  descendant_pins);
         if (native) {
             const bool unverified = build_state.is_object() &&
                 build_state.value("cache_trust", std::string()) == "unverified";
             note_component_load(abspath, disk_stamp, bool(live), unverified);
         }
-        return describe_component(std::move(bodies), appearances, std::move(material_keys),
-                                  std::move(error), std::move(build_state), std::move(owner_map),
-                                  source_document, abspath, std::move(descendant_pins));
+        auto lc = describe_component(std::move(bodies), appearances, std::move(material_keys),
+                                     std::move(mesh_keys), std::move(error),
+                                     std::move(build_state), std::move(owner_map), source_document, abspath, std::move(descendant_pins));
+        const bool unverified = lc->build_state.is_object() &&
+            lc->build_state.value("cache_trust", std::string()) == "unverified";
+        if (identified && lc->error.empty() && !unverified) lc->content_key = key;
+        return lc;
     };
     // A→B and B→A can be owned by different prefetch workers. An unfinished
     // recursive hit must load locally (the path stack reports the eventual cycle),
@@ -879,6 +1030,8 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
                 lc->build_state.value("cache_trust", std::string()) == "unverified";
             const bool cacheable = lc->error.empty() && !unverified &&
                                    component_cache_key(abspath, current) == key;
+            // The source moved on during the load: these bodies have no settled identity.
+            if (!cacheable) lc->content_key.clear();
             mine->set_value(lc);
             std::lock_guard<std::mutex> lk(g_cache_mtx);
             if (!cacheable) {
@@ -1819,6 +1972,8 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         body.transform = xform;
         body.appearance_regions = lit->second->appearance_regions;
         body.body_material_keys = lit->second->body_material_keys;
+        body.mesh_key = lit->second->content_key;
+        body.body_mesh_keys = lit->second->body_mesh_keys;
         for (auto& appearance : body.appearance_regions)
             apply_doc_appearance(doc, static_cast<uint32_t>(ordinal), appearance.color,
                                  appearance.metallic, appearance.roughness);

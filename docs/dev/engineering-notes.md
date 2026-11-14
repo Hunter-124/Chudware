@@ -327,6 +327,12 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
   match recursive disk fingerprints; unsaved source geometry cannot be certified against
   the older file. Unchanged component shapes and encoded display chunks are reused; the
   flat AICM handoff still copies the complete resulting mesh for publication.
+- Cold assembly loads read `doc/asm_disk_cache` (`%LOCALAPPDATA%\Chudware\cache\assembly`,
+  `~/.cache/chudware/assembly`; `CHUDWARE_ASM_CACHE_DIR` / `_MAX_MB` / `CHUDWARE_ASM_CACHE=0`):
+  each component's local display mesh and each nested sub-assembly's solved bodies, keyed by
+  `component_cache_key` (document hashes of the source and every descendant) plus the engine
+  geometry epoch. It replaces neither the archive caches nor their 256 MiB budget, which stays
+  a limit on untrusted archives. Only complete, verified loads are stored; 2 GiB LRU by mtime.
 - `add_features mode:"new"`/`merge:false` is an independent body; unknown modes refuse by name;
   `transform` moves (`copy:true` duplicates).
 

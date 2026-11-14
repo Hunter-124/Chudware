@@ -58,6 +58,12 @@ struct AsmBodyOut {
     // Material registry key per source body, aligned with shape_local's bodies (the shape
     // itself for one body, else its compound children); "" = no material assigned.
     std::vector<std::string> body_material_keys;
+    // Content identity of shape_local (its source's component cache key), "" when the
+    // geometry has no trustworthy identity. Keys the persistent display-mesh cache.
+    std::string mesh_key;
+    // A nested sub-assembly's per-body content identities, aligned with shape_local's
+    // compound children; empty when the component is meshed as one shape.
+    std::vector<std::string> body_mesh_keys;
 };
 
 // Per-component build status. ok requires the ENTIRE source to rebuild successfully,

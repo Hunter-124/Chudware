@@ -1668,6 +1668,7 @@ if(CHUDWARE_WITH_OCCT)
     doc/motion_dynamics.cpp
     doc/recon.cpp
     doc/assembly.cpp
+    doc/asm_disk_cache.cpp
     doc/sketch_geom.cpp
     doc/stepplus.cpp
     doc/validate.cpp

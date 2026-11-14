@@ -91,6 +91,7 @@
 #include "doc/validate.h"  // validate_document (explicit-axis acceptance regression)
 #include "doc/session.h"   // doc_new/doc_apply_ops (top-level-option hoist regression)
 #include "doc/stepplus.h"  // stepplus_save (craft a persisted broken-import doc on disk)
+#include "doc/asm_disk_cache.h"  // persistent assembly mesh / nested-solve cache
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 #include "geom/text.h"     // resolve_font_path (bundled-font lookup regression)
 #include "geom/dress.h"    // edge_boundary_uses (free-edge rule the dress ops share)
@@ -12314,4 +12315,121 @@ TEST_CASE("a rejected batch names the edited feature that broke a downstream one
             prefixed = row.value("error", std::string()).find(
                            "broken by this batch's change to " + p.box) == 0;
     CHECK(prefixed);
+}
+
+// Cold assembly loads read solved nested bodies and component display meshes from the
+// persistent content-keyed cache (doc/asm_disk_cache). Entries are checksummed, size-capped,
+// and keyed so a part edit below a nested assembly selects new entries, never the old ones.
+TEST_CASE("asm disk cache: round-trips, rejects corruption, evicts, and keys by content") {
+    using namespace chudware::doc;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() /
+        ("chudware-asm-cache-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto set_env = [](const char* name, const std::string& value) {
+#ifdef _WIN32
+        _putenv_s(name, value.c_str());
+#else
+        if (value.empty()) ::unsetenv(name); else ::setenv(name, value.c_str(), 1);
+#endif
+    };
+    set_env("CHUDWARE_ASM_CACHE_DIR", (dir / "store").string());
+    REQUIRE(asm_disk_cache::directory() == (dir / "store").string());
+
+    std::string payload;
+    CHECK_FALSE(asm_disk_cache::get("mesh", "k1", payload));
+    asm_disk_cache::put("mesh", "k1", "hello");
+    REQUIRE(asm_disk_cache::get("mesh", "k1", payload));
+    CHECK(payload == "hello");
+    CHECK_FALSE(asm_disk_cache::get("nested", "k1", payload));  // kinds never alias
+    // A flipped payload byte fails the checksum and reads as a miss.
+    for (const auto& entry : fs::directory_iterator(dir / "store")) {
+        std::fstream f(entry.path(), std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(-70, std::ios::end);
+        f.put('X');
+    }
+    CHECK_FALSE(asm_disk_cache::get("mesh", "k1", payload));
+
+    // Size cap: entries over a quarter of it are refused; the oldest are evicted.
+    set_env("CHUDWARE_ASM_CACHE_MAX_MB", "1");
+    asm_disk_cache::put("mesh", "huge", std::string(400 * 1024, 'h'));
+    CHECK_FALSE(asm_disk_cache::get("mesh", "huge", payload));
+    for (int i = 0; i < 12; ++i)
+        asm_disk_cache::put("mesh", "e" + std::to_string(i), std::string(200 * 1024, 'a' + i));
+    CHECK(asm_disk_cache::total_bytes() <= 1024u * 1024u);
+    REQUIRE(asm_disk_cache::get("mesh", "e11", payload));
+    CHECK(payload == std::string(200 * 1024, 'a' + 11));
+    set_env("CHUDWARE_ASM_CACHE_MAX_MB", "");
+    fs::remove_all(dir / "store");
+
+    // Mesh encoding round-trips a real tessellation; truncation is rejected.
+    const std::string part = doc_new("part", "AsmCacheSource").at("doc_id");
+    const auto box = [&](double length) {
+        return json::array({{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Block"},
+            {"params", {{"length", length}, {"width", 20.0}, {"height", 30.0},
+                        {"centered", false}}}}}}});
+    };
+    const std::string block = doc_apply_ops(part, -1, box(10.0), false).at("id_map").at("$0");
+    const auto bodies = doc_tessellate_bodies(part);
+    REQUIRE(bodies.size() == 1);
+    const std::string encoded = asm_disk_cache::encode_body(bodies[0]);
+    aicm::AicmBody decoded;
+    REQUIRE(asm_disk_cache::decode_body(encoded, decoded));
+    CHECK(decoded.pos.vec() == bodies[0].pos.vec());
+    CHECK(decoded.idx.vec() == bodies[0].idx.vec());
+    CHECK(decoded.faces.size() == bodies[0].faces.size());
+    CHECK(decoded.edge_pts.vec() == bodies[0].edge_pts.vec());
+    CHECK_FALSE(asm_disk_cache::decode_body(encoded.substr(0, encoded.size() - 1), decoded));
+
+    // A nested assembly stores its solved bodies and each component's mesh.
+    fs::create_directories(dir);
+    const auto part_path = dir / "source.step+";
+    const auto nested_path = dir / "nested.step+";
+    doc_save(part, part_path.string());
+    const auto translation = [](double x) {
+        return json::array({1.0,0.0,0.0,x, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0});
+    };
+    const std::string nested = doc_new("assembly", "AsmCacheNested").at("doc_id");
+    doc_apply_ops(nested, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}, {"transform", translation(0)}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", part_path.string()}}},
+         {"fixed", true}, {"transform", translation(40)}}
+    }), false);
+    doc_save(nested, nested_path.string());
+    CHECK(doc_close(nested));
+    const auto entries = [&] {
+        std::size_t n = 0;
+        std::error_code ec;
+        for (fs::directory_iterator it(dir / "store", ec), end; !ec && it != end; it.increment(ec)) ++n;
+        return n;
+    };
+    const auto root_extent = [&]() {
+        const std::string root = doc_new("assembly", "AsmCacheRoot").at("doc_id");
+        doc_apply_ops(root, -1, json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", nested_path.string()}}},
+             {"fixed", true}, {"transform", translation(0)}}
+        }), false);
+        const json world = doc_asm_world_bodies(root, true, false);
+        double max_x = -1e300;
+        for (const json& b : world.at("bodies"))
+            max_x = std::max(max_x, b.at("bbox").at("max")[0].get<double>());
+        CHECK(doc_close(root));
+        return max_x;
+    };
+    CHECK(root_extent() == doctest::Approx(50.0));
+    const std::size_t first = entries();
+    CHECK(first >= 2);  // "nested" solved bodies + the nested component's display mesh
+
+    // Editing the part below the nested assembly changes every key above it.
+    doc_apply_ops(part, -1, json::array({{{"op", "edit_feature"}, {"id", block},
+        {"params", {{"length", 15.0}}}}}), false);
+    doc_save(part, part_path.string());
+    CHECK(root_extent() == doctest::Approx(55.0));
+    CHECK(entries() > first);
+
+    CHECK(doc_close(part));
+    set_env("CHUDWARE_ASM_CACHE_DIR", "");
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

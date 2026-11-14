@@ -14,6 +14,7 @@
 #include "geom/assembly_clearance.h"
 
 #include "util/aicm_handoff.h"
+#include "doc/asm_disk_cache.h"
 #include "util/resource_governor.h"
 #include "util/process_isolation.h"
 #include "util/component_ref.h"  // absolutize_component_paths: re-root moved projects
@@ -8593,11 +8594,13 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
             }
         };
         const int qkey = static_cast<int>(s.display_quality);
-        // One component's mesh at identity: the shared single-flight cache entry, or a fresh
-        // tessellation that fills it. Safe to call from several threads at once.
-        auto local_mesh_of = [&](const AsmBodyOut& body) -> std::shared_ptr<const aicm::AicmBody> {
-            const float color[3] = {body.color[0], body.color[1], body.color[2]};
-            const AsmTessKey key{body.shape_local.TShape().get(), qkey};
+        // A mesh of `shape` at identity: the shared single-flight memory entry for its TShape,
+        // else the persistent store under `mesh_key` (a content identity; "" skips it), else
+        // `build()`, which fills both. Safe to call from several threads at once.
+        auto mesh_cached = [&](const TopoDS_Shape& shape, const std::string& mesh_key,
+                               const std::function<aicm::AicmBody()>& build)
+            -> std::shared_ptr<const aicm::AicmBody> {
+            const AsmTessKey key{shape.TShape().get(), qkey};
             std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
             std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
             {
@@ -8610,20 +8613,29 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                     mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
                     fut = mine->get_future().share();
                     s_asm_tess_cache.emplace(key, AsmTessEntry{
-                        body.shape_local, fut, ++s_asm_tess_clock, true});
+                        shape, fut, ++s_asm_tess_clock, true});
                     trim_tess_cache();
                 }
             }
             if (mine) {
                 try {
-                    // Tessellate at identity so every placement can reuse the mesh.
-                    const TopoDS_Shape local_shape =
-                        body.shape_local.Located(TopLoc_Location());
-                    const ::geom::DisplayDeflections d =
-                        ::geom::display_deflections(s.display_quality, local_shape);
-                    mine->set_value(std::make_shared<const aicm::AicmBody>(
-                        ::geom::tessellate_body(local_shape, 0, std::string(), color,
-                                                d.lin, d.ang)));
+                    const std::string disk_key = mesh_key.empty() ? std::string()
+                        : mesh_key + "|quality=" + std::to_string(qkey) + "|orientation=" +
+                              std::to_string(static_cast<int>(shape.Orientation()));
+                    std::shared_ptr<const aicm::AicmBody> mesh;
+                    {
+                        std::string stored;
+                        aicm::AicmBody decoded;
+                        if (!disk_key.empty() && asm_disk_cache::get("mesh", disk_key, stored) &&
+                            asm_disk_cache::decode_body(stored, decoded))
+                            mesh = std::make_shared<const aicm::AicmBody>(std::move(decoded));
+                    }
+                    if (!mesh) {
+                        mesh = std::make_shared<const aicm::AicmBody>(build());
+                        if (!disk_key.empty())
+                            asm_disk_cache::put("mesh", disk_key, asm_disk_cache::encode_body(*mesh));
+                    }
+                    mine->set_value(std::move(mesh));
                     {
                         std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
                         auto it = s_asm_tess_cache.find(key);
@@ -8640,14 +8652,98 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
             }
             return fut.get();  // rethrows for every waiter
         };
+        // Tessellate at identity so every placement can reuse the mesh.
+        auto tessellate_local = [&](const TopoDS_Shape& shape, const float color[3]) {
+            const TopoDS_Shape local_shape = shape.Located(TopLoc_Location());
+            const ::geom::DisplayDeflections d =
+                ::geom::display_deflections(s.display_quality, local_shape);
+            return ::geom::tessellate_body(local_shape, 0, std::string(), color, d.lin, d.ang);
+        };
+        // A nested sub-assembly's compound children, when each has its own content identity
+        // and a rigid placement: those are meshed (and cached) one body at a time, so editing
+        // one part re-meshes that part, not the whole sub-assembly.
+        auto mesh_children = [&](const AsmBodyOut& body) {
+            std::vector<TopoDS_Shape> children;
+            if (body.body_mesh_keys.size() < 2 || body.shape_local.ShapeType() != TopAbs_COMPOUND)
+                return children;
+            for (TopoDS_Iterator it(body.shape_local); it.More(); it.Next()) {
+                const gp_Trsf t = it.Value().Location().Transformation();
+                if (std::abs(t.ScaleFactor() - 1.0) >= 1e-12 || t.IsNegative()) return decltype(children){};
+                children.push_back(it.Value());
+            }
+            if (children.size() != body.body_mesh_keys.size()) children.clear();
+            return children;
+        };
+        // One component's mesh at identity.
+        auto local_mesh_of = [&](const AsmBodyOut& body) -> std::shared_ptr<const aicm::AicmBody> {
+            const float color[3] = {body.color[0], body.color[1], body.color[2]};
+            const std::vector<TopoDS_Shape> children = mesh_children(body);
+            if (children.empty())
+                return mesh_cached(body.shape_local, body.mesh_key,
+                                   [&] { return tessellate_local(body.shape_local, color); });
+            // Concatenating per-body meshes reproduces tessellate_body's face/edge/vertex
+            // numbering exactly when no placed sub-shape is shared between bodies (the
+            // compound's index maps are then the bodies' maps in order). Shared topology
+            // shows as fewer compound faces/edges/vertices: mesh the compound whole then.
+            return mesh_cached(body.shape_local, std::string(), [&]() -> aicm::AicmBody {
+                aicm::AicmBody out;
+                std::copy(color, color + 3, out.color);
+                for (std::size_t i = 0; i < children.size(); ++i) {
+                    const TopoDS_Shape& child = children[i];
+                    aicm::AicmBody part = *mesh_cached(
+                        child, body.body_mesh_keys[i],
+                        [&] { return tessellate_local(child, color); });
+                    const gp_Trsf t = child.Location().Transformation();
+                    if (t.Form() != gp_Identity) ::geom::transform_body_rigid(part, t);
+                    const auto face_base = static_cast<uint32_t>(out.faces.size());
+                    const auto edge_base = static_cast<uint32_t>(out.edges.size());
+                    const auto vert_base = static_cast<uint32_t>(out.verts.size());
+                    const uint32_t tri_base = out.n_tris(), node_base = out.n_verts();
+                    const uint32_t pt_base = out.total_edge_pts();
+                    out.pos.insert_end(part.pos.cbegin(), part.pos.cend());
+                    out.nrm.insert_end(part.nrm.cbegin(), part.nrm.cend());
+                    out.edge_pts.insert_end(part.edge_pts.cbegin(), part.edge_pts.cend());
+                    std::vector<uint32_t> idx(part.idx.cbegin(), part.idx.cend());
+                    for (uint32_t& v : idx) v += node_base;
+                    out.idx.insert_end(idx.begin(), idx.end());
+                    std::vector<aicm::FaceRec> faces(part.faces.cbegin(), part.faces.cend());
+                    for (aicm::FaceRec& f : faces) { f.face_id += face_base; f.first_tri += tri_base; }
+                    out.faces.insert_end(faces.begin(), faces.end());
+                    std::vector<aicm::EdgeRec> edges(part.edges.cbegin(), part.edges.cend());
+                    for (aicm::EdgeRec& e : edges) { e.edge_id += edge_base; e.first_pt += pt_base; }
+                    out.edges.insert_end(edges.begin(), edges.end());
+                    std::vector<aicm::VertRec> verts(part.verts.cbegin(), part.verts.cend());
+                    for (aicm::VertRec& v : verts) v.vertex_id += vert_base;
+                    out.verts.insert_end(verts.begin(), verts.end());
+                }
+                TopTools_IndexedMapOfShape faces, edges, verts;
+                TopExp::MapShapes(body.shape_local, TopAbs_FACE, faces);
+                TopExp::MapShapes(body.shape_local, TopAbs_EDGE, edges);
+                TopExp::MapShapes(body.shape_local, TopAbs_VERTEX, verts);
+                if (static_cast<std::size_t>(faces.Extent()) != out.faces.size() ||
+                    static_cast<std::size_t>(edges.Extent()) != out.edges.size() ||
+                    static_cast<std::size_t>(verts.Extent()) != out.verts.size())
+                    return tessellate_local(body.shape_local, color);
+                return out;
+            });
+        };
         // Mesh the components this pass cannot replay side by side. BRepMesh already spreads
         // one body's faces over threads, but a cold assembly is dominated by a few heavy
         // parts meshed one after another (HERC rover front half: two wheel corners were 60%
-        // of a 29 s insert). Failures are left to the serial pass below, which retries and
-        // reports them exactly as before.
+        // of a 29 s insert). A nested sub-assembly contributes its bodies as work units and
+        // is then only concatenated. BRepMesh stores triangulations on the shared face
+        // TShapes, so units that share any face (a part placed directly and inside a nested
+        // sub-assembly, or in two of them) are meshed by one worker, in turn. Failures are
+        // left to the serial pass below, which retries and reports them exactly as before.
         std::map<const AsmBodyOut*, std::shared_ptr<const aicm::AicmBody>> prefetched;
         {
-            std::vector<const AsmBodyOut*> cold;
+            struct Unit {
+                TopoDS_Shape shape;
+                const std::string* mesh_key;  // a nested body's identity; null: `body` itself
+                const AsmBodyOut* body;
+            };
+            std::vector<Unit> units;
+            std::vector<const AsmBodyOut*> assembled;
             std::set<const void*> queued;
             for (const AsmBodyOut& body : ares->bodies) {
                 std::optional<Eigen::Vector3d> off;
@@ -8662,22 +8758,56 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                     cached->second.local_mesh &&
                     cached->second.body.shape_local.IsPartner(body.shape_local))
                     continue;
-                if (queued.insert(body.shape_local.TShape().get()).second) cold.push_back(&body);
+                if (!queued.insert(body.shape_local.TShape().get()).second) continue;
+                const std::vector<TopoDS_Shape> children = mesh_children(body);
+                if (children.empty()) {
+                    units.push_back({body.shape_local, nullptr, &body});
+                    continue;
+                }
+                assembled.push_back(&body);
+                for (std::size_t i = 0; i < children.size(); ++i)
+                    if (queued.insert(children[i].TShape().get()).second)
+                        units.push_back({children[i], &body.body_mesh_keys[i], &body});
             }
-            if (cold.size() > 1) {
-                std::vector<std::shared_ptr<const aicm::AicmBody>> meshes(cold.size());
-                std::atomic<std::size_t> next{0};
-                auto work = [&]() {
-                    for (std::size_t i = next.fetch_add(1); i < cold.size(); i = next.fetch_add(1)) {
-                        try {
-                            meshes[i] = local_mesh_of(*cold[i]);
-                        } catch (...) {
-                            // The serial pass retries this body and reports the failure.
-                        }
+            if (units.size() > 1) {
+                std::vector<std::size_t> parent(units.size());
+                for (std::size_t i = 0; i < parent.size(); ++i) parent[i] = i;
+                auto find = [&](std::size_t i) {
+                    while (parent[i] != i) i = parent[i] = parent[parent[i]];
+                    return i;
+                };
+                std::unordered_map<const void*, std::size_t> face_owner;
+                for (std::size_t u = 0; u < units.size(); ++u) {
+                    TopTools_IndexedMapOfShape faces;
+                    TopExp::MapShapes(units[u].shape, TopAbs_FACE, faces);
+                    for (int f = 1; f <= faces.Extent(); ++f) {
+                        auto [it, fresh] = face_owner.emplace(faces(f).TShape().get(), u);
+                        if (!fresh) parent[find(u)] = find(it->second);
                     }
+                }
+                std::map<std::size_t, std::vector<std::size_t>> by_root;
+                for (std::size_t u = 0; u < units.size(); ++u) by_root[find(u)].push_back(u);
+                std::vector<std::vector<std::size_t>> groups;
+                for (auto& entry : by_root) groups.push_back(std::move(entry.second));
+                std::vector<std::shared_ptr<const aicm::AicmBody>> meshes(units.size());
+                std::atomic<std::size_t> next{0};
+                const float neutral[3] = {0.62f, 0.70f, 0.82f};
+                auto work = [&]() {
+                    for (std::size_t g = next.fetch_add(1); g < groups.size(); g = next.fetch_add(1))
+                        for (std::size_t u : groups[g]) {
+                            try {
+                                const Unit& unit = units[u];
+                                meshes[u] = unit.mesh_key
+                                    ? mesh_cached(unit.shape, *unit.mesh_key,
+                                                  [&] { return tessellate_local(unit.shape, neutral); })
+                                    : local_mesh_of(*unit.body);
+                            } catch (...) {
+                                // The serial pass retries this body and reports the failure.
+                            }
+                        }
                 };
                 const std::size_t threads = std::min<std::size_t>(
-                    std::max<std::size_t>(1, chudware::governor::solver_threads()), cold.size());
+                    std::max<std::size_t>(1, chudware::governor::solver_threads()), groups.size());
                 std::vector<std::thread> pool;
                 try {
                     for (std::size_t k = 1; k < threads; ++k) pool.emplace_back(work);
@@ -8686,8 +8816,17 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                 }
                 work();
                 for (std::thread& th : pool) th.join();
-                for (std::size_t i = 0; i < cold.size(); ++i)
-                    if (meshes[i]) prefetched.emplace(cold[i], std::move(meshes[i]));
+                for (std::size_t u = 0; u < units.size(); ++u)
+                    if (meshes[u] && !units[u].mesh_key)
+                        prefetched.emplace(units[u].body, std::move(meshes[u]));
+            }
+            // Concatenate each nested sub-assembly from its now-cached bodies, on this thread.
+            for (const AsmBodyOut* body : assembled) {
+                try {
+                    prefetched.emplace(body, local_mesh_of(*body));
+                } catch (...) {
+                    // The serial pass retries this body and reports the failure.
+                }
             }
         }
         for (const AsmBodyOut& body : ares->bodies) {

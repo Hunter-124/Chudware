@@ -62,6 +62,64 @@ def test_sync_tools_leave_the_event_loop_free():
     assert ran.index("get_job") < ran.index("slow"), "get_job is not gated behind slow"
 
 
+def test_read_tools_run_beside_a_running_mutation():
+    mcp, ran, release = _server()
+
+    @mcp.tool()
+    def list_parts() -> str:  # read-class: must not queue behind a long rebuild
+        ran.append("list_parts")
+        return "parts"
+
+    @mcp.tool()
+    def cad_guide() -> str:
+        ran.append("cad_guide")
+        return "guide"
+
+    mcp._tool_manager._chudware_threaded = False
+    srv._install_threaded_dispatch(mcp)
+
+    async def main():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(mcp.call_tool, "slow", {})
+            await anyio.sleep(0.05)
+            with anyio.fail_after(2):
+                await mcp.call_tool("list_parts", {})
+                await mcp.call_tool("cad_guide", {})
+            release.set()
+
+    anyio.run(main)
+    assert ran == ["list_parts", "cad_guide", "slow"]
+    assert srv._tool_is_gated("add_features") and srv._tool_is_gated("save_part")
+    assert not srv._tool_is_gated("check_interference")
+
+
+def test_mutations_serialize_per_document_not_globally():
+    mcp = FastMCP("doc-gate-test")
+    ran: list[str] = []
+    release = threading.Event()
+
+    @mcp.tool()
+    def add_features(doc_id: str, tag: str) -> str:
+        if tag == "first":
+            release.wait(10)
+        ran.append(tag)
+        return tag
+
+    srv._install_threaded_dispatch(mcp)
+
+    async def main():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(mcp.call_tool, "add_features", {"doc_id": "doc-a", "tag": "first"})
+            await anyio.sleep(0.05)
+            tg.start_soon(mcp.call_tool, "add_features", {"doc_id": "doc-a", "tag": "same-doc"})
+            with anyio.fail_after(2):  # another document is not held up by doc-a
+                await mcp.call_tool("add_features", {"doc_id": "doc-b", "tag": "other-doc"})
+            release.set()
+
+    anyio.run(main)
+    assert ran == ["other-doc", "first", "same-doc"]
+
+
 def test_a_call_cancelled_while_queued_never_runs():
     mcp, ran, release = _server()
 

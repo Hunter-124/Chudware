@@ -8593,6 +8593,103 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
             }
         };
         const int qkey = static_cast<int>(s.display_quality);
+        // One component's mesh at identity: the shared single-flight cache entry, or a fresh
+        // tessellation that fills it. Safe to call from several threads at once.
+        auto local_mesh_of = [&](const AsmBodyOut& body) -> std::shared_ptr<const aicm::AicmBody> {
+            const float color[3] = {body.color[0], body.color[1], body.color[2]};
+            const AsmTessKey key{body.shape_local.TShape().get(), qkey};
+            std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
+            std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
+            {
+                std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                auto it = s_asm_tess_cache.find(key);
+                if (it != s_asm_tess_cache.end()) {
+                    fut = it->second.body;
+                    it->second.last_used = ++s_asm_tess_clock;
+                } else {
+                    mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
+                    fut = mine->get_future().share();
+                    s_asm_tess_cache.emplace(key, AsmTessEntry{
+                        body.shape_local, fut, ++s_asm_tess_clock, true});
+                    trim_tess_cache();
+                }
+            }
+            if (mine) {
+                try {
+                    // Tessellate at identity so every placement can reuse the mesh.
+                    const TopoDS_Shape local_shape =
+                        body.shape_local.Located(TopLoc_Location());
+                    const ::geom::DisplayDeflections d =
+                        ::geom::display_deflections(s.display_quality, local_shape);
+                    mine->set_value(std::make_shared<const aicm::AicmBody>(
+                        ::geom::tessellate_body(local_shape, 0, std::string(), color,
+                                                d.lin, d.ang)));
+                    {
+                        std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                        auto it = s_asm_tess_cache.find(key);
+                        if (it != s_asm_tess_cache.end()) it->second.in_flight = false;
+                        trim_tess_cache();
+                    }
+                } catch (...) {
+                    mine->set_exception(std::current_exception());
+                    // A failed tessellation is not cached; the next caller retries.
+                    std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                    s_asm_tess_cache.erase(key);
+                    trim_tess_cache();
+                }
+            }
+            return fut.get();  // rethrows for every waiter
+        };
+        // Mesh the components this pass cannot replay side by side. BRepMesh already spreads
+        // one body's faces over threads, but a cold assembly is dominated by a few heavy
+        // parts meshed one after another (HERC rover front half: two wheel corners were 60%
+        // of a 29 s insert). Failures are left to the serial pass below, which retries and
+        // reports them exactly as before.
+        std::map<const AsmBodyOut*, std::shared_ptr<const aicm::AicmBody>> prefetched;
+        {
+            std::vector<const AsmBodyOut*> cold;
+            std::set<const void*> queued;
+            for (const AsmBodyOut& body : ares->bodies) {
+                std::optional<Eigen::Vector3d> off;
+                auto oit = offsets.find(body.component_id);
+                if (oit != offsets.end()) off = oit->second;
+                const gp_Trsf t = placed_world_trsf(body, off) *
+                                  body.shape_local.Location().Transformation();
+                if (std::abs(t.ScaleFactor() - 1.0) >= 1e-12 || t.IsNegative()) continue;
+                const auto cached = s.asm_display_chunks.find(body.component_id);
+                if (cached != s.asm_display_chunks.end() &&
+                    cached->second.quality == s.display_quality &&
+                    cached->second.local_mesh &&
+                    cached->second.body.shape_local.IsPartner(body.shape_local))
+                    continue;
+                if (queued.insert(body.shape_local.TShape().get()).second) cold.push_back(&body);
+            }
+            if (cold.size() > 1) {
+                std::vector<std::shared_ptr<const aicm::AicmBody>> meshes(cold.size());
+                std::atomic<std::size_t> next{0};
+                auto work = [&]() {
+                    for (std::size_t i = next.fetch_add(1); i < cold.size(); i = next.fetch_add(1)) {
+                        try {
+                            meshes[i] = local_mesh_of(*cold[i]);
+                        } catch (...) {
+                            // The serial pass retries this body and reports the failure.
+                        }
+                    }
+                };
+                const std::size_t threads = std::min<std::size_t>(
+                    std::max<std::size_t>(1, chudware::governor::solver_threads()), cold.size());
+                std::vector<std::thread> pool;
+                try {
+                    for (std::size_t k = 1; k < threads; ++k) pool.emplace_back(work);
+                } catch (...) {
+                    // Fewer workers than planned still drain the queue.
+                }
+                work();
+                for (std::thread& th : pool) th.join();
+                for (std::size_t i = 0; i < cold.size(); ++i)
+                    if (meshes[i]) prefetched.emplace(cold[i], std::move(meshes[i]));
+            }
+        }
         for (const AsmBodyOut& body : ares->bodies) {
             std::optional<Eigen::Vector3d> off;
             auto oit = offsets.find(body.component_id);
@@ -8633,48 +8730,8 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                     cached->second.body.shape_local.Orientation() == body.shape_local.Orientation())
                     local_mesh = cached->second.local_mesh;
                 if (!local_mesh) {
-                    const AsmTessKey key{body.shape_local.TShape().get(), qkey};
-                    std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
-                    std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
-                    {
-                        std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                        auto it = s_asm_tess_cache.find(key);
-                        if (it != s_asm_tess_cache.end()) {
-                            fut = it->second.body;
-                            it->second.last_used = ++s_asm_tess_clock;
-                        } else {
-                            mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
-                            fut = mine->get_future().share();
-                            s_asm_tess_cache.emplace(key, AsmTessEntry{
-                                body.shape_local, fut, ++s_asm_tess_clock, true});
-                            trim_tess_cache();
-                        }
-                    }
-                    if (mine) {
-                        try {
-                            // Tessellate at identity so every placement can reuse the mesh.
-                            const TopoDS_Shape local_shape =
-                                body.shape_local.Located(TopLoc_Location());
-                            const ::geom::DisplayDeflections d =
-                                ::geom::display_deflections(s.display_quality, local_shape);
-                            mine->set_value(std::make_shared<const aicm::AicmBody>(
-                                ::geom::tessellate_body(local_shape, 0, std::string(), color,
-                                                        d.lin, d.ang)));
-                            {
-                                std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                                auto it = s_asm_tess_cache.find(key);
-                                if (it != s_asm_tess_cache.end()) it->second.in_flight = false;
-                                trim_tess_cache();
-                            }
-                        } catch (...) {
-                            mine->set_exception(std::current_exception());
-                            // A failed tessellation is not cached; the next caller retries.
-                            std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                            s_asm_tess_cache.erase(key);
-                            trim_tess_cache();
-                        }
-                    }
-                    local_mesh = fut.get();  // rethrows for every waiter
+                    const auto pre = prefetched.find(&body);
+                    local_mesh = pre != prefetched.end() ? pre->second : local_mesh_of(body);
                 }
                 bt = *local_mesh;  // COW buffers — O(1) until the transform detaches
                 bt.body_id = static_cast<uint32_t>(body.body_id);

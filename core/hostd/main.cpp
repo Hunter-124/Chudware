@@ -161,6 +161,9 @@ static void reportPreviousCrashes(const std::string& logDir) {
     for (const auto& e : fs::directory_iterator(logDir, ec)) {
         const std::string name = e.path().filename().string();
         if (name.rfind("hostd-crash-", 0) != 0 || e.path().extension() != ".txt") continue;
+        // Already-read reports keep the .txt extension ("x.reported.txt"); skip them, or
+        // every start re-logs the same crash and appends another ".reported".
+        if (name.find(".reported") != std::string::npos) continue;
         FILE* f = std::fopen(e.path().string().c_str(), "rb");
         if (!f) continue;
         char buf[2048];

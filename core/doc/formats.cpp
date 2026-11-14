@@ -158,6 +158,10 @@
 #include <Interface_HArray1OfHAsciiString.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
+#include <Message_Messenger.hxx>
+#include <Transfer_FinderProcess.hxx>
+#include <XSControl_TransferWriter.hxx>
+#include <XSControl_WorkSession.hxx>
 #include <TCollection_HAsciiString.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <ShapeFix_Shape.hxx>
@@ -205,6 +209,12 @@
 namespace chudware::doc {
 
 namespace {
+// Drops every printer from the writer's transfer messenger (stdout by default).
+void quiet_step_writer(STEPControl_Writer& writer) {
+    Handle(Message_Messenger) quiet = new Message_Messenger();
+    quiet->ChangePrinters().Clear();
+    writer.WS()->TransferWriter()->FinderProcess()->SetMessenger(quiet);
+}
 
 // Lower-case a string (extension matching).
 std::string lower(std::string s) {
@@ -3754,6 +3764,9 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
     try {
         if (fmt == "step") {
             STEPControl_Writer w;
+            // One transfer per solid prints OCCT's "Statistics on Transfer" banner each time
+            // (thousands per assembly save) to stdout; this writer reports nothing useful there.
+            quiet_step_writer(w);
             // Transfer one SOLID at a time, not the whole COMPOUND AsIs (Issue 3). A boolean
             // result body can be a compound of DISJOINT LUMPS (e.g. a steering body: knuckles +
             // tie rod + column + handlebar); transferring that compound AsIs can emit a single
@@ -3770,8 +3783,12 @@ std::string export_bodies(const std::vector<TopoDS_Shape>& bodies, const std::st
                     units.push_back(std::move(unit));
             }
             if (units.empty()) units.push_back(shape);
-            for (const TopoDS_Shape& u : units)
-                if (w.Transfer(u, STEPControl_AsIs) != IFSelect_RetDone)
+            // compgraph only on the last transfer: OCCT rebuilds the whole model's entity
+            // graph after each one when asked, which made an N-solid export O(N^2) (a
+            // 3000-solid rover assembly spent 95% of its save in Interface_Graph).
+            for (std::size_t i = 0; i < units.size(); ++i)
+                if (w.Transfer(units[i], STEPControl_AsIs, i + 1 == units.size()) !=
+                    IFSelect_RetDone)
                     throw OpError("export_failed", "STEP writer: transfer failed", {{"format", fmt}});
             if (!provenance.source.empty() && !provenance.doc_hash.empty()) {
                 APIHeaderSection_MakeHeader header(w.Model());

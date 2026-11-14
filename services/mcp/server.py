@@ -1555,10 +1555,35 @@ def _client_call_budget_s() -> float:
     return max(5.0, client_s - 10.0)
 
 
-# Tools whose body only polls engine/job state: they skip the serial gate so a long
-# wait never holds every other tool hostage, and they never mutate documents.
+# Tools that skip the serial gate: job polls plus every read-class tool (tool_registry's
+# risk classifier). Reads already run concurrently under the in-app agent, and each worker
+# thread holds its own daemon connection, so only mutations need serializing here. Under
+# one gate, a subagent's cad_guide/list_parts/render waited behind another subagent's 45 s
+# rebuild (HERC session 2026-11-13: cad_guide p90 54 s, list_parts up to 89 s).
 _UNGATED_TOOLS = frozenset({"wait_job", "get_job"})
-_TOOL_GATE = threading.Lock()
+# Mutations serialize per document (the doc_id they name; "" for calls that name none, such
+# as new_part/import_part). The engine already orders edits per document, and the in-app
+# agent runs edits on different documents side by side; one process-wide lock made
+# subagents building different parts wait on each other (a one-op transform took 86 s).
+_DOC_GATES: dict[str, threading.Lock] = {}
+_DOC_GATES_LOCK = threading.Lock()
+
+
+def _gate_for(kwargs: dict) -> threading.Lock:
+    doc_id = kwargs.get("doc_id")
+    key = doc_id if isinstance(doc_id, str) else ""
+    with _DOC_GATES_LOCK:
+        gate = _DOC_GATES.get(key)
+        if gate is None:
+            gate = _DOC_GATES[key] = threading.Lock()
+        return gate
+
+
+def _tool_is_gated(name: str) -> bool:
+    if name in _UNGATED_TOOLS:
+        return False
+    from services.mcp import tool_registry
+    return tool_registry._risk_of(name) != tool_registry.RISK_READ
 
 
 def _install_threaded_dispatch(server) -> None:
@@ -1571,8 +1596,9 @@ def _install_threaded_dispatch(server) -> None:
     taking every in-flight call and the hostd connection with it (HERC rover audit,
     2026-11-13: 38 connection drops, each 2-4 s after a request timeout).
 
-    Bodies still run one at a time behind ``_TOOL_GATE`` (tool code shares per-process
-    state such as the current document), so the semantics stay what they were. A call
+    Mutating bodies run one at a time per document (``_gate_for``: the doc_id they name, or
+    one shared gate for calls naming none); read-class tools and job polls run beside them
+    (``_tool_is_gated``). A call
     cancelled while it waits for the gate never runs — a timed-out mutation must not land
     minutes later behind the client's back. A call cancelled mid-body runs to completion
     (Python threads cannot be interrupted) and keeps the gate until it does.
@@ -1585,7 +1611,7 @@ def _install_threaded_dispatch(server) -> None:
         return
 
     def wrap(name, fn):
-        gated = name not in _UNGATED_TOOLS
+        gated = _tool_is_gated(name)
 
         @functools.wraps(fn)
         async def run_off_loop(**kwargs):
@@ -1594,7 +1620,7 @@ def _install_threaded_dispatch(server) -> None:
             def body():
                 if not gated:
                     return fn(**kwargs)
-                with _TOOL_GATE:
+                with _gate_for(kwargs):
                     if abandoned.is_set():
                         return None  # cancelled while queued: never run it
                     return fn(**kwargs)

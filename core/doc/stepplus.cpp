@@ -51,6 +51,10 @@
 #include <IFSelect_ReturnStatus.hxx>
 #include <STEPControl_StepModelType.hxx>
 #include <STEPControl_Writer.hxx>
+#include <Message_Messenger.hxx>
+#include <Transfer_FinderProcess.hxx>
+#include <XSControl_TransferWriter.hxx>
+#include <XSControl_WorkSession.hxx>
 #include <TopAbs.hxx>
 #include <TopExp_Explorer.hxx>
 #include <UnitsMethods_LengthUnit.hxx>
@@ -73,6 +77,12 @@ namespace chudware::doc {
 using nlohmann::json;
 
 namespace {
+// Drops every printer from the writer's transfer messenger (stdout by default).
+void quiet_step_writer(STEPControl_Writer& writer) {
+    Handle(Message_Messenger) quiet = new Message_Messenger();
+    quiet->ChangePrinters().Clear();
+    writer.WS()->TransferWriter()->FinderProcess()->SetMessenger(quiet);
+}
 
 constexpr const char* kContainer = "aicad.step+/1";
 constexpr const char* kAppVersion = "Chudware/M1";
@@ -1717,6 +1727,9 @@ std::string stepplus_geometry_step_bytes(const std::vector<TopoDS_Shape>& bodies
     if (bodies.empty()) return std::string();
     try {
         STEPControl_Writer writer;
+        // One transfer per solid prints OCCT's "Statistics on Transfer" banner each time
+        // (thousands per assembly save) to stdout; this writer reports nothing useful there.
+        quiet_step_writer(writer);
         // Pin the contracted schema + unit on the transfer instead of relying on the
         // process-wide Interface_Static defaults: the container promises AP214 in mm, and a
         // host that set write.step.schema for an interchange export must not be able to
@@ -1724,25 +1737,27 @@ std::string stepplus_geometry_step_bytes(const std::vector<TopoDS_Shape>& bodies
         DESTEP_Parameters params;
         params.WriteSchema = DESTEP_Parameters::WriteMode_StepSchema_AP214IS;
         params.WriteUnit = UnitsMethods_LengthUnit_Millimeter;
-        std::size_t transferred = 0;
+        // One SOLID per transfer (mirrors export_bodies): a boolean-result body can be a
+        // compound of DISJOINT lumps, and transferring that compound AsIs emits a single
+        // malformed manifold_solid_brep that re-reads as one invalid solid.
+        std::vector<TopoDS_Shape> units;
         for (const TopoDS_Shape& body : bodies) {
             if (body.IsNull()) continue;
             bool any_solid = false;
-            // One SOLID per transfer (mirrors export_bodies): a boolean-result body can be a
-            // compound of DISJOINT lumps, and transferring that compound AsIs emits a single
-            // malformed manifold_solid_brep that re-reads as one invalid solid.
             for (TopExp_Explorer ex(body, TopAbs_SOLID); ex.More(); ex.Next()) {
-                if (writer.Transfer(ex.Current(), STEPControl_AsIs, params) != IFSelect_RetDone)
-                    return std::string();
+                units.push_back(ex.Current());
                 any_solid = true;
-                ++transferred;
             }
-            if (any_solid) continue;
-            if (writer.Transfer(body, STEPControl_AsIs, params) != IFSelect_RetDone)
-                return std::string();
-            ++transferred;
+            if (!any_solid) units.push_back(body);
         }
-        if (transferred == 0) return std::string();
+        if (units.empty()) return std::string();
+        // Rebuild the model's entity graph once, after the last transfer. Asking for it on
+        // every transfer made an N-solid save O(N^2): a 3000-solid rover assembly spent
+        // >95% of a 15+ minute save in Interface_Graph::Evaluate.
+        for (std::size_t i = 0; i < units.size(); ++i)
+            if (writer.Transfer(units[i], STEPControl_AsIs, params, i + 1 == units.size()) !=
+                IFSelect_RetDone)
+                return std::string();
         std::ostringstream os(std::ios::binary);
         if (writer.WriteStream(os) != IFSelect_RetDone) return std::string();
         return os.str();

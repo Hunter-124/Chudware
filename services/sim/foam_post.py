@@ -43,7 +43,7 @@ def parse_coefficients(case_dir: str, expected_time: Optional[float] = None) -> 
     for dat in dats:
         cd_col: Optional[int] = None
         cl_col: Optional[int] = None
-        for line in dat.read_text(errors="ignore").splitlines():
+        for line in dat.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -102,7 +102,7 @@ def parse_forces(case_dir: str, expected_time: Optional[float] = None) -> Tuple[
     seen_times: List[float] = []
     for dat in dats:
         total_cols: Optional[Tuple[int, int, int]] = None
-        for line in dat.read_text(errors="ignore").splitlines():
+        for line in dat.read_text(encoding="utf-8", errors="ignore").splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
@@ -172,7 +172,7 @@ def _read_case(case_dir: str, expected_time: Optional[float] = None):
 
     foam = Path(case_dir) / "case.foam"
     if not foam.exists():
-        foam.write_text("")
+        foam.write_text("", encoding="utf-8")
     reader = pv.OpenFOAMReader(str(foam))
     times = [float(t) for t in reader.time_values if math.isfinite(float(t))]
     if not times:
@@ -219,7 +219,7 @@ def parse_wall_heat_flux(case_dir: str, expected_time: Optional[float] = None):
     dats = sorted(pp.glob("wallHeatFlux*/**/wallHeatFlux.dat"))
     rows: List[Tuple[float, float]] = []
     for dat in dats:
-        for line in dat.read_text(errors="ignore").splitlines():
+        for line in dat.read_text(encoding="utf-8", errors="ignore").splitlines():
             cols = line.strip().split()
             if not cols or cols[0].startswith("#"):
                 continue

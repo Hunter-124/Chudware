@@ -2424,7 +2424,7 @@ if(CHUDWARE_WITH_OCCT)
     hostd/hostd_log.cpp
     # hostd/mfg_lane.cpp is compiled into chudware_manufacturing, not here, so the daemon
     # and test_mfg_lane share exactly one definition of the single-owner device lane.
-    hostd/tray_icon.cpp               # optional Linux AppIndicator status cube
+    hostd/tray_icon.cpp               # optional status tray (Windows notification area / Linux AppIndicator)
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_transport_win.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../services/ipc/ipc_discovery.cpp
@@ -2441,8 +2441,11 @@ if(CHUDWARE_WITH_OCCT)
   if(WIN32)
     # advapi32: pipe DACL (SetEntriesInAclW), token/SID (OpenProcessToken,
     # ConvertSidToStringSidW, CreateWellKnownSid). Everything else (named pipes,
-    # Job Objects, CreateProcessW) is kernel32, linked by default.
-    target_link_libraries(chudware-hostd PRIVATE advapi32)
+    # Job Objects, CreateProcessW) is kernel32, linked by default. shell32/user32:
+    # notification-area icon (Shell_NotifyIconW) and its message window + menu;
+    # hostd.rc embeds the icon it shows. Disable at runtime with CHUDWARE_HOSTD_TRAY=0.
+    target_sources(chudware-hostd PRIVATE hostd/hostd.rc)
+    target_link_libraries(chudware-hostd PRIVATE advapi32 shell32 user32)
   else()
     if(UNIX)
       find_library(CHUDWARE_TCMALLOC_MINIMAL_LIBRARY NAMES tcmalloc_minimal)

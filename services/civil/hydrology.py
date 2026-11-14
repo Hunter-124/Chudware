@@ -68,7 +68,7 @@ def _uniform_grid(duration_s, dt_s):
 
 @lru_cache(maxsize=1)
 def _tables():
-    return json.loads(Path(__file__).with_name("data").joinpath("hydrology_nrcs_tables.json").read_text())
+    return json.loads(Path(__file__).with_name("data").joinpath("hydrology_nrcs_tables.json").read_text(encoding="utf-8"))
 
 
 def rational_peak(c, intensity_mm_h, area_m2):

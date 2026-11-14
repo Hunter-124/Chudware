@@ -155,6 +155,28 @@ qualification of an installed release.
   exercise that surface, but does not qualify hardware GPU performance or become part
   of the shipped runtime. The M1 capture must adopt the saved mesh on reopen rather
   than report success from an intact feature tree while photographing an empty viewport.
+- **Console windows.** `chudware.exe` links as a GUI-subsystem binary
+  (`WIN32_EXECUTABLE`, entry `mainCRTStartup`), so Explorer, taskbar, Start and
+  file-association launches open no console. Standard handles a parent redirected (pipes,
+  files: Python helpers, CI) are inherited unchanged; a launch from an interactive shell
+  attaches that shell's console so CLI modes still print there, but the shell does not
+  wait for the process — redirect its output or use `Start-Process -Wait` when a script
+  needs the exit code. Child processes the host or hostd start
+  (provisioning, workers) use `CREATE_NO_WINDOW` or `DETACHED_PROCESS`. hostd starts an
+  interpreter worker (`CHUDWARE_PYTHON`) with a hidden console rather than detached,
+  because a venv `python.exe` launcher re-spawns the base interpreter without console
+  flags and that child would otherwise open a visible console; compiled workers stay
+  `DETACHED_PROCESS`.
+- **Notification-area icon.** `chudware-hostd` shows the app icon (embedded from
+  `assets/app.ico` by `core/hostd/hostd.rc`) in the notification area while it runs; the
+  tooltip and menu header report its status, and the menu's **Quit hostd** drains it.
+  `CHUDWARE_HOSTD_TRAY=0` disables it.
+- **Text encoding.** Python's Windows default text encoding is the ANSI code page
+  (cp1252), not UTF-8. Service code must pass `encoding="utf-8"` to `open()`,
+  `Path.read_text()` and `Path.write_text()`; a role card with one non-cp1252 byte
+  otherwise fails every agent turn with `UnicodeDecodeError: 'charmap' codec`. The host
+  and hostd also start Python workers with `PYTHONUTF8=1`, so subprocess text pipes and
+  the Python children those workers start use UTF-8 as well.
 - **glad** lives at `extern/glad` (vendored, compiled directly into the target).
 
 ## 5. Python runtime and tests
@@ -176,9 +198,13 @@ simulation tools keep their explicit provisioning commands; dependency setup nev
 silently downloads or builds them.
 
 Native Windows Python cannot run `scripts/testbox.py` because it imports POSIX
-`fcntl`. Run isolated suites from a supported POSIX environment or host instead;
-see [Running tests](../../CONTRIBUTING.md#running-tests). Windows native build and
-test coverage also runs on GitHub Actions.
+`fcntl`. Windows suites run in the `windows-gate` workflow instead: it configures
+`windows-occt` without LTO and runs `scripts/test_lite.py --suite <names>` natively, which
+builds the suites' targets in `build/windows-occt`, runs their CTest labels from
+`build/windows-occt/core`, and runs their pytest files against `libchudware.dll` and
+`chudware-hostd.exe` from that tree. `WINDOWS_SUITES` in the workflow lists the suites a
+release requires on Windows. The same command runs on a Windows developer host
+(`--dry-run` shows the plan first).
 
 ### Launch a developer build with the service runtime
 
@@ -198,6 +224,12 @@ cache. Provider login is a separate user action in Settings; provisioning does n
 authenticate or send a prompt. These environment variables apply to this shell and its
 children, not every application on the machine. Keep the checkout root as `CHUDWARE_REPO`
 when running a staged developer build so Python services resolve from the complete source tree.
+
+A launch from Explorer, the taskbar, or Start inherits only the persisted environment. To
+run a developer build that way, store the same three variables at user scope (for example
+`[Environment]::SetEnvironmentVariable("CHUDWARE_PYTHON", $env:CHUDWARE_PYTHON, "User")`).
+`chudware-hostd` is a shared daemon that outlives the GUI; stop it with
+`chudware-hostd.exe --stop` after rebuilding so the next launch starts the new binary.
 
 ### Optional: offline wheelhouse mode
 

@@ -79,7 +79,7 @@ def _load_ranker_weights() -> dict:
     for p in candidates:
         if p.exists():
             try:
-                _RANKER_WEIGHTS = _json.loads(p.read_text())
+                _RANKER_WEIGHTS = _json.loads(p.read_text(encoding="utf-8"))
                 return _RANKER_WEIGHTS
             except Exception:  # noqa: BLE001
                 pass

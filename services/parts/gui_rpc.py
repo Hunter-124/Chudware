@@ -375,7 +375,7 @@ def _cef_unavailable() -> bool:
         return True
     cache = binary.parent.parent / "CMakeCache.txt"
     if cache.is_file():
-        config = cache.read_text(errors="replace")
+        config = cache.read_text(encoding="utf-8", errors="replace")
         if "CHUDWARE_ENABLE_CEF:BOOL=OFF" in config:
             return True
         if "CHUDWARE_ENABLE_CEF:BOOL=ON" in config:

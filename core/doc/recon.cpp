@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "doc/session.h"  // OpError
+#include "geom/booleans.h"  // split_pair — common + both cuts from one intersection
 #include "geom/plane.h"   // chudware::geom::SketchPlane — face-plane frame convention
 #include "geom/profile.h"
 #include "geom/face_normal.h"  // plane_outward_normal — handedness-aware planar normal
@@ -163,24 +164,14 @@ json compare_shapes(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     double common_vol = 0.0, missing_vol = 0.0, extra_vol = 0.0;
     TopoDS_Shape missing_shape, extra_shape;
     try {
-        BRepAlgoAPI_Common common_op(a, b);
-        common_op.SetFuzzyValue(1e-4);
-        common_op.Build();
-        if (!common_op.IsDone()) return degrade("A^B common did not converge");
-        common_vol = volume_or_zero(common_op.Shape());
-
-        BRepAlgoAPI_Cut cut_ab(a, b);
-        cut_ab.SetFuzzyValue(1e-4);
-        cut_ab.Build();
-        if (!cut_ab.IsDone()) return degrade("A-B cut did not converge");
-        missing_shape = cut_ab.Shape();
+        ::geom::PairSplit split = ::geom::split_pair(a, b, /*fuzzy=*/1e-4, /*want_b_minus_a=*/true);
+        if (split.common.IsNull()) return degrade("A^B common did not converge");
+        common_vol = volume_or_zero(split.common);
+        if (split.a_minus_b.IsNull()) return degrade("A-B cut did not converge");
+        missing_shape = std::move(split.a_minus_b);
         missing_vol = volume_or_zero(missing_shape);
-
-        BRepAlgoAPI_Cut cut_ba(b, a);
-        cut_ba.SetFuzzyValue(1e-4);
-        cut_ba.Build();
-        if (!cut_ba.IsDone()) return degrade("B-A cut did not converge");
-        extra_shape = cut_ba.Shape();
+        if (split.b_minus_a.IsNull()) return degrade("B-A cut did not converge");
+        extra_shape = std::move(split.b_minus_a);
         extra_vol = volume_or_zero(extra_shape);
     } catch (const Standard_Failure& ex) {
         return degrade(std::string("kernel exception: ") + ex.GetMessageString());

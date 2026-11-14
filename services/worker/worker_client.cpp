@@ -30,6 +30,8 @@
 #include <cwchar> // _wcsnicmp for the Win32 child env block
 #include <string>
 #include <shared_mutex>
+#include <initializer_list>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #if defined(_WIN32)
@@ -684,31 +686,40 @@ std::string win32Error(DWORD code) {
 
 // CreateProcessW only reads a *wide* environment block when it is also given
 // CREATE_UNICODE_ENVIRONMENT — the two go together or the child sees garbage.
-// Copy the parent block, overriding (or inserting) one NAME=VALUE, and return a
+// Copy the parent block, overriding (or inserting) each NAME=VALUE, and return a
 // double-NUL-terminated wchar_t buffer suitable for lpEnvironment.
-std::vector<wchar_t> childEnvBlockWith(const std::wstring &name,
-                                       const std::wstring &value) {
+std::vector<wchar_t> childEnvBlockWith(
+    std::initializer_list<std::pair<std::wstring, std::wstring>> overrides) {
   std::vector<wchar_t> out;
-  const std::wstring prefix = name + L"=";
   wchar_t *parent = GetEnvironmentStringsW();
   if (parent) {
     for (wchar_t *p = parent; *p;) {
       const std::wstring entry(p);
       p += entry.size() + 1;
-      // Drop any existing binding for `name` (Windows env names are
+      // Drop any existing binding for an overridden name (Windows env names are
       // case-insensitive) so ours is the only one. Everything else, including
       // cmd's "=C:=..." per-drive entries, is copied verbatim.
-      if (entry.size() >= prefix.size() &&
-          _wcsnicmp(entry.c_str(), prefix.c_str(), prefix.size()) == 0)
+      bool overridden = false;
+      for (const auto &kv : overrides) {
+        const std::wstring prefix = kv.first + L"=";
+        if (entry.size() >= prefix.size() &&
+            _wcsnicmp(entry.c_str(), prefix.c_str(), prefix.size()) == 0) {
+          overridden = true;
+          break;
+        }
+      }
+      if (overridden)
         continue;
       out.insert(out.end(), entry.begin(), entry.end());
       out.push_back(0);
     }
     FreeEnvironmentStringsW(parent);
   }
-  const std::wstring ours = prefix + value;
-  out.insert(out.end(), ours.begin(), ours.end());
-  out.push_back(0);
+  for (const auto &kv : overrides) {
+    const std::wstring ours = kv.first + L"=" + kv.second;
+    out.insert(out.end(), ours.begin(), ours.end());
+    out.push_back(0);
+  }
   out.push_back(0); // block terminator
   return out;
 }
@@ -1214,9 +1225,12 @@ bool WorkerClient::start(std::string &err, const std::string &module) {
 
   // Explicit wide env block (see childEnvBlockWith): lpEnvironment must be
   // paired with CREATE_UNICODE_ENVIRONMENT, otherwise CreateProcessW reads the
-  // wide bytes as ANSI.
-  std::vector<wchar_t> envBlock =
-      childEnvBlockWith(L"CHUDWARE_ENGINE_DAEMON", widen(enginePin));
+  // wide bytes as ANSI. PYTHONUTF8: Python's Windows default text encoding is the
+  // ANSI code page (cp1252), which cannot decode the UTF-8 files and tool output
+  // the services read; UTF-8 mode fixes open(), subprocess pipes and stdio for the
+  // worker and the Python children that inherit it.
+  std::vector<wchar_t> envBlock = childEnvBlockWith(
+      {{L"CHUDWARE_ENGINE_DAEMON", widen(enginePin)}, {L"PYTHONUTF8", L"1"}});
 
   PROCESS_INFORMATION pi{};
   BOOL ok = CreateProcessW(nullptr, cmdbuf.data(), nullptr, nullptr, TRUE,

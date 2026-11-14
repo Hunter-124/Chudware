@@ -279,7 +279,7 @@ def research_and_ingest(
         "sources": sources,
     }
     bundle_path = datasheet_dir / "research_bundle.json"
-    bundle_path.write_text(json.dumps(bundle, indent=2))
+    bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
 
     # mission_seed: what to hand off to reveng_datasheet n_ingest
     mission_seed = {

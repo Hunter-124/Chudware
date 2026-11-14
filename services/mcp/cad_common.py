@@ -1644,7 +1644,7 @@ def _write_handoff_control(d: Path, active: Optional[str]) -> bool:
     frag = {"rev": _PUB["rev"], "active": frag_active, "docs": frag_entries,
             "session": _SESSION_ID, "pid": _HANDOFF_PID, "updated_at": time.time()}
     tmp = d / f"docs-{_SESSION_ID}.json.tmp"
-    tmp.write_text(json.dumps(frag))
+    tmp.write_text(json.dumps(frag), encoding="utf-8")
     os.replace(tmp, d / f"docs-{_SESSION_ID}.json")
     return _merge_handoff_fragments(d)
 
@@ -1663,7 +1663,7 @@ def _merge_handoff_fragments(d: Path) -> bool:
         live_sessions: set = set()  # sessions with a still-alive fragment (their step files are kept)
         for fp in sorted(d.glob("docs-*.json")):
             try:
-                m = json.loads(fp.read_text())
+                m = json.loads(fp.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001 — half-written / corrupt; skip this round
                 continue
             pid = int(m.get("pid", 0) or 0)
@@ -1710,14 +1710,14 @@ def _merge_handoff_fragments(d: Path) -> bool:
             active = merged[-1].get("doc_id") if merged else None
         payload = {"rev": top_rev, "active": active, "docs": merged}
         tmp = d / "docs.json.tmp"
-        tmp.write_text(json.dumps(payload))
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, d / "docs.json")
         # live.json (legacy single-doc host) — point at the active merged entry.
         act = next((e for e in merged if e["doc_id"] == active), None) or (merged[-1] if merged else None)
         if act is not None:
             tmp = d / "live.json.tmp"
             tmp.write_text(json.dumps({"rev": top_rev, "step": act["step"],
-                                       "doc_id": act["doc_id"], "presented": True}))
+                                       "doc_id": act["doc_id"], "presented": True}), encoding="utf-8")
             os.replace(tmp, d / "live.json")
         else:
             (d / "live.json").unlink(missing_ok=True)
@@ -1790,10 +1790,10 @@ def _publish_current(doc_id: str, _deferred: bool = False,
         if _PUB["rev"] is None:
             # Seed from any existing control file so the rev keeps rising across MCP restarts.
             try:
-                _PUB["rev"] = int(json.loads((d / "docs.json").read_text()).get("rev", 0))
+                _PUB["rev"] = int(json.loads((d / "docs.json").read_text(encoding="utf-8")).get("rev", 0))
             except Exception:
                 try:
-                    _PUB["rev"] = int(json.loads((d / "live.json").read_text()).get("rev", 0))
+                    _PUB["rev"] = int(json.loads((d / "live.json").read_text(encoding="utf-8")).get("rev", 0))
                 except Exception:
                     _PUB["rev"] = 0
         _PUB["rev"] += 1
@@ -2048,7 +2048,7 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> bool:
         meta = {"session": _SESSION_ID, "doc_id": doc_id, "name": name or "",
                 "saved_at": time.time(), "revision": saved.get("revision"),
                 "metadata_revision": saved.get("metadata_revision")}
-        (_autosave_dir() / f"{stem}.json").write_text(json.dumps(meta))
+        (_autosave_dir() / f"{stem}.json").write_text(json.dumps(meta), encoding="utf-8")
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -2881,7 +2881,7 @@ def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str, st
     legacy untagged file the stem IS the doc_id."""
     side = step_path.with_suffix(".json")
     try:
-        m = json.loads(side.read_text())
+        m = json.loads(side.read_text(encoding="utf-8"))
         return (m.get("session"),
                 float(m.get("saved_at", step_path.stat().st_mtime)),
                 m.get("name", ""),

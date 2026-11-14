@@ -45,7 +45,7 @@ def _number(value, field, *, positive=False, nonnegative=False):
 
 @lru_cache(maxsize=1)
 def _inlets():
-    return json.loads(Path(__file__).with_name("data").joinpath("culvert_hds5_coefficients.json").read_text())["inlets"]
+    return json.loads(Path(__file__).with_name("data").joinpath("culvert_hds5_coefficients.json").read_text(encoding="utf-8"))["inlets"]
 
 
 def inlet_types():

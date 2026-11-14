@@ -31,9 +31,23 @@ from services.sim import jobs as J
 from services.agent import request_context as _rc
 
 
+# Windows refuses to replace a file another process holds open (a get_job poller
+# reading partial.json/result.json) with PermissionError; the reader closes within
+# milliseconds, so retry briefly instead of failing a solve that may have run for
+# half an hour.
+_REPLACE_RETRY_S = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0)
+
+
 def _atomic_write(path: Path, obj: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, allow_nan=False), encoding="utf-8")
+    if sys.platform == "win32":
+        for delay in _REPLACE_RETRY_S:
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(delay)
     os.replace(tmp, path)
 
 

@@ -821,8 +821,8 @@ int main(int argc, char** argv) {
     hostd::log().line("hostd %s starting: key=%s sock=%s pid=%ld", CHUDWARE_HOSTD_BUILD_ID,
                       key.c_str(), sock.c_str(), selfPid());
 
-    // Optional system tray (Linux + libappindicator). No-op when disabled,
-    // headless, or the feature was not compiled in.
+    // Optional system tray (Windows notification area, Linux + libappindicator). No-op
+    // when disabled, headless, or the feature was not compiled in.
     hostd::trayStart(self);
     hostd::traySetQuitHandler(&trayQuitThunk, nullptr);
     hostd::traySetStatus(hostd::TrayStatus::Busy, "Chudware hostd — starting…");

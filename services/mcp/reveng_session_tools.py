@@ -435,7 +435,7 @@ def _datasheet_dims(session_id: str, rows: list):
     bundle = ds_dir / "research_bundle.json"
     if bundle.is_file():
         try:
-            data = _json.loads(bundle.read_text())
+            data = _json.loads(bundle.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             data = {}
         for cand in data.get("candidate_dims") or []:
@@ -448,7 +448,7 @@ def _datasheet_dims(session_id: str, rows: list):
     sheet = ds_dir / "datasheet.json"
     if sheet.is_file():
         try:
-            data = _json.loads(sheet.read_text())
+            data = _json.loads(sheet.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             data = {}
         for table in data.get("tables") or []:

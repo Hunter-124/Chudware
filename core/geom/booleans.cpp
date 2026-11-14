@@ -1,5 +1,6 @@
 #include "geom/booleans.h"
 
+#include <BOPAlgo_PaveFiller.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
@@ -184,6 +185,30 @@ TopoDS_Shape cut_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>&
 TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     if (a.IsNull() || b.IsNull()) return TopoDS_Shape();
     return run_pair<BRepAlgoAPI_Common>(a, b);
+}
+
+PairSplit split_pair(const TopoDS_Shape& a, const TopoDS_Shape& b, double fuzzy,
+                     bool want_b_minus_a) {
+    PairSplit out;
+    if (a.IsNull() || b.IsNull()) return out;
+    TopTools_ListOfShape args;
+    args.Append(a);
+    args.Append(b);
+    BOPAlgo_PaveFiller filler;
+    filler.SetArguments(args);
+    if (fuzzy > 0.0) filler.SetFuzzyValue(fuzzy);
+    filler.SetNonDestructive(Standard_True);  // never mutate cached argument TShapes
+    filler.Perform();
+    if (filler.HasErrors()) return out;
+    BRepAlgoAPI_Common common_op(a, b, filler);
+    if (common_op.IsDone()) out.common = common_op.Shape();
+    BRepAlgoAPI_Cut cut_ab(a, b, filler);
+    if (cut_ab.IsDone()) out.a_minus_b = cut_ab.Shape();
+    if (want_b_minus_a) {
+        BRepAlgoAPI_Cut cut_ba(a, b, filler, /*bFWD=*/Standard_False);
+        if (cut_ba.IsDone()) out.b_minus_a = cut_ba.Shape();
+    }
+    return out;
 }
 
 bool is_degenerate_patch(const TopoDS_Face& face) {

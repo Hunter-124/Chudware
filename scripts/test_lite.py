@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ast
 from dataclasses import dataclass
+import functools
 import importlib.util
 import json
 import os
@@ -32,11 +33,21 @@ STAMP = Path('.cache/test_lite.stamp')
 TIMINGS = Path('.cache/test_lite_times.json')
 CPP_SUFFIXES = {'.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx', '.inl', '.ipp', '.inc', '.tpp'}
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
-TARGET = re.compile(r'(?:^|/)CMakeFiles/([^/]+)\.dir/')
+TARGET = re.compile(r'(?:^|[\\/])CMakeFiles[\\/]([^\\/]+)\.dir[\\/]')
 REGISTRATION = re.compile(r'^add_test\(\[(=*)\[(.*?)\]\1\]\s+(.*)\)\s*$')
+WINDOWS = os.name == 'nt'
 # A developer checkout may keep an OCCT tree beside the gate's tree; a testbox slot
-# configures only core/build-linux (the same CHUDWARE_WITH_OCCT=ON engine).
-CORE_TREES = ('core/build-occt-linux', 'core/build-linux')
+# configures only core/build-linux (the same CHUDWARE_WITH_OCCT=ON engine). Native
+# Windows runs suites against the windows-occt preset tree and the CI host tree.
+CORE_TREES = ('build/windows-occt',) if WINDOWS else ('core/build-occt-linux', 'core/build-linux')
+HOST_TREE = 'host/build-windows' if WINDOWS else 'host/build-linux'
+RUNTIME_TARGETS = (('chudware', 'chudware-hostd') if WINDOWS else
+                   ('chudware', 'chudware-hostd', 'chudware-shape-build-worker'))
+
+
+def ctest_dir(build_dir: str) -> str:
+    """The windows-occt preset nests core/ under its binary dir; the others are the tree."""
+    return f'{build_dir}/core' if build_dir == 'build/windows-occt' else build_dir
 
 
 @dataclass
@@ -243,7 +254,7 @@ def compile_targets(root: Path, build_dir: str) -> tuple[dict[str, set[Path]], d
     directory = root / build_dir
     try:
         entries = json.loads((directory / 'compile_commands.json').read_text(encoding='utf-8'))
-        registrations = (directory / 'CTestTestfile.cmake').read_text(encoding='utf-8')
+        registrations = (root / ctest_dir(build_dir) / 'CTestTestfile.cmake').read_text(encoding='utf-8')
     except OSError as exc:
         raise ValueError(f'{build_dir} needs a configured Ninja tree with compile_commands.json and CTestTestfile.cmake') from exc
     sources: dict[str, set[Path]] = {}
@@ -262,6 +273,8 @@ def compile_targets(root: Path, build_dir: str) -> tuple[dict[str, set[Path]], d
             continue
         for argument in shlex.split(match.group(3)):
             target = Path(argument).name
+            if target.lower().endswith('.exe'):
+                target = target[:-4]
             if target in sources:
                 tests.setdefault(target, set()).add(match.group(2))
     return sources, tests
@@ -295,7 +308,7 @@ def native_selection(root: Path, changed: list[str], area: str) -> tuple[NativeS
              and (area != 'host' or name.startswith(('host/src/', 'host/tests/')))]
     if not files:
         return None, set()
-    build_dir = core_test_tree(root) if area == 'core' else 'host/build-linux'
+    build_dir = core_test_tree(root) if area == 'core' else HOST_TREE
     sources, tests = compile_targets(root, build_dir)
     selected_targets: set[str] = set()
     matched: set[str] = set()
@@ -329,10 +342,14 @@ def core_test_tree(root: Path) -> str:
     return CORE_TREES[0]  # unconfigured: compile_targets reports the missing tree
 
 
+def configured(root: Path, build_dir: str) -> bool:
+    return ((root / build_dir / 'build.ninja').is_file()
+            and (root / ctest_dir(build_dir) / 'CTestTestfile.cmake').is_file())
+
+
 def python_runtime_tree(root: Path) -> str:
-    for build_dir in ('core/build-linux', 'core/build-occt-linux'):
-        if ((root / build_dir / 'build.ninja').is_file()
-                and (root / build_dir / 'CTestTestfile.cmake').is_file()):
+    for build_dir in CORE_TREES if WINDOWS else ('core/build-linux', 'core/build-occt-linux'):
+        if configured(root, build_dir):
             return build_dir
     raise ValueError('Python tests need a configured core Ninja tree for libchudware and chudware-hostd')
 
@@ -364,9 +381,8 @@ def select_suites(root: Path, manifest: test_suites.Manifest, suites: tuple[str,
     targets = [f'tests-{suite}' for suite in suites]
     native = [
         NativeSelection(build_dir, list(targets), [])
-        for build_dir in ('core/build-occt-linux', 'core/build-linux', 'host/build-linux')
-        if (root / build_dir / 'build.ninja').is_file()
-        and (root / build_dir / 'CTestTestfile.cmake').is_file()
+        for build_dir in (*CORE_TREES, HOST_TREE)
+        if configured(root, build_dir)
     ]
     runtime_builds = [python_runtime_tree(root)] if tests else []
     return Selection([], tests, native, runtime_builds, False, [], suites)
@@ -400,6 +416,10 @@ def save_json(path: Path, data: object, mtime_ns: int | None = None) -> None:
 
 def running_runtime_users(root: Path, build_dir: str, proc: Path = Path('/proc')) -> list[str]:
     """Identify live application processes that could be disturbed by a relink."""
+    if WINDOWS:
+        # Windows refuses to overwrite a mapped image: a relink under a live app fails
+        # with LNK1104 instead of swapping the engine beneath it.
+        return []
     tree = (root / build_dir).resolve()
     try:
         processes = list(proc.iterdir())
@@ -486,12 +506,11 @@ def commands(selection: Selection) -> list[tuple[str, list[str], str | None]]:
     if selection.check:
         result.append(('check.py', [sys.executable, 'scripts/check.py'], None))
     native_by_dir = {item.build_dir: item for item in selection.native}
-    for build_dir in ('core/build-occt-linux', 'core/build-linux', 'host/build-linux'):
+    for build_dir in (*CORE_TREES, HOST_TREE):
         native = native_by_dir.get(build_dir)
         targets = list(native.targets) if native else []
         if build_dir in selection.runtime_builds:
-            targets.extend(t for t in ('chudware', 'chudware-hostd', 'chudware-shape-build-worker')
-                           if t not in targets)
+            targets.extend(t for t in RUNTIME_TARGETS if t not in targets)
         if not targets:
             continue
         area = 'host' if build_dir.startswith('host/') else 'core'
@@ -507,11 +526,11 @@ def commands(selection: Selection) -> list[tuple[str, list[str], str | None]]:
         result.append((label, [*build, *targets], None))
         if native and selection.suites:
             pattern = '^(' + '|'.join(re.escape(name) for name in selection.suites) + ')$'
-            result.append((f'{area} ctest', ['ctest', '--test-dir', build_dir,
+            result.append((f'{area} ctest', ['ctest', '--test-dir', ctest_dir(build_dir),
                                              '-L', pattern, '--output-on-failure'], None))
         elif native and native.tests:
             pattern = '^(' + '|'.join(re.escape(name) for name in native.tests) + ')$'
-            result.append((f'{area} ctest', ['ctest', '--test-dir', build_dir,
+            result.append((f'{area} ctest', ['ctest', '--test-dir', ctest_dir(build_dir),
                                              '--output-on-failure', '--no-tests=error', '-R', pattern], None))
     if selection.suites:
         units: dict[str, list[str]] = {}
@@ -527,7 +546,24 @@ def commands(selection: Selection) -> list[tuple[str, list[str], str | None]]:
     return result
 
 
+@functools.lru_cache(maxsize=1)
+def windows_process():
+    """services/windows_process.py, loaded by path: scripts/ is not a services importer."""
+    spec = importlib.util.spec_from_file_location(
+        '_chudware_windows_process', ROOT / 'services' / 'windows_process.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def process_start(pid: int) -> str | None:
+    if WINDOWS:
+        windows_start = windows_process().process_start
+        try:
+            start = windows_start(pid)
+        except OSError:
+            return None
+        return None if start is None else str(start)
     try:
         # Everything after the parenthesized comm starts with field 3 (state);
         # field 22 is the kernel's process start time, used to guard PID reuse.
@@ -537,6 +573,13 @@ def process_start(pid: int) -> str | None:
 
 
 def descendants(pid: int) -> dict[int, str]:
+    if WINDOWS:
+        process_tree = windows_process().process_tree
+        try:
+            tree = process_tree(pid, 65536)
+        except (OSError, RuntimeError):
+            return {}
+        return {child: str(start) for child, (_parent, start) in tree.items() if child != pid}
     found: dict[int, str] = {}
     todo = [pid]
     while todo:
@@ -562,8 +605,10 @@ def run_command(command: list[str], root: Path, environment: dict[str, str], tim
     start = time.monotonic()
     with tempfile.TemporaryFile(mode='w+t', encoding='utf-8', errors='replace') as output:
         try:
+            spawn = ({'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS
+                     else {'start_new_session': True})
             process = subprocess.Popen(command, cwd=root, env=environment, stdout=output,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
+                                       stderr=subprocess.STDOUT, **spawn)
         except OSError as exc:
             return 'FAIL', time.monotonic() - start, str(exc)
         try:
@@ -571,6 +616,19 @@ def run_command(command: list[str], root: Path, environment: dict[str, str], tim
             result = 'PASS' if code == 0 else 'NO TESTS' if code == 5 and allow_no_tests else f'FAIL ({code})'
         except subprocess.TimeoutExpired:
             owned_children = descendants(process.pid)
+            if WINDOWS:
+                # No process groups and no SIGINT delivery into a child's console group:
+                # terminate the root, then the descendants observed before it died.
+                process.kill()
+                process.wait()
+                for pid, child_start in owned_children.items():
+                    if process_start(pid) == child_start:
+                        try:
+                            os.kill(pid, signal.SIGTERM)  # TerminateProcess
+                        except OSError:
+                            pass
+                output.seek(0)
+                return 'BUDGET', time.monotonic() - start, output.read()
             # SIGINT lets pytest run fixture teardown (including its private daemon).
             try:
                 os.killpg(process.pid, signal.SIGINT)
@@ -612,7 +670,7 @@ def print_plan(selection: Selection, stages: list[tuple[str, list[str], str | No
         print('Selected test suites:')
         found = False
         for item in selection.native:
-            tree = item.build_dir.split('/', 1)[0]
+            tree = 'host' if item.build_dir.startswith('host/') else 'core'
             owners = {test: suite for suite, tests in manifest.native[tree].items() for test in tests}
             for test in item.tests:
                 print(f'  {tree}/{test}: {owners.get(test, "(not in manifest)")}')
@@ -708,9 +766,11 @@ def main(argv: list[str] | None = None) -> int:
             # user's running host or the dist daemon watched by that host.
             runtime = ROOT / selection.runtime_builds[0] / 'bin'
             if not env.get('CHUDWARE_LIBCHUDWARE'):
-                env['CHUDWARE_LIBCHUDWARE'] = str(runtime / 'libchudware.so')
+                env['CHUDWARE_LIBCHUDWARE'] = str(
+                    runtime / ('libchudware.dll' if WINDOWS else 'libchudware.so'))
             if not env.get('CHUDWARE_HOSTD_BIN'):
-                env['CHUDWARE_HOSTD_BIN'] = str(runtime / 'chudware-hostd')
+                env['CHUDWARE_HOSTD_BIN'] = str(
+                    runtime / ('chudware-hostd.exe' if WINDOWS else 'chudware-hostd'))
         for key, directory in {'HOME': 'home', 'USERPROFILE': 'home', 'APPDATA': 'data',
                                'XDG_DATA_HOME': 'data', 'XDG_CONFIG_HOME': 'config',
                                'XDG_CACHE_HOME': 'cache', 'XDG_RUNTIME_DIR': 'run',
@@ -730,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
             if failed or (remaining is not None and remaining <= 0):
                 reason = 'earlier failure' if failed else 'budget exhausted'
                 failed = True
-            elif len(command) >= 3 and command[:2] == ['ninja', '-C'] and command[2].startswith('core/'):
+            elif len(command) >= 3 and command[:2] == ['ninja', '-C'] and command[2] in CORE_TREES:
                 build_dir = command[2]
                 if blocked:
                     reason = f'runtime rebuild already blocked: {blocked[0]}'
@@ -742,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
                         print(f'WARNING: skipping {build_dir} build: {reason}', flush=True)
                 if reason:
                     skipped_builds.add(build_dir)
-            elif label == 'core ctest' and command[2] in skipped_builds:
+            elif label == 'core ctest' and any(command[2] == ctest_dir(b) for b in skipped_builds):
                 reason = 'core build was skipped'
             elif blocked and (test is not None or (label == 'host ctest' and host_needs_runtime)):
                 reason = f'runtime rebuild skipped: {blocked[0]}'

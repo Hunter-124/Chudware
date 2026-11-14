@@ -7,6 +7,7 @@
 #include "util/process_isolation.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <map>
 #include <cmath>
@@ -940,17 +941,17 @@ class FilletValidityBudget : public Message_ProgressIndicator {
 public:
     explicit FilletValidityBudget(std::chrono::steady_clock::time_point deadline)
         : deadline_(deadline) {}
-    bool interrupted() const { return interrupted_; }
+    bool interrupted() const { return interrupted_.load(std::memory_order_relaxed); }
 protected:
     Standard_Boolean UserBreak() override {
         if (std::chrono::steady_clock::now() < deadline_) return Standard_False;
-        interrupted_ = true;
+        interrupted_.store(true, std::memory_order_relaxed);
         return Standard_True;
     }
     void Show(const Message_ProgressScope&, const Standard_Boolean) override {}
 private:
     std::chrono::steady_clock::time_point deadline_;
-    bool interrupted_ = false;
+    std::atomic<bool> interrupted_{false};  // UserBreak runs on the checker's worker threads
 };
 
 std::string fillet_solid_rejection(const TopoDS_Shape& shape,
@@ -975,7 +976,7 @@ std::string fillet_solid_rejection(const TopoDS_Shape& shape,
         checker.SetArguments(args);
         checker.SetLevelOfCheck(9);
         checker.SetNonDestructive(Standard_True);
-        checker.SetRunParallel(Standard_False);
+        checker.SetRunParallel(Standard_True);
         checker.Perform(budget->Start());
         if (budget->interrupted()) return "fillet self-intersection validation timed out";
         if (checker.HasErrors()) {
@@ -3207,7 +3208,6 @@ TopoDS_Shape chamfer_vertices(const TopoDS_Shape& shape, double d,
                 GProp_GProps before;
                 BRepGProp::VolumeProperties(current, before);
                 BRepAlgoAPI_Cut cut(current, cutter);
-                cut.Build();
                 if (!cut.IsDone() || cut.Shape().IsNull()) return {};
                 TopoDS_Shape next = cut.Shape();
                 if (recording) chain.push_back(cut.History());
@@ -3412,7 +3412,6 @@ TopoDS_Shape closed_shell_offset_cut(const TopoDS_Shape& body, double t, bool ou
             const TopoDS_Shape& big   = outward ? offset_solid : body;
             const TopoDS_Shape& small = outward ? body         : offset_solid;
             BRepAlgoAPI_Cut cut(big, small);
-            cut.Build();
             if (!cut.IsDone() || cut.Shape().IsNull()) {
                 tried.emplace_back(label, "the wall boolean (cut) failed");
                 continue;

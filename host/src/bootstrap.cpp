@@ -152,7 +152,9 @@ int runWait(const std::string &cmd, const std::string &cwd) {
   if (childEnv.empty())
     childEnv.push_back(0);
   childEnv.push_back(0);
-  if (!CreateProcessA(nullptr, c.data(), nullptr, nullptr, FALSE, 0, childEnv.data(),
+  // The GUI-subsystem host has no console; without CREATE_NO_WINDOW each provisioning
+  // step (venv, pip) would open its own console window.
+  if (!CreateProcessA(nullptr, c.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, childEnv.data(),
                       cwd.empty() ? nullptr : cwd.c_str(), &si, &pi))
     return -1;
   WaitForSingleObject(pi.hProcess, INFINITE);

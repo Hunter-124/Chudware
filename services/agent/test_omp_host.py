@@ -327,7 +327,7 @@ class FakeClient:
         for request in requests:
             for listener in tuple(self.ui_listeners):
                 listener(request)
-        return {"providerId": provider_id}
+        return provider_id  # omp_rpc.RpcClient.login -> str
 
     def cancel_ui_request(self, request_id):
         self.calls.append(("cancel_ui_request", {"id": request_id}))

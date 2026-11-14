@@ -1,0 +1,7 @@
+// Windows resource script for chudware-hostd.exe. Embeds the application icon the
+// daemon's notification-area (tray) icon loads by resource id (tray_icon.cpp), so the
+// tray shows the brand mark in every layout (build tree, staged dist, install) with no
+// asset lookup. Wired into the build by core/CMakeLists.txt (WIN32-only). ICON paths
+// are relative to this .rc file (core/hostd/).
+
+1 ICON "../../assets/app.ico"

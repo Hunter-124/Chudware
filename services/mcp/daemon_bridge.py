@@ -289,7 +289,7 @@ def _pid_alive(pid: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     try:
-        with open(f"/proc/{pid}/stat") as f:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
             if f.read().rsplit(")", 1)[-1].split()[0] == "Z":
                 try:
                     os.waitpid(pid, os.WNOHANG)  # reap if it's our child

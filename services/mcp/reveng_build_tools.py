@@ -620,7 +620,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         _invalidate_downstream(s)
         fits_path = _session_path(session_id) / "fits.json"
         try:
-            fits_path.write_text(_json.dumps(fits, indent=2))
+            fits_path.write_text(_json.dumps(fits, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             _save_session(s)
             return _dumps({"ok": False, "reason": f"fits persistence error: {exc}"})
@@ -878,7 +878,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                          else _Path(dest).expanduser())
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             session_root = _session_path(session_id).resolve()
-            manifest = _json.loads((session_root / "session.json").read_text())
+            manifest = _json.loads((session_root / "session.json").read_text(encoding="utf-8"))
 
             def owned_file(value):
                 if not isinstance(value, str) or not value:

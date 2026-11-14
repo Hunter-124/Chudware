@@ -63,6 +63,19 @@ constexpr int EQ[NQ][3] = {
     {0, -1, 1},   // 18
 };
 
+// EQ as float rows, one contiguous row per axis. EQ[q][k] is a strided int read, which
+// keeps MSVC from vectorizing the per-cell loops over q; these rows hold the same values.
+struct AxisRows {
+    alignas(16) float v[3][NQ];
+};
+constexpr AxisRows make_axis_rows() {
+    AxisRows rows{};
+    for (int q = 0; q < NQ; ++q)
+        for (int k = 0; k < 3; ++k) rows.v[k][q] = static_cast<float>(EQ[q][k]);
+    return rows;
+}
+constexpr AxisRows EQF = make_axis_rows();
+
 // Weights — EXACT _W (float32). 1/3 rest, 1/18 face (1..6), 1/36 edge (7..18).
 const float W[NQ] = {
     1.0f / 3.0f,
@@ -359,41 +372,6 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
         });
     };
 
-    // ---- _stream(f): g[...,q] = np.roll(f[...,q], shift=(ex,ey,ez), axis=(0,1,2))
-    // np.roll positive shift moves data toward higher index with wrap:
-    //   g[x,y,z,q] = f[(x-ex) mod Nx, (y-ey) mod Ny, (z-ez) mod Nz, q].
-    // Destination-cell gather writes a contiguous 19-population row, rather than
-    // striding the entire AoS lattice nineteen times. Reads and wrap semantics are
-    // unchanged; X slabs keep the innermost Z rows contiguous.
-    auto stream = [&](const std::vector<float>& F, std::vector<float>& G) {
-        lattice_for(static_cast<std::size_t>(nx), lbm_threads, [&](std::size_t xx) {
-            const int x = static_cast<int>(xx);
-            int sx[NQ];
-            for (int q = 0; q < NQ; ++q) {
-                sx[q] = x - EQ[q][0];
-                if (sx[q] < 0) sx[q] += nx;
-                else if (sx[q] >= nx) sx[q] -= nx;
-            }
-            for (int y = 0; y < ny; ++y) {
-                int sy[NQ];
-                for (int q = 0; q < NQ; ++q) {
-                    sy[q] = y - EQ[q][1];
-                    if (sy[q] < 0) sy[q] += ny;
-                    else if (sy[q] >= ny) sy[q] -= ny;
-                }
-                for (int z = 0; z < nz; ++z) {
-                    const std::size_t base = fidx(x, y, z, 0);
-                    for (int q = 0; q < NQ; ++q) {
-                        int sz = z - EQ[q][2];
-                        if (sz < 0) sz += nz;
-                        else if (sz >= nz) sz -= nz;
-                        G[base + q] = F[fidx(sx[q], sy[q], sz, q)];
-                    }
-                }
-            }
-        });
-    };
-
     // ---- initialise: f = feq(1, u_lat, 0, 0); zero solid cells --------------------
     feq_compute(rho, ux, uy, uz, f);
     for (std::size_t c = 0; c < ncell; ++c) {
@@ -521,66 +499,94 @@ LbmResult lbm_run(const std::vector<uint8_t>& solid, int nx, int ny, int nz,
 
     int step = 0;
     for (step = 1; step <= n_steps; ++step) {
-        // --- Collision (BGK + Smagorinsky), FUSED (P3) ---
+        // --- Collision (BGK + Smagorinsky) fused with streaming ---
         // macros -> feq -> collide used to be three full-lattice passes through memory
-        // (with a persistent ncell*19 feq buffer in the middle). Each cell's update is
-        // independent and uses only its own 19 distributions, so the whole thing fuses
-        // into ONE pass with the equilibrium held in registers. Per cell the arithmetic
-        // (pairwise sums, float32 expression order) is exactly the old sequence, so the
-        // lattice walk stays bit-identical to the oracle; cells write disjoint slots, so
-        // the OpenMP split changes nothing.
-        lattice_for(ncell, lbm_threads, [&](std::size_t c) {
-            const std::size_t base = c * sz_q;
-            // _macros for this cell (same pairwise reductions as the macros() lambda).
-            float prod[NQ];
-            const float sr = pairwise_sum19(&f[base]);
-            for (int q = 0; q < NQ; ++q) prod[q] = f[base + q] * static_cast<float>(EQ[q][0]);
-            const float sx = pairwise_sum19(prod);
-            for (int q = 0; q < NQ; ++q) prod[q] = f[base + q] * static_cast<float>(EQ[q][1]);
-            const float sy = pairwise_sum19(prod);
-            for (int q = 0; q < NQ; ++q) prod[q] = f[base + q] * static_cast<float>(EQ[q][2]);
-            const float szv = pairwise_sum19(prod);
-            const float rho_safe = (sr > 1e-10f) ? sr : 1.0f;
-            const float cux = sx / rho_safe, cuy = sy / rho_safe, cuz = szv / rho_safe;
-            // _feq_fast for this cell, in registers.
-            float feq_c[NQ];
-            const float u2 = cux * cux + cuy * cuy + cuz * cuz;
+        // (with a persistent ncell*19 feq buffer in the middle), followed by a gather
+        // stream pass. Each cell's update is independent and uses only its own 19
+        // distributions, so it runs in registers, and its post-collision population q is
+        // pushed straight to its streaming destination g[x+ex, y+ey, z+ez, q] (periodic
+        // wrap, as np.roll): the same values land in the same slots as collide-in-place
+        // followed by the gather, with one lattice pass instead of two. Per cell the
+        // arithmetic (pairwise sums, float32 expression order) is exactly the old
+        // sequence, so the lattice walk stays bit-identical to the oracle. Destinations
+        // are a permutation of the slots, so the x slabs write disjoint memory.
+        lattice_for(static_cast<std::size_t>(nx), lbm_threads, [&](std::size_t xx) {
+            const int x = static_cast<int>(xx);
+            int dx[NQ];
             for (int q = 0; q < NQ; ++q) {
-                float eu = cux * static_cast<float>(EQ[q][0]);
-                eu += cuy * static_cast<float>(EQ[q][1]);
-                eu += cuz * static_cast<float>(EQ[q][2]);
-                float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) -
-                             u2 / (2.0f * CS2);
-                feq_c[q] = W[q] * sr * term;
+                dx[q] = x + EQ[q][0];
+                if (dx[q] < 0) dx[q] += nx;
+                else if (dx[q] >= nx) dx[q] -= nx;
             }
-            if (use_smag) {
-                // _smag_tau: pi_mag = sqrt(sum_q (f-feq)^2); nu_eff = nu0 + Cs^2*sqrt2*pi;
-                // tau_eff retains the physical molecular floor tau0; only the upper stability
-                // bound is clipped. Raising the floor to 0.51 silently changed Reynolds number.
-                float sq[NQ];
+            for (int y = 0; y < ny; ++y) {
+                std::size_t row[NQ];  // destination (x, y) row start per q, in cells
                 for (int q = 0; q < NQ; ++q) {
-                    const float fn = f[base + q] - feq_c[q];
-                    sq[q] = fn * fn;
+                    int dy = y + EQ[q][1];
+                    if (dy < 0) dy += ny;
+                    else if (dy >= ny) dy -= ny;
+                    row[q] = (static_cast<std::size_t>(dx[q]) * ny + dy) * nz;
                 }
-                const float pi_mag = std::sqrt(pairwise_sum19(sq));
-                const float smag = SMAG_C * pi_mag;
-                const float nu_eff = nu0 + smag;  // float32
-                float tau_eff = nu_eff / CS2 + 0.5f;
-                if (tau_eff < static_cast<float>(tau_current))
-                    tau_eff = static_cast<float>(tau_current);
-                if (tau_eff > 2.0f) tau_eff = 2.0f;
-                const float omega = 1.0f / tau_eff;  // float32(1.0)/tau_arr
-                for (int q = 0; q < NQ; ++q)
-                    f[base + q] = f[base + q] - omega * (f[base + q] - feq_c[q]);
-            } else {
-                for (int q = 0; q < NQ; ++q)
-                    f[base + q] = f[base + q] - omega_s * (f[base + q] - feq_c[q]);
+                for (int z = 0; z < nz; ++z) {
+                    const std::size_t base = cidx(x, y, z) * sz_q;
+                    // Work on a local copy of the cell's 19 populations: with no aliasing
+                    // between the lattice and the scratch rows the q loops vectorize.
+                    // Every element sees exactly the scalar arithmetic it did before; only
+                    // the reductions order the q's, and they stay the scalar pairwise sums.
+                    float fc[NQ];
+                    for (int q = 0; q < NQ; ++q) fc[q] = f[base + q];
+                    // _macros for this cell (same pairwise reductions as the macros() lambda).
+                    float prod[NQ];
+                    const float sr = pairwise_sum19(fc);
+                    for (int q = 0; q < NQ; ++q) prod[q] = fc[q] * EQF.v[0][q];
+                    const float sx = pairwise_sum19(prod);
+                    for (int q = 0; q < NQ; ++q) prod[q] = fc[q] * EQF.v[1][q];
+                    const float sy = pairwise_sum19(prod);
+                    for (int q = 0; q < NQ; ++q) prod[q] = fc[q] * EQF.v[2][q];
+                    const float szv = pairwise_sum19(prod);
+                    const float rho_safe = (sr > 1e-10f) ? sr : 1.0f;
+                    const float cux = sx / rho_safe, cuy = sy / rho_safe, cuz = szv / rho_safe;
+                    // _feq_fast for this cell, in registers.
+                    float feq_c[NQ];
+                    const float u2 = cux * cux + cuy * cuy + cuz * cuz;
+                    for (int q = 0; q < NQ; ++q) {
+                        float eu = cux * EQF.v[0][q];
+                        eu += cuy * EQF.v[1][q];
+                        eu += cuz * EQF.v[2][q];
+                        float term = 1.0f + eu / CS2 + (eu * eu) / (2.0f * CS2 * CS2) -
+                                     u2 / (2.0f * CS2);
+                        feq_c[q] = W[q] * sr * term;
+                    }
+                    float omega = omega_s;
+                    if (use_smag) {
+                        // _smag_tau: pi_mag = sqrt(sum_q (f-feq)^2); nu_eff = nu0 +
+                        // Cs^2*sqrt2*pi; tau_eff retains the physical molecular floor tau0;
+                        // only the upper stability bound is clipped. Raising the floor to
+                        // 0.51 silently changed Reynolds number.
+                        float sq[NQ];
+                        for (int q = 0; q < NQ; ++q) {
+                            const float fn = fc[q] - feq_c[q];
+                            sq[q] = fn * fn;
+                        }
+                        const float pi_mag = std::sqrt(pairwise_sum19(sq));
+                        const float smag = SMAG_C * pi_mag;
+                        const float nu_eff = nu0 + smag;  // float32
+                        float tau_eff = nu_eff / CS2 + 0.5f;
+                        if (tau_eff < static_cast<float>(tau_current))
+                            tau_eff = static_cast<float>(tau_current);
+                        if (tau_eff > 2.0f) tau_eff = 2.0f;
+                        omega = 1.0f / tau_eff;  // float32(1.0)/tau_arr
+                    }
+                    float post[NQ];
+                    for (int q = 0; q < NQ; ++q) post[q] = fc[q] - omega * (fc[q] - feq_c[q]);
+                    for (int q = 0; q < NQ; ++q) {
+                        int dz = z + EQ[q][2];
+                        if (dz < 0) dz += nz;
+                        else if (dz >= nz) dz -= nz;
+                        fstream[(row[q] + dz) * sz_q + q] = post[q];
+                    }
+                }
             }
         });
-        // f.astype(np.float32) — already float32; no-op.
-
-        // --- Streaming ---
-        stream(f, fstream);
         f.swap(fstream);
 
         // --- Boundary conditions ---

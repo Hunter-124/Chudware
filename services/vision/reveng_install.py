@@ -112,7 +112,7 @@ def install_brush(progress: Optional[Progress] = None) -> Path:
     receipt_path = target / "install.json"
     if target.exists():
         try:
-            receipt = json.loads(receipt_path.read_text())
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             executable = target / "brush_app"
             if (receipt["archive_sha256"] == BRUSH_SHA256
                     and receipt["source_commit"] == BRUSH_SOURCE
@@ -137,7 +137,7 @@ def install_brush(progress: Optional[Progress] = None) -> Path:
                    "source_repository": BRUSH_REPOSITORY, "source_commit": BRUSH_SOURCE,
                    "archive_url": BRUSH_URL, "archive_sha256": BRUSH_SHA256,
                    "executable_sha256": digest(executable)}
-        (payload / "install.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        (payload / "install.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         payload.rename(target)
     return target / "brush_app"
 
@@ -152,7 +152,7 @@ def install_openmvs(progress: Optional[Progress] = None) -> Path:
     receipt_path = target / "install.json"
     if target.exists():
         try:
-            receipt = json.loads(receipt_path.read_text())
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             if (receipt["archive_sha256"] == OPENMVS_SHA256
                     and all(receipt["tools"][n] == digest(target / n) and os.access(target / n, os.X_OK)
                             for n in OPENMVS_TOOLS)):
@@ -186,7 +186,7 @@ def install_openmvs(progress: Optional[Progress] = None) -> Path:
                    "source_repository": "https://github.com/cdcseacave/openMVS",
                    "archive_url": OPENMVS_URL, "archive_sha256": OPENMVS_SHA256,
                    "tools": {n: digest(payload / n) for n in OPENMVS_TOOLS}}
-        (payload / "install.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        (payload / "install.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         payload.rename(target)
     return target
 

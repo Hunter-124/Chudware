@@ -1613,6 +1613,11 @@ std::wstring workerEnvironment(const wchar_t* lane) {
     entries[L"CHUDWARE_HOSTD_WORKER_LANE"] = std::wstring(L"CHUDWARE_HOSTD_WORKER_LANE=") + lane;
     // hostd workers always reach hostd, never an independent in-process engine.
     entries[L"CHUDWARE_ENGINE_DAEMON"] = L"CHUDWARE_ENGINE_DAEMON=1";
+    // Python's Windows default text encoding is the ANSI code page (cp1252), which cannot
+    // decode the UTF-8 role cards, docs and tool output the services read and pipe. UTF-8
+    // mode makes open(), subprocess text pipes and stdio UTF-8 for the worker and every
+    // Python child it starts (the variable is inherited), matching Linux and macOS.
+    entries[L"PYTHONUTF8"] = L"PYTHONUTF8=1";
     std::wstring block;
     for (const auto& entry : entries) { block += entry.second; block.push_back(L'\0'); }
     block.push_back(L'\0');
@@ -1826,8 +1831,13 @@ bool WorkerBridge::spawn(std::string& err) {
     auto environment = workerEnvironment(laneWide.c_str());
     PROCESS_INFORMATION created{};
     // CREATE_NO_WINDOW still allocates a conhost child. Explicit private stdio
-    // needs no console; detaching avoids that idle resource and unknown census entry.
-    const DWORD flags = DETACHED_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
+    // needs no console; detaching a compiled worker avoids that idle resource and
+    // unknown census entry. An interpreter launch (developer CHUDWARE_PYTHON) is
+    // often a venv python.exe launcher that re-spawns the base interpreter without
+    // console flags; under DETACHED_PROCESS that child opens a visible console, so
+    // give the launcher a hidden one for the child to inherit.
+    const DWORD consoleFlag = compiledWorker_ ? DETACHED_PROCESS : CREATE_NO_WINDOW;
+    const DWORD flags = consoleFlag | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT |
                         EXTENDED_STARTUPINFO_PRESENT;
     const bool launched = handlesReady && !environment.empty() &&
         CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, flags, environment.data(),

@@ -164,6 +164,7 @@ def test_job_worker_promotes_stage_ok_false_to_failure(isolated_registry, monkey
     assert finished["error"] == "solver rejected"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
 def test_cancel_kills_surviving_process_group_after_leader_exits(
         isolated_registry, monkeypatch):
     job_id = "sim-group-survivor"
@@ -197,6 +198,33 @@ def test_cancel_kills_surviving_process_group_after_leader_exits(
     assert result["terminated"] is True
     assert result["pid_alive_after"] is False
     assert result["group_alive_after"] is False
+
+
+def test_cancel_terminates_a_running_job_process(isolated_registry):
+    job = J.start("test", "selftest_sleep", {"seconds": 60, "steps": 600})
+    row = J._row(job["job_id"])
+    assert J.pid_alive(row["pid"], row["proc_key"])
+    result = J.cancel(job["job_id"], timeout_s=10.0)
+    assert result["terminated"] is True, result
+    assert result["state"] == J.CANCELLED
+    assert not J.pid_alive(row["pid"], row["proc_key"])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows refuses to replace an open file")
+def test_progress_publication_waits_out_a_reader_holding_the_file(tmp_path):
+    import threading
+    target = tmp_path / "partial.json"
+    target.write_text("{}", encoding="utf-8")
+    reader = open(target, encoding="utf-8")  # a get_job poll mid-read
+    release = threading.Timer(0.1, reader.close)
+    release.start()
+    try:
+        job_worker._atomic_write(target, {"phase": "solve"})
+    finally:
+        release.join()
+        reader.close()
+    assert json.loads(target.read_text(encoding="utf-8")) == {"phase": "solve"}
+
 
 
 # --------------------------------------------------------------- stage allowlist / payloads

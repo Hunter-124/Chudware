@@ -17,6 +17,7 @@
 #include "doc/asm_disk_cache.h"
 #include "util/resource_governor.h"
 #include "util/process_isolation.h"
+#include "util/thread_pool.h"  // eval_feature_attachment's parallel face sampling
 #include "util/component_ref.h"  // absolutize_component_paths: re-root moved projects
 
 #include <algorithm>
@@ -71,9 +72,9 @@
 #include <BRepTools.hxx>
 #include <BRep_Tool.hxx>
 #include <Bnd_Box.hxx>
-#include <BRepBndLib.hxx>
 #include <BndLib_AddSurface.hxx>
 #include <Precision.hxx>
+#include <BRepBndLib.hxx>
 #include <Poly_Triangulation.hxx>
 #include <Standard_Failure.hxx>
 #include <TopLoc_Location.hxx>
@@ -17649,7 +17650,6 @@ std::optional<gp_Lin> eval_axis_line(const TopoDS_Shape& sh) {
     return std::nullopt;
 }
 
-
 // The plane of a planar face (nullopt for any other element).
 std::optional<gp_Pln> eval_plane(const TopoDS_Shape& sh) {
     try {
@@ -17673,6 +17673,7 @@ std::optional<gp_Lin> eval_straight_line(const TopoDS_Shape& sh) {
     }
     return std::nullopt;
 }
+
 
 // engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius+diameter+length (circle)
 // or length; FACE -> area+perimeter; VERTEX -> point; else volume.
@@ -17821,7 +17822,6 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
             result["axis_angle"] = axis_angle;
         }
     }
-    // Per-element enrichment for the two resolved refs (anchor/polyline on a/b).
     // A plane paired with a parallel plane or a parallel straight edge: the PERPENDICULAR
     // separation of the two, independent of how the bounded faces overlap. The minimum
     // distance above is the closest-point gap between the bounded elements and reads as a
@@ -17857,6 +17857,7 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
                                                      json::array({to.X(), to.Y(), to.Z()})});
         }
     }
+    // Per-element enrichment for the two resolved refs (anchor/polyline on a/b).
     json ea = json::object();
     eval_measure_enrich(ea, a);
     json eb = json::object();
@@ -19175,7 +19176,7 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
                     ck.SetArguments(one);
                     ck.SetLevelOfCheck(9);
                     ck.SetNonDestructive(Standard_True);
-                    ck.SetRunParallel(Standard_False);
+                    ck.SetRunParallel(Standard_True);
                     ck.Perform(si_budget->Start());
                     if (si_budget->broke()) {
                         si_reason = "not checked — the self-intersection check hit its " +
@@ -19289,7 +19290,6 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
     auto add_material = [&](const TopoDS_Shape& solid) {
         BRepBuilderAPI_MakeFace plane_face(pln);
         BRepAlgoAPI_Common common(solid, plane_face.Face());
-        common.Build();
         if (!common.IsDone())
             throw OpError("section_failed", "cutting-plane material intersection failed",
                           {{"doc_id", doc_id}});
@@ -19491,7 +19491,6 @@ json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane
 
         const double vol_mirror = eval_vol_or_zero(mirrored);
         BRepAlgoAPI_Common common(shape, mirrored);
-        common.Build();
         if (!common.IsDone() || common.HasErrors() || common.Shape().IsNull())
             throw OpError("symmetry_failed",
                           "the Boolean common of the body with its mirror image did not "
@@ -20969,6 +20968,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     // their bbox gap ("approx": true) so narration callers don't pay the all-pairs exact
     // distance pass on large assemblies. Fuzzy fallback volumes are marked approximate.
     const bool quick = params.contains("quick") && params["quick"].is_boolean() &&
+                       params["quick"].get<bool>();
     // overlap_mesh is the viewport's red overlap preview (GUI evaluate dialog). Agents
     // read volumes and bboxes, and the meshes were ~290 KB of a 628 KB reply on a
     // 22-part assembly, so MCP passes include_overlap_mesh:false (and skips the
@@ -20976,7 +20976,6 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     const bool include_overlap_mesh = !params.contains("include_overlap_mesh") ||
                                       !params["include_overlap_mesh"].is_boolean() ||
                                       params["include_overlap_mesh"].get<bool>();
-                       params["quick"].get<bool>();
     json report = interference_report(members, include_coincident, min_clearance_mm, quick,
                                       component_ids, include_overlap_mesh,
                                       clearance_mode == "threshold");
@@ -21034,7 +21033,6 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
             double vol = 0.0;
             try {
                 BRepAlgoAPI_Common common(a.tool, b.tool);
-                common.Build();
                 if (common.IsDone()) {
                     vol = eval_vol_or_zero(common.Shape());
                     ov_ok = true;
@@ -21294,42 +21292,128 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
     // INSIDE one of the rest-of-part solids. A point whose inner side (p - probe * normal) is
     // not in the feature's KEPT material is skipped: a later cut or shell removed the
     // feature there, so nothing has to hold it up (a collar over a shelled duct's bore).
-    using Classifiers = std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>>;
-    auto inside_any = [](const gp_Pnt& q, Classifiers& cls, const std::vector<Bnd_Box>& boxes) {
-        for (std::size_t k = 0; k < cls.size(); ++k) {
-            if (boxes[k].IsOut(q)) continue;
-            cls[k]->Perform(q, 1e-7);
-            if (cls[k]->State() == TopAbs_IN) return true;
-        }
-        return false;
+    // Solids a probe point is tested against, with their probe-enlarged boxes.
+    struct SolidSet {
+        std::vector<TopoDS_Shape> solids;
+        std::vector<Bnd_Box> boxes;
     };
-    auto sample_face = [&](const TopoDS_Face& f, int n, Classifiers& cls,
-                           const std::vector<Bnd_Box>& boxes, Classifiers& kept_cls,
-                           const std::vector<Bnd_Box>& kept_boxes, int* in_face) {
+    auto solid_set = [&](std::vector<TopoDS_Shape> solids) {
+        SolidSet set;
+        set.solids = std::move(solids);
+        for (const TopoDS_Shape& so : set.solids) {
+            Bnd_Box bb;
+            BRepBndLib::Add(so, bb, Standard_False);
+            bb.Enlarge(probe);
+            set.boxes.push_back(bb);
+        }
+        return set;
+    };
+    // One classifier per solid.
+    struct Classify {
+        const SolidSet& set;
+        std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> cls;
+        explicit Classify(const SolidSet& s) : set(s) {
+            for (const TopoDS_Shape& so : s.solids)
+                cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(so));
+        }
+        bool inside_any(const gp_Pnt& q) {
+            for (std::size_t k = 0; k < cls.size(); ++k) {
+                if (set.boxes[k].IsOut(q)) continue;
+                cls[k]->Perform(q, 1e-7);
+                if (cls[k]->State() == TopAbs_IN) return true;
+            }
+            return false;
+        }
+    };
+    // Sampling state of one pool thread for one feature instance: classifiers for its
+    // solid sets and the adaptors of the face it is sampling. Classifiers and surface
+    // adaptors are stateful, so no two threads share one; a thread reuses its own across
+    // rows and faces because building a classifier walks every face of its solid.
+    struct ThreadSampler {
+        Classify rest, kept;
+        TopoDS_Face face;
+        std::unique_ptr<BRepAdaptor_Surface> sa;
+        std::unique_ptr<BRepTopAdaptor_FClass2d> inside;
+        ThreadSampler(const SolidSet& r, const SolidSet& k) : rest(r), kept(k) {}
+        void bind(const TopoDS_Face& f) {
+            if (sa && face.IsEqual(f)) return;
+            sa.reset();
+            inside.reset();
+            face = f;
+            sa = std::make_unique<BRepAdaptor_Surface>(f);
+            inside = std::make_unique<BRepTopAdaptor_FClass2d>(f, 1e-7);
+        }
+    };
+    struct Samplers {
+        const SolidSet& rest;
+        const SolidSet& kept;
+        std::mutex mu;
+        std::map<std::thread::id, std::unique_ptr<ThreadSampler>> by_thread;
+        Samplers(const SolidSet& r, const SolidSet& k) : rest(r), kept(k) {}
+        ThreadSampler& mine() {
+            const std::thread::id self = std::this_thread::get_id();
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                const auto it = by_thread.find(self);
+                if (it != by_thread.end()) return *it->second;
+            }
+            auto built = std::make_unique<ThreadSampler>(rest, kept);  // may raise
+            std::lock_guard<std::mutex> lock(mu);
+            return *(by_thread[self] = std::move(built));
+        }
+    };
+    auto sample_face = [&](const TopoDS_Face& f, int n, Samplers& samplers, int* in_face) {
+        // Per grid index: -1 outside the face or without a normal, 0 no kept material
+        // behind it, 1 kept, 2 kept and supported. Rows are classified in parallel;
+        // collecting in grid order up to the first kernel failure reproduces the serial
+        // walk exactly.
         std::vector<Sample> pts;
         *in_face = 0;
+        double u0, u1, v0, v1;
         try {
-            double u0, u1, v0, v1;
             BRepTools::UVBounds(f, u0, u1, v0, v1);
-            BRepAdaptor_Surface sa(f);
-            BRepTopAdaptor_FClass2d inside(f, 1e-7);
-            const bool reversed = f.Orientation() == TopAbs_REVERSED;
-            for (int i = 0; i < n; ++i)
-                for (int j = 0; j < n; ++j) {
+        } catch (const Standard_Failure&) {
+            return pts;
+        }
+        const int count = n * n;
+        std::vector<signed char> state(count, -1);
+        std::vector<gp_Pnt> where(count);
+        std::atomic<int> first_failure{count};
+        const bool reversed = f.Orientation() == TopAbs_REVERSED;
+        chudware::pool::shared().parallel_for(n, [&](int i) {
+            int index = i * n;
+            try {
+                ThreadSampler& ts = samplers.mine();
+                ts.bind(f);
+                for (int j = 0; j < n; ++j, ++index) {
                     const double u = u0 + (i + 0.5) / n * (u1 - u0);
                     const double v = v0 + (j + 0.5) / n * (v1 - v0);
-                    if (inside.Perform(gp_Pnt2d(u, v)) != TopAbs_IN) continue;
-                    BRepLProp_SLProps props(sa, u, v, 1, 1e-7);
+                    if (ts.inside->Perform(gp_Pnt2d(u, v)) != TopAbs_IN) continue;
+                    BRepLProp_SLProps props(*ts.sa, u, v, 1, 1e-7);
                     if (!props.IsNormalDefined()) continue;
-                    ++*in_face;
                     gp_Dir nrm = props.Normal();
                     if (reversed) nrm.Reverse();
                     const gp_Pnt p = props.Value();
                     const gp_Vec step = gp_Vec(nrm) * probe;
-                    if (!inside_any(p.Translated(-step), kept_cls, kept_boxes)) continue;
-                    pts.push_back({p, inside_any(p.Translated(step), cls, boxes)});
+                    state[index] = 0;
+                    if (!ts.kept.inside_any(p.Translated(-step))) continue;
+                    where[index] = p;
+                    state[index] = ts.rest.inside_any(p.Translated(step)) ? 2 : 1;
                 }
-        } catch (const Standard_Failure&) {
+            } catch (const Standard_Failure&) {
+                // The serial walk had already counted a sample whose normal was defined
+                // when its classification raised; it never recorded it as kept.
+                const int stop = (index < count && state[index] == 0) ? index + 1 : index;
+                int seen = first_failure.load();
+                while (stop < seen && !first_failure.compare_exchange_weak(seen, stop)) {
+                }
+            }
+        });
+        const int stop = first_failure.load();
+        for (int k = 0; k < stop; ++k) {
+            if (state[k] < 0) continue;
+            ++*in_face;
+            if (state[k] > 0) pts.push_back({where[k], state[k] == 2});
         }
         return pts;
     };
@@ -21365,19 +21449,16 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
             const double tool_vol = eval_vol_or_zero(t);
             TopoDS_Shape X, Y;
             try {
-                BRepAlgoAPI_Common common(part, t);
-                common.Build();
-                BRepAlgoAPI_Cut cut(part, t);
-                cut.Build();
-                if (!common.IsDone() || !cut.IsDone() || common.HasErrors() || cut.HasErrors() ||
-                    common.Shape().IsNull() || cut.Shape().IsNull()) {
+                ::geom::PairSplit split = ::geom::split_pair(part, t, /*fuzzy=*/0.0,
+                                                         /*want_b_minus_a=*/false);
+                if (split.common.IsNull() || split.a_minus_b.IsNull()) {
                     mark_not_checked(tr.feature_id,
                                      "the boolean common/cut of the part with this feature's "
                                      "tool did not complete");
                     continue;
                 }
-                X = common.Shape();
-                Y = cut.Shape();
+                X = std::move(split.common);
+                Y = std::move(split.a_minus_b);
             } catch (const Standard_Failure& ex) {
                 mark_not_checked(tr.feature_id,
                                  std::string("the boolean common/cut raised: ") +
@@ -21424,25 +21505,10 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
             e["contact_area_mm2"] =
                 std::max(0.0, 0.5 * (area_of(X) + area_of(Y) - part_area));
 
-            std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> cls;
-            std::vector<Bnd_Box> boxes;
-            for (const TopoDS_Shape& so : rest) {
-                cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(so));
-                Bnd_Box bb;
-                BRepBndLib::Add(so, bb, Standard_False);
-                bb.Enlarge(probe);
-                boxes.push_back(bb);
-            }
+            const SolidSet rest_set = solid_set(rest);
             // The feature's material that survives downstream features.
-            Classifiers kept_cls;
-            std::vector<Bnd_Box> kept_boxes;
-            for (const TopoDS_Shape& so : solids_of(X)) {
-                kept_cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(so));
-                Bnd_Box bb;
-                BRepBndLib::Add(so, bb, Standard_False);
-                bb.Enlarge(probe);
-                kept_boxes.push_back(bb);
-            }
+            const SolidSet kept_set = solid_set(solids_of(X));
+            Samplers samplers(rest_set, kept_set);
             // The base is the feature's FOOT: the face that sits on the part. Rank the faces
             // by the SHARE of their kept area that has material behind it, not by the
             // supported area. A proud boss's side wall is only partly buried, and that
@@ -21489,7 +21555,7 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                 max_face_area = std::max(max_face_area, fs.area);
                 int in_face = 0;
                 const std::vector<Sample> pts =
-                    sample_face(fs.face, 8, cls, boxes, kept_cls, kept_boxes, &in_face);
+                    sample_face(fs.face, 8, samplers, &in_face);
                 if (pts.empty()) continue;
                 std::size_t sup = 0;
                 for (const Sample& sm : pts) sup += sm.supported ? 1 : 0;
@@ -21547,8 +21613,7 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
             for (std::size_t c = 0; c < cands.size() && c < 6; ++c) {
                 FaceSupport& fs = *cands[c];
                 if (c > 0 && fs.frac < coarse_floor) break;
-                fs.fine = sample_face(fs.face, 36, cls, boxes, kept_cls, kept_boxes,
-                                      &fs.fine_in_face);
+                fs.fine = sample_face(fs.face, 36, samplers, &fs.fine_in_face);
                 if (fs.fine.empty() || fs.fine_in_face <= 0) continue;
                 std::size_t sup = 0;
                 for (const Sample& sm : fs.fine) sup += sm.supported ? 1 : 0;
@@ -21784,7 +21849,12 @@ json doc_render_diff(const nlohmann::json& params) {
         {
             TopoDS_Shape uni;
             try {
-                BRepAlgoAPI_Fuse fuse_op(shape_a, shape_b);
+                TopTools_ListOfShape args, tools;
+                args.Append(shape_a);
+                tools.Append(shape_b);
+                BRepAlgoAPI_Fuse fuse_op;
+                fuse_op.SetArguments(args);
+                fuse_op.SetTools(tools);
                 fuse_op.SetFuzzyValue(1e-4);
                 fuse_op.Build();
                 if (fuse_op.IsDone()) uni = fuse_op.Shape();
@@ -21831,24 +21901,15 @@ json doc_render_diff(const nlohmann::json& params) {
         TopoDS_Shape common_s, removed_s, added_s;
         std::string bool_fail;
         try {
-            BRepAlgoAPI_Common common_op(shape_a, shape_b);
-            common_op.SetFuzzyValue(1e-4);
-            common_op.Build();
-            if (!common_op.IsDone()) bool_fail = "A^B common did not converge";
-            else common_s = common_op.Shape();
-            if (bool_fail.empty()) {
-                BRepAlgoAPI_Cut cut_ab(shape_a, shape_b);
-                cut_ab.SetFuzzyValue(1e-4);
-                cut_ab.Build();
-                if (!cut_ab.IsDone()) bool_fail = "A-B cut did not converge";
-                else removed_s = cut_ab.Shape();
-            }
-            if (bool_fail.empty()) {
-                BRepAlgoAPI_Cut cut_ba(shape_b, shape_a);
-                cut_ba.SetFuzzyValue(1e-4);
-                cut_ba.Build();
-                if (!cut_ba.IsDone()) bool_fail = "B-A cut did not converge";
-                else added_s = cut_ba.Shape();
+            ::geom::PairSplit split = ::geom::split_pair(shape_a, shape_b, /*fuzzy=*/1e-4,
+                                                     /*want_b_minus_a=*/true);
+            if (split.common.IsNull()) bool_fail = "A^B common did not converge";
+            else if (split.a_minus_b.IsNull()) bool_fail = "A-B cut did not converge";
+            else if (split.b_minus_a.IsNull()) bool_fail = "B-A cut did not converge";
+            else {
+                common_s = std::move(split.common);
+                removed_s = std::move(split.a_minus_b);
+                added_s = std::move(split.b_minus_a);
             }
         } catch (const Standard_Failure& ex) {
             bool_fail = std::string("kernel exception: ") + ex.GetMessageString();

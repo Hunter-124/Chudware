@@ -681,7 +681,6 @@ TopoDS_Shape half_space_box(Vec3 normal, Vec3 point, double depth) {
 TopoDS_Shape half_space_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point) {
     TopoDS_Shape tool = half_space_box(normal, point, 0.0);
     BRepAlgoAPI_Cut cut(raw, tool);
-    cut.Build();
     if (!cut.IsDone()) throw std::runtime_error("section half-space cut failed");
     return cut.Shape();
 }
@@ -698,11 +697,9 @@ TopoDS_Shape section_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point, const
     if (mode == "half" && half_axis && std::sqrt(dot(*half_axis, *half_axis)) > 1e-9) {
         TopoDS_Shape side = half_space_box(*half_axis, point, 0.0);
         BRepAlgoAPI_Common common(tool, side);
-        common.Build();
         if (common.IsDone()) tool = common.Shape();
     }
     BRepAlgoAPI_Cut cut(raw, tool);
-    cut.Build();
     if (!cut.IsDone()) throw std::runtime_error("section cut failed");
     for (TopAbs_ShapeEnum kind : {TopAbs_EDGE, TopAbs_FACE}) {
         TopTools_IndexedMapOfShape subs;

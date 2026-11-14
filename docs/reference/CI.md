@@ -13,6 +13,7 @@ the complete application image through its own Fedora-based Dockerfile.
 |---|---|---|
 | `fast-gate.yml` | Every pull request, push to `master` | Runs `scripts/check.py` (source-level audits) on Linux, Windows and macOS with the audit packages pinned in `requirements.txt`. |
 | `linux-gate.yml` | Every pull request, push to `master` | Runs the strict Linux gate in a Fedora 44 container, with core CTest results by suite and an unlabeled-test check; then runs host GUI CTest and web gateway/deploy pytest coverage. |
+| `windows-gate.yml` | Every pull request, push to `master`, manual | Configures `windows-occt` without LTO and runs `scripts/test_lite.py --suite` for the `WINDOWS_SUITES` list natively on Windows: the suites' CTest labels plus their pytest files against `libchudware.dll` and `chudware-hostd.exe`. |
 | `native-build.yml` | Push to `master` touching native code, manual | Configures, builds and tests through the CMake presets: `linux-core` plus the host GUI on Linux, `windows-occt` plus the host GUI on Windows, `macos-arm64` (core only) on macOS. Uploads nothing. |
 | `site-build.yml` | Changes under `website/` | Builds the static site. On pushes to `master` it also deploys `website/dist` to the `chudware-site` Cloudflare Pages project; pull requests only build. |
 | `release.yml` | Push of a `v*` tag, manual for an existing tag | Builds, signs and publishes a GitHub Release. See [RELEASING.md](RELEASING.md). |

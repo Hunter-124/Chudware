@@ -123,7 +123,7 @@ def _load_doc(doc: Union[str, dict, None]) -> Any:
     if isinstance(doc, str):
         s = doc.strip()
         if s and s[0] != "{" and os.path.isfile(s):
-            with open(s) as fh:
+            with open(s, encoding="utf-8") as fh:
                 return json.load(fh)
         return json.loads(s)
     raise TypeError(f"doc must be a dict, JSON string, or file path (got {type(doc).__name__})")

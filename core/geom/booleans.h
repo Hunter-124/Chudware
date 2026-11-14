@@ -56,6 +56,18 @@ TopoDS_Shape cut_many(const TopoDS_Shape& base, const std::vector<TopoDS_Shape>&
 // shape on kernel failure OR when the two solids do not overlap.
 TopoDS_Shape common(const TopoDS_Shape& a, const TopoDS_Shape& b);
 
+// a ∩ b, a − b and (optionally) b − a of ONE operand pair from a single shared
+// intersection pass (one BOPAlgo_PaveFiller feeding every op). Separate
+// BRepAlgoAPI_Common/Cut calls each re-intersect the pair from scratch, and the
+// intersection is nearly all of a boolean's cost. `fuzzy` > 0 sets the fuzzy value.
+// Each result is null when its op failed (or the intersection did); the inputs are
+// never modified. Kernel exceptions propagate to the caller.
+struct PairSplit {
+    TopoDS_Shape common, a_minus_b, b_minus_a;
+};
+PairSplit split_pair(const TopoDS_Shape& a, const TopoDS_Shape& b, double fuzzy,
+                     bool want_b_minus_a);
+
 // Merge co-planar/co-cylindrical adjacent faces sharing a domain into single faces
 // (ShapeUpgrade_UnifySameDomain). build123d runs this in its `.clean()` after every
 // boolean, so a combine/mirror that welds two flush blocks reports ONE merged face

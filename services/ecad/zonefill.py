@@ -568,7 +568,7 @@ def fill_zones(board: dict, resolution: float = DEFAULT_RESOLUTION) -> dict:
 if __name__ == "__main__":  # pragma: no cover - smoke
     import json
     import sys
-    doc = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else schema.new_board()
+    doc = json.load(open(sys.argv[1], encoding="utf-8")) if len(sys.argv) > 1 else schema.new_board()
     filled = fill_zones(doc)
     print(json.dumps([{"id": z.get("id"), "n_polys": len(z.get("filled_polys", [])),
                        "polys": z.get("filled_polys", [])}

@@ -40,7 +40,7 @@ _POLICY: Optional[dict] = None
 def _load_policy() -> dict:
     global _POLICY  # noqa: PLW0603
     if _POLICY is None:
-        with open(_POLICY_PATH) as fh:
+        with open(_POLICY_PATH, encoding="utf-8") as fh:
             _POLICY = json.load(fh)
     return _POLICY
 

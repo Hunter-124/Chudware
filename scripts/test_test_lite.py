@@ -152,6 +152,20 @@ def test_native_target_and_ctest_selection(tmp_path):
     assert lite.select(tmp_path, ['host/src/ui/widget.inl']).native[0].targets == ['test_widget']
     assert lite.select(tmp_path, ['core/tests/test_parts.cpp']).native[0].tests == ['parts', 'parts_extra']
 
+def test_windows_tree_maps_backslash_objects_and_exe_registrations(tmp_path):
+    build = 'build/windows-occt'
+    put(tmp_path, 'core/tests/test_parts.cpp')
+    put(tmp_path, f'{build}/compile_commands.json', json.dumps([{
+        'directory': str(tmp_path / build), 'file': str(tmp_path / 'core/tests/test_parts.cpp'),
+        'output': 'core\\CMakeFiles\\test_parts.dir\\tests\\test_parts.cpp.obj'}]))
+    # The preset nests core/ under its binary dir, so CTest registrations live there.
+    put(tmp_path, f'{build}/core/CTestTestfile.cmake',
+        f'add_test([=[parts]=] "{(tmp_path / build).as_posix()}/bin/test_parts.exe")\n')
+    sources, tests = lite.compile_targets(tmp_path, build)
+    assert set(sources) == {'test_parts'}
+    assert tests == {'test_parts': {'parts'}}
+
+
 def test_runtime_rebuilds_and_fresh_test_paths(tmp_path, monkeypatch):
     put(tmp_path, 'core/parts/generate.cpp', '#include "parts/parts.h"\n')
     put(tmp_path, 'core/parts/parts.h')

@@ -219,7 +219,7 @@ def prepare_dataset(sparse_dir, image_dir, dataset_dir, *, source_image_map=None
         if (model.num_reg_images() != source_model.num_reg_images()
                 or model.num_reg_images() < 1 or model.num_points3D() < 1):
             raise ValueError("undistorted reconstruction is incomplete")
-        model.write_text(str(model_dir))
+        model.write_text(str(model_dir), encoding="utf-8")
         mapping = {}
         for image_id in model.reg_image_ids():
             name = model.images[image_id].name
@@ -433,7 +433,7 @@ def _run_incremental(
         # Pick the largest reconstruction and write it
         best = max(maps.values(), key=lambda r: r.num_reg_images())
         best.write(sparse_dir)
-        best.write_text(sparse_dir)
+        best.write_text(sparse_dir, encoding="utf-8")
         return best.num_reg_images()
 
 
@@ -465,5 +465,5 @@ def _run_glomap(
             return 0
 
         reconstruction.write(sparse_dir)
-        reconstruction.write_text(sparse_dir)
+        reconstruction.write_text(sparse_dir, encoding="utf-8")
         return reconstruction.num_reg_images()

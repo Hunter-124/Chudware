@@ -521,6 +521,25 @@ std::string guiTakeActivationDoc() {
 }
 #endif  // !__EMSCRIPTEN__
 
+#ifdef _WIN32
+// chudware.exe links as a GUI-subsystem binary, so Windows gives it no console. Standard
+// handles a parent already redirected (pipes, files: Python helpers, CI) are inherited and
+// keep working; a launch from an interactive shell attaches that shell's console so CLI
+// modes still print there. An Explorer/taskbar launch has neither and stays windowless.
+static void attachParentConsole() {
+    auto inherited = [](DWORD id) {
+        HANDLE h = GetStdHandle(id);
+        return h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN;
+    };
+    const bool out = inherited(STD_OUTPUT_HANDLE);
+    const bool err = inherited(STD_ERROR_HANDLE);
+    if ((out && err) || !AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    FILE* reopened = nullptr;
+    if (!out) freopen_s(&reopened, "CONOUT$", "w", stdout);
+    if (!err) freopen_s(&reopened, "CONOUT$", "w", stderr);
+}
+#endif
+
 int main(int argc, char** argv) {
     startup_trace::mark("main entry");
 #ifdef __EMSCRIPTEN__
@@ -558,6 +577,9 @@ int main(int argc, char** argv) {
     }, rc);
     return rc;
 #else
+#ifdef _WIN32
+    attachParentConsole();
+#endif
     const std::filesystem::path executable = chudware::platform::executablePath();
     if (argc == 4 && std::strcmp(argv[1], "--verify-payload-manifest") == 0) {
         const auto root = chudware::security::installedPayloadRoot(executable);

@@ -432,7 +432,7 @@ def _load_role_document(role_name: str, roles_dir: Path | None) -> tuple[Any, st
     path = (roles_dir or _ROLES_DIR) / filename
     if not path.exists():
         raise RoleError(f"role card not found: {path}")
-    return yaml.safe_load(path.read_text()), str(path)
+    return yaml.safe_load(path.read_text(encoding="utf-8")), str(path)
 
 
 def load_role(role_id: str, *, roles_dir: Path | None = None) -> RoleCard:

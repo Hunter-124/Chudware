@@ -653,7 +653,7 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
     vals: dict[int, float] = {}
     known_key = key.upper() in _DAT_HEADER_KEYWORD
     kw = _DAT_HEADER_KEYWORD.get(key.upper(), key.lower())
-    lines = Path(dat_path).read_text().splitlines()
+    lines = Path(dat_path).read_text(encoding="utf-8").splitlines()
     i = 0
     while i < len(lines):
         header = lines[i].strip()

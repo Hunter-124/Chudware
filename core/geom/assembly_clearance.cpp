@@ -89,14 +89,12 @@ double volume(const TopoDS_Shape& shape) {
 }
 TopoDS_Shape fuse(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     BRepAlgoAPI_Fuse op(a, b);
-    op.Build();
     if (!op.IsDone() || op.Shape().IsNull()) throw std::runtime_error("sweep_fuse_failed");
     if (!BRepCheck_Analyzer(op.Shape()).IsValid()) throw std::runtime_error("sweep_fuse_invalid");
     return op.Shape();
 }
 double overlap(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     BRepAlgoAPI_Common op(a, b);
-    op.Build();
     if (!op.IsDone() || op.Shape().IsNull()) throw std::runtime_error("common_failed");
     return volume(op.Shape());
 }

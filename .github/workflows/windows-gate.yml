@@ -1,0 +1,90 @@
+# Native Windows suites: the windows-occt engine plus the Python services that drive
+# it, run through scripts/test_lite.py --suite exactly as on Linux. Windows-only
+# breakage (process liveness, signals, file replacement under a reader, path and
+# encoding assumptions) never shows up in the Linux gate, so a release needs this row
+# green as well.
+#
+# The engine is configured without LTO: suites need a correct engine, not the release
+# link, and a Release/LTO link alone can take hours on a hosted runner.
+# WINDOWS_SUITES is the set that must pass on Windows; add suites as they go green.
+name: windows-gate
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  suites:
+    name: Windows suites
+    runs-on: windows-2025
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      WINDOWS_SUITES: sim,platform,mesh_fea,geom
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # chudware_version.h is generated from `git describe --tags`.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Enter the MSVC x64 developer environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'No Visual Studio installation with the x64 C++ toolset' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64' | Out-Null
+          # Persist only what the developer shell changed so later steps use the same toolchain.
+          Get-ChildItem env: | Where-Object { $before[$_.Name] -ne $_.Value } |
+            ForEach-Object { "$($_.Name)=$($_.Value)" } | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Refresh Windows source junctions
+        run: |
+          powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\setup_windows_links.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure core (windows-occt, no LTO)
+        run: |
+          cmake --preset windows-occt -DCHUDWARE_LTO=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install the service runtime
+        run: |
+          python -m venv .venv-mcp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .venv-mcp\Scripts\python -m pip install --disable-pip-version-check -r requirements.txt pytest pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CHUDWARE_PYTHON=$PWD\.venv-mcp\Scripts\python.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run Windows suites
+        run: |
+          .venv-mcp\Scripts\python scripts\test_lite.py --suite $env:WINDOWS_SUITES
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

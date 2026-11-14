@@ -466,6 +466,13 @@ endif()
 if(NOT EMSCRIPTEN)
   if(WIN32)
     target_sources(Chudware PRIVATE app.rc)
+    # GUI subsystem: Explorer/taskbar/Start launches open no console window. main()
+    # stays the entry point, and main.cpp re-attaches the launching shell's console for
+    # CLI output when stdio is not already redirected.
+    set_target_properties(Chudware PROPERTIES WIN32_EXECUTABLE TRUE)
+    if(MSVC)
+      target_link_options(Chudware PRIVATE /ENTRY:mainCRTStartup)
+    endif()
   endif()
   if(WIN32)
     add_executable(chudware-update-helper WIN32

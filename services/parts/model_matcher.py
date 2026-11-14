@@ -180,7 +180,7 @@ def _cad_adapters() -> list[Any]:
             binary = cef_client.resolve_cef_bin()
             cache = binary.parent.parent / "CMakeCache.txt" if binary else None
             if binary is None or cache and cache.is_file() and (
-                    "CHUDWARE_ENABLE_CEF:BOOL=OFF" in cache.read_text()):
+                    "CHUDWARE_ENABLE_CEF:BOOL=OFF" in cache.read_text(encoding="utf-8")):
                 browser_ready = False
         if not browser_ready:
             available = [a for a in available if a.key == "printables"]

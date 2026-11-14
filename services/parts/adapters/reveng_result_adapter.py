@@ -36,7 +36,7 @@ def _reveng_dir() -> Path:
 
 def _load_sidecar(path: Path) -> dict | None:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 

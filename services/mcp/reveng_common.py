@@ -176,7 +176,7 @@ def _session_path(session_id: str, *, create: bool = False) -> _Path:
     manifest = path / "session.json"
     if manifest.is_file():
         try:
-            _require_record_owner(_json.loads(manifest.read_text()))
+            _require_record_owner(_json.loads(manifest.read_text(encoding="utf-8")))
         except (OSError, ValueError, TypeError, AttributeError):
             raise KeyError("not_found") from None
     return path
@@ -193,7 +193,7 @@ def _list_sessions(project_dir: Optional[str] = None) -> list[dict]:
     sessions = []
     for path in sorted(base.glob("*/session.json")):
         try:
-            manifest = _json.loads(path.read_text())
+            manifest = _json.loads(path.read_text(encoding="utf-8"))
             _require_record_owner(manifest)
             session = _load_session(manifest["session_id"])
             if (session is not None and
@@ -269,7 +269,7 @@ def _make_session(session_id: str, name: str, part_ref: Optional[str],
 def _load_session(session_id: str, *, merge_gaussian: bool = True) -> Optional[dict]:
     try:
         p = _session_json_path(session_id)
-        session = _json.loads(p.read_text())
+        session = _json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(session, dict) or session.get("session_id") != session_id:
             raise KeyError("not_found")
         _require_record_owner(session)
@@ -586,7 +586,7 @@ def _load_current_fits(session: dict) -> Optional[dict]:
             path = root / path
         if _rc.in_cell() and not path.resolve().is_relative_to(root.resolve()):
             return None
-        fits = _json.loads(path.read_text())
+        fits = _json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(fits, dict):
             return None
         provenance = fits.get("provenance")
@@ -710,7 +710,7 @@ _DATASHEET_NODE_STAGE: dict[str, tuple[str, int]] = {
 def _load_template(name: str) -> dict:
     """Load a frozen aicad.dag/1 mission template by base name (no extension)."""
     path = _TEMPLATES_DIR / f"{name}.json"
-    return _json.loads(path.read_text())
+    return _json.loads(path.read_text(encoding="utf-8"))
 
 
 def _reveng_runs_dir() -> Optional[_Path]:
@@ -1521,7 +1521,7 @@ def _make_pipeline_agent_fn(
             # Persist aicad.reveng_fits/1 for n_parametric / GUI
             fits_path = _session_path(session_id) / "fits.json"
             try:
-                fits_path.write_text(_json.dumps(fits, indent=2))
+                fits_path.write_text(_json.dumps(fits, indent=2), encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
                 _save_session(s)
                 return _Result(False, "fits_persistence_error", {
@@ -1640,7 +1640,7 @@ def _make_pipeline_agent_fn(
                 if ml.get("cadquery_src"):
                     cq_path = _session_path(session_id) / "cad_recode.py"
                     try:
-                        cq_path.write_text(str(ml["cadquery_src"]))
+                        cq_path.write_text(str(ml["cadquery_src"]), encoding="utf-8")
                         s["artifacts"]["cadquery_path"] = str(cq_path)
                     except Exception:  # noqa: BLE001
                         pass
@@ -1778,7 +1778,7 @@ def _write_run_record(rec: dict) -> None:
     try:
         path = _run_record_path(rec["run_id"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps(rec, indent=2))
+        path.write_text(_json.dumps(rec, indent=2), encoding="utf-8")
     except Exception:  # noqa: BLE001
         if _rc.in_cell():
             raise
@@ -1788,7 +1788,7 @@ def _write_run_record(rec: dict) -> None:
 def _read_run_record(run_id: str) -> Optional[dict]:
     try:
         path = _run_record_path(run_id)
-        rec = _json.loads(path.read_text())
+        rec = _json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(rec, dict):
             raise KeyError("not_found")
         _require_record_owner(rec)
@@ -2092,7 +2092,7 @@ def _find_session_run(session_id: str) -> Optional[dict]:
     newest: Optional[tuple[float, dict]] = None
     for path in base.glob("*.reveng.json"):
         try:
-            rec = _json.loads(path.read_text())
+            rec = _json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             continue
         if not isinstance(rec, dict) or rec.get("session_id") != session_id:

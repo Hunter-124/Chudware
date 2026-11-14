@@ -4083,7 +4083,8 @@ def _invoke_canonical(client: Any, command: str, payload: Mapping[str, Any]) -> 
                 else {"providers": providers}
             )
         if command == "login":
-            return method(payload["providerId"])
+            # The SDK returns the signed-in provider id as a bare string.
+            return {"providerId": method(payload["providerId"])}
         if command == "get_logout_accounts":
             return {"ok": True, "accounts": method(payload["providerId"])}
         if command == "logout":

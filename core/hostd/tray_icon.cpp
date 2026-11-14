@@ -1,14 +1,264 @@
-// chudware-hostd system tray (Linux + libappindicator3).
+// chudware-hostd system tray: Windows notification area (Shell_NotifyIconW) or
+// Linux + libappindicator3.
 //
-// GTK runs on a dedicated thread so the daemon accept loop stays free. Status
-// updates and Quit are marshalled through g_idle_add. When the feature is
-// compiled out or unavailable at runtime, every entry point is a no-op.
+// The tray runs on a dedicated thread (a Win32 message loop or GTK) so the daemon
+// accept loop stays free. Status updates and Quit are marshalled onto that thread.
+// When the feature is compiled out or unavailable at runtime, every entry point is
+// a no-op.
 
 #include "tray_icon.h"
 
 #include <string>
 
-#if defined(CHUDWARE_HOSTD_HAS_TRAY) && CHUDWARE_HOSTD_HAS_TRAY && !defined(_WIN32)
+#if defined(_WIN32)
+
+#include <windows.h>
+#include <shellapi.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <future>
+#include <mutex>
+#include <thread>
+
+namespace hostd {
+namespace {
+
+constexpr UINT kIconMsg = WM_APP + 1;    // notification-area icon callback
+constexpr UINT kStatusMsg = WM_APP + 2;  // traySetStatus -> refresh the tooltip
+constexpr UINT kIconId = 1;
+constexpr UINT kQuitCmd = 1;
+constexpr wchar_t kWindowClass[] = L"ChudwareHostdTray";
+
+struct TrayState {
+    std::mutex mu;
+    std::thread thr;
+    std::atomic<bool> started{false};
+    HWND hwnd = nullptr;  // guarded by mu; set while the message loop runs
+    std::wstring tip = L"Chudware hostd";
+    void (*quitFn)(void*) = nullptr;
+    void* quitUd = nullptr;
+    HICON icon = nullptr;     // tray thread only
+    bool ownsIcon = false;    // tray thread only
+    UINT taskbarCreated = 0;  // Explorer restarted: the icon must be re-added
+};
+
+TrayState g;
+
+bool envDisabled() {
+    const char* v = std::getenv("CHUDWARE_HOSTD_TRAY");
+    if (!v || !*v) return false;
+    return v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F';
+}
+
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring out(n > 0 ? n : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n);
+    return out;
+}
+
+NOTIFYICONDATAW iconData(HWND hwnd) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = kIconId;
+    return nid;
+}
+
+void copyTip(NOTIFYICONDATAW& nid) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    wcsncpy_s(nid.szTip, g.tip.c_str(), _TRUNCATE);
+}
+
+void addIcon(HWND hwnd) {
+    NOTIFYICONDATAW nid = iconData(hwnd);
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    nid.uCallbackMessage = kIconMsg;
+    nid.hIcon = g.icon;
+    copyTip(nid);
+    Shell_NotifyIconW(NIM_ADD, &nid);
+    nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+}
+
+void refreshTip(HWND hwnd) {
+    NOTIFYICONDATAW nid = iconData(hwnd);
+    nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    copyTip(nid);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+void showMenu(HWND hwnd) {
+    std::wstring tip;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        tip = g.tip;
+    }
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, tip.c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kQuitCmd, L"Quit hostd");
+    POINT pt{};
+    GetCursorPos(&pt);
+    // Without foreground the menu never dismisses on an outside click; the WM_NULL
+    // afterwards is the documented companion for the same TrackPopupMenu quirk.
+    SetForegroundWindow(hwnd);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                                    pt.x, pt.y, 0, hwnd, nullptr);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (cmd != kQuitCmd) return;
+    void (*fn)(void*) = nullptr;
+    void* ud = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        fn = g.quitFn;
+        ud = g.quitUd;
+    }
+    if (fn) fn(ud);
+}
+
+LRESULT CALLBACK trayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == kIconMsg) {
+        // NOTIFYICON_VERSION_4: the event is LOWORD(lParam).
+        const UINT event = LOWORD(lp);
+        if (event == WM_CONTEXTMENU || event == WM_LBUTTONUP) showMenu(hwnd);
+        return 0;
+    }
+    if (msg == kStatusMsg) {
+        refreshTip(hwnd);
+        return 0;
+    }
+    if (g.taskbarCreated != 0 && msg == g.taskbarCreated) {
+        addIcon(hwnd);
+        return 0;
+    }
+    if (msg == WM_CLOSE) {
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_DESTROY) {
+        NOTIFYICONDATAW nid = iconData(hwnd);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void trayThreadMain(std::promise<bool>* ready) {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    // Icon resource 1 is assets/app.ico, embedded by hostd/hostd.rc.
+    g.icon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                           GetSystemMetrics(SM_CXSMICON),
+                                           GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    g.ownsIcon = g.icon != nullptr;
+    if (!g.icon) g.icon = LoadIconW(nullptr, IDI_APPLICATION);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = trayWndProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = kWindowClass;
+    RegisterClassExW(&wc);
+    g.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    // A hidden top-level window rather than HWND_MESSAGE: only top-level windows
+    // receive the TaskbarCreated broadcast sent when Explorer restarts.
+    HWND hwnd = CreateWindowExW(0, kWindowClass, L"Chudware hostd", WS_OVERLAPPED, 0, 0, 0, 0,
+                                nullptr, nullptr, inst, nullptr);
+    if (!hwnd) {
+        if (g.ownsIcon) DestroyIcon(g.icon);
+        g.icon = nullptr;
+        UnregisterClassW(kWindowClass, inst);
+        ready->set_value(false);
+        return;
+    }
+    addIcon(hwnd);
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        g.hwnd = hwnd;
+    }
+    ready->set_value(true);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        g.hwnd = nullptr;
+    }
+    if (g.ownsIcon) DestroyIcon(g.icon);
+    g.icon = nullptr;
+    g.ownsIcon = false;
+    UnregisterClassW(kWindowClass, inst);
+}
+
+}  // namespace
+
+bool trayStart(const std::string&) {
+    if (envDisabled()) return false;
+    bool expected = false;
+    if (!g.started.compare_exchange_strong(expected, true)) return true;
+    std::promise<bool> ready;
+    std::future<bool> created = ready.get_future();
+    try {
+        g.thr = std::thread(trayThreadMain, &ready);
+    } catch (...) {
+        g.started.store(false);
+        return false;
+    }
+    if (!created.get()) {
+        g.thr.join();
+        g.started.store(false);
+        return false;
+    }
+    return true;
+}
+
+void traySetStatus(TrayStatus, const std::string& tooltip) {
+    // Windows reports status through the tooltip and the menu header; the icon keeps
+    // the brand mark.
+    if (!g.started.load()) return;
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!tooltip.empty()) g.tip = widen(tooltip);
+    if (g.hwnd) PostMessageW(g.hwnd, kStatusMsg, 0, 0);
+}
+
+void traySetQuitHandler(void (*fn)(void*), void* user) {
+    std::lock_guard<std::mutex> lk(g.mu);
+    g.quitFn = fn;
+    g.quitUd = user;
+}
+
+void trayStop() {
+    // Quit runs on the tray thread and only signals server->stop(); trayStop itself
+    // runs on the main thread after server.run returns. Never join from the tray thread.
+    HWND hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        hwnd = g.hwnd;
+    }
+    if (g.thr.joinable() && std::this_thread::get_id() == g.thr.get_id()) {
+        if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    if (hwnd) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    if (g.thr.joinable()) g.thr.join();
+    g.started.store(false);
+    std::lock_guard<std::mutex> lk(g.mu);
+    g.quitFn = nullptr;
+    g.quitUd = nullptr;
+}
+
+}  // namespace hostd
+
+#elif defined(CHUDWARE_HOSTD_HAS_TRAY) && CHUDWARE_HOSTD_HAS_TRAY
 
 #include <algorithm>
 #include <atomic>

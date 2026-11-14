@@ -267,7 +267,7 @@ def ingest_datasheet(
             "reason": "pdf_not_found",
             "hint": f"File not found: {pdf_path}",
         }
-        (out_dir / "datasheet.json").write_text(json.dumps(result, indent=2))
+        (out_dir / "datasheet.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
 
     # Try backends in priority order
@@ -292,7 +292,7 @@ def ingest_datasheet(
 
         data["pdf_path"] = str(pdf_path)
         data["session_root"] = str(session_root)
-        (out_dir / "datasheet.json").write_text(json.dumps(data, indent=2))
+        (out_dir / "datasheet.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
         return data
 
     # No backend available
@@ -303,5 +303,5 @@ def ingest_datasheet(
         "pdf_path": str(pdf_path),
         "session_root": str(session_root),
     }
-    (out_dir / "datasheet.json").write_text(json.dumps(envelope, indent=2))
+    (out_dir / "datasheet.json").write_text(json.dumps(envelope, indent=2), encoding="utf-8")
     return envelope

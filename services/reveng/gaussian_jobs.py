@@ -47,7 +47,7 @@ def _module_command(module: str) -> list[str]:
 
 def _read(path: Path) -> dict:
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -92,11 +92,11 @@ def gpu_slot(root: Path):
 
 def _identity(pid: int) -> dict:
     try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
         if fields[0] == "Z":
             return {}
         return {"pid": pid, "start": fields[19],
-                "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+                "boot": Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()}
     except (OSError, IndexError):
         return {}
 

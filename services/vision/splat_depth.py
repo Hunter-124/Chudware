@@ -290,7 +290,7 @@ def render_median_depth(means, cov6, opacity, camera):
 
 def _render_worker(job_path):
     """Worker-process entry: render the views listed in a job file into .npy depth maps."""
-    job = json.loads(Path(job_path).read_text())
+    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
     root = Path(job["root"])
     means = np.load(root / "means.npy", mmap_mode="r")
     cov6 = np.load(root / "cov6.npy", mmap_mode="r")
@@ -302,13 +302,13 @@ def _render_worker(job_path):
         camera["t"] = np.asarray(view["t"], dtype=np.float64)
         depth, _, stats = render_median_depth(means, cov6, opacity, camera)
         np.save(root / f"depth_{view['index']}.npy", depth)
-        (root / f"depth_{view['index']}.json").write_text(json.dumps(stats))
+        (root / f"depth_{view['index']}.json").write_text(json.dumps(stats), encoding="utf-8")
 
 
 def _available_memory():
     """Reclaimable-inclusive available memory in bytes (Linux MemAvailable), or None."""
     try:
-        with open("/proc/meminfo") as stream:
+        with open("/proc/meminfo", encoding="utf-8") as stream:
             for line in stream:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
@@ -352,7 +352,7 @@ def _render_all(means, cov6, opacity, views, work, deadline):
     try:
         for n, views_of_job in enumerate(jobs):
             path = work / f"job_{n}.json"
-            path.write_text(json.dumps({"root": str(work), "views": views_of_job}))
+            path.write_text(json.dumps({"root": str(work), "views": views_of_job}), encoding="utf-8")
             processes.append(subprocess.Popen(
                 [sys.executable, "-m", "services.vision.splat_depth", str(path)],
                 cwd=repo, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -377,7 +377,7 @@ def _render_all(means, cov6, opacity, views, work, deadline):
     depths, fragments = [], 0
     for index in range(len(views)):
         depths.append(np.load(work / f"depth_{index}.npy"))
-        fragments += json.loads((work / f"depth_{index}.json").read_text())["fragments"]
+        fragments += json.loads((work / f"depth_{index}.json").read_text(encoding="utf-8"))["fragments"]
     return depths, {"render_workers": workers, "fragments": fragments}
 
 

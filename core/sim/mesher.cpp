@@ -4320,7 +4320,12 @@ std::vector<BodyGroup> group_touching_solids(
       continue;
     }
     try {
-      BRepAlgoAPI_Fuse fuse(group.shape, solids[i]);
+      TopTools_ListOfShape args, tools;
+      args.Append(group.shape);
+      tools.Append(solids[i]);
+      BRepAlgoAPI_Fuse fuse;
+      fuse.SetArguments(args);
+      fuse.SetTools(tools);
       fuse.SetFuzzyValue(kFuseTolMm);
       fuse.Build();
       if (fuse.IsDone() && !fuse.Shape().IsNull())

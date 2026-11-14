@@ -2037,7 +2037,7 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape, bool* timed_out 
             checker.SetArguments(one);
             checker.SetLevelOfCheck(9);
             checker.SetNonDestructive(Standard_True);
-            checker.SetRunParallel(Standard_False);
+            checker.SetRunParallel(Standard_True);
             try {
                 checker.Perform(budget->Start());
             } catch (...) {

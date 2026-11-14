@@ -105,8 +105,10 @@ less than 30 GiB free there are skipped, and an explicit `--host` fails fast. Us
 host. Containers are capped at `nproc - 2` CPUs and run niced so the live app stays
 responsive; `--jobs N` lowers parallelism further. Run logs are copied to
 `.cache/testbox/<host>-<timestamp>/`. The runner
-requires POSIX facilities and does not run directly under native Windows Python;
-see the [Windows guide](docs/reference/BUILD_WINDOWS.md).
+requires POSIX facilities and does not run directly under native Windows Python.
+Windows has its own release row: the `windows-gate` workflow runs
+`scripts/test_lite.py --suite` natively against the `windows-occt` engine (see the
+[Windows guide](docs/reference/BUILD_WINDOWS.md)).
 
 `scripts/testbox.py --gate` runs the authoritative full Linux gate, including source
 audits, core tests by suite, GUI and runtime builds, Python suites and screenshot

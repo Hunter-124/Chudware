@@ -811,8 +811,8 @@ TEST_CASE("B14 invalid picks and null or empty shapes still return null") {
 
 TEST_CASE("ownerless rebind is bounded and reports movement") {
     const json original = vtx_selector(0, 0, 0, std::string("f1"));
-    const std::vector<TopoInfo> far = {vtx(0, 30, 0, 0, 0, std::string("f2"))};
-    CHECK_FALSE(resolve(original, far, 100.0).index.has_value());
+    const std::vector<TopoInfo> distant = {vtx(0, 30, 0, 0, 0, std::string("f2"))};
+    CHECK_FALSE(resolve(original, distant, 100.0).index.has_value());
 
     const std::vector<TopoInfo> moved = {vtx(0, 1, 0, 0, 0, std::string("f2"))};
     chudware::doc::RebindScope scope;

@@ -153,7 +153,7 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
 def load_tier(name: str, *, path: Path | None = None) -> TierProfile:
     """Load a single tier profile by name from tiers.yaml."""
     p = path or _TIERS_PATH
-    data = yaml.safe_load(p.read_text())
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
     schema = data.get("schema")
     if schema != TIER_SCHEMA:
         raise TierError(f"{p}: schema is {schema!r}, expected {TIER_SCHEMA!r}")
@@ -168,7 +168,7 @@ def load_tier(name: str, *, path: Path | None = None) -> TierProfile:
 def load_all_tiers(*, path: Path | None = None) -> dict[str, TierProfile]:
     """Load all tier profiles from tiers.yaml."""
     p = path or _TIERS_PATH
-    data = yaml.safe_load(p.read_text())
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
     schema = data.get("schema")
     if schema != TIER_SCHEMA:
         raise TierError(f"{p}: schema is {schema!r}, expected {TIER_SCHEMA!r}")
@@ -188,7 +188,7 @@ def load_local_models(*, path: Path | None = None) -> dict:
     routing.yaml role->model bindings and user overrides always win.
     """
     p = path or _TIERS_PATH
-    data = yaml.safe_load(p.read_text())
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
     schema = data.get("schema")
     if schema != TIER_SCHEMA:
         raise TierError(f"{p}: schema is {schema!r}, expected {TIER_SCHEMA!r}")

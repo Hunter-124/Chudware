@@ -106,7 +106,7 @@ def _load_rows() -> tuple[dict, ...]:
     if not os.path.isfile(_FITTINGS_CSV):
         return ()
     rows: list[dict] = []
-    with open(_FITTINGS_CSV, newline="") as fh:
+    with open(_FITTINGS_CSV, newline="", encoding="utf-8") as fh:
         for raw in csv.DictReader(fh):
             row: dict[str, Any] = {}
             for k, v in raw.items():

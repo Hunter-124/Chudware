@@ -608,5 +608,5 @@ def run_hostcheck(board: dict, library: Any = None, opts: dict | None = None) ->
 if __name__ == "__main__":  # pragma: no cover - smoke
     import json
     import sys
-    doc = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else schema.new_board()
+    doc = json.load(open(sys.argv[1], encoding="utf-8")) if len(sys.argv) > 1 else schema.new_board()
     print(json.dumps({"violations": run_hostcheck(doc)}, indent=2, sort_keys=True))

@@ -305,7 +305,25 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             call = {"doc_id": d, "path": out, "format": fmt}
             if units:
                 call["units"] = units
-            r = cb.call("export_file", call)
+            try:
+                r = cb.call("export_file", call)
+            except CoreError as exc:
+                if exc.code != "export_failed" or "re-reading it recovered" not in str(exc):
+                    raise
+                # check_geometry_health runs BRepCheck on the live body; this check runs it
+                # on the solids read back from the written file, so the two can disagree.
+                detail = dict(exc.detail or {})
+                detail["check"] = (
+                    "BRepCheck_Analyzer on the solids re-read from the written file, not on "
+                    "the live body that check_geometry_health inspects")
+                return _dumps({
+                    "ok": False, "code": exc.code, "error": str(exc), "doc_id": d,
+                    "detail": detail,
+                    "hint": "The live model can be sound while its translated copy is not; "
+                            "heal_body on the live body does not change this. The file was "
+                            "written but failed the read-back. Keep the native .step+ as "
+                            "the source of record and report the read-back failure rather "
+                            "than rebuilding a sound part."})
             if r.get("ok") is False:
                 return _dumps(r)
             written = r.get("path", out)
@@ -675,11 +693,31 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def list_standard_parts() -> str:
+    def list_standard_parts(family: Optional[str] = None) -> str:
         """List the parametric standard-parts catalog (screws, nuts, washers, bearings, ...):
-        each family's key, sizes, and lengths. Feed a family + size to make_standard_part."""
+        each family's key, sizes, and lengths. Feed a family + size to make_standard_part.
+
+        The default listing omits per-size provenance tables (`size_sources`, e.g. every
+        AS568 O-ring's dimensions) and gives `size_sources_count` instead;
+        family=<key> returns that one family in full, size_sources included.
+        """
         try:
-            return _dumps(cb.call("parts_catalog_list", {}))
+            catalog = cb.call("parts_catalog_list", {})
+            families = [f for f in (catalog.get("families") or []) if isinstance(f, dict)]
+            if family is not None:
+                hit = [f for f in families if f.get("key") == family]
+                if not hit:
+                    raise ValueError(f"list_standard_parts: unknown family {family!r}; "
+                                     f"families: {', '.join(str(f.get('key')) for f in families)}")
+                return _dumps({**catalog, "families": hit})
+            compact = []
+            for row in families:
+                row = dict(row)
+                sources = row.pop("size_sources", None)
+                if isinstance(sources, dict):
+                    row["size_sources_count"] = len(sources)
+                compact.append(row)
+            return _dumps({**catalog, "families": compact})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

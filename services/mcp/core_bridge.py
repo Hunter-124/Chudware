@@ -633,6 +633,104 @@ def _document_version(row: dict | None) -> tuple | None:
     return None
 
 
+# doc_id -> {"name", "start", "peak"}: the name this process last knew the document by, the
+# daemon_start_id it was seen under, and the most content (features + components) it has
+# been seen to carry. hostd numbers doc ids per daemon run, so after a restart
+# "doc-cpp00000002" can name a different part (HERC audit: FRAME-100, then an FEA doc,
+# then the chassis assembly). A mutation that would land on a re-issued id is refused.
+_DOC_IDENTITY: dict[str, dict] = {}
+_DOC_IDENTITY_LOCK = threading.Lock()
+_IN_PROCESS_START_ID = f"in-process-{os.getpid()}"
+
+
+def _engine_start_id() -> Optional[str]:
+    """The current engine run's identity (hostd's hello daemon_start_id); None if unknown."""
+    if not active_daemon_mode():
+        return _IN_PROCESS_START_ID
+    from .daemon_bridge import client
+    info = getattr(client(), "server_info", None) or {}
+    start = info.get("daemon_start_id")
+    return str(start) if start not in (None, "") else None
+
+
+def _row_content(row: dict) -> int:
+    total = 0
+    for key in ("feature_count", "component_count"):
+        value = row.get(key)
+        if type(value) is int and value > 0:
+            total += value
+    return total
+
+
+def note_doc_identity(doc_id: Optional[str], name: Optional[str],
+                      row: Optional[dict] = None) -> None:
+    """Record what this process now knows `doc_id` to be (it was created, opened, listed
+    to the caller or named explicitly)."""
+    if not doc_id or not isinstance(name, str) or not name:
+        return
+    start = _engine_start_id()
+    content = _row_content(row) if isinstance(row, dict) else 0
+    with _DOC_IDENTITY_LOCK:
+        seen = _DOC_IDENTITY.get(str(doc_id))
+        same = seen is not None and seen["name"] == name and seen["start"] == start
+        peak = max(seen["peak"], content) if same else content
+        _DOC_IDENTITY[str(doc_id)] = {"name": name, "start": start, "peak": peak}
+
+
+def note_doc_identities(rows: list) -> None:
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("doc_id"):
+            note_doc_identity(str(row["doc_id"]), row.get("name"), row)
+
+
+def doc_content_peak(doc_id: str) -> int:
+    """The most features + components this process has seen `doc_id` carry (0 = unknown)."""
+    with _DOC_IDENTITY_LOCK:
+        seen = _DOC_IDENTITY.get(str(doc_id))
+        return seen["peak"] if seen else 0
+
+
+def _forget_doc_identity(doc_id: str) -> None:
+    with _DOC_IDENTITY_LOCK:
+        _DOC_IDENTITY.pop(str(doc_id), None)
+
+
+def _check_doc_identity(method: str, doc_id: str, row: Optional[dict]) -> None:
+    """Refuse a write/close whose doc_id the engine re-issued to a different part.
+
+    Only a daemon restart re-issues ids, so the comparison runs only when the remembered
+    daemon_start_id differs from the current one. `row` is the document's live doc_list
+    row (already fetched for the mutation), so the check itself costs no RPC."""
+    name = row.get("name") if isinstance(row, dict) else None
+    if not isinstance(name, str) or not name:
+        return  # not open (the engine reports that) or unnamed: nothing to compare
+    start = _engine_start_id()
+    with _DOC_IDENTITY_LOCK:
+        seen = _DOC_IDENTITY.get(str(doc_id))
+    if (seen is not None and seen["name"] != name and seen["start"] is not None
+            and start is not None and seen["start"] != start):
+        old = seen["name"]
+        moved = None
+        try:
+            moved = next((r.get("doc_id") for r in
+                          (_dispatch_call("doc_list", {}).get("docs") or [])
+                          if isinstance(r, dict) and r.get("name") == old), None)
+        except Exception:  # noqa: BLE001 — the refusal stands without the suggestion
+            pass
+        hint = (f'"{old}" is open now as doc_id="{moved}"; use that id.' if moved else
+                f'"{old}" is not open; reopen it with import_part(path="<its .step+>", '
+                "resume=True) and use the doc_id it returns.")
+        raise CoreError(
+            f"Refused {method} on doc_id={doc_id!r}: the engine restarted and re-issued that "
+            f'id to "{name}", but this session last used it for "{old}". Nothing was '
+            f"changed. {hint} If you do mean \"{name}\", call list_parts() (it refreshes "
+            "the ids this session knows) and retry.",
+            code="doc_id_reissued",
+            detail={"doc_id": doc_id, "expected_name": old, "current_name": name,
+                    "expected_doc_id": moved})
+    note_doc_identity(doc_id, name, row)
+
+
 def lease_document(doc_id: str) -> None:
     """Hold a listed/read document on this turn's connection until the pool closes."""
     if not doc_id or CURRENT_AGENT.get() is None or not active_daemon_mode():
@@ -684,10 +782,19 @@ def call(method: str, params: Optional[dict] = None) -> dict:
             writers.add(doc_id)
             connection._mcp_writer_docs = writers
     before_row = (_take_resolution_row(doc_id) or _document_row(doc_id)) if mutating else None
+    if mutating:
+        _check_doc_identity(method, str(doc_id), before_row)
+    elif method in ("doc_close", "doc_discard") and doc_id:
+        # _doc() just listed the documents, so its row costs nothing here.
+        _check_doc_identity(method, str(doc_id), _take_resolution_row(doc_id))
     before = _document_version(before_row)
     result = _dispatch_call(method, params)
     if result.get("ok") is False or "rejected_tree" in result:
         return result
+    if method in ("doc_new", "doc_open") and result.get("doc_id") and result.get("name"):
+        note_doc_identity(str(result["doc_id"]), result["name"], result)
+    if method in ("doc_close", "doc_discard") and doc_id and not result.get("detached"):
+        _forget_doc_identity(str(doc_id))
     if (active_daemon_mode() and (mutating or
             (method in ("doc_new", "doc_open") and not result.get("reused")))
             and (doc_id or result.get("doc_id"))):

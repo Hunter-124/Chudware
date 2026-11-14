@@ -3768,6 +3768,17 @@ def _normalize_op_elements(ops: list, notes: list, index_map: Optional[dict] = N
                 continue
             if kind in docops or kind == "new_part":
                 normalized = _normalize_op_target(el, kind, notes)
+                if kind == "set_material":
+                    normalized = _normalize_set_material_op(normalized, i, notes)
+                if (kind == "rename" and isinstance(normalized.get("id"), str)
+                        and re.fullmatch(r"k[1-9]\d*", normalized["id"])
+                        and set(normalized) <= {"op", "id", "name"}):
+                    # Component ids ("k3") are minted only for assembly components; the
+                    # component's name lives on the component record, which
+                    # asm_edit_component edits (HERC audit: «no feature 'k56'»).
+                    normalized = {**normalized, "op": "asm_edit_component"}
+                    notes.append(f'ops[{i}] rename: "{normalized["id"]}" is an assembly '
+                                 "component, renamed with asm_edit_component")
                 if kind == "sketch_fully_define" and "sketch" not in normalized and "id" in normalized:
                     normalized = dict(normalized)
                     normalized["sketch"] = normalized.pop("id")
@@ -3832,6 +3843,28 @@ def _normalize_op_elements(ops: list, notes: list, index_map: Optional[dict] = N
             if any(old != new for old, new in shifts.items()) else out)
 
 
+def _normalize_set_material_op(op: dict, index: int, notes: list) -> dict:
+    """The set_material OP reads `key` (and `id` for one body); the top-level set_material
+    TOOL takes `material` (and `body`). HERC audit: agents wrote the tool's spelling inside
+    add_features and got «set_material reads only key … got key 'material'»."""
+    out = dict(op)
+    if "key" not in out and "material" in out:
+        value = out.pop("material")
+        out["key"] = value
+        notes.append(f"ops[{index}] set_material: interpreted material={value!r} as "
+                     "key — the set_material op names its registry material in `key`")
+    if "id" not in out and "body" in out:
+        body = out["body"]
+        if type(body) is int and body >= 1:
+            body = f"b{body}"
+        if isinstance(body, str) and re.fullmatch(r"b[1-9]\d*", body.strip()):
+            out.pop("body")
+            out["id"] = body.strip()
+            notes.append(f"ops[{index}] set_material: interpreted body={op['body']!r} as "
+                         f'id="{out["id"]}" — the set_material op names one body in `id`')
+    return out
+
+
 def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
     """`{"op":"delete_feature","feature_id":"f2"}` -> the canonical `id` key."""
     if kind == "set_rollback":
@@ -3888,7 +3921,8 @@ def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
         raise ValueError(
             f'rename renames a FEATURE by id: {{"op":"rename","id":"f1","name":'
             f'"{op.get("name") or "NewName"}"}} (feature ids come from get_part(summary=true) '
-            f"or an earlier add_features reply). "
+            f"or an earlier add_features reply; on an assembly, a component id such as "
+            f'"k3" renames that component). '
             f"This one names no feature, so nothing was applied. add_features has no op "
             f"that renames the open part/document: its name is set when it is created — "
             f'new_part(name="…"), or a leading {{"op":"new_part","name":"…"}} in a batch '
@@ -6120,6 +6154,64 @@ def _migrate_ref_slots(ops: Any, notes: Optional[list] = None) -> Any:
     return ops
 
 
+#: Feature types whose target body is params.body (an owning feature id, a "$N" batch
+#: position or {"kind":"body","owner_feature":"f3"}) and which have NO ref slots
+#: (core/doc/validate.cpp: {"transform", {{}, {}}}, {"heal", {{}, {}}}).
+_PARAM_BODY_TYPES = frozenset({"transform", "heal"})
+_BODY_REF_SPELLINGS = ("body", "target", "targets", "bodies", "feature", "features")
+_DISPLAY_BODY_ID = re.compile(r"b[1-9]\d*")
+
+
+def _normalize_transform_body(ops: Any, notes: list) -> Any:
+    """One spelling for transform/heal's target body: params.body.
+
+    HERC audit §6: refs.body "$3" -> «transform takes no refs», params.body "b1" -> «not a
+    feature id», params.body "$3" worked — three spellings, contradictory errors. A ref
+    slot naming the body moves to params.body; a b<N> display id (which names no feature)
+    is refused here with the accepted forms."""
+    if not isinstance(ops, list):
+        return ops
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) and op.get("op") == "add_feature" else None
+        if not isinstance(feat, dict):
+            continue
+        ftype = str(feat.get("type") or "").strip().lower()
+        if ftype not in _PARAM_BODY_TYPES:
+            continue
+        label = feat.get("name") or ftype
+        params = dict(feat.get("params") or {}) if isinstance(feat.get("params"), dict) else {}
+        refs = dict(feat.get("refs") or {}) if isinstance(feat.get("refs"), dict) else {}
+        for slot in _BODY_REF_SPELLINGS:
+            if slot not in refs:
+                continue
+            value = refs.pop(slot)
+            if isinstance(value, list) and len(value) == 1:
+                value = value[0]
+            if "body" not in params and "body" not in feat:
+                params["body"] = value
+                notes.append(f"{label}: moved refs.{slot} to params.body — {ftype} takes no "
+                             "refs; its target is params.body (an owning feature id such as "
+                             '"f3", or "$N" for a feature built earlier in this batch)')
+            else:
+                notes.append(f"{label}: dropped refs.{slot} — {ftype} takes no refs and "
+                             "params.body already names the target")
+        body = params.get("body", feat.get("body"))
+        if isinstance(body, str) and _DISPLAY_BODY_ID.fullmatch(body.strip()):
+            raise ValueError(
+                f'{label}: body "{body}" is a display body id, which {ftype} cannot target. '
+                f'params.body takes the OWNING FEATURE id of the body ("f3" — see '
+                f'get_part(summary=True)), "$N" for a feature built earlier in this batch, '
+                f'or {{"kind":"body","owner_feature":"f3"}}. With no body it moves the '
+                f"current (most recently built) body.")
+        if refs != (feat.get("refs") or {}) or params != (feat.get("params") or {}):
+            if refs:
+                feat["refs"] = refs
+            else:
+                feat.pop("refs", None)
+            feat["params"] = params
+    return ops
+
+
 def _unwrap_enum_dims(ops: Any, notes: Optional[list] = None) -> Any:
     """Unwrap text/enum params a model dressed up as a dimension.
 
@@ -7522,6 +7614,14 @@ def _native_read_file(path: str, sections: Optional[list[str]],
 #: _SUMMARY_LIST_KEEP items, and the feature records the cut in `truncated_lists`.
 _SUMMARY_LIST_MAX = 64
 _SUMMARY_LIST_KEEP = 16
+#: get_part(summary=True) size caps (JSON characters). A feature whose trimmed params
+#: exceed _SUMMARY_PARAMS_MAX_CHARS keeps only params of at most _SUMMARY_PARAM_MAX_CHARS
+#: each (the rest named in params_elided); once the page's params reach
+#: _SUMMARY_BUDGET_CHARS, later features carry no params (params_omitted). HERC audit:
+#: summaries of 115-230 KB overflowed the client.
+_SUMMARY_PARAMS_MAX_CHARS = 4000
+_SUMMARY_PARAM_MAX_CHARS = 200
+_SUMMARY_BUDGET_CHARS = 20000
 
 
 def _non_body_edit_context(ops: list, tree: dict, id_map: dict) -> Optional[dict]:
@@ -7652,6 +7752,112 @@ def _engine_reply_failure(reply: Any) -> Optional[dict]:
             "error": f"{head} — {why}"}
 
 
+def _revision_mismatch(doc_id: str, expected: int, current: Any) -> dict:
+    """add_features(expect_revision=…) refusal: the document moved since that revision."""
+    return {
+        "ok": False, "code": "revision_mismatch", "doc_id": doc_id, "applied": False,
+        "expected_revision": expected, "current_revision": current,
+        "error": (f"not applied: expect_revision={expected}, but the document is at revision "
+                  f"{current}. It changed since then — an earlier attempt of this call may "
+                  "already have landed."),
+        "hint": ("read get_part(doc_id, summary=True) to see whether the edit is already "
+                 "there; resend with expect_revision=<current_revision> only if it is still "
+                 "needed."),
+    }
+
+
+#: add_features features[] rows keep `data` only up to this many JSON characters; the
+#: fillet report (requested/effective radii) is always kept. HERC audit: batch replies
+#: reached 65 KB, mostly per-feature data nobody reads in the reply.
+_FEATURE_DATA_MAX_CHARS = 600
+_FEATURE_DATA_ALWAYS = ("fillet",)
+#: overlap_warnings.pairs kept in an add_features reply (pairs_total reports the rest).
+_OVERLAP_PAIRS_MAX = 20
+
+
+def _compact_feature_rows(rows: list) -> None:
+    """Elide bulky per-feature `data` in place; get_part(feature_ids=…) has the full record."""
+    for row in rows:
+        if not isinstance(row, dict) or "data" not in row:
+            continue
+        data = row["data"]
+        if data is None:
+            del row["data"]
+            continue
+        try:
+            size = len(json.dumps(data, default=str))
+        except Exception:  # noqa: BLE001
+            continue
+        if size <= _FEATURE_DATA_MAX_CHARS:
+            continue
+        kept = ({k: data[k] for k in _FEATURE_DATA_ALWAYS if k in data}
+                if isinstance(data, dict) else {})
+        if kept:
+            row["data"] = kept
+        else:
+            del row["data"]
+        row["data_elided_chars"] = size
+
+
+#: Ops a "cut-only" batch may carry besides its cut features, for the cut safety net.
+_CUT_CHECK_NEUTRAL_TYPES = frozenset({
+    "sketch", "sketch3d", "datum", "datum_plane", "datum_axis", "datum_point",
+    "plane", "axis", "point", "reference_plane"})
+
+
+def _cut_batch_feature_ids(ops: list, id_map: dict) -> Optional[list]:
+    """Ids of the mode:"cut" features when the batch only cuts (plus sketches/datums and
+    their auto-define), else None — mixed batches change volume/solids for other reasons."""
+    cuts = []
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict):
+            return None
+        if op.get("op") == "sketch_fully_define":
+            continue
+        feat = op.get("feature") if op.get("op") == "add_feature" else None
+        if not isinstance(feat, dict):
+            return None
+        ftype = str(feat.get("type") or "").strip().lower()
+        params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
+        if str(params.get("mode") or "").strip().lower() == "cut":
+            cuts.append(id_map.get(f"${i}") or f"${i}")
+        elif ftype not in _CUT_CHECK_NEUTRAL_TYPES:
+            return None
+    return cuts or None
+
+
+def _cut_warnings(cut_ids: list, rows: list, before_vol: Any, after_vol: Any,
+                  before_solids: Any, after_solids: Any) -> Optional[dict]:
+    """The Python safety net for cuts that hit the wrong body (HERC audit §5).
+
+    mode:"cut" subtracts from the most recent body only, so a cut aimed at another body
+    removes nothing, and a cut through a stack of plates splits them. Skipped when the
+    engine already attached a warning to one of the cut features."""
+    by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
+    if any((by_id.get(fid) or {}).get("warning") for fid in cut_ids):
+        return None
+    problems = []
+    if (isinstance(before_vol, (int, float)) and isinstance(after_vol, (int, float))
+            and before_vol > 0):
+        removed = before_vol - after_vol
+        if removed <= max(1e-6 * before_vol, 1e-3):
+            problems.append(
+                f"the cut removed ~no material (volume {before_vol:.6g} -> {after_vol:.6g} mm^3)")
+    if (type(before_solids) is int and type(after_solids) is int
+            and after_solids > before_solids):
+        problems.append(f"the solid count went UP ({before_solids} -> {after_solids}): the "
+                        "cut split a body")
+    if not problems:
+        return None
+    return {
+        "features": cut_ids,
+        "summary": "; ".join(problems),
+        "hint": ('mode:"cut" subtracts from the CURRENT (most recently built) body only. '
+                 "Check it hit the body you meant (render_part / list_world_bodies); to cut "
+                 "a specific body use a boolean with explicit targets/tools."),
+    }
+
+
 def _prepare_add_features_ops(ops: list, doc_id: str, auto_define: bool,
                               notes: list) -> tuple[list, dict]:
     """Prepare an existing document's batch, without applying any operations."""
@@ -7669,6 +7875,7 @@ def _prepare_add_features_ops(ops: list, doc_id: str, auto_define: bool,
     ops = _normalize_feature_types(ops, notes)
     ops = _normalize_type_param_aliases(ops, notes)
     ops = _migrate_ref_slots(ops, notes)
+    ops = _normalize_transform_body(ops, notes)
     ops = _normalize_closed_shell_flag(ops, notes)
     ops = _drop_empty_ref_slots(ops, notes)
     ops = _normalize_inline_boolean(ops, notes)
@@ -7760,7 +7967,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         Omit topic or pass an empty string for a compact topic index. Choose a
         feature name such as "hole", "fillet", or "sketch" for focused parameters.
-        "overview", "ops" and "features" return the large operation compendium;
+        "overview", "ops" and "features" return a compact operation index with the live
+        per-feature parameter keys; the full compendium is paged as "ops_workflow",
+        "ops_features" and "ops_sketch" ("ops_full" for all of it). "planes",
+        "primitives", "transform", "regions" (centroid), "material" and
+        "asm_edit_component" cover the conventions agents most often got wrong.
         "add_features" returns the complete mutation reference. The result is text;
         embedded Eval's details.xdev.inner is already decoded, not JSON to parse.
         Hyphens and underscores are interchangeable in topics (edit-part = edit_part).
@@ -7943,6 +8154,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         # Path-stem/version resumes may only have read doc_list, and a cached
         # volume can skip every later engine call. Claim the selected doc now.
         cb.lease_document(did)
+        cb.note_doc_identity(did, entry.get("name"), entry)
         _CUR["doc_id"] = did
         claim_process_doc(did)
         built = entry.get("feature_count")
@@ -8136,6 +8348,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         Follow with add_features(...) to build geometry. Each part is a real parametric feature
         tree (undo/redo, editable parameters), not a one-shot mesh.
+
+        A minted part is saved into the project folder when one is configured
+        (persisted:true, saved_path). Without one the reply carries persisted:false and a
+        one-line `warning`; the part is still live and editable — save_part(path="….step+")
+        writes it to a file when you need one.
         """
         try:
             # A document under the EXACT requested name is already open. That case is the
@@ -8224,6 +8441,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # Land the (still empty) part in the user's project folder immediately so it
             # exists as a real, openable file; add_features refreshes it as geometry grows.
             persist_result(did, out, actual)
+            if (out.get("persist_error") or {}).get("code") == "no_project_save_dir":
+                # Expected without a configured project folder, not a failure: one short
+                # line on how to persist instead of an error-shaped persist_error block.
+                out.pop("persist_error")
+                out["warning"] = ("not saved to disk yet (no project folder is configured); "
+                                  'save_part(path="<name>.step+") writes it to a file')
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -8376,6 +8599,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     @result_contract("Running with job_id means acceptance, not completion; inspect the job result.")
     def add_features(ops: Optional[list] = None, doc_id: Optional[str] = None,
                      background: bool = False, auto_define: bool = True,
+                     expect_revision: Optional[int] = None,
                      **extra: Annotated[Any, Field(default=None)]) -> str:
         """Apply an atomic list of document ops to build or edit a part.
 
@@ -8431,6 +8655,19 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         Heavy operations may return status="running" with job_id: this is acceptance,
         not a completed result. Use get_job or wait_job and inspect its nested result.
         background=True requests immediate handoff; open docs are autosaved beforehand.
+
+        RETRYING SAFELY: expect_revision=<revision> applies the batch only if the document
+        is still at that revision (read it from get_part/list_parts or the previous reply's
+        `revision`). A call that timed out or was cancelled mid-run may still have landed;
+        resend it with the revision you read BEFORE the first attempt. If the batch landed
+        meanwhile, the retry is refused with code "revision_mismatch",
+        applied:false and current_revision — read the part instead of re-applying.
+
+        Replies stay compact: features[] rows carry id/name/type/ok/error/warning and small
+        `data` (fillet radii); bulky per-feature data is elided (data_elided_chars), so use
+        get_part(feature_ids=[...]) or inspect_feature for the full record. A batch with a
+        mode:"cut" feature that removes ~no volume or splits the body adds a
+        cut_warnings entry: the cut hit the most recent body, which may not be the one meant.
         Sketch mutations return sketch_readbacks: read them before further sketch edits.
         VERIFY AT MILESTONES: do not render after every mutation. Measure/inspect once the
         features that realize a requirement are in (render when visual judgment is needed),
@@ -8550,6 +8787,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         f'calling it "{mint_actual_name}" from now on; send its build ops '
                         f"in the next call")
                 return _dumps(out)
+            if expect_revision is not None:
+                if type(expect_revision) is not int or expect_revision < 0:
+                    raise ValueError("expect_revision must be a nonnegative integer revision "
+                                     "(the `revision` a previous reply or get_part reported)")
+                current_revision = _doc_revision(d)
+                if current_revision is not None and current_revision != expect_revision:
+                    return _dumps(_revision_mismatch(d, expect_revision, current_revision))
             ops, auto_define_indices = _prepare_add_features_ops(
                 ops, d, auto_define, interpreted)
             interpreted, assumptions = _split_notes(interpreted)
@@ -8600,7 +8844,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         raise
                     pass
 
-                r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
+                apply_params: dict = {"doc_id": d, "ops": ops}
+                if expect_revision is not None:
+                    # The engine's own compare-and-apply: atomic with the edit itself.
+                    apply_params["base_revision"] = expect_revision
+                try:
+                    r = cb.call("doc_apply_ops", apply_params)
+                except cb.CoreError as exc:
+                    if expect_revision is None or getattr(exc, "code", None) != "stale_revision":
+                        raise
+                    current = (exc.detail or {}).get("current_revision") if isinstance(
+                        exc.detail, dict) else None
+                    return _revision_mismatch(d, expect_revision, current)
                 fs = (r.get("rebuild") or {}).get("feature_status", [])
                 try:
                     _enrich_zero_volume_errors(fs, ops, r.get("id_map") or {})
@@ -8675,6 +8930,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                     reverted = "rejected_tree" in r
                     if not reverted:
                         reverted = cb.revert_own_batch(d, ckpt, r.get("revision"))
+                    _compact_feature_rows(feats)
                     fail = [feature for feature in feats if not feature.get("ok")]
                     _publish_current(d)  # mirror the rolled-back (or current) state to the app
                     # The agent card renders `error` TRUNCATED (~160 chars) and never
@@ -8841,6 +9097,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         bbox_after, after_hist, physical_count = None, {}, None
                     out["body_count"] = physical_count
                     out["body_count_basis"] = "physical_solids"
+                    cut_ids = (_cut_batch_feature_ids(ops, r.get("id_map") or {})
+                               if baseline_current else None)
+                    if cut_ids:
+                        before_solids = ((before or {}).get("exact") or {}).get("solid_count") \
+                            if isinstance((before or {}).get("exact"), dict) else None
+                        cut_warning = _cut_warnings(cut_ids, feats, before_vol, vol_after,
+                                                    before_solids, physical_count)
+                        if cut_warning:
+                            out["cut_warnings"] = cut_warning
                     try:
                         out["changes"] = _write_diff(
                             before_hist if baseline_current else {}, after_hist,
@@ -8893,7 +9158,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     summary = summary.replace(old, new, 1)
                                 out["overlap_warnings"] = {
                                     "summary": summary,
-                                    "pairs": pairs,
+                                    "pairs": pairs[:_OVERLAP_PAIRS_MAX],
+                                    **({"pairs_total": len(pairs)}
+                                       if len(pairs) > _OVERLAP_PAIRS_MAX else {}),
                                     "dead_features": dead,
                                     "basis": ov.get("basis") or "unknown",
                                     "note": ov.get("note") or (
@@ -9057,6 +9324,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             raise
                         out["sketch_readbacks_error"] = (
                             f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+                _compact_feature_rows(out.get("features") or [])
                 return out
 
             if background:
@@ -9138,8 +9406,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                  cursor: int = 0) -> str:
         """Return a part's revision and feature tree at tree.features.
 
-        summary=True elides large geometry and strings and truncates long lists
-        (reported in truncated_lists); never use summary parameters for edits.
+        summary=True is a size-capped overview: every feature's id/name/type/status
+        (active, suppressed or rolled_back), type_counts for the whole tree, and its params
+        with large geometry and strings elided and long lists truncated (truncated_lists).
+        A feature with bulky params keeps only the small ones (params_elided names the
+        rest); once the page's params reach ~20 KB, later features omit params
+        (params_omitted, params_omitted_from). Never use summary parameters for edits.
         The default returns complete data and owner_map for round-trip editing.
         feature_ids selects complete matching records in document order, omitting
         other tree sections and owner_map; unknown IDs fail and [] selects none.
@@ -9199,28 +9471,66 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
             tree = r.get("tree") or {}
             feats = tree.get("features") or []
+            # Status without a rebuild: suppressed, or behind the rollback bar.
+            all_feats = [f for f in (source_tree.get("features") or []) if isinstance(f, dict)]
+            rolled: set = set()
+            bar = source_tree.get("rollback_after")
+            if bar is not None:
+                ids = [f.get("id") for f in all_feats]
+                rolled = set(ids[ids.index(bar) + 1:] if bar in ids else
+                             (ids if bar == "start" else []))
+            type_counts: dict = {}
+            for f in all_feats:
+                key = str(f.get("type") or "?")
+                type_counts[key] = type_counts.get(key, 0) + 1
             out_feats = []
+            used = 0
+            omitted_from = None
             for f in feats:
                 if not isinstance(f, dict):
                     continue
-                truncated: dict = {}
-                params = _trim(f.get("params") or {}, "params", truncated)
                 entry = {
                     "id": f.get("id"),
                     "name": f.get("name"),
                     "type": f.get("type"),
                     "suppressed": bool(f.get("suppressed", False)),
-                    "params": params,
+                    "status": ("suppressed" if f.get("suppressed") else
+                               "rolled_back" if f.get("id") in rolled else "active"),
                 }
-                if truncated:
-                    entry["truncated_lists"] = truncated
+                truncated: dict = {}
+                params = _trim(f.get("params") or {}, "params", truncated)
+                size = len(json.dumps(params, default=str))
+                if size > _SUMMARY_PARAMS_MAX_CHARS and isinstance(params, dict):
+                    # Keep the scalar design values; drop the bulky ones by name.
+                    small = {k: v for k, v in params.items()
+                             if len(json.dumps(v, default=str)) <= _SUMMARY_PARAM_MAX_CHARS}
+                    entry["params_elided"] = sorted(k for k in params if k not in small)
+                    truncated = {p: c for p, c in truncated.items()
+                                 if p.split(".")[1].split("[")[0] in small}
+                    params = small
+                    size = len(json.dumps(params, default=str))
+                if used + size > _SUMMARY_BUDGET_CHARS:
+                    omitted_from = omitted_from or f.get("id")
+                    entry["params_omitted"] = True
+                else:
+                    used += size
+                    entry["params"] = params
+                    if truncated:
+                        entry["truncated_lists"] = truncated
                 out_feats.append(entry)
             # Same nesting as the full form: a caller that read one form reads the other
             # (2026-10-10: summary reads taught `["features"]`, then a full read raised
             # KeyError; c237 hit the reverse with `["tree"]`).
-            return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
-                           "summary": True, "feature_count": total, "feature_page": page_info,
-                           "tree": {"features": out_feats, **rollback}})
+            out = {"ok": True, "doc_id": d, "revision": r.get("revision"),
+                   "summary": True, "feature_count": total, "feature_page": page_info,
+                   "type_counts": type_counts,
+                   "tree": {"features": out_feats, **rollback}}
+            if omitted_from is not None:
+                out["params_omitted_from"] = omitted_from
+                out["note"] = (f"summary size cap: params are omitted from feature "
+                               f"{omitted_from} on (params_omitted); read them with "
+                               f"get_part(feature_ids=[...]) or a smaller limit/cursor page")
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -9247,6 +9557,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         body: "b1", "b2", ... or ordinal; default all bodies.
         measure_part (and the Mass Properties panel) weigh each body with its applied
         material; FEA calls still take their own material input for the solve.
+        A name returns density_known (and density_g_cm3 when true). density_known=false
+        with a warning means only a look was applied (e.g. "plastic"): mass does not
+        reflect that name, so give measure_part density_g_cm3= or name a registry grade.
         The native tree exposes both the document default and body_materials overrides.
 
         faces: nonempty face SID strings (e.g. "F123abc") or complete face selector
@@ -9285,7 +9598,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         break
                 if not material_key and _material_not_modelled(material):
                     # The registry lacks solve properties for this known designation (e.g.
-                    # 4140), but the document can and should still preserve the user's exact
+                    # 316L), but the document can and should still preserve the user's exact
                     # engineering identity instead of silently retaining default 6061.
                     material_key = _material_norm(material).replace(" ", "_")
                     unsupported_identity = material_key
@@ -9326,15 +9639,30 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                    "revision": r.get("revision")}
             if faces is not None:
                 out["faces"] = faces
+            if isinstance(material, str) and material.strip():
+                # Whether measure_part can weigh this identity from the registry. False means
+                # mass would come from an unrelated prior/default density, never this name.
+                from .cad_common import _material_registry_density  # noqa: PLC0415
+                density = (_material_registry_density(material_key)
+                           if registry_material else None)
+                out["density_known"] = density is not None
+                if density is not None:
+                    out["density_g_cm3"] = density
             if unsupported_identity:
                 out["warning"] = (
                     f"stored engineering material identity {unsupported_identity!r}, but the "
                     "registry has no solve-property row for it; analysis needs an explicit "
-                    "material property dict")
+                    "material property dict, and measure_part mass needs density_g_cm3=")
             elif isinstance(material, str) and not material_key:
                 out["warning"] = (
                     f"{material!r} has a visual preset but no engineering registry identity; "
-                    "appearance changed, document material metadata did not")
+                    "appearance changed, document material metadata did not. measure_part "
+                    "mass will NOT reflect this material (it keeps the previous/default "
+                    "density): name a registry grade or pass density_g_cm3= to measure_part")
+            elif isinstance(material, str) and not out.get("density_known"):
+                out["warning"] = (
+                    f"registry row {material_key!r} carries no density; measure_part mass "
+                    "needs density_g_cm3=")
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -9417,6 +9745,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             docs = result.get("docs") or []
             page = docs[cursor:cursor + limit]
             cb.lease_documents(page)
+            # The caller now sees what each id names: refresh the doc-identity guard.
+            cb.note_doc_identities(page)
             return _dumps({**result, "docs": page, "total": len(docs), "cursor": cursor,
                            "limit": limit, "next_cursor": (
                                cursor + len(page) if cursor + len(page) < len(docs) else None)})
@@ -9791,7 +10121,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         For durable simulation jobs, progress.probe contains the live fill counters.
         progress.last_advance_s is time since counters or phase last changed, not
         time since a heartbeat. progress.stalled is true only while running with
-        more than 120 seconds without advancement. Cancel for lack of progress
+        more than 120 seconds without advancement and without solver CPU use;
+        progress.summary/fill name the mesh fill the counters belong to (a fill's
+        sub_phase "complete" is not the job finishing). Cancel for lack of progress
         only when stalled is true, not for a healthy long mesh probe.
         """
         # The process-local mapping lookup is the only work allowed under _JOB_LOCK.
@@ -9805,6 +10137,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             durable_job = durable_job_snapshot(job_id)
             snap = dict(durable_job) if durable_job is not None else None
         if snap is None:
+            if isinstance(job_id, str) and not job_id.startswith(_DURABLE_JOB_PREFIX):
+                return _dumps({
+                    "ok": False, "code": "job_not_in_this_process",
+                    "error": f"unknown job_id {job_id!r} in this MCP server",
+                    "hint": ("job-* ids are in-process jobs of the MCP server that started "
+                             "them and do not survive a server restart; the edit may "
+                             "already be applied — read get_part(doc_id, summary=True) or "
+                             "list_parts before resending. Simulation (durable) job ids "
+                             "survive restarts.")})
             return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
         out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
         if snap.get("progress"):

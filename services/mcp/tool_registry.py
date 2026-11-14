@@ -805,7 +805,7 @@ def _guard(fn, name):
                 refused = _admit(name, call, args, kwargs)
                 if refused is not None:
                     return shape(refused)
-                return tool_reply(await fn(*args, **kwargs))
+                return tool_reply(await fn(*args, **kwargs), name)
         aguard._refusal_shaper = shape  # type: ignore[attr-defined]  # tests/introspection
         return aguard
 
@@ -817,7 +817,7 @@ def _guard(fn, name):
             refused = _admit(name, call, args, kwargs)
             if refused is not None:
                 return shape(refused)
-            return tool_reply(fn(*args, **kwargs))
+            return tool_reply(fn(*args, **kwargs), name)
     guard._refusal_shaper = shape  # type: ignore[attr-defined]  # tests/introspection
     return guard
 

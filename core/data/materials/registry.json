@@ -1041,7 +1041,7 @@
     "bronze_c93200_b505_m07": {
       "name": "C93200 SAE 660 continuous-cast ASTM B505 M07",
       "category": "metal",
-      "aliases": ["C93200 B505 M07", "SAE660 B505 M07"],
+      "aliases": ["C93200 B505 M07", "SAE660 B505 M07", "C93200", "C932", "SAE 660", "SAE660", "bearing bronze", "bronze"],
       "condition": "Continuous-cast C93200/SAE660, ASTM B505/B505M temper M07",
       "constitutive_model": "isotropic_incomplete",
       "mechanical": {"density_g_cm3": 8.91},
@@ -1313,6 +1313,303 @@
         "source": "ASTM A312/A312M tensile requirements (TP316); ASME B31.3 Appendix C modulus of elasticity",
         "source_type": "standard",
         "url": null
+      }
+    },
+    "steel_4140_annealed": {
+      "name": "Chromoly steel (AISI 4140, annealed)",
+      "category": "metal",
+      "aliases": ["4140", "AISI 4140", "SAE 4140", "4140 steel", "4140 chromoly", "UNS G41400", "4140 annealed", "AISI 4140 annealed"],
+      "condition": "Annealed (furnace-cooled). Bare '4140' resolves here because annealed is the lowest-strength common condition of the grade; heat-treated stock must name its condition.",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 205000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 415, "ultimate_mpa": 655},
+      "property_basis": {
+        "E_mpa": "typical for steel (MW Components 4140 sheet, 205 GPa); AZoM lists 190-210 GPa",
+        "nu": "typical, MW Components 4140 sheet (0.29); AZoM lists 0.27-0.30",
+        "density_g_cm3": "typical, AZoM and MW Components (7.85)",
+        "yield_mpa": "typical annealed value, AZoM table (60.2 ksi, HB 197, 25.7 % elongation); not a procurement minimum",
+        "ultimate_mpa": "typical annealed value, AZoM table (95 ksi)"
+      },
+      "selection_status": "Typical handbook values for annealed bar; heat-treated 4140 is far stronger (see steel_4140_normalized, steel_4140_qt_le100). Not a received-stock certificate.",
+      "provenance": {
+        "source": "AZoM 'AISI 4140 Alloy Steel (UNS G41400)' mechanical/physical property table (annealed, HB 197); MW Components (Elgin) Alloy Steel Grade 4140 fact sheet for E/nu",
+        "source_type": "industry_reference",
+        "url": "https://www.azom.com/article.aspx?ArticleID=6769",
+        "urls": ["https://www.mwcomponents.com/uploads/Resource-Center/Elgin-Material-Sheets/Alloy-Steel-Grade-4140-Fact-Sheet_Elgin-Website.pdf"]
+      }
+    },
+    "steel_4140_normalized": {
+      "name": "Chromoly steel (AISI 4140, normalized 870 C)",
+      "category": "metal",
+      "aliases": ["4140 normalized", "AISI 4140 normalized", "4140 normalised"],
+      "condition": "Normalized at 870 C (1600 F), air cooled, 25 mm (1 in.) round; HB 302",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 205000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 655, "ultimate_mpa": 1020},
+      "property_basis": {
+        "E_mpa": "typical for steel, per source",
+        "nu": "calculated, per source",
+        "density_g_cm3": "typical, per source",
+        "yield_mpa": "typical for the stated 25 mm normalized round (95 ksi), not a procurement minimum; larger sections are weaker",
+        "ultimate_mpa": "typical for the stated 25 mm normalized round (148 ksi)"
+      },
+      "selection_status": "Typical values for a 25 mm normalized round; not a received-stock certificate.",
+      "provenance": {
+        "source": "MW Components (Elgin) Alloy Steel Grade 4140 fact sheet: AISI 4140 Steel, normalized at 870 C, air cooled, 25 mm round",
+        "source_type": "manufacturer_reference",
+        "url": "https://www.mwcomponents.com/uploads/Resource-Center/Elgin-Material-Sheets/Alloy-Steel-Grade-4140-Fact-Sheet_Elgin-Website.pdf"
+      }
+    },
+    "steel_4140_qt_le100": {
+      "name": "Chromoly steel (AISI 4140 Q&T, 10-100 mm, 740 MPa minimum)",
+      "category": "metal",
+      "aliases": ["4140 Q&T", "4140 QT", "4140 quenched and tempered", "AISI 4140 Q&T", "AISI 4140 quenched and tempered"],
+      "condition": "Quenched (oil, 830-860 C) and tempered (540-680 C), supply condition U or T/U, section 10-100 mm",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 205000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 740, "ultimate_mpa": 930},
+      "property_basis": {
+        "E_mpa": "typical for steel, MW Components 4140 sheet",
+        "nu": "typical, MW Components 4140 sheet",
+        "density_g_cm3": "typical, MW Components 4140 sheet",
+        "yield_mpa": "supplier minimum Rp0.2 for 10-100 mm (101-250 mm: 665 MPa minimum)",
+        "ultimate_mpa": "lower bound of the supplier's 930-1080 MPa range for 10-100 mm (101-250 mm: 850-1000 MPa)",
+        "hardness": "269-331 HB for 10-100 mm"
+      },
+      "selection_status": "Supplier minima for one distributor's Q&T bar; other Q&T or pre-hardened 4140 must be confirmed against its own certificate.",
+      "provenance": {
+        "source": "voestalpine High Performance Metals Australia, AISI 4140 / 1.7225 datasheet, mechanical properties (heat treated)",
+        "source_type": "manufacturer",
+        "url": "https://www.voestalpine.com/highperformancemetals/australia/app/uploads/sites/265/2024/08/Datasheet-4140-2026-v2.pdf",
+        "urls": ["https://www.mwcomponents.com/uploads/Resource-Center/Elgin-Material-Sheets/Alloy-Steel-Grade-4140-Fact-Sheet_Elgin-Website.pdf"]
+      }
+    },
+    "steel_52100": {
+      "name": "Bearing steel (AISI 52100)",
+      "category": "metal",
+      "aliases": ["52100", "AISI 52100", "SAE 52100", "E52100", "52100 steel", "UNS G52986", "100Cr6", "GCr15", "bearing steel"],
+      "condition": "Condition unspecified (supplied spheroidize-annealed, used hardened to about HRC 62); density only",
+      "constitutive_model": "isotropic_incomplete",
+      "mechanical": {"density_g_cm3": 7.81},
+      "property_basis": {
+        "density_g_cm3": "typical, AZoM",
+        "elastic_modulus_gpa_range": "190-210 (AZoM)",
+        "poisson_ratio_range": "0.27-0.30 (AZoM)",
+        "hardness_hrc": "62 oil quenched + 150 C temper; 64 oil quenched (AZoM)",
+        "strength_note": "The source gives no tensile or yield strength; hardened 52100 is limited by hardness/brittleness, so no isotropic yield is imported. 100Cr6 is the EN analogue; the condition-specific Ovako 803J row (steel_100cr6_ovako803j_qtm) carries supplier strengths."
+      },
+      "constitutive_gaps": ["Condition-specific yield and tensile strength", "Rolling-contact fatigue data"],
+      "selection_status": "Density for mass only; FEA needs an explicit property dict or the Ovako 803J row.",
+      "provenance": {
+        "source": "AZoM 'AISI 52100 Alloy Steel (UNS G52986)' property table",
+        "source_type": "industry_reference",
+        "url": "https://www.azom.com/article.aspx?ArticleID=6704"
+      }
+    },
+    "steel_astm_a500_grade_b_round": {
+      "name": "Structural tubing ASTM A500 Grade B round (290 MPa minimum)",
+      "category": "metal",
+      "aliases": ["ASTM A500 Grade B round", "A500 Grade B round", "A500 Gr B round", "A500B round", "A500", "ASTM A500", "A500 Grade B", "A500 Gr B", "A500B", "ASTM A500 Grade B", "A500 tube", "A500 tubing"],
+      "condition": "Cold-formed welded or seamless round structural tubing. Bare 'A500' and 'A500 Grade B' resolve here because this is the lowest specified minimum of Grades B and C.",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 290, "ultimate_mpa": 400},
+      "property_basis": {
+        "E_mpa": "Nominal structural-steel modulus (29,000 ksi), as in steel_a36",
+        "nu": "Nominal carbon-steel value, as in steel_a36",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A500/A500M Table 2 specified minimum yield, Grade B rounds, 42 ksi (290 MPa)",
+        "ultimate_mpa": "ASTM A500/A500M Table 2 specified minimum tensile, Grade B, 58 ksi (400 MPa)",
+        "edition_note": "Steel Tube Institute reports that A500-21 raised round minima to equal shaped; the pre-2021 round value kept here is the lower, conservative one."
+      },
+      "selection_status": "Engineering selection; design strength per AISC 360 uses these minima. No received-stock certificate.",
+      "provenance": {
+        "source": "ASTM A500/A500M Table 2 tensile requirements as tabulated by Major Metals (citing A500/A500M-23); Steel Tube Institute ASTM A500 resource for the A500-21 change",
+        "source_type": "standard",
+        "url": "https://major-metals-website.pages.dev/welded-steel-tubing/astm-a500",
+        "urls": ["https://steeltubeinstitute.org/resources/astm-a500/"]
+      }
+    },
+    "steel_astm_a500_grade_b_shaped": {
+      "name": "Structural tubing ASTM A500 Grade B shaped (315 MPa minimum)",
+      "category": "metal",
+      "aliases": ["ASTM A500 Grade B shaped", "A500 Grade B shaped", "A500 Gr B shaped", "A500B shaped", "A500 Grade B square", "A500 Grade B rectangular"],
+      "condition": "Cold-formed welded or seamless square/rectangular structural tubing",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 315, "ultimate_mpa": 400},
+      "property_basis": {
+        "E_mpa": "Nominal structural-steel modulus (29,000 ksi), as in steel_a36",
+        "nu": "Nominal carbon-steel value, as in steel_a36",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A500/A500M Table 2 specified minimum yield, Grade B shapes, 46 ksi (315 MPa)",
+        "ultimate_mpa": "ASTM A500/A500M Table 2 specified minimum tensile, Grade B, 58 ksi (400 MPa)"
+      },
+      "selection_status": "Engineering selection; design strength per AISC 360 uses these minima. No received-stock certificate.",
+      "provenance": {
+        "source": "ASTM A500/A500M Table 2 tensile requirements as tabulated by Major Metals (citing A500/A500M-23)",
+        "source_type": "standard",
+        "url": "https://major-metals-website.pages.dev/welded-steel-tubing/astm-a500"
+      }
+    },
+    "steel_astm_a500_grade_c_round": {
+      "name": "Structural tubing ASTM A500 Grade C round (315 MPa minimum)",
+      "category": "metal",
+      "aliases": ["ASTM A500 Grade C round", "A500 Grade C round", "A500 Gr C round", "A500C round", "A500 Grade C", "A500 Gr C", "A500C", "ASTM A500 Grade C"],
+      "condition": "Cold-formed welded or seamless round structural tubing. Bare 'A500 Grade C' resolves here because the round minimum is the lower one.",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 315, "ultimate_mpa": 425},
+      "property_basis": {
+        "E_mpa": "Nominal structural-steel modulus (29,000 ksi), as in steel_a36",
+        "nu": "Nominal carbon-steel value, as in steel_a36",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A500/A500M Table 2 specified minimum yield, Grade C rounds, 46 ksi (315 MPa)",
+        "ultimate_mpa": "ASTM A500/A500M Table 2 specified minimum tensile, Grade C, 62 ksi (425 MPa)",
+        "edition_note": "Steel Tube Institute and the AISC 16th-edition Manual give 50 ksi for Grade C rounds under A500-21; the pre-2021 46 ksi kept here is the lower, conservative value."
+      },
+      "selection_status": "Engineering selection; design strength per AISC 360 uses these minima. No received-stock certificate.",
+      "provenance": {
+        "source": "ASTM A500/A500M Table 2 tensile requirements as tabulated by Major Metals (citing A500/A500M-23); Steel Tube Institute ASTM A500 resource for the A500-21 change",
+        "source_type": "standard",
+        "url": "https://major-metals-website.pages.dev/welded-steel-tubing/astm-a500",
+        "urls": ["https://steeltubeinstitute.org/resources/astm-a500/"]
+      }
+    },
+    "steel_astm_a500_grade_c_shaped": {
+      "name": "Structural tubing ASTM A500 Grade C shaped (345 MPa minimum)",
+      "category": "metal",
+      "aliases": ["ASTM A500 Grade C shaped", "A500 Grade C shaped", "A500 Gr C shaped", "A500C shaped", "A500 Grade C square", "A500 Grade C rectangular"],
+      "condition": "Cold-formed welded or seamless square/rectangular structural tubing",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 345, "ultimate_mpa": 425},
+      "property_basis": {
+        "E_mpa": "Nominal structural-steel modulus (29,000 ksi), as in steel_a36",
+        "nu": "Nominal carbon-steel value, as in steel_a36",
+        "density_g_cm3": "Nominal carbon-steel density, as in steel_a36",
+        "yield_mpa": "ASTM A500/A500M Table 2 specified minimum yield, Grade C shapes, 50 ksi (345 MPa)",
+        "ultimate_mpa": "ASTM A500/A500M Table 2 specified minimum tensile, Grade C, 62 ksi (425 MPa)"
+      },
+      "selection_status": "Engineering selection; design strength per AISC 360 uses these minima. No received-stock certificate.",
+      "provenance": {
+        "source": "ASTM A500/A500M Table 2 tensile requirements as tabulated by Major Metals (citing A500/A500M-23); Steel Tube Institute ASTM A500 resource",
+        "source_type": "standard",
+        "url": "https://major-metals-website.pages.dev/welded-steel-tubing/astm-a500",
+        "urls": ["https://steeltubeinstitute.org/resources/astm-a500/"]
+      }
+    },
+    "zinc_zamak3_die_cast": {
+      "name": "Zinc die-casting alloy Zamak 3 (as-cast)",
+      "category": "metal",
+      "aliases": ["Zamak 3", "Zamak", "Mazak 3", "ZP3", "ZnAl4", "AG40A", "ASTM AG40A", "UNS Z33520", "Zinc alloy 3", "zinc die cast"],
+      "condition": "Pressure die cast (ASTM B86 alloy 3, cast from ASTM B240 ingot), as-cast, room temperature",
+      "constitutive_model": "isotropic",
+      "mechanical": {"E_mpa": 84300, "nu": 0.27, "density_g_cm3": 6.6, "yield_mpa": 221, "ultimate_mpa": 283, "endurance_mpa": 48},
+      "property_basis": {
+        "E_mpa": "International Zinc Association, ZP3 nominal, calculated from the stress-strain curve of 1.5 mm die-cast flat specimens",
+        "nu": "International Zinc Association, ZP3 (Umicore R&D / Brescia University)",
+        "density_g_cm3": "6.6 (CMP alloy table; IZA specific gravity 6.6 at zero porosity)",
+        "yield_mpa": "typical as-cast yield, CMP zinc alloy table, 32 ksi (221 MPa); IZA thin-wall specimens give 276 MPa, the lower value is kept",
+        "ultimate_mpa": "typical as-cast tensile, CMP zinc alloy table, 41 ksi (283 MPa); IZA thin-wall specimens give 315 MPa",
+        "endurance_mpa": "rotary-bend fatigue strength at 5x10^8 cycles, IZA (48 MPa); CMP lists 47.6 MPa",
+        "creep_note": "Zinc alloys creep at room temperature under sustained load; these short-time values are not sustained-load allowables."
+      },
+      "selection_status": "Typical as-cast values, not procurement minima; die castings vary with wall thickness and porosity.",
+      "provenance": {
+        "source": "CMP Group zinc alloy specifications (Zamak 3 / No. 3 column); International Zinc Association die-casting mechanical and physical properties (ZP3)",
+        "source_type": "industry_reference",
+        "url": "https://cmpgroup.net/?p=4249",
+        "urls": [
+          "https://diecasting.zinc.org/properties/en/alloy_properties/eng_prop_mechanical-properties/",
+          "https://diecasting.zinc.org/properties/en/alloy_properties/eng_prop_a_physical-properties/"
+        ]
+      }
+    },
+    "hdpe_generic_sheet": {
+      "name": "HDPE high-density polyethylene (generic sheet)",
+      "category": "plastic",
+      "aliases": ["HDPE", "High density polyethylene", "High-density polyethylene", "PE-HD", "PEHD", "HDPE sheet", "HDPE plastic"],
+      "condition": "Generic extruded HDPE sheet, natural, 23 C",
+      "constitutive_model": "polymer_incomplete",
+      "mechanical": {"density_g_cm3": 0.959},
+      "property_basis": {
+        "density_g_cm3": "typical, ASTM D792, 59.88 lb/ft3",
+        "tensile_yield_psi": 4279,
+        "tensile_break_psi": 4423,
+        "elongation_at_yield_pct": 18,
+        "tensile_modulus_psi": 224812,
+        "flexural_modulus_psi": 166796,
+        "hardness_shore_d": 67,
+        "value_class": "Typical values for reference and comparison only; the source says they must not be used as a basis for design specifications."
+      },
+      "constitutive_gaps": ["Poisson ratio", "Time/temperature-dependent creep and relaxation, sustained-load allowables"],
+      "selection_status": "Density for mass; a branded sheet (e.g. hdpe_king_starboard_black) should be named when known.",
+      "provenance": {
+        "source": "Plastics International HDPE data sheet (typical properties)",
+        "source_type": "manufacturer_reference",
+        "url": "https://www.plasticsintl.com/media/bf1geqtj/hdpe-data-sheet.pdf"
+      }
+    },
+    "tpu_95a_generic": {
+      "name": "TPU thermoplastic polyurethane, Shore 95A (generic)",
+      "category": "plastic",
+      "aliases": ["TPU", "TPU 95A", "95A TPU", "Thermoplastic polyurethane", "TPU-95A"],
+      "condition": "Generic injection-moulded polyether TPU, Shore 95-96A; density from BASF Elastollan 1195 A 10 FC as the reference grade",
+      "constitutive_model": "polymer_incomplete",
+      "mechanical": {"density_g_cm3": 1.15},
+      "property_basis": {
+        "density_g_cm3": "BASF Elastollan 1195 A 10 FC, DIN EN ISO 1183-1-A, 1.15; polyester and printed 95A grades run higher (UltiMaker S-series TPU 95A 1.22, row tpu_ultimaker_s95a_black)",
+        "hardness_shore_a": 96,
+        "tensile_strength_mpa": 55,
+        "elongation_at_break_pct": 500,
+        "stress_at_100pct_mpa": 10,
+        "stress_at_300pct_mpa": 18,
+        "value_class": "Manufacturer general guidance data, injection-moulded plaques; not printed-part properties."
+      },
+      "constitutive_gaps": ["Hyperelastic model; no linear isotropic modulus or yield applies"],
+      "selection_status": "Density for mass only; name the actual filament or resin when known.",
+      "provenance": {
+        "source": "BASF Elastollan 1195 A 10 FC general product information (version 8)",
+        "source_type": "manufacturer",
+        "url": "https://download.basf.com/p1/8a8081ec96f843480197313c768004bb/en/Elastollan%25C2%25AE_E_1195_A_10FC000"
+      }
+    },
+    "rubber_nr_60a": {
+      "name": "Natural rubber (NR) 60 Shore A",
+      "category": "elastomer",
+      "aliases": ["rubber", "natural rubber", "NR", "NR 60A", "natural rubber 60A", "60A rubber"],
+      "condition": "Sulfur-cured black natural-rubber compound, 60 +/- 5 Shore A",
+      "constitutive_model": "elastomer_incomplete",
+      "mechanical": {"density_g_cm3": 1.12},
+      "property_basis": {
+        "density_g_cm3": "nominal 1.12 +/- 0.05 g/cm3; filled compounds vary widely",
+        "hardness_shore_a": 60,
+        "tensile_strength_mpa": 20,
+        "elongation_at_break_pct": 500,
+        "value_class": "Typical values on standard specimens, not guaranteed properties (per source)."
+      },
+      "constitutive_gaps": ["Hyperelastic model; no linear isotropic modulus or yield applies"],
+      "selection_status": "Density for mass only; name the actual compound when known.",
+      "provenance": {
+        "source": "Angst+Pfister technical data sheet NR 60.01-02 (natural rubber, 60 Shore A)",
+        "source_type": "manufacturer",
+        "url": "https://apsoparts.com/media/downloads/asset//std.lang.all/1-/02/NR_60_01-02.pdf"
+      }
+    },
+    "rubber_neoprene_cr_60a": {
+      "name": "Neoprene (CR) 60 Shore A, BS 2752 C60",
+      "category": "elastomer",
+      "aliases": ["neoprene", "chloroprene", "polychloroprene", "CR rubber", "neoprene 60A", "neoprene rubber"],
+      "condition": "Neoprene sheet to BS 2752 C60, 60 +/- 5 IRHD",
+      "constitutive_model": "elastomer_incomplete",
+      "mechanical": {"density_g_cm3": 1.4},
+      "property_basis": {
+        "density_g_cm3": "1.40 (BS 903 Part A1)",
+        "hardness_irhd": 60,
+        "tensile_strength_kg_cm2": 133,
+        "elongation_at_break_pct": 250,
+        "value_class": "Guidance values, not a guarantee (per source)."
+      },
+      "constitutive_gaps": ["Hyperelastic model; no linear isotropic modulus or yield applies"],
+      "selection_status": "Density for mass only; name the actual compound when known.",
+      "provenance": {
+        "source": "The Rubber Company RC0308-C60 60 Shore neoprene sheeting datasheet (BS 2752 C60), rev 2.0",
+        "source_type": "manufacturer",
+        "url": "https://therubbercompany.com/wp-content/uploads/2025/04/RC0308-C60-60°-Neoprene-Rubber-Sheeting-BS2752-Rev2.0.pdf"
       }
     },
     "steel_a36": {
@@ -1676,7 +1973,9 @@
       "aliases": [
         "cast iron",
         "gray iron",
-        "grey iron"
+        "grey iron",
+        "gray cast iron",
+        "grey cast iron"
       ],
       "mechanical": {
         "E_mpa": 110000,

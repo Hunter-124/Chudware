@@ -125,6 +125,18 @@ def test_plm_checkpoint_without_workspace_does_not_use_cwd(
     assert not (tmp_path / ".aicadvault").exists()
 
 
+def test_plm_dot_without_workspace_names_the_missing_root(tmp_path, tools, monkeypatch):
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    for spelling in (".", "./"):
+        result = _j(tools["plm_status"](spelling))
+        assert result["reason"] == "project_root_unavailable", result
+        assert "ABSOLUTE" in result["hint"]
+    assert not (tmp_path / ".aicadvault").exists()
+
+
 def test_plm_relative_path_uses_workspace_not_cwd(tmp_path, tools, monkeypatch):
     from services.agent.request_context import bind_roots
 

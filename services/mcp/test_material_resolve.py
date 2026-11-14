@@ -116,7 +116,6 @@ def test_7075_is_not_silently_generic_aluminum():
     ("316", "Stainless 316", "stainless"),
     ("316 stainless steel", "Stainless 316", "stainless"),
     ("stainless 316L", "Stainless 316L", "stainless"),
-    ("4140", "4140", "4130"),
     ("A572 Gr 50", "A572", "steel"),
     ("6063-T6", "6063", "aluminum"),
 ])
@@ -493,8 +492,9 @@ def test_selected_section_strengths_do_not_fall_back_to_generic_alloys():
     assert hub["yield_mpa"] == 650
     assert plate["yield_mpa"] == 240
     assert _resolve_material("6061-T6")["yield_mpa"] == 276
-    with pytest.raises(ValueError):
-        _resolve_material("4140")
+    # Bare 4140 is its own (annealed, lowest-strength) row, never 42CrMo4 +QT or 4130.
+    bare = _resolve_material("4140")
+    assert "annealed" in bare["name"].lower() and bare["yield_mpa"] == 415, bare
 
 
 def test_product_registry_appearance_overrides_generic_family_and_is_copied():

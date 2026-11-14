@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from services.agent import request_context as _rc
+from services.sim import mesh_remedy as _mesh_remedy
 
 # ---------------------------------------------------------------- states
 
@@ -1168,14 +1169,32 @@ def status(job_id: str) -> dict:
     prog = _read_json(job_dir(job_id) / "partial.json")
     if prog:
         progress = {k: v for k, v in prog.items()
-                    if k not in ("partial", "_last_advance_monotonic")}
+                    if k not in ("partial", "_last_advance_monotonic",
+                                 "_last_cpu_active_monotonic")}
         last_advance = prog.get("_last_advance_monotonic")
         age = float(progress.get("last_advance_s", 0.0))
         if last_advance is not None:
             age = max(0.0, _clock() - float(last_advance))
         progress["last_advance_s"] = round(age, 3)
-        progress["stalled"] = st["state"] == RUNNING and age > _STALL_S
+        # Counters alone call a long native sub-phase stalled (one exterior-edge
+        # projection runs 150+ s without moving any). A worker that also reports its
+        # process CPU is stalled only when it has neither advanced NOR burned CPU for the
+        # threshold; an older worker without the field keeps the counter-only rule.
+        cpu_busy = False
+        last_cpu = prog.get("_last_cpu_active_monotonic")
+        if last_cpu is not None:
+            cpu_age = max(0.0, _clock() - float(last_cpu))
+            progress["last_cpu_active_s"] = round(cpu_age, 3)
+            cpu_busy = cpu_age <= _STALL_S
+        running = st["state"] == RUNNING
+        progress["stalled"] = running and age > _STALL_S and not cpu_busy
+        if running and age > _STALL_S and cpu_busy:
+            progress["stall_note"] = (
+                f"no counter has moved for {age:.0f} s, but the solver process is using "
+                "CPU, so this is a long native phase rather than a stall")
         st["progress"] = progress
+    if st.get("error"):
+        st["error"] = _mesh_remedy.to_mcp(st["error"])
     st["ok"] = st["state"] not in (FAILED, CANCELLED)
     return st
 

@@ -18,3 +18,4 @@ Example B - a 3mm-radius hole bored at the corner [18,8] of a plate (cut, taller
 1. radius/height are dim OBJECTS {"value":n,"expr":null}, not bare numbers. `at` is a plain [x,y,z] list.
 2. For a through-hole make the cylinder LONGER than the wall and use mode "cut"; an exact-length cut may leave a sliver.
 3. Without `at` the cylinder is on the Z axis through the origin - several cuts without `at` stack and remove no material. Give each its own `at`.
+4. mode "cut" subtracts from the CURRENT (most recently built) body only; a boss fuses into every body it touches; merge:false keeps a separate body. `centered:false` puts the BASE centre at `at`. Orientation, body rules and order: cad_guide("primitives").

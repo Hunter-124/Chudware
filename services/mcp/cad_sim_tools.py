@@ -43,6 +43,7 @@ from .cad_common import (
     cb,
 )
 from services.sim import jobs as simjobs
+from services.sim import mesh_remedy as _mesh_remedy
 from . import cad_common as _cad_jobs
 
 
@@ -2935,9 +2936,11 @@ def _started(job: dict, doc_id) -> dict:
             "solving in a SEPARATE PROCESS — this call did not wait. The job is "
             "persisted on disk, so it survives an MCP restart and can be collected "
             f"in a later turn. Poll get_job('{jid}') or sim_status('{jid}'); "
-            "progress.last_advance_s measures counter/phase inactivity, not heartbeat age. "
-            "Cancel for lack of progress only when progress.stalled is true "
-            "(running with >120s unchanged counters), not during a healthy long probe. "
+            "progress.last_advance_s measures counter/phase inactivity, not heartbeat age; "
+            "progress.summary names the solid and mesh fill the counters belong to (each "
+            "fill restarts its passes and element count). Cancel for lack of progress only "
+            "when progress.stalled is true (running with >120s unchanged counters AND no "
+            "solver CPU use), not during a healthy long probe. "
             f"sim_cancel('{jid}') really terminates the solver."
         ),
         "next_actions": [f"get_job('{jid}')"],
@@ -2945,19 +2948,11 @@ def _started(job: dict, doc_id) -> dict:
 
 
 def _fill_guard_advice(value):
-    """Retain the native refusal while mapping its CLI advice to the MCP surface."""
-    if isinstance(value, str) and "geometry fill-stage guard failed" in value:
-        return (value + " MCP retry: set a smaller mesh_size_mm (the native -h values "
-                "are in metres; mesh_size_mm is in millimetres), and lower min_size_mm "
-                "if its floor would prevent refinement. Do not combine mesh_size_mm "
-                "with a non-default mesh_fineness. The native --max-elems/--max-dof "
-                "flags are not MCP arguments. A retry is still potentially under-resolved; "
-                "check mesh quality and convergence before relying on it.")
-    if isinstance(value, dict):
-        return {k: _fill_guard_advice(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_fill_guard_advice(v) for v in value]
-    return value
+    """Rephrase the mesher's CLI remedies (-h, --max-elems, --mesher) as MCP parameters.
+
+    Idempotent: services.sim.jobs.status already rewrites a job's error, and a reply that
+    passes through here again is left alone."""
+    return _mesh_remedy.apply(value)
 
 
 def _guard_error(exc: Exception) -> str:
@@ -2977,8 +2972,7 @@ def _run_solve(
     """Start one durable solve, and either hand back its id or wait out the sync budget."""
     if background:
         return _started(simjobs.start(kind, stage, payload, meta), doc_id)
-    result = solve_durable_or_handoff(kind, stage, payload, meta)
-    return _fill_guard_advice(result) if kind in ("fea_static", "fea_contact") else result
+    return _fill_guard_advice(solve_durable_or_handoff(kind, stage, payload, meta))
 
 
 # ---------------------------------------------- in-process (thread) jobs behind the sim_* tools
@@ -4242,7 +4236,16 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    Without interfaces a positive value enables legacy all-nearby bonding.
         mesh_fineness : 0..1 (default 0.5), or a preset word
                    ("coarse"=0.25, "medium"=0.5, "fine"=0.75, "finest"=1.0).
-                   Second-order (tet10) elements are used for accuracy.
+                   Second-order (tet10) elements are used for accuracy. It is a
+                   dimensionless dial, not a size: the engine turns it into an element
+                   size in mm from the part's own dimensions and element budget (a
+                   chassis at 0.5 can come out near 12 mm), and mesh_quality.char_len_mm
+                   reports what was delivered. Pass mesh_size_mm instead when you need a
+                   definite size.
+                   There is no mesher or element-cap argument: the FEA tools always use
+                   the graded-tet mesher, and the element/DOF ceilings come from this
+                   machine's memory budget. A refusal naming CLI flags (-h, --max-elems,
+                   --mesher) is rephrased in these parameters.
         mesh_size_mm : the EXACT characteristic element size in mm, e.g. 6.0 — mutually
                    exclusive with mesh_fineness (passing both is refused: they are two
                    different meshes). It maps straight to study.target_size_mm and
@@ -4952,8 +4955,17 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         output, never as `running` and never as `done`.
         progress.probe preserves native live fill counters; last_advance_s is time
         since counters/phase advanced, independent of 30-second heartbeats.
-        stalled means running with >120 seconds without advancement. Cancel for
-        lack of progress only when stalled is true, not for healthy long probes.
+        The mesher runs several fills per job (size probes, recovery retries, one per
+        separate solid), and each restarts its sub-phase passes and element count:
+        progress.fill {index, completed, completed_elements} and progress.summary say
+        which fill (and, for multi-solid studies, progress.body {index, total} which
+        solid) the counters describe. A probe sub_phase "complete" ends ONE fill; the
+        job is finished only when state leaves running.
+        stalled means running with >120 seconds without advancement AND without
+        solver CPU use (last_cpu_active_s); a long native phase that is computing
+        shows stall_note instead. stalled is always false once the job is terminal.
+        Cancel for lack of progress only when stalled is true, not for healthy long
+        probes.
         A failed/cancelled run of a kind that retains them (topology) is persisted to
         its study once and returned as `detail` under `code` solve_failed|solve_cancelled.
         In-process driver jobs (job-* ids from run_fea_convergence and
@@ -4993,8 +5005,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "Cancel for lack of progress only when progress.stalled is true, "
                     "not for a healthy long probe."
                 )
-            return _dumps(_fill_guard_advice(st) if st.get("kind") in
-                          ("fea_static", "fea_contact") else st)
+            return _dumps(_fill_guard_advice(st))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -5008,7 +5019,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         process survives, this returns ok:false and says the solver is STILL RUNNING rather
         than flipping a flag and letting you believe the CPU was freed.
         For lack of progress, cancel only when progress.stalled is true (>120s
-        without counter/phase advancement), not merely because a probe is long.
+        without counter/phase advancement and without solver CPU use), not merely
+        because a probe is long.
         """
         try:
             thread = _thread_job(job_id)

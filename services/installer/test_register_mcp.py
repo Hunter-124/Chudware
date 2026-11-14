@@ -30,6 +30,15 @@ def test_unparseable_config_is_preserved_while_other_target_registers(tmp_path, 
     assert result["code"]["wrote"] is True
 
 
+def test_source_entry_carries_import_path(tmp_path: Path, monkeypatch):
+    """Claude clients start stdio servers outside the registered cwd (Claude Code in the
+    user's project), so the source module must stay importable through PYTHONPATH."""
+    monkeypatch.delenv("CHUDWARE_MCP_BIN", raising=False)
+    entry = register_mcp.server_entry(tmp_path / "python", tmp_path)
+    assert entry["args"] == ["-m", "services.mcp.server"]
+    assert entry["env"]["PYTHONPATH"] == str(tmp_path.resolve())
+
+
 def test_default_python_uses_posix_runtime_layout(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(register_mcp.paths, "RUNTIME", tmp_path)
     monkeypatch.setattr(register_mcp.sys, "platform", "darwin")

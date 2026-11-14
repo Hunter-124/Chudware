@@ -93,6 +93,9 @@ def server_entry(python_exe: Path, cwd: Path, hostd_bin: Path | None = None,
         # and therefore never emits a Python fallback.
         command = str(python_exe)
         command_args = ["-m", "services.mcp.server"]
+        # Claude Code starts stdio servers in the user's project folder and Claude Desktop
+        # in its own directory; neither honours `cwd`, so `-m services...` needs the path.
+        env["PYTHONPATH"] = str(cwd)
     return {
         "command": command,
         "args": command_args,

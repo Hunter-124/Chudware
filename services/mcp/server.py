@@ -187,7 +187,8 @@ _LITE_INSTRUCTIONS = (
     "for parameters or cad_guide('add_features') for batch shapes and worked examples. "
     "Use cad_guide('sketch') for the 2D sketch workflow, "
     "'scad' for OpenSCAD and 'parts' for portable libraries; "
-    "explicit 'ops' returns the full vocabulary.\n"
+    "'ops' is a compact operation index (pages: ops_workflow/ops_features/ops_sketch, "
+    "ops_full); topics also cover planes, primitives, transform, regions, material.\n"
     "ECAD: KiCad project/schematic/board files are the documents of record; humans "
     "edit in KiCad and agent ecad_* edits save to bound files. Open with ecad_open(path), "
     "inspect KiCad with ecad_kicad_status(), and search footprints with "
@@ -199,12 +200,22 @@ _LITE_INSTRUCTIONS = (
     "with ngspice and never falls back to MNA; inspect the reported backend.\n"
     "GEOMETRY PITFALLS: box/cylinder primitives are CENTRED on `at` (a cylinder spans "
     "+-height/2 along `axis`); centered:false puts the base at `at`. mode:'cut' subtracts "
-    "from the CURRENT (last-built) body only - check volume_mm3/body_count after a cut. Sketch "
-    "offsets run along the plane normal: plane.front is -Y, plane.top +Z, plane.right +X. "
-    "asm_add_component at/rotate is a pose, not a fit: check_interference(members=[...]) the "
-    "parts you placed. wait_job returns still_running before the client timeout: call it "
-    "again. A call that timed out may still have applied - read list_parts/get_part(summary=True) "
-    "before resending a mutation.\n"
+    "from the CURRENT (last-built) body unless params.body names the target feature; read "
+    "each cut's warning (cut_warnings: removed nothing / split a body). Sketch offsets run "
+    "along the plane normal: plane.front is -Y, plane.top +Z, plane.right +X "
+    "(cad_guide('planes')). transform targets params.body = the owning feature id (f3) or "
+    "'$N', never b<N>. asm_add_component at/rotate is a pose (world = R*part + at, degrees), "
+    "not a fit: check_interference(members=[...]) the parts you placed; touching pairs are "
+    "listed as contacts. Inside add_features the set_material op takes key; check "
+    "set_material's density_known before trusting mass. wait_job returns still_running "
+    "before the client timeout: call it again. A call that timed out may still have applied: "
+    "resend add_features with expect_revision=<revision read before the first try> (a landed "
+    "batch then returns revision_mismatch), or read list_parts/get_part(summary=True) first. "
+    "After an engine restart a doc_id can name a different part; writes to it are refused "
+    "(doc_id_reissued) - call list_parts() for your part's id. Replies over ~60 KB come back "
+    "with _truncated and a note naming the paging param; ok/error/revision are always kept. "
+    "FEA mesh refusals name mesh_size_mm (mm); in long solves read progress.summary (a fill's "
+    "sub_phase complete is not the job) and cancel only when progress.stalled.\n"
     "SCAN REFERENCES: cad_guide('scan_reference') covers embedded non-solid scans, "
     "placement, visibility and sampled deviation against the editable part.\n"
     "CONVENTIONS THAT MATTER: prefer STRUCTURED geometry queries such as "
@@ -307,15 +318,28 @@ _FULL_INSTRUCTIONS = (
         "parameters or cad_guide('add_features') for batch shapes; 'simulation' and 'review' "
         "cover FEA/CFD and annotated renders; 'sketch' is the "
         "2D sketch workflow; 'scad' and 'parts' cover OpenSCAD and portable libraries. "
-        "Explicit 'ops' returns the full vocabulary.\n"
+        "'ops' is a compact operation index with live per-feature parameter keys; the full "
+        "compendium is paged as ops_workflow/ops_features/ops_sketch (ops_full for all). "
+        "Topics also cover planes, primitives, transform, regions (centroid), material and "
+        "asm_edit_component.\n"
         "GEOMETRY PITFALLS: box/cylinder primitives are CENTRED on `at` (a cylinder spans "
         "+-height/2 along `axis`); centered:false puts the base at `at`. mode:'cut' subtracts "
-        "from the CURRENT (last-built) body only - check volume_mm3/body_count after a cut. Sketch "
-        "offsets run along the plane normal: plane.front is -Y, plane.top +Z, plane.right +X. "
-        "asm_add_component at/rotate is a pose, not a fit: check_interference(members=[...]) the "
-        "parts you placed. wait_job returns still_running before the client timeout: call it "
-        "again. A call that timed out may still have applied - read list_parts/get_part(summary=True) "
-        "before resending a mutation.\n"
+        "from the CURRENT (last-built) body unless params.body names the target feature; read "
+        "each cut's warning (cut_warnings: removed nothing / split a body). Sketch offsets run "
+        "along the plane normal: plane.front is -Y, plane.top +Z, plane.right +X "
+        "(cad_guide('planes')). transform targets params.body = the owning feature id (f3) or "
+        "'$N', never b<N>. asm_add_component at/rotate is a pose (world = R*part + at, degrees), "
+        "not a fit: check_interference(members=[...]) the parts you placed; touching pairs are "
+        "listed as contacts. Inside add_features the set_material op takes key; check "
+        "set_material's density_known before trusting mass. wait_job returns still_running "
+        "before the client timeout: call it again. A call that timed out may still have applied: "
+        "resend add_features with expect_revision=<revision read before the first try> (a landed "
+        "batch then returns revision_mismatch), or read list_parts/get_part(summary=True) first. "
+        "After an engine restart a doc_id can name a different part; writes to it are refused "
+        "(doc_id_reissued) - call list_parts() for your part's id. Replies over ~60 KB come back "
+        "with _truncated and a note naming the paging param; ok/error/revision are always kept. "
+        "FEA mesh refusals name mesh_size_mm (mm); in long solves read progress.summary (a fill's "
+        "sub_phase complete is not the job) and cancel only when progress.stalled.\n"
         "SCAN REFERENCES: cad_guide('scan_reference') covers embedded non-solid scans, "
         "placement, visibility and sampled deviation against the editable part.\n"
         "MODEL INTENT: edit original features, define critical dimensions and relations, "
@@ -1487,6 +1511,38 @@ if _ARG_TEACHING:
     _install_arg_teaching(mcp)
 
 
+_PROJECT_ROOT_VARS = ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT")
+
+
+def _default_project_dir_from_cwd() -> None:
+    """Use the client's working directory as the project when none is configured.
+
+    Claude Code starts stdio servers with cwd = the user's project (HERC-Rover), but sets
+    none of the project variables, so new_part could not persist, render_part(save_path=…)
+    and plm_*(".") were refused (HERC rover audit: ~141 persisted:false replies). A cwd
+    that is not a project — a drive root, the home folder, this checkout, or the Windows
+    system dir that Claude Desktop uses — is never adopted.
+    """
+    if any((os.environ.get(k) or "").strip() for k in _PROJECT_ROOT_VARS):
+        return
+    from pathlib import Path
+
+    from services.mcp import core_bridge as cb
+
+    try:
+        cwd = Path.cwd().resolve()
+        repo = cb._repo_root().resolve()
+        system = Path(os.environ.get("SystemRoot") or r"C:\Windows").resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return
+    if (cwd == Path(cwd.anchor) or cwd == home or cwd == repo or repo in cwd.parents
+            or cwd == system or system in cwd.parents):
+        return
+    os.environ["CHUDWARE_PROJECT_DIR"] = str(cwd)
+    os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = str(cwd)
+
+
 def _client_call_budget_s() -> float:
     """How long one tool call may block before the client gives up, minus headroom.
 
@@ -1842,6 +1898,7 @@ def main() -> None:
     real_stream = _install_clean_stdout()
     _install_threaded_dispatch(mcp)  # keep the event loop free for cancels/pings
     os.environ.setdefault("CHUDWARE_MCP_CALL_BUDGET_S", str(_client_call_budget_s()))
+    _default_project_dir_from_cwd()
     # Warm the core only AFTER fd 1 is redirected, so its load-time prints land in the log,
     # never on the protocol pipe.
     threading.Thread(target=_warm_core, name="chudware-warm", daemon=True).start()

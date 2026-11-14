@@ -2057,19 +2057,29 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 "parts/bracket.step+", wherever the assembly file itself lives.
         name  : component display name (default: the file stem).
         fixed : ground this component (default: the FIRST component is fixed, later ones free).
-        at    : optional [x,y,z] mm translation — a STARTING POSE for the mate solver, or a
+        at    : optional [x,y,z] translation in mm, in the ASSEMBLY (world) frame: where the
+                part file's own origin lands. A STARTING POSE for the mate solver, or a
                 MEASURED pose when you are placing without mates.
-        rotate/angle : optional axis [ax,ay,az] + degrees rotation (applied BEFORE `at`'s
-                translation). `angle` needs a `rotate` axis and `rotate` needs a nonzero
-                `angle`; a zero-length axis is refused (each used to place the component
-                wrongly and still report ok).
+        rotate/angle : optional rotation axis [ax,ay,az] (assembly frame; any nonzero
+                length — it is normalised) and `angle` in DEGREES, right-hand rule about
+                that axis through the part's own origin. Composition: the rotation is
+                applied FIRST, then `at`: world = R(rotate, angle) · p_part + at — so
+                rotating never moves where the part origin lands. The pose is absolute
+                (the component's full transform), not added to a previous one.
+                `angle` needs a `rotate` axis and `rotate` needs a nonzero `angle`; a
+                zero-length axis is refused (each used to place the component wrongly and
+                still report ok).
         Returns the new component id ("k1", "k2", ...) for use in asm_mate refs, plus
         `placement_source` ("transform" when you passed at/rotate, "mate" once a mate on this
         component solves). Provenance is saved inside the .step+ document and survives reopen.
         Use add_features with a transform feature and body:<component_id> to compose a
         measured world-space move with its placement (copy:true alone duplicates).
         Mate-owned poses refuse. set_suppressed with that component id suppresses/restores
-        it; feature ids are only valid suppression targets on part documents.
+        it; feature ids are only valid suppression targets on part documents. To rename a
+        placed component, add_features on the assembly with
+        {"op":"rename","id":"k3","name":"LeftWheel"} (or
+        {"op":"asm_edit_component","id":"k3","name":"LeftWheel"}); `name` here sets it at
+        insert time.
 
         `at`/`rotate` ARE NOT A GUESS. For INDEPENDENTLY-SOURCED parts (a wheel from one
         vendor onto a frame from another) a pose must come from ONE of:
@@ -2437,7 +2447,8 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
         cannot solve — so fix or suppress the named mate and call again.
 
         `source_status` captures the live source fingerprint match before the solve
-        refreshes it: current, stale, or not_built. `source_states` identifies changed,
+        refreshes it: current, stale, or not_built; its `sources` lists only changed or
+        open-and-unsaved component sources (`sources_total` counts all). `source_states` identifies changed,
         missing, or independently live-unsaved sources; `source_problems` lists failures.
         """
         try:
@@ -2464,7 +2475,13 @@ def register_cad_asm_tools(mcp: FastMCP) -> None:
                 out["residual_dof"] = rb["residual_dof"]
             if rep["source_problems"]:
                 out["source_problems"] = rep["source_problems"]
-            out["source_status"] = source_status
+            # Every component's current+cached fingerprints made this reply ~70 KB on a large
+            # assembly; only rows with something to act on are listed (the count stays).
+            rows = [r for r in (source_status.get("sources") or []) if isinstance(r, dict)]
+            flagged = [r for r in rows if r.get("changed") is True
+                       or (r.get("open") and r.get("dirty"))]
+            out["source_status"] = {**source_status, "sources": flagged,
+                                    "sources_total": len(rows)}
             states = source_states(d, _asm_components(d), source_status)
             if states:
                 out["source_states"] = states

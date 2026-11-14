@@ -18,3 +18,4 @@ Example B - a 20x20x10 boss sitting on top at one end, centered at [20,0,10]:
 1. Each dimension is a dim OBJECT {"value":n,"expr":null}; `at` is a plain [x,y,z] list.
 2. Without `at` the box is centered on the origin (top face at z=+height/2). Two boxes with NO `at` both center on the origin and give a plus/cross, not an L - give them different `at`, or sketch+extrude the outline.
 3. `at` is the box CENTER unless you set `centered:false` (then it is the min corner).
+4. mode "cut" subtracts from the CURRENT (most recently built) body only; a boss fuses into every body it touches; merge:false keeps a separate body. Orientation, body rules and order: cad_guide("primitives").

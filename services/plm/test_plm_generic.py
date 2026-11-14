@@ -127,7 +127,7 @@ def test_item_paths_cannot_escape_project_on_add_or_snapshot(tmp_path):
         for rel in ("../secret.txt", "shortcut.txt", str(outside)):
             with pytest.raises(VaultError, match="outside the project") as exc:
                 v.add_item(rel)
-            assert exc.value.reason == "invalid_mode"
+            assert exc.value.reason == "invalid_item"
         assert v.manifest()["items"] == []
 
         # An old or peer-supplied manifest cannot cause a content read either.
@@ -419,3 +419,51 @@ def test_add_container_via_item_add_rejected_before_other_checks(tmp_path):
                 f"expected a container add with doc_type={supplied_type!r} to be rejected"
             )
     v.close()
+
+
+def test_project_entry_summary_names_the_changed_items(tmp_path):
+    """A whole-project entry re-records every item; its summary must describe the
+    items that changed, not whichever item sorts first ("No changes."/"First version")."""
+    (tmp_path / "a_notes.txt").write_text("one")
+    (tmp_path / "b_spec.txt").write_text("two")
+    v = Vault.open(tmp_path)
+    try:
+        v.add_item("a_notes.txt")
+        v.add_item("b_spec.txt")
+        (tmp_path / "b_spec.txt").write_text("two, longer")
+        entry = v.checkpoint("edited spec")["entry"]
+        assert entry["summary"] == "b_spec.txt grew to 11 bytes."
+        assert v.history(None, 1)[0]["summary"] == entry["summary"]
+        (tmp_path / "a_notes.txt").write_text("one!")
+        (tmp_path / "b_spec.txt").write_text("two")
+        summary = v.checkpoint("both")["entry"]["summary"]
+        assert summary.startswith("2 items changed: ") and "a_notes.txt" in summary
+        assert "b_spec.txt" in summary
+        assert v.checkpoint("nothing")["entry"]["summary"] == "No changes."
+    finally:
+        v.close()
+
+
+def test_project_summary_lists_first_versions_compactly():
+    from services.plm import summarize
+
+    many = [f"First version of P{i}." for i in range(54)] + ["No changes."]
+    text = summarize.summarize_project(many)
+    assert text.startswith("54 items changed: First versions of P0, P1, P2 and 51 more")
+    edits = summarize.summarize_project(["Added Boss.", "First version of BOM.", "No changes."])
+    assert edits == "2 items changed: Added Boss; First version of BOM."
+
+
+def test_absolute_or_dotted_item_path_inside_project_is_tracked(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "spec.md").write_text("spec")
+    (tmp_path / "notes.md").write_text("notes")
+    v = Vault.open(tmp_path)
+    try:
+        spelled = str(tmp_path / "docs" / "spec.md")
+        if spelled[1:2] == ":":  # Windows: any letter case names the same file
+            spelled = spelled.upper()
+        assert v.add_item(spelled)["path"] == "docs/spec.md"
+        assert v.add_item("./notes.md")["path"] == "notes.md"
+    finally:
+        v.close()

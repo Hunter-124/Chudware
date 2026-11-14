@@ -102,3 +102,33 @@ def test_windows_spawns_the_staged_hostd_the_gui_uses():
     staged = next(i for i, p in enumerate(names) if p.endswith("dist/Chudware/chudware-hostd.exe"))
     legacy = next(i for i, p in enumerate(names) if "/host/build-win/" in p)
     assert staged < legacy
+
+
+def test_project_dir_defaults_to_a_project_cwd(monkeypatch, tmp_path):
+    for k in srv._PROJECT_ROOT_VARS:
+        monkeypatch.setenv(k, "")  # record the prior value so teardown restores it
+        monkeypatch.delenv(k)
+    project = tmp_path / "HERC-Rover"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    srv._default_project_dir_from_cwd()
+    import os
+    assert os.environ["CHUDWARE_PROJECT_DIR"] == str(project.resolve())
+    assert os.environ["CHUDWARE_PROJECT_SAVE_DIR"] == str(project.resolve())
+
+
+def test_project_dir_never_adopts_the_checkout_or_an_explicit_setting(monkeypatch, tmp_path):
+    import os
+    from services.mcp import core_bridge as cb
+
+    for k in srv._PROJECT_ROOT_VARS:
+        monkeypatch.setenv(k, "")  # record the prior value so teardown restores it
+        monkeypatch.delenv(k)
+    monkeypatch.chdir(cb._repo_root())
+    srv._default_project_dir_from_cwd()
+    assert not any(os.environ.get(k) for k in srv._PROJECT_ROOT_VARS)
+
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    srv._default_project_dir_from_cwd()
+    assert "CHUDWARE_PROJECT_DIR" not in os.environ

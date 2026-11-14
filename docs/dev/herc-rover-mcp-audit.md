@@ -60,9 +60,49 @@ not idle-exit under a parked client within 30 s); not investigated.
 | `weld_member` impossible to use | `_migrate_ref_slots` moved `params.profile` → `refs.profile` ("the engine reads geometry selectors from refs"); validation then said *both* `params.profile: required` and `refs.profile: unknown ref slot`. ≥6 failed batches; agents abandoned weldments and hand-built tubes. | `profile` excluded for `weld_member` in `_REFS_ONLY_SLOTS_TYPE_EXCLUDE` (`services/mcp/cad_doc_tools.py`). Test added. |
 | `cad_guide("cylinder")` returned the ISO 1219 hydraulic guide | Hit in ≥4 transcripts while agents were trying to learn cylinder `at`/`centered` semantics. | Alias renamed to `hydraulic_cylinder` (`cad_guide.py`); `cylinder` now reaches the primitive cheatsheet. Test added. |
 
-## Ranked findings (status as of 2026-11-13)
+## Second pass (2026-11-13, evening): the open findings below
 
-Items 1–3 are largely addressed by the root-cause fixes above; the rest remain open.
+Fixed unless noted; the findings are kept below as the record of what agents hit.
+
+- **§1 transport:** doc-id reuse after a hostd restart is refused for writes
+  (`doc_id_reissued`, core_bridge); `add_features(expect_revision=N)` makes a retry a no-op
+  (`revision_mismatch`); in-process `job-*` ids that died with their MCP server say so
+  (`job_not_in_this_process`) instead of "unknown"; a job-registry read error is reported, not
+  swallowed.
+- **§3 sizes:** every reply passes a ~60 KB budget in `tool_reply` that never drops
+  ok/error/revision and names the narrowing param; compact paged defaults for
+  `check_interference`, `measure_part`, `describe_assembly`, `get_part(summary)`,
+  `add_features`, `list_standard_parts`, `solve_mates`; `cad_guide('ops')` is a 9 KB index
+  with paged sections.
+- **§4 FEA:** mesh refusals are rephrased as MCP params in mm on every reply path (they said
+  "native -h is metres" before — wrong); multi-solid meshes report progress per solid, and a
+  fill's `sub_phase:"complete"` no longer looks like the job finishing; `stalled` needs idle
+  counters *and* idle CPU. Not exposed: mesher choice / element cap (the backend has one
+  graded-tet mesher and a memory-derived cap).
+- **§5/§6 geometry:** cut-mode features take an optional `params.body` target and warn when a
+  cut splits a body, removes nothing, or passes through a body it did not cut (contract
+  section in `contracts/feature_params.md`); transform errors name the live body owner and the
+  accepted form; a rejected batch names the edit that broke a downstream feature; `plane.front`
+  was +Y in assembly patterns (`world_axis_from_ref`) — now −Y like everywhere else; the
+  "already merged" boolean error names the feature to rebuild. Not changed: the 20 s fillet
+  validation budget (deliberate, tested policy).
+- **§7 assembly:** component rename works (`rename` on a k-id); pose semantics documented
+  (world = R·part + at, degrees, normalised axis); touching pairs are reported as contacts.
+- **§8 materials:** 13 sourced rows (AISI 4140 annealed/normalized/QT, ASTM A500 B/C round
+  and shaped, Zamak 3, generic HDPE, TPU 95A, NR and neoprene rubber, 52100) plus aliases
+  (gray cast iron, bronze, …); AISI/SAE/UNS/ASTM prefixes are stripped after exact matches;
+  `set_material` reports `density_known`, and `measure_part` warns on fallback densities.
+  MatWeb refused automated requests (HTTP 403), so every row cites a standard or datasheet.
+  Density-only rows (52100, HDPE, TPU, rubbers) still need strength data.
+- **§9 persistence:** the stdio server adopts the client's cwd as the project folder when none
+  is configured (Claude Code starts it in the project); `new_part`'s unpersisted state is one
+  warning; a part whose every feature was deleted is not autosaved over its file.
+- **§10:** STEP export read-back no longer fails for validity the source lacked, and repairs
+  read-tolerance growth before judging (`readback_tolerance_fixed`); PLM `"."`, in-project
+  paths on Windows and checkpoint summaries are fixed; the missing `cad_guide` topics exist
+  (planes, primitives, transform, regions, material, weld_member, asm_edit_component).
+
+## Ranked findings (as found)
 
 ### 1. Transport / daemon instability under parallel subagents — ~176 hard errors
 88 `Request timed out`, 50 `Server "chudware" unavailable`, 38 `Connection closed`, 43

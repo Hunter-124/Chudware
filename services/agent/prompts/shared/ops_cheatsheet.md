@@ -297,10 +297,10 @@ components into one coordinate frame for assembly (e.g. move a tail to meet the 
           each by id to its seat. Build hollow CURVED bodies with a wall-profile revolve/loft, not
           shell (shell is prismatic-only).
 
-PLANE / OFFSET CONVENTIONS (Z-up). plane.top = XY (normal +Z), plane.front = XZ (normal +Y),
+PLANE / OFFSET CONVENTIONS (Z-up). plane.top = XY (normal +Z), plane.front = XZ (normal -Y),
 plane.right = YZ (normal +X). A sketch `offset`:<mm> shifts the sketch plane ALONG that normal
-(positive = +Z on top, +Y on front, +X on right); a negative offset goes the other way. When
-sketching ON a face, `offset` lifts along that face's outward normal.
+(positive = +Z on top, -Y on front, +X on right); a negative offset goes the other way. When
+sketching ON a face, `offset` lifts along that face's outward normal. Detail: cad_guide("planes").
 
 ----------------------------------------------------------------- SKETCH OPS (append to an existing sketch feature)
 

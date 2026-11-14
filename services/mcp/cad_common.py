@@ -976,6 +976,10 @@ def _doc(doc_id: Optional[str]) -> str:
             # Naming a document explicitly IS a claim on it: record it so this process's later
             # bare calls can still resolve to it once `_CUR` is cleared or scoped away.
             claim_process_doc(resolved)
+            if _docs_named(docs, raw):
+                # Addressed by its NAME: the caller knows which part this id is now, so a
+                # re-issued id (core_bridge doc-identity guard) is not a surprise here.
+                cb.note_doc_identity(resolved, ids[resolved].get("name"), ids[resolved])
             return resolved
         if _FOREIGN_HANDLE_RE.match(raw):
             # A drawing / ECAD handle: its registry, not doc_list, is the authority on
@@ -2222,6 +2226,18 @@ def _project_save_locked(doc_id: Optional[str], name: Optional[str]) -> Optional
     else:
         raise CoreError("No native destination or project save directory",
                         code="no_project_save_dir", detail={"doc_id": doc_id})
+    emptied = (entry.get("feature_count") == 0 and not entry.get("component_count")
+               and not entry.get("mesh_reference_count") and cb.doc_content_peak(doc_id) > 0)
+    if emptied and path.is_file():
+        # Every feature was deleted from a part that had content and a file behind it. An
+        # automatic save would overwrite that file with an empty part (HERC audit: a batch
+        # of eight delete_feature ops auto-saved the empty tree over the user's file).
+        raise CoreError(
+            f"Not saved automatically: the part is now EMPTY (every feature was deleted), "
+            f"and saving would overwrite {str(path)!r}, which still holds the earlier "
+            f"version. Undo or rebuild the features, or save_part(path={str(path)!r}) to "
+            f"overwrite it with the empty part on purpose.",
+            code="empty_tree_not_persisted", detail={"doc_id": doc_id, "path": str(path)})
     r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path),
                               "if_no_human_dirty": True})
     if r.get("ok") is False:
@@ -3450,8 +3466,12 @@ def durable_job_snapshot(job_id: str) -> Optional[dict]:
     """
     try:
         st = _simjobs.status(job_id)
-    except Exception:  # noqa: BLE001 — an unreachable registry is "not our job", not a crash
-        return None
+    except Exception as exc:  # noqa: BLE001 — report the registry failure, never "unknown"
+        # Swallowing this as None turned a registry read error (Windows os.kill(pid, 0) in
+        # pid_alive) into "unknown job_id" for jobs that existed (HERC rover audit).
+        return {"kind": None, "durable": True, "job_id": job_id, "status": "error",
+                "result": None, "progress": {}, "code": "job_registry_error",
+                "error": f"simulation job registry read failed: {type(exc).__name__}: {exc}"}
     state = st.get("state")
     if state == "unknown":
         return None
@@ -3616,10 +3636,6 @@ _MATERIAL_NOT_MODELLED = {
     "316l": ("Stainless 316L", "stainless (304)", "316L yields 170 MPa vs 304's 215 MPa",
              "{'E_mpa': 193000, 'nu': 0.30, 'density_g_cm3': 8.0, 'yield_mpa': 170, "
              "'ultimate_mpa': 485}"),
-    "4140": ("Chromoly steel AISI 4140 (normalized)", "steel (A36) / 4130",
-             "4140 yields 655 MPa vs 4130's 435 and A36's 250",
-             "{'E_mpa': 205000, 'nu': 0.29, 'density_g_cm3': 7.85, 'yield_mpa': 655, "
-             "'ultimate_mpa': 1020}"),
     "a572": ("A572 Grade 50 structural steel", "steel (A36)",
              "A572-50 yields 345 MPa vs A36's 250 MPa",
              "{'E_mpa': 200000, 'nu': 0.29, 'density_g_cm3': 7.85, 'yield_mpa': 345, "
@@ -3667,7 +3683,16 @@ def _material_candidates(raw: object) -> list:
             if len(generic) == 1:                      # word order: registry spells the
                 add(" ".join(kept + generic))          # category word last
                 add(" ".join(generic + kept))          # ("grade 2 titanium")
+    if len(toks) > 1 and toks[0] in _MATERIAL_DESIGNATION_PREFIXES:
+        # "AISI 4140" == "4140". Tried only AFTER the exact spellings, so a registry alias
+        # that keeps its prefix ("ASTM A106 Grade B") still wins.
+        for c in _material_candidates(" ".join(toks[1:])):
+            add(c)
     return out
+
+
+# Standards-body prefixes a designation may carry without changing the grade.
+_MATERIAL_DESIGNATION_PREFIXES = frozenset({"aisi", "sae", "uns", "astm", "asme"})
 
 
 def _material_registry_record(name: str) -> Optional[dict]:
@@ -3678,6 +3703,22 @@ def _material_registry_record(name: str) -> Optional[dict]:
         _reraise_transport(exc)  # ... but a lost or draining engine is an outage, not a miss
         return None
     return rec if isinstance(rec, dict) else None
+
+
+def _material_registry_density(key: Optional[str]) -> Optional[float]:
+    """The registry density (g/cm3) behind a resolved material key, else None.
+
+    None means mass for that identity has no material basis: a visual-only preset, an
+    identity-only key, or a registry row that carries no density."""
+    if not key:
+        return None
+    rec = _material_registry_record(key)
+    mech = rec.get("mechanical") if isinstance(rec, dict) else None
+    density = mech.get("density_g_cm3") if isinstance(mech, dict) else None
+    if (isinstance(density, bool) or not isinstance(density, (int, float))
+            or not math.isfinite(density) or density <= 0):
+        return None
+    return float(density)
 
 
 def _material_registry_row(name: str) -> Optional[dict]:

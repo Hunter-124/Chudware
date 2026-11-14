@@ -24,12 +24,26 @@ def _prompts_dir() -> Path:
     return cb._repo_root() / "services" / "agent" / "prompts"
 
 
+def _source_prompts_dir() -> Path:
+    return cb._repo_root() / "services" / "agent" / "prompts"
+
+
 def _read_prompt(rel: str) -> str:
-    p = _prompts_dir() / rel
-    try:
-        return p.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+    # A staged dist copy can predate a sheet added in the source tree; fall back to the
+    # source prompts so a new topic is reachable before the next stage.
+    for base in (_prompts_dir(), _source_prompts_dir()):
+        try:
+            return (base / rel).read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return ""
+
+
+def _cheatsheet_names() -> list:
+    names = set()
+    for base in (_prompts_dir(), _source_prompts_dir()):
+        names.update(p.stem for p in (base / "shared" / "cheatsheets").glob("*.md"))
+    return sorted(names)
 
 
 _SIM_GUIDE = """\
@@ -1657,6 +1671,84 @@ an unchanged rejected batch or treat it as a transport problem.
 """
 
 
+# cad_guide('ops') / ('overview'): a compact, readable-in-one-call index. The full
+# compendium (~60 KB) stays reachable as 'ops_full' and in the pages below.
+_OPS_INDEX = """\
+Chudware OPERATION INDEX (C++ parametric engine). The full compendium is paged:
+  cad_guide('ops_workflow')  workflow, render/measure/save/export discipline, primitive
+                             placement, geometry query grammar (~19 KB)
+  cad_guide('ops_features')  every add_feature family with params/refs (~25 KB)
+  cad_guide('ops_sketch')    sketch ops, edit_feature, worked examples (~12 KB)
+  cad_guide('ops_vocab')     the live engine vocabulary printed below
+  cad_guide('ops_full')      all of the above in one reply (~60 KB, may exceed a client limit)
+  cad_guide('add_features')  the complete mutation reference (batch shapes, replies)
+
+LOOP: new_part(name) -> add_features([{"op":"add_feature","feature":{...}}, ...]) ->
+render_part() -> measure_part()/query_geometry() -> simulate -> export_part()/make_drawing().
+Units mm and degrees; dimensions are {"value":n,"expr":null}; "$N" names op N of the SAME call,
+"fN" a feature from get_part.
+
+FEATURE TOPICS (cad_guide(<name>)):
+  primitives (box, cylinder, sphere, cone, torus) | sketch, planes, regions |
+  extrude, revolve, loft, sweep, helix, rib, split | fillet, chamfer, shell |
+  hole, thread, pattern, mirror, transform | sheetmetal, sm_relief, weldment (weld_member),
+  surfacing | text, airfoil, hardware | material | assembly, asm_edit_component.
+  draft and standard_part are covered in cad_guide('ops_features').
+
+PITFALLS (details in the topics above):
+  - Primitives are CENTRED on `at`; centered:false puts a box corner / cylinder base at `at`.
+    A boss fuses into every body it touches; mode:"cut" subtracts from the CURRENT (last
+    built) body only; merge:false keeps a separate body. A boss that adds no material or a
+    cut that removes none is refused.
+  - plane.top/front/right pass through the origin; normals +Z / -Y / +X. A sketch `offset`
+    and a blind extrude run along that normal (plane.front goes toward -Y).
+  - A blind cut starts along the sketch normal; params.flip:true reverses it. Without flip,
+    the engine retries the other direction only when the first removes no material.
+  - Region centroid picks choose one closed-loop region, voids included: omit centroid for
+    tubes/washers (cad_guide('regions')).
+  - transform targets body:"fN" (or "$N" in the same call), never b1..bN ids or refs.body.
+  - STL export reports validation_stages and names the face and coordinates of a refused
+    facet; fix the model there (cad_guide('ops_workflow')).
+"""
+
+_OPS_SKETCH_DIVIDER = "----------------------------------------------------------------- SKETCH OPS"
+
+_MATERIAL_GUIDE = """\
+MATERIAL — engineering identity + appearance for a part or one body.
+
+set_material(material, body=None, doc_id=None, faces=None)  (the tool takes `material`)
+  material  a registry name/designation ("6061-T6", "A36", "PETG", ...) or an explicit
+            appearance {"color":[r,g,b], "metallic"?, "roughness"?} (visual only).
+  body      "b1", "b2", ... (or the ordinal) for one body; omitted = the whole part, which
+            also clears earlier per-body overrides.
+  faces     face SIDs/selectors for a visual-only colour on those faces (needs body).
+Read the reply: material_key and engineering_material_set say whether an engineering
+identity was stored; material_registry_resolved=false with a warning means the designation
+is stored but the registry has no property row (analysis needs explicit properties), and a
+name with only a visual preset changes appearance but NOT the document material. Tell the
+user before substituting another grade.
+Inside add_features the op reads `key`, not `material`:
+  {"op":"set_material","key":"<material_key>"} or with "id":"b2" for one body.
+measure_part weighs each body with its applied material; FEA tools take their own
+material input. The table below is typical values for early sizing, not a datasheet.
+"""
+
+# Topic aliases that resolve to a per-feature cheatsheet file (shared/cheatsheets/<name>.md).
+_CHEATSHEET_ALIASES = {
+    "primitive": "primitives", "sphere": "primitives", "cone": "primitives",
+    "torus": "primitives",
+    "plane": "planes", "datum_plane": "planes", "datum_planes": "planes",
+    "sketch_offset": "planes",
+    "move": "transform", "move_body": "transform", "rotate": "transform",
+    "region": "regions", "centroid": "regions", "profile": "regions",
+    "profile_regions": "regions",
+    "asm_edit_component": "asm_pose", "asm_add_component": "asm_pose",
+    "component_pose": "asm_pose", "pose": "asm_pose",
+    "weld_member": "weldment", "weld_members": "weldment", "weldments": "weldment",
+    "weld_gusset": "weldment", "weld_end_cap": "weldment",
+}
+
+
 def cad_guide_text(topic: str = "") -> str:
     topic = (topic or "").strip().lower().replace("-", "_")
     if topic == "eval_helper":
@@ -1696,12 +1788,14 @@ def cad_guide_text(topic: str = "") -> str:
                  "sketch_probe"):
         topic = "sketch"
     if not topic:
-        avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md"))
+        avail = _cheatsheet_names()
         return (
             "CAD GUIDE TOPICS — choose cad_guide(topic=...) for focused guidance.\n"
             "Modeling: edit_part, feature_history (insertion, reorder, rollback), model_history, "
-            "add_features (complete mutation reference), assembly, sketch, sketch3d, rib, split, "
-            "eq_set, sm_relief, scad, regen, overview or ops (full operation compendium).\n"
+            "add_features (complete mutation reference), assembly, asm_edit_component "
+            "(component pose), sketch, sketch3d, planes, regions (profile centroid picks), "
+            "primitives, transform, material, rib, split, eq_set, sm_relief, scad, regen, "
+            "ops (operation index; pages ops_workflow, ops_features, ops_sketch, ops_vocab).\n"
             "Review and simulation: review, gsl, evaluate, verify, simulation, stress_risers, motion.\n"
             "Engineering: intake, cam, ecad, harness, parts, reverse, reveng, video_to_part, scan_reference, splats, drawings, civil, piping, "
             "industrial, hydraulic, firmware, structural, mechanical, tolerance_stackup, "
@@ -1832,8 +1926,22 @@ def cad_guide_text(topic: str = "") -> str:
             "SCAD cannot recover native history. See contracts/doc_ops.md and the formats "
             "reference for prerequisites and portability."
         )
-    if topic in ("overview", "features", "ops", "geometry", "vocabulary", "vocab"):
+    if topic in ("overview", "features", "ops", "geometry"):
+        return _OPS_INDEX + _engine_vocabulary_block()
+    if topic in ("ops_workflow", "workflow_overview"):
+        return _OVERVIEW_HEADER
+    if topic in ("ops_features", "ops_sketch"):
+        sheet = _read_prompt("shared/ops_cheatsheet.md")
+        head, sep, tail = sheet.partition(_OPS_SKETCH_DIVIDER)
+        return head if topic == "ops_features" else (sep + tail if sep else "")
+    if topic in ("ops_vocab", "vocabulary", "vocab"):
+        return _engine_vocabulary_block().lstrip("\n")
+    if topic in ("ops_full", "ops_all"):
         return _OVERVIEW_HEADER + _read_prompt("shared/ops_cheatsheet.md") + _engine_vocabulary_block()
+    if topic in ("material", "set_material", "materials", "material_get"):
+        sheet = _read_prompt("shared/cheatsheets/materials.md")
+        return _MATERIAL_GUIDE + ("\n" + sheet if sheet else "")
+    topic = _CHEATSHEET_ALIASES.get(topic, topic)
     if topic in ("feature_history", "insert_feature", "insertion", "reorder_feature",
                  "reorder", "set_rollback", "rollback"):
         return (

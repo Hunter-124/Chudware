@@ -41,6 +41,7 @@ from .cad_common import (
     _reading_from_measure,
     _render_view_png,
     _resolve_feature_ref,
+    _material_registry_density,
     _resolve_material_density,
     _resolve_measure_target,
     _resolve_one_selector,
@@ -415,18 +416,173 @@ def _mass_warnings(mass: dict) -> list:
             out.append(f"{who}no material is applied, so 7.85 g/cm^3 (steel) was ASSUMED — mass "
                        f"and inertia scale with it; set_material(...) or pass density_g_cm3= / "
                        f"material=")
+        elif material.get("density_known") is False:
+            out.append(f"{who}material {material.get('key')!r} has no registry density (a "
+                       f"visual-only or identity-only material), so its "
+                       f"{material.get('density_g_cm3')} g/cm^3 is a FALLBACK — mass and "
+                       f"inertia are not material-backed; set_material(...) to an engineering "
+                       f"material or pass density_g_cm3=")
+
+    def _mark(material) -> None:
+        """Density provenance: an applied material key whose registry row carries no
+        density (cad_common._material_registry_density is None) is density_known:false."""
+        if (isinstance(material, dict) and material.get("key")
+                and material.get("source") not in ("explicit", "default")
+                and not material.get("unresolved_key")):
+            material["density_known"] = _material_registry_density(material["key"]) is not None
 
     bodies = [b for b in (mass.get("bodies") or []) if isinstance(b, dict)]
+    _mark(mass.get("material"))
+    for b in bodies:
+        _mark(b.get("material"))
     _material(mass.get("material"))
-    if (mass.get("material") or {}).get("mixed"):
-        for b in bodies:
-            _material(b.get("material"), f"body {b.get('body_id')}: ")
     if mass.get("warning"):
         out.append(str(mass["warning"]))
+    # Per-body warnings are grouped by message: a 650-solid import with one open shell
+    # each used to repeat the same sentence 650 times.
+    per_body: dict = {}
     for b in bodies:
+        found: list = []
+        if (mass.get("material") or {}).get("mixed"):
+            before = len(out)
+            _material(b.get("material"))
+            found.extend(out[before:])
+            del out[before:]
         if b.get("warning"):
-            out.append(f"body {b.get('body_id')}: {b['warning']}")
+            found.append(str(b["warning"]))
+        for message in found:
+            per_body.setdefault(message, []).append(b.get("body_id"))
+    for message, ids in per_body.items():
+        if len(ids) <= 3:
+            out.extend(f"body {i}: {message}" for i in ids)
+        else:
+            shown = ", ".join(str(i) for i in ids[:10]) + (", ..." if len(ids) > 10 else "")
+            out.append(f"{len(ids)} bodies ({shown}): {message}")
     return list(dict.fromkeys(out))
+
+
+_MASS_BODY_ROWS = 20
+_MASS_BODY_KEYS = ("body_id", "volume_mm3", "mass_g", "com", "surface", "closed_solid",
+                   "warning", "material")
+
+
+def _compact_mass_bodies(mass: dict, limit: int, offset: int) -> dict:
+    """`mass` with `bodies[]` paged heaviest-first and cut to the core per-body fields.
+
+    A document with at most `limit` bodies (and offset 0) is returned unchanged. Larger ones
+    keep totals untouched and get `bodies_page` (paging), `bodies_by_material` (count, mass
+    and volume per density source) and `open_body_ids`; a body's inertia/principal axes come
+    from measure_part(body_id=N)."""
+    bodies = [b for b in (mass.get("bodies") or []) if isinstance(b, dict)]
+    if not bodies or (offset == 0 and len(bodies) <= limit):
+        return mass
+    ordered = sorted(bodies, key=lambda b: -float(b.get("mass_g") or 0.0))
+    page = ordered[offset:offset + limit]
+    out = dict(mass)
+    out["bodies"] = [{k: b[k] for k in _MASS_BODY_KEYS if k in b} for b in page]
+    out["bodies_page"] = {
+        "offset": offset, "limit": limit, "total": len(bodies), "order": "mass_desc",
+        "next_offset": offset + limit if offset + limit < len(bodies) else None,
+        "omitted_fields": "inertia, principal_moments, principal_axes — "
+                          "measure_part(body_id=N) for one body"}
+    groups: dict = {}
+    for b in bodies:
+        mat = b.get("material") if isinstance(b.get("material"), dict) else {}
+        key = (mat.get("key"), mat.get("source"), mat.get("density_g_cm3"))
+        g = groups.setdefault(key, {"key": key[0], "source": key[1], "density_g_cm3": key[2],
+                                    "bodies": 0, "mass_g": 0.0, "volume_mm3": 0.0})
+        g["bodies"] += 1
+        g["mass_g"] += float(b.get("mass_g") or 0.0)
+        g["volume_mm3"] += float(b.get("volume_mm3") or 0.0)
+    out["bodies_by_material"] = sorted(groups.values(), key=lambda g: -g["mass_g"])
+    open_ids = [b.get("body_id") for b in bodies if b.get("closed_solid") is False]
+    if open_ids:
+        out["open_body_ids"] = open_ids[:50]
+        out["open_body_count"] = len(open_ids)
+    return out
+
+
+# --------------------------------------------------------------------------- interference
+_TOUCH_MM = 1e-6  # the engine's coincident tolerance (include_coincident)
+_CLEARANCE_ROWS = 20
+_PARTS_ROWS = 30
+
+
+def _gap_of(row: Any) -> float:
+    if isinstance(row, dict):
+        for key in ("distance", "distance_lower_bound_mm"):
+            if isinstance(row.get(key), (int, float)):
+                return float(row[key])
+    return math.inf
+
+
+def promote_touching(res: dict) -> None:
+    """Move exactly-touching clearances (measured distance <= 1e-6 mm) into `contacts`.
+
+    Without include_coincident the engine files a face-to-face touch as a 0.00 mm clearance
+    and the verdict read "No interference" with contacts: [] — the touching pair was
+    invisible. Approximate/lower-bound rows are never promoted: they are not measured."""
+    keep, moved = [], []
+    for row in res.get("clearances") or []:
+        if (isinstance(row, dict) and isinstance(row.get("distance"), (int, float))
+                and not row.get("approx") and row["distance"] <= _TOUCH_MM):
+            moved.append({**row, "touching": True})
+        else:
+            keep.append(row)
+    if moved:
+        res["clearances"] = keep
+        res["contacts"] = list(res.get("contacts") or []) + moved
+
+
+def touching_note(res: dict) -> str:
+    """Summary sentence naming the touching pairs, or "" when there are none.
+
+    Contacts are touching by definition; a 0-distance measured clearance (kept there by
+    include_coincident=False) is named too."""
+    rows = [(c, "contacts") for c in (res.get("contacts") or []) if isinstance(c, dict)]
+    rows += [(c, "clearances") for c in (res.get("clearances") or [])
+             if isinstance(c, dict) and not c.get("approx")
+             and isinstance(c.get("distance"), (int, float)) and c["distance"] <= _TOUCH_MM]
+    if not rows:
+        return ""
+    names = ", ".join(f"{c.get('a')}<->{c.get('b')}" for c, _ in rows[:5])
+    more = f" and {len(rows) - 5} more" if len(rows) > 5 else ""
+    where = " and ".join(dict.fromkeys(w for _, w in rows))
+    return (f" {len(rows)} pair(s) TOUCH (0 mm gap, face contact — not interference): "
+            f"{names}{more}; see {where}.")
+
+
+def compact_interference(res: dict, *, clearance_limit: int = _CLEARANCE_ROWS,
+                         clearance_offset: int = 0,
+                         include_parts: Optional[bool] = None) -> dict:
+    """An eval_interference report sized for a reply.
+
+    interferences, contacts and failures stay complete. `clearances` is unchanged when it
+    has at most `clearance_limit` rows (and offset 0); otherwise it becomes one page sorted
+    tightest-first with `clearances_page`. `clearance_violations` always lists every
+    below/within-tolerance row and `clearances_total` counts all. `parts` is kept when
+    include_parts is True, or None with at most 30 parts; else trimmed (None) or removed
+    (False), with `parts_total`."""
+    out = dict(res)
+    rows = list(res.get("clearances") or [])
+    out["clearances_total"] = len(rows)
+    out["clearance_violations"] = [
+        r for r in rows if isinstance(r, dict)
+        and r.get("clearance_status") in ("below", "within_tolerance")]
+    if clearance_offset or len(rows) > clearance_limit:
+        ordered = sorted(rows, key=_gap_of)
+        end = clearance_offset + clearance_limit
+        out["clearances"] = ordered[clearance_offset:end]
+        out["clearances_page"] = {"offset": clearance_offset, "limit": clearance_limit,
+                                  "order": "tightest first",
+                                  "next_offset": end if end < len(rows) else None}
+    parts = list(res.get("parts") or [])
+    out["parts_total"] = len(parts)
+    if include_parts is False:
+        out.pop("parts", None)
+    elif include_parts is None and len(parts) > _PARTS_ROWS:
+        out["parts"] = parts[:_PARTS_ROWS]
+    return out
 
 
 _THINNEST_FACES = 3
@@ -934,7 +1090,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     def query_geometry(query: Optional[Union[str, dict]] = None,
                        doc_id: Optional[str] = None,
                        owner: Optional[str] = None, feature: Optional[str] = None,
-                       offset: int = 0, page_size: int = 100,
+                       offset: int = 0, page_size: int = 50,
                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.
 
@@ -974,7 +1130,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         faces/edges are considered, BEFORE side, pick, near, count and index. This is
         engine attribution, which may include geometry regenerated by a boolean, not
         necessarily only geometry created by the feature. offset/page_size page results
-        (default 100, maximum 100). count remains a geometric selection cap.
+        (default 50, maximum 100; next_offset is the next page's offset, null on the last).
+        count remains a geometric selection cap.
         Shared SIDs are reported in ambiguous_sids; never assume a SID uniquely identifies
         geometry when it is listed there.
 
@@ -1558,6 +1715,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def measure_part(doc_id: Optional[str] = None, density_g_cm3: Optional[float] = None,
                      body_id: Optional[int] = None,
+                     body_limit: int = _MASS_BODY_ROWS, body_offset: int = 0,
                      **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.
 
@@ -1567,7 +1725,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         7.85 g/cm^3 steel, and then the top-level `warnings` says so (never silent).
         `mass.material` names the density and its `source` (body_material | document_material |
         component_material | default | explicit; `per_body` with `mixed:true` when bodies
-        differ). density_g_cm3 overrides every body for this readout. It is also accepted as
+        differ). An applied material whose registry entry carries no density (visual-only or
+        identity-only) is marked `density_known: false` and named in `warnings`: its density
+        is a fallback, not material-backed. density_g_cm3 overrides every body for this readout. It is also accepted as
         density= / density_g_cc= / material_density= / rho=, or as a NAME: material="aluminum"
         resolves its registry density, including density-only and orthotropic records. The
         density is g/cm^3 and a value above 25 (osmium, the densest element, is 22.6) is
@@ -1584,7 +1744,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         For multi-body docs these are the COMBINED total of ALL bodies (about the combined
         centre of mass), and `mass.bodies[]` lists each body's own properties (with
         `mass.body_count`). body_id=N (1-based, an entry of mass.bodies[]) measures just that
-        one physical solid.
+        one physical solid. With more than body_limit bodies (default 20), mass.bodies[] is
+        one page, heaviest first, of {body_id, volume_mm3, mass_g, com, material, ...}
+        without per-body inertia (`mass.bodies_page`; the next page is
+        body_offset=next_offset), plus `mass.bodies_by_material` (count/mass/volume per
+        density source) and `mass.open_body_ids`; totals always cover every body. Per-body
+        warnings repeated by more than three bodies are grouped into one line.
 
         Whole-part wall thickness is also accepted only under exact intent spellings — e.g.
         `measure_part(kind="thickness")` or `measure_part(what="wall thickness")` routes to
@@ -1673,7 +1838,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         f"first lists the candidates and their sids, and describe_part(doc_id) "
                         f"gives the part's bbox plus the named face/edge roster.")
             _reject_unknown("measure_part", extra,
-                            "it takes doc_id=, body_id= and density_g_cm3= only.")
+                            "it takes doc_id=, body_id=, density_g_cm3=, body_limit= and "
+                            "body_offset= only.")
+            for label, value, low in (("body_limit", body_limit, 1),
+                                      ("body_offset", body_offset, 0)):
+                if isinstance(value, bool) or not isinstance(value, int) or value < low:
+                    raise ValueError(f"measure_part: {label} must be an integer >= {low}.")
             if body_id is not None and (isinstance(body_id, bool) or not isinstance(body_id, int)
                                         or body_id < 1):
                 raise ValueError(
@@ -1690,10 +1860,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             if body_id is not None:
                 params["body"] = body_id
             mass = cb.call("eval_mass", params)
+            warnings = _mass_warnings(mass)
+            mass = _compact_mass_bodies(mass, body_limit, body_offset)
             out = {"ok": True, "doc_id": d, "mass": mass}
             if "volume_mm3" in mass:
                 out["volume_mm3"] = mass["volume_mm3"]
-            warnings = _mass_warnings(mass)
             # eval_check inspects the last compiled body, not all physical solids; its body
             # numbering differs from eval_mass's exploded solids. State its scope explicitly.
             if body_id is None:
@@ -1999,6 +2170,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                            min_clearance_mm: Optional[float] = None,
                            members: Optional[list[str]] = None,
                            clearance_mode: Literal["exact", "threshold"] = "exact",
+                           clearance_limit: int = _CLEARANCE_ROWS,
+                           clearance_offset: int = 0,
+                           include_parts: Optional[bool] = None,
                            **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?
 
@@ -2018,9 +2192,19 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         Omit or pass [] to check all members. A scoped result does not
         verify placement of the rest of the document; scope and pair counts are explicit.
 
-        include_coincident: also classify near-zero-clearance face-touching pairs (distance
+        include_coincident: classify near-zero-clearance face-touching pairs (distance
         <= 1e-6 mm) as `contacts` entries instead of clearances — the "coincident faces" case
         SolidWorks flags separately (two parts touching exactly, not overlapping or gapped).
+        Omitted, a MEASURED touching gap is still moved to `contacts` (touching=true) and the
+        summary names the touching pairs; include_coincident=False keeps them as 0 mm
+        clearances (still named in the summary).
+
+        Reply size: interferences, contacts and failures are always complete, and
+        `clearance_violations` lists every below/within-tolerance pair. `clearances` is
+        complete up to clearance_limit rows (default 20); past that it is one page sorted
+        tightest-first (`clearances_page`, next page with clearance_offset=next_offset) and
+        `clearances_total` counts all. `parts` is listed up to 30 entries
+        (include_parts=True lists all, False omits it); `parts_total` counts them.
         min_clearance_mm: compare clearances against this minimum. Measured pairs report
         clearance_status="below"|"within_tolerance"|"above" and clearance_tolerance_mm.
         A gap within the band is not a definite pass or violation. Also accepted as
@@ -2028,7 +2212,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         include_coincident= as coincident= / include_contacts= (echoed in `interpreted`).
 
         Returns {ok, clear, complete, clearance_mode, summary, pairs_checked, pairs_total,
-        parts:[{name,bbox,volume}], interferences:[{a,b,volume}], clearances, contacts}.
+        parts:[{name,bbox,volume}], interferences:[{a,b,volume}], clearances, contacts,
+        clearance_violations, clearances_total, parts_total}.
         Pairs resolved with a fuzzy Boolean fallback have method="fallback_fuzzy_common",
         "fallback_fuzzy_cut", or "fallback_fuzzy_common_and_cut", approximate=true and
         fuzzy_tolerance_mm; their overlap classification and volume are approximate.
@@ -2079,9 +2264,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             include_coincident = bool(coincident)
             if clearance_mode not in ("exact", "threshold"):
                 raise ValueError("check_interference: clearance_mode must be 'exact' or 'threshold'.")
+            for label, value, low in (("clearance_limit", clearance_limit, 1),
+                                      ("clearance_offset", clearance_offset, 0)):
+                if isinstance(value, bool) or not isinstance(value, int) or value < low:
+                    raise ValueError(f"check_interference: {label} must be an integer >= {low}.")
             _reject_unknown("check_interference", extra,
-                            "it takes doc_id=, include_coincident=, min_clearance_mm=, members= "
-                            "and clearance_mode='exact'|'threshold'.")
+                            "it takes doc_id=, include_coincident=, min_clearance_mm=, members=, "
+                            "clearance_mode='exact'|'threshold', clearance_limit=, "
+                            "clearance_offset= and include_parts=.")
             d = _doc(doc_id)
             if members:
                 bodies = cb.call("asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies", [])
@@ -2113,6 +2303,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # ok = the check ran to completion; clear = the complete check found no overlap.
             # Interference is a finding, so it never makes the tool call fail.
             complete = res.get("complete") is True
+            if coincident is None:
+                promote_touching(res)
+            touching = touching_note(res)
+            res = compact_interference(res, clearance_limit=clearance_limit,
+                                       clearance_offset=clearance_offset,
+                                       include_parts=include_parts)
             out = {**res, "ok": complete, "doc_id": d,
                    "clear": complete and not res.get("interferences")}
             if complete and res.get("interferences"):
@@ -2120,6 +2316,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                   "change the bodies, then run check_interference again.")
             elif not complete and not res.get("reason"):
                 out["error"] = res.get("summary") or "Interference check incomplete."
+            if touching and complete:
+                out["summary"] = str(out.get("summary") or "") + touching
             return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "check_interference()"))

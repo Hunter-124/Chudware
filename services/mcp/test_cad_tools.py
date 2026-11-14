@@ -2390,7 +2390,11 @@ def test_dogfood_truthful_mutation_feedback(tmp_path, monkeypatch):
         assert split["body_count_basis"] == "physical_solids"
         assert split["changes"]["preexisting_warnings"], split
         assert "clamped to a through hole" not in split["changes"]["summary"], split
-        assert not split["changes"].get("new_warnings"), split
+        # The only new warning is the engine's cut-split notice: this cut deliberately
+        # divides the body, and agents must be told when a cut does that.
+        new_warnings = split["changes"].get("new_warnings") or []
+        assert [w.get("id") for w in new_warnings] in ([], ["f4"]), split
+        assert all("split body" in w.get("warning", "") for w in new_warnings), split
 
         # A face split/thread may change the number of concave faces without creating
         # any physical holes; this wording must hold even if total face count is unchanged.
@@ -3327,7 +3331,8 @@ def test_add_features_attaches_overlap_warnings():
 def test_check_interference_include_coincident_contacts():
     """include_coincident classifies exactly-touching bodies as `contacts` (the SolidWorks
     'coincident faces' case) instead of burying them in clearances; without the flag the
-    same pair reports as a 0-distance clearance."""
+    same pair is still promoted to a contact (touching=true), and include_coincident=False
+    keeps it a 0-distance clearance; either way the summary names the touching pair."""
     r, _ = _call("new_part", {"name": "touch"})
     doc = r["doc_id"]
     _call("add_features", {"doc_id": doc, "ops": [
@@ -3343,10 +3348,18 @@ def test_check_interference_include_coincident_contacts():
     assert ci["contacts"][0]["distance"] <= 1e-6, ci
     assert ci["clearances"] == [], ci  # the pair moved out of clearances
 
-    ci2, _ = _call("check_interference", {"doc_id": doc})
+    assert "TOUCH" in ci["summary"], ci
+
+    default, _ = _call("check_interference", {"doc_id": doc})
+    assert default["ok"] is True and default["clearances"] == [], default
+    assert len(default["contacts"]) == 1 and default["contacts"][0]["touching"], default
+    assert "TOUCH" in default["summary"] and "see contacts" in default["summary"], default
+
+    ci2, _ = _call("check_interference", {"doc_id": doc, "include_coincident": False})
     assert ci2["ok"] is True, ci2
     assert ci2["contacts"] == [], ci2
     assert len(ci2["clearances"]) == 1 and ci2["clearances"][0]["distance"] <= 1e-6, ci2
+    assert "see clearances" in ci2["summary"], ci2
 
 
 def test_render_part_caption_pairs_image_with_text():
@@ -3532,8 +3545,10 @@ def _build_rotated_slider_assembly(tmp_path) -> tuple:
 
 @pytest.mark.parametrize("line_source", [
     "authored", "authored_parallel", "authored_placed", "authored_tilted", "authored_near_axis", "pin_reference"])
-def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
+def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source, monkeypatch):
     """An angle-only rear plate folds about the FRONT pin, not a guessed origin axis."""
+    # Every frame is checked; the MCP reply budget would trim the trajectory list.
+    monkeypatch.setenv("CHUDWARE_MCP_REPLY_BUDGET", "0")
     point = [31.0, 17.0, 23.0]
     axis = [0, 1, 0]
     invariant_axis = "y"

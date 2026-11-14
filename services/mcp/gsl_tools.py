@@ -32,6 +32,7 @@ from services.mcp.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
                                    placement_source_of, placement_warnings, require_list)
 from services.mcp.cad_asm_tools import resolve_component_source, source_states
 from services.mcp.cad_tools import _doc, _dumps, _err
+from services.mcp.cad_eval_tools import compact_interference
 from services.mcp.fit_narration import _format_fit  # single home; loop.py shares it
 
 
@@ -1300,7 +1301,14 @@ def _component_sources(doc_id: str) -> tuple:
     return base, rows
 
 
-def _describe_assembly_text(doc_id: str) -> str:
+_DESCRIBE_ROWS = 40          # bodies/components per describe_assembly page
+_DESCRIBE_CLEARANCES = 10    # clearance rows kept in the compact fit
+_DESCRIBE_LINES = 10         # per-section warning lines narrated before "... N more"
+_BODY_ROW_KEYS = ("body_id", "name", "component", "bbox", "placement_source")
+
+
+def _describe_assembly_text(doc_id: str, *, offset: int = 0, limit: int = _DESCRIBE_ROWS,
+                            detail: bool = False) -> str:
     """Narrate world placement, the mate-solve verdict, and collision-only fit.
 
     Captures assembly source status before asm_world_bodies can refresh it, then calls
@@ -1338,9 +1346,12 @@ def _describe_assembly_text(doc_id: str) -> str:
     doc_kind = "multi-body part" if is_multi else "assembly"
     lines = [f'Assembly "{doc_id}" — {n} component(s) / bod(y/ies) [{doc_kind}]']
 
-    # 2. Per-body placement narrative
+    # 2. Per-body placement narrative — one page of it: a 650-solid part narrated every body
+    #    (and its source ordinals) into a ~1 MB reply the client refused.
+    shown = bodies if detail else bodies[offset:offset + limit]
+    end = offset + len(shown)
     lines.append("\nComponent placement (world frame):")
-    for b in bodies:
+    for b in shown:
         name = b.get("name") or b.get("component") or "?"
         bbox = b.get("bbox") or {}
         bmin = bbox.get("min", [None, None, None])
@@ -1363,6 +1374,10 @@ def _describe_assembly_text(doc_id: str) -> str:
         psrc_txt = f", placed by {psrc}" if psrc else ""
         lines.append(f"  {name}: {size_txt}, {origin_txt}{psrc_txt}  "
                      f"(source: asm_world_bodies)")
+    if not detail and len(shown) < n:
+        lines.append(f"  (bodies {offset + 1 if shown else offset}-{end} of {n}"
+                     + (f"; describe_assembly(offset={end}) for the next page)" if end < n
+                        else ")"))
 
     # 2b. Component sources: the stored path and the absolute file the engine opens.
     components: list = []
@@ -1376,15 +1391,20 @@ def _describe_assembly_text(doc_id: str) -> str:
                          f"{source_base or 'no folder (no file and no project folder)'}. "
                          "To insert the same file into another assembly, use "
                          "components[].source_resolved as source.path.")
-        for c in unresolved:
+        for c in unresolved[:_DESCRIBE_LINES]:
             lines.append(f"  WARNING {c['name'] or c['id']}: the relative source "
                          f"{c['source']['path']!r} has no base folder. Give an absolute path.")
+        if len(unresolved) > _DESCRIBE_LINES:
+            lines.append(f"  ... {len(unresolved) - _DESCRIBE_LINES} more unresolved sources")
     states = source_states(doc_id, components, source_status) if not is_multi else []
     if not is_multi:
         lines.append(f"\nAssembly source status before refresh: {source_status.get('status')}")
-    for state in states:
+    for state in states[:_DESCRIBE_LINES]:
         lines.append(f"\nComponent source {state['component']}: {state['state']} "
                      f"({state['source']})")
+    if len(states) > _DESCRIBE_LINES:
+        lines.append(f"\n... {len(states) - _DESCRIBE_LINES} more component source states "
+                     "(source_states lists them)")
 
     # 3. Solve/DOF summary, including solved-pose freedom beside mechanism mobility.
     try:
@@ -1431,6 +1451,11 @@ def _describe_assembly_text(doc_id: str) -> str:
         and not if_r.get("error")
         and (if_r.get("ok") is True or bool(if_r.get("interferences")))
     )
+    if not detail:
+        # Every N(N-1)/2 clearance row (each narrated as a line) and the parts list were most
+        # of a 1 MB reply; keep the findings and counts, not the passing pairs.
+        if_r = compact_interference(if_r, clearance_limit=_DESCRIBE_CLEARANCES,
+                                    include_parts=False)
     if complete:
         lines.append("\n" + _format_fit(if_r))
         if checked == 0:
@@ -1446,6 +1471,10 @@ def _describe_assembly_text(doc_id: str) -> str:
             lines.append(f"  Pair failure: {failure}")
         if if_r.get("error"):
             lines.append(f"  Fit error: {if_r['error']}")
+    if if_r.get("clearances_page"):
+        lines.append(f"  ({if_r['clearances_total']} clearance pairs; the "
+                     f"{len(if_r.get('clearances') or [])} tightest listed — "
+                     "check_interference pages them all)")
     lines.append(f"  Pair coverage: {checked if checked is not None else 'unknown'} checked / "
                  f"{total if total is not None else 'unknown'} total.")
     lines.append("  Collision-only threshold check; minimum measured gap is not available.")
@@ -1458,13 +1487,25 @@ def _describe_assembly_text(doc_id: str) -> str:
 
     lines.append("\n(Source: asm_world_bodies pre-solve placement snapshot; doc_solve_mates "
                  "live solve; eval_interference live threshold classification and overlap volumes)")
-    out = {"ok": True, "text": "\n".join(lines), "bodies": bodies,
-           "components": components, "component_source_base": source_base,
+    out = {"ok": True, "text": "\n".join(lines),
+           "bodies": shown if detail else [{k: b[k] for k in _BODY_ROW_KEYS if k in b}
+                                           for b in shown],
+           "components": components if detail else components[offset:offset + limit],
+           "component_source_base": source_base,
            "fit": if_r,
            "collision_free": complete and checked > 0 and if_r.get("ok") is True
            and not if_r.get("interferences")}
+    if not detail:
+        out["page"] = {"offset": offset, "limit": limit, "bodies_total": n,
+                       "components_total": len(components),
+                       "next_offset": (offset + limit
+                                       if offset + limit < max(n, len(components)) else None)}
     if not is_multi:
-        out["source_status"] = source_status
+        rows = [r for r in (source_status.get("sources") or []) if isinstance(r, dict)]
+        out["source_status"] = source_status if detail else {
+            **source_status, "sources_total": len(rows),
+            "sources": [r for r in rows
+                        if r.get("changed") is True or (r.get("open") and r.get("dirty"))]}
     if states:
         out["source_states"] = states
     if not complete:
@@ -2882,7 +2923,8 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- narration (assembly/board/project)
 
     @mcp.tool()
-    def describe_assembly(doc_id: Optional[str] = None) -> str:
+    def describe_assembly(doc_id: Optional[str] = None, offset: int = 0,
+                          limit: int = _DESCRIBE_ROWS, detail: bool = False) -> str:
         """Compact narrative of an assembly (or multi-body part) — world placement, fit/clearance,
         and mate solve summary. Use INSTEAD of dumping asm_world_bodies JSON.
 
@@ -2902,9 +2944,19 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         `source_resolved`, the absolute path of the file the engine opens. A relative stored
         path is relative to `component_source_base`. To insert the same file into another
         assembly, use `source_resolved` as `source.path`.
+
+        Compact by default: `bodies` (name, component, world bbox, placement_source) and
+        `components` are one page of `limit` rows (default 40) from `offset` (`page` says
+        the totals and next_offset), and `fit` keeps interferences, contacts, failures and
+        counts with at most 10 clearance rows (tightest first) and no parts list.
+        detail=True returns every body/component row and the raw fit report.
         """
         try:
-            return _describe_assembly_text(_doc(doc_id))
+            for label, value, low in (("offset", offset, 0), ("limit", limit, 1)):
+                if isinstance(value, bool) or not isinstance(value, int) or value < low:
+                    raise ValueError(f"describe_assembly: {label} must be an integer >= {low}.")
+            return _describe_assembly_text(_doc(doc_id), offset=offset, limit=limit,
+                                           detail=bool(detail))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

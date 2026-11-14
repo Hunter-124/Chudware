@@ -190,9 +190,11 @@ def test_fea_fill_guard_names_available_mesh_parameters(monkeypatch):
     monkeypatch.setattr(sim, "_run_solve", fail)
     out = _call("run_fea_static", fixtures=[], loads=[])
     assert out["ok"] is False
-    assert native in out["error"]
-    assert "mesh_size_mm" in out["error"] and "min_size_mm" in out["error"]
-    assert "not MCP arguments" in out["error"] and "under-resolved" in out["error"]
+    assert "geometry fill-stage guard failed at h=0.01" in out["error"]
+    assert "-h" not in out["error"].replace("CLI's -h", "")
+    assert "--max-elems" not in out["error"]
+    assert "Reduce mesh_size_mm" in out["error"] and "min_size_mm" in out["error"]
+    assert "not tool arguments" in out["error"] and "under-resolved" in out["error"]
 
 
 def test_query_geometry_names_a_stale_sid(bored_cube):

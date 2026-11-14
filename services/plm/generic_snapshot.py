@@ -68,6 +68,33 @@ def _sha(data: bytes) -> str:
 def _raise_walk_error(error: OSError) -> None:
     raise error
 
+def project_relative(root: Path, raw: str) -> str:
+    """The project-relative POSIX spelling of an item path supplied by a caller.
+
+    Agents pass the absolute path of a file they can see; inside the project (in any
+    separator or, on Windows, letter-case spelling, or through the resolved project
+    folder) it becomes relative. Leading "./" is dropped. Anything else is returned
+    unchanged for contained_path to judge, so escapes are still refused there.
+    """
+    text = str(raw or "").strip()
+    if Path(text).is_absolute() or PureWindowsPath(text).drive:
+        lexical = Path(os.path.normpath(os.path.expanduser(text)))
+        real_root = root.resolve()
+        for base in (Path(os.path.normpath(os.path.abspath(root))), real_root):
+            if lexical == base:
+                return "."  # the project folder itself: refused as an invalid item path
+            if lexical.is_relative_to(base):
+                real = lexical.resolve()  # the on-disk spelling (letter case)
+                if real != real_root and real.is_relative_to(real_root):
+                    return real.relative_to(real_root).as_posix()
+                return lexical.relative_to(base).as_posix()  # contained_path judges it
+        return text
+    text = text.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
 def contained_path(root: Path, rel: str) -> Path:
     """Reject traversal, reserved control paths and symlink escapes."""
     from services.plm.vault import VaultError

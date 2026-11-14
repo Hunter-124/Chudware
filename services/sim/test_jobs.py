@@ -392,7 +392,8 @@ def test_fill_heartbeat_retains_measured_progress(isolated_registry, capsys, mon
     assert all(row["phase"] == "mesh_interface_band_fill" and row["elements"] == 128
                for row in lines[2:])
     assert {k: v for k, v in lines[-1].items()
-            if k not in ("partial", "_last_advance_monotonic")} == {
+            if k not in ("partial", "_last_advance_monotonic",
+                         "_last_cpu_active_monotonic")} == {
                 k: v for k, v in observed.items() if k != "stalled"}
 
 

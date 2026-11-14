@@ -24,13 +24,18 @@ The JSON writer itself is one function; every place the conventions disagree
 about ``indent`` / ``sort_keys`` / ``default`` is an argument to it, not a fork.
 :func:`dumps` is also the shared reply path that stamps ``engine: "private"`` onto a reply
 while the process is served by a private in-process engine (see :func:`stamp_engine`).
+:func:`tool_reply` (every registered tool's reply, via ``tool_registry._guard``) also keeps a
+JSON reply under :func:`reply_budget` characters (:func:`shrink_reply`).
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
-from typing import Any, Callable, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Callable, Iterator, Optional
 
 _CODE_TOKEN = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -86,20 +91,192 @@ def normalize_error(payload: Any) -> Any:
     return result
 
 
-def tool_reply(value: Any) -> Any:
-    """Normalize tool refusals and add private-engine disclosure without changing schema."""
+def tool_reply(value: Any, tool: str = "") -> Any:
+    """Normalize tool refusals, add private-engine disclosure, and keep the reply readable.
+
+    A JSON reply (a ``dict`` or a JSON-object ``str``) larger than :func:`reply_budget` is
+    shrunk by :func:`shrink_reply` — MCP clients refuse a result past ~25k tokens, and an
+    unreadable mutation reply hides whether the edit committed. Non-JSON text, lists
+    ([image, caption]) and model objects pass through untouched.
+    """
+    budget = reply_budget()
     if isinstance(value, dict):
-        return stamp_engine(normalize_error(value))
+        result = stamp_engine(normalize_error(value))
+        return shrink_reply(result, budget, tool) or result
     if isinstance(value, str) and value.lstrip().startswith("{"):
+        oversized = bool(budget) and len(value) > budget
         try:
             parsed = json.loads(value)
         except (ValueError, TypeError):
             return value
         if isinstance(parsed, dict):
             result = stamp_engine(normalize_error(parsed))
+            if oversized:
+                shrunk = shrink_reply(result, budget, tool)
+                # Whitespace alone may be the overflow (indent=2 on a deep reply): the
+                # compact form then carries every byte of data and needs no note.
+                return json.dumps(shrunk or result, ensure_ascii=False, default=str,
+                                  separators=(",", ":"))
             if result is not parsed:
                 return json.dumps(result, ensure_ascii=False)
     return value
+
+
+# --------------------------------------------------------------------------- reply budget
+# Claude Code refuses a tool result past ~25k tokens ("exceeds maximum allowed tokens") and
+# the agent then sees nothing — fatal for a mutation, whose reply says whether it committed.
+# Every tool reply passes through tool_reply (tool_registry._guard), so this is the one
+# place that guarantees a readable reply. Tool-specific compaction (measure_part,
+# check_interference, describe_assembly, ...) still owns the useful default shape; this is
+# the safety net for whatever a tool did not anticipate.
+REPLY_BUDGET_ENV = "CHUDWARE_MCP_REPLY_BUDGET"
+DEFAULT_REPLY_BUDGET = 60_000  # characters of compact JSON (~15-20k tokens)
+
+# Top-level keys the net never drops: the verdict, identity and revision of the reply.
+# Scalars stay verbatim; containers under them are only capped generously.
+_PROTECTED_KEYS = frozenset({
+    "ok", "error", "code", "reason", "hint", "detail", "doc_id", "revision", "name",
+    "body_count", "volume_mm3", "mass_g", "summary", "warnings", "still_running", "job_id",
+    "status", "state", "complete", "clear", "converged", "collision_free", "dof",
+    "total_count", "next_offset", "offset", "page_size", "count", "interpreted", "engine",
+    "engine_warning", "truncated", "_truncated",
+})
+
+# (items kept per list, characters kept per string), tried in order until the reply fits.
+_SHRINK_STEPS = ((50, 4000), (20, 2000), (10, 1000), (5, 400), (3, 200), (1, 120), (0, 80))
+_MAP_KEYS_CAP = 64  # a dict with more keys than this is a map (id -> row), not a record
+
+# How to see the rest, per tool: the narrowing parameter the agent should use.
+_NARROW_HINTS = {
+    "check_interference": "scope with members=[...], page clearances with clearance_limit= / "
+                          "clearance_offset=, include_parts=True for the parts list",
+    "measure_part": "measure_part(body_id=N) for one body; body_limit= / body_offset= page "
+                    "mass.bodies (heaviest first)",
+    "describe_assembly": "describe_assembly(offset=, limit=) pages bodies/components; "
+                         "check_interference(members=[...]) for a scoped fit",
+    "get_part": "get_part(summary=True), describe_part(), or inspect_feature(<id>) for one "
+                "feature",
+    "add_features": "ok/revision/body_count above are authoritative for whether the batch "
+                    "committed; read get_part(summary=True) to verify and send smaller batches",
+    "cad_guide": "ask for a focused topic, e.g. cad_guide('<feature_type>'), not 'ops'",
+    "query_geometry": "page with offset= / page_size=, or tighten the query "
+                      "(side/surf/near/count)",
+    "list_standard_parts": "list_standard_parts(family=<key>) lists one family's sizes",
+    "solve_mates": "list_world_bodies() for placements",
+    "wait_job": "read the finished job's result with the domain reader (sim_results / "
+                "describe_results) instead of the raw job record",
+    "get_job": "read the finished job's result with the domain reader (sim_results / "
+               "describe_results) instead of the raw job record",
+}
+
+
+_FULL_REPLIES: ContextVar[bool] = ContextVar("chudware_full_replies", default=False)
+
+
+@contextmanager
+def full_replies() -> Iterator[None]:
+    """Turn the reply budget off for calls in this context.
+
+    The OMP host-tool projection (services/agent/omp_tools) bounds results itself and
+    spills the complete JSON to a file the agent can load, so it must receive the full
+    reply; this net is for MCP clients, which have no such recovery."""
+    token = _FULL_REPLIES.set(True)
+    try:
+        yield
+    finally:
+        _FULL_REPLIES.reset(token)
+
+
+def reply_budget() -> int:
+    """The reply budget in characters; ``CHUDWARE_MCP_REPLY_BUDGET=0`` disables the net,
+    and so does :func:`full_replies`."""
+    if _FULL_REPLIES.get():
+        return 0
+    raw = os.environ.get(REPLY_BUDGET_ENV, "").strip()
+    if not raw:
+        return DEFAULT_REPLY_BUDGET
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_REPLY_BUDGET
+
+
+def _compact_size(payload: Any) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")))
+
+
+def _shrink(value: Any, items: int, chars: int, path: str, cut: dict) -> Any:
+    """*value* with lists/maps cut to *items* entries and strings to *chars* characters.
+
+    Every cut is recorded in *cut* as ``{path: original_size}``.
+    """
+    if isinstance(value, str):
+        if len(value) <= chars:
+            return value
+        cut[f"{path}(chars)"] = len(value)
+        return value[:chars] + f"... [+{len(value) - chars} chars]"
+    if isinstance(value, dict):
+        entries = list(value.items())
+        if len(entries) > _MAP_KEYS_CAP and len(entries) > items:
+            cut[path or "(reply)"] = len(entries)
+            entries = entries[:items]
+        return {k: _shrink(v, items, chars, f"{path}.{k}" if path else str(k), cut)
+                for k, v in entries}
+    if isinstance(value, (list, tuple)):
+        rows = list(value)
+        if len(rows) > items:
+            cut[path or "(reply)"] = len(rows)
+            rows = rows[:items]
+        return [_shrink(v, items, chars, f"{path}[]", cut) for v in rows]
+    return value
+
+
+def shrink_reply(payload: dict, budget: int, tool: str = "") -> Optional[dict]:
+    """A copy of *payload* that fits *budget* characters of compact JSON, or None when it
+    already fits (or the budget is disabled).
+
+    Protected top-level scalars (ok, error, code, doc_id, revision, body_count, summary,
+    still_running, job_id, ...) are never dropped. Lists and maps are cut to their first N
+    entries, long strings are clipped, and the reply gains ``_truncated`` ({field path:
+    original count}) plus a ``truncated`` note naming how to page or narrow this tool.
+    """
+    if not budget or not isinstance(payload, dict):
+        return None
+    original = _compact_size(payload)
+    if original <= budget:
+        return None
+    narrow = _NARROW_HINTS.get(tool) or ("narrow the request (a filter, offset/limit paging "
+                                         "or a summary flag) to see the rest")
+    note_key = "truncated" if not isinstance(payload.get("truncated"), (list, dict, str)) \
+        else "reply_truncated"
+
+    def _noted(out: dict, cut: dict, items: int) -> dict:
+        out["_truncated"] = cut
+        out[note_key] = (f"This reply was {original} chars, over the {budget}-char MCP result "
+                         f"budget, so lists were cut to their first {items} entries and long "
+                         f"strings clipped; `_truncated` gives each cut field's full size. "
+                         f"To see the rest: {narrow}.")
+        return out
+
+    for items, chars in _SHRINK_STEPS:
+        cut: dict = {}
+        out: dict = {}
+        for key, value in payload.items():
+            if key in _PROTECTED_KEYS:
+                out[key] = _shrink(value, max(items, 10), max(chars, 2000), key, cut)
+            else:
+                out[key] = _shrink(value, items, chars, key, cut)
+        out = _noted(out, cut, items)
+        if _compact_size(out) <= budget:
+            return out
+    # Last resort: only the protected verdict/identity fields survive.
+    cut = {key: _compact_size(value) for key, value in payload.items()
+           if key not in _PROTECTED_KEYS}
+    out = {key: _shrink(value, 3, 500, key, {}) for key, value in payload.items()
+           if key in _PROTECTED_KEYS}
+    out = _noted(out, {f"{key}(chars)": n for key, n in cut.items()}, 0)
+    out[note_key] += " Every other field was dropped."
+    return out
 
 
 def error_payload(message: Any, *, code: str = "", hint: str = "", detail: Any = None,

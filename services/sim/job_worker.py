@@ -39,17 +39,37 @@ def _atomic_write(path: Path, obj: dict) -> None:
 
 _HEARTBEAT_S = 30.0
 
+#: Process CPU seconds (all threads, native ones included) that count as "the solver is
+#: working". A native mesh sub-phase can run for minutes without moving one counter
+#: (exterior_edge_projection: 150-166 s on a 58k-element chassis solid), while the main
+#: thread's own heartbeats cost milliseconds per 30 s, so one CPU-second separates a busy
+#: solver from a blocked one.
+_CPU_ACTIVE_S = 1.0
+
+#: How many completed mesh fills keep their element count in the progress record.
+_FILL_HISTORY = 8
+
 
 class _Progress:
     """Serialize phase events and heartbeat snapshots through one atomic publisher."""
 
-    def __init__(self, directory: Path, job_id: str, *, clock=None):
+    def __init__(self, directory: Path, job_id: str, *, clock=None, cpu_clock=None):
         self.path = directory / "partial.json"
         self.job_id = job_id
         self.clock = clock or J._clock
+        self.cpu_clock = cpu_clock or time.process_time
         self.started = self.clock()
         self.last_write = self.started
         self.last_advance = self.started
+        self.cpu_mark = self.cpu_clock()
+        self.last_cpu_active = self.started
+        # The mesher fills one lattice per probe, per recovery rung and per separate
+        # solid, and each fill restarts its own sub-phase passes and element count. Count
+        # them so the record says WHICH fill it describes instead of appearing to go
+        # backwards.
+        self.fills_done = 0
+        self.fill_elements: list = []
+        self.awaiting_fill = False
         self.latest: dict = {"phase": "starting", "elements": None}
         # SIGTERM may interrupt the main thread during its heartbeat publication.
         self.lock = threading.RLock()
@@ -59,6 +79,7 @@ class _Progress:
             raise ValueError("partial snapshot must be an object")
         with self.lock:
             previous = self._counters()
+            was_complete = str(self.latest.get("phase") or "").endswith("_complete")
             self.latest.update((key, value) for key, value in snapshot.items()
                                if key != "elements" or value is not None)
             if isinstance(snapshot.get("probe"), dict):
@@ -68,22 +89,76 @@ class _Progress:
                     self.latest["elements"] = probe["elements_so_far"]
             if "stage" in snapshot and "phase" not in snapshot:
                 self.latest["phase"] = snapshot["stage"]
+            phase = str(self.latest.get("phase") or "")
+            if (phase.startswith("mesh") and phase.endswith("_complete")
+                    and not was_complete and "phase" in snapshot):
+                self.fills_done += 1
+                self.fill_elements = (self.fill_elements
+                                      + [self.latest.get("elements")])[-_FILL_HISTORY:]
+                self.awaiting_fill = True
+            elif (isinstance(snapshot.get("probe"), dict)
+                    and snapshot["probe"].get("sub_phase") != "complete"):
+                # The native event carries the LAST fill's probe until the next fill
+                # reports, so only a live sub-phase marks the new fill as started.
+                self.awaiting_fill = False
+            if self.fills_done or isinstance(self.latest.get("probe"), dict):
+                self.latest["fill"] = self._fill_record(phase)
+                self.latest["summary"] = self._summary(phase)
             now = self.clock()
             if self._counters() != previous:
                 self.last_advance = now
+            cpu = self.cpu_clock()
+            if cpu - self.cpu_mark >= _CPU_ACTIVE_S:
+                self.cpu_mark = cpu
+                self.last_cpu_active = now
             body = dict(self.latest)
             body.update(partial=True, converged=False, job_id=self.job_id,
                         elapsed_s=round(now - self.started, 3),
                         _last_advance_monotonic=self.last_advance,
-                        last_advance_s=round(now - self.last_advance, 3))
+                        last_advance_s=round(now - self.last_advance, 3),
+                        cpu_s=round(cpu, 1),
+                        _last_cpu_active_monotonic=self.last_cpu_active,
+                        last_cpu_active_s=round(now - self.last_cpu_active, 3))
             _atomic_write(self.path, body)
             print(json.dumps(body, allow_nan=False), flush=True)
             self.last_write = now
+
+    def _fill_record(self, phase: str) -> dict:
+        complete = phase.endswith("_complete")
+        return {"index": self.fills_done if complete else self.fills_done + 1,
+                "completed": self.fills_done,
+                "completed_elements": list(self.fill_elements)}
+
+    def _summary(self, phase: str) -> str:
+        """One line that reads monotonically: which solid, which fill, which pass."""
+        parts = []
+        solid = self.latest.get("body")
+        if isinstance(solid, dict) and solid.get("index") and solid.get("total"):
+            parts.append(f"solid {solid['index']}/{solid['total']}")
+        fill = self._fill_record(phase)
+        if phase.endswith("_complete"):
+            parts.append(f"mesh fill {fill['index']} complete")
+        else:
+            parts.append(f"mesh fill {fill['index']} ({fill['completed']} completed)")
+        probe = self.latest.get("probe") or {}
+        if phase.endswith("_complete"):
+            pass
+        elif self.awaiting_fill:
+            parts.append(f"{phase}: starting")
+        elif probe.get("sub_phase"):
+            sub = probe["sub_phase"]
+            parts.append(f"{phase}: " + ("fill done, finishing" if sub == "complete" else sub))
+        if self.latest.get("elements") is not None and not self.awaiting_fill:
+            parts.append(f"{self.latest['elements']} elements in this fill")
+        return ("; ".join(parts) + ". Pass counters and element counts restart with each "
+                "fill (probe sizes, recovery retries, separate solids); the job is finished "
+                "only when its state leaves running.")
 
     def _counters(self) -> tuple:
         # Publication time, elapsed time and notes are not work. Native fill
         # counters can reset at a new h/sub-phase; those transitions are work too.
         probe = self.latest.get("probe") or {}
+        solid = self.latest.get("body") or {}
         return (
             *(self.latest.get(key) for key in (
                 "phase", "elements", "step", "n_steps", "pct", "iteration",
@@ -91,6 +166,7 @@ class _Progress:
                 "cells_total", "work_done", "work_total")),
             *(probe.get(key) for key in (
                 "h_mm", "cells_done", "cells_total", "elements_so_far", "sub_phase")),
+            solid.get("index") if isinstance(solid, dict) else None,
         )
 
     def heartbeat(self) -> None:

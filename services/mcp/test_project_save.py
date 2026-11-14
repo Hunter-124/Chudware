@@ -125,7 +125,9 @@ def test_unset_env_writes_nothing_and_payload_is_unchanged(engine, monkeypatch, 
     assert r["ok"] is True and r["doc_id"] == _DOC and r["name"] == "widget"
     assert "revision" in r
     assert "saved_path" not in r
-    assert r["persist_error"]["code"] == "no_project_save_dir"
+    # No project folder is expected, not a failure: one short warning, no persist_error.
+    assert r["persisted"] is False and "persist_error" not in r
+    assert "save_part(path=" in r["warning"]
     assert engine.saves == []
     assert not list(tmp_path.glob("*.step+"))
 

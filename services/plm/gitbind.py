@@ -259,6 +259,29 @@ class GitBinding:
         return {child.path.decode("utf-8"): child.sha
                 for child in self._read_object(entry[1]).items()}
 
+    def child_blobs(self, commit_hex: str, prefix: str, name: str) -> dict[str, bytes]:
+        """Read the blob *name* inside each immediate child directory of *prefix*
+        (e.g. every ``items/<id>/summary.txt``) without flattening the commit."""
+        base = prefix.rstrip("/") + "/"
+        hit = _tree_cache_get(commit_hex)
+        if hit is not None:
+            out = {}
+            for path, data in hit.items():
+                rest = path[len(base):] if path.startswith(base) else ""
+                child, sep, leaf = rest.partition("/")
+                if sep and leaf == name:
+                    out[child] = data
+            return out
+        out = {}
+        for child, oid in self.child_ids(commit_hex, prefix).items():
+            try:
+                mode, sha = self._read_object(oid)[name.encode("utf-8")]
+            except (KeyError, TypeError):
+                continue
+            if mode != 0o040000:
+                out[child] = self._repo[sha].data
+        return out
+
     def read_subtree(self, commit_hex: str, prefix: str) -> dict[str, bytes]:
         """Read only one item's blobs, reusing a warm whole-tree snapshot."""
         prefix = prefix.rstrip("/") + "/"

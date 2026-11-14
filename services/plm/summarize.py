@@ -255,6 +255,38 @@ def summarize_first_version(doc: dict[str, Any] | None, path: str) -> str:
     return f"First version of {name or path}."
 
 
+_FIRST_VERSION = "First version of "
+_UNCHANGED = frozenset({"", "No changes.", "No design changes."})
+_MAX_NAMED = 3
+
+
+def summarize_project(item_summaries: list[str]) -> str:
+    """One line for a whole-project entry from every item's own summary.
+
+    A project entry re-records every item, so the unchanged ones carry "No changes."
+    and must not stand in for the entry; the changed ones are listed (real edits
+    before first versions) with a count of the rest.
+    """
+    changed = [s.strip() for s in item_summaries if (s or "").strip() not in _UNCHANGED]
+    if not changed:
+        return "No changes."
+    if len(changed) == 1:
+        return changed[0]
+    edits = [s.rstrip(".") for s in changed if not s.startswith(_FIRST_VERSION)]
+    firsts = [s[len(_FIRST_VERSION):].rstrip(".") for s in changed
+              if s.startswith(_FIRST_VERSION)]
+    clauses = edits[:_MAX_NAMED]
+    if len(edits) > _MAX_NAMED:
+        clauses.append(f"{len(edits) - _MAX_NAMED} more changed")
+    if firsts:
+        named = firsts[:_MAX_NAMED]
+        if len(firsts) > _MAX_NAMED:
+            named.append(f"{len(firsts) - _MAX_NAMED} more")
+        lead = "First versions of " if len(firsts) > 1 else _FIRST_VERSION
+        clauses.append(lead + _join(named))
+    return f"{len(changed)} items changed: " + "; ".join(clauses) + "."
+
+
 def _maybe_polish(text: str, diff: dict[str, Any]) -> str:
     """Apply the optional learned polish — flag-gated, validated, discardable."""
     if os.environ.get(_POLISH_FLAG) != "1" or _polish_hook is None:

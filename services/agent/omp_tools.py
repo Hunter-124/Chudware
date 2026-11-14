@@ -1833,9 +1833,11 @@ def dispatch_host_tool(
     refusal = _binding_context_refusal(binding)
     if refusal is not None:
         return refusal
+    from services.mcp._envelopes import full_replies  # host_tool_result bounds + spills
+
     with tenancy.bind_context(binding.trusted_context), tenancy.bind_roots(
         binding.project_root, binding.save_root,
-    ):
+    ), full_replies():
         return _dispatch_host_tool(
             binding, args, progress, cancel,
             agent_id=agent_id, parent_agent_id=parent_agent_id, connection_cancel=connection_cancel,

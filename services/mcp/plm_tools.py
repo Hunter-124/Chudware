@@ -32,6 +32,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ._envelopes import compact_err as _err, sorted_ok as _ok
+from services.agent.request_context import root_value
+
 from .cad_common import require_mapping, resolve_agent_path
 
 # A live general-lane replay ended with bare plm_checkpoint(), after earlier bare
@@ -39,13 +41,27 @@ from .cad_common import require_mapping, resolve_agent_path
 # for this vault-backed family, so resolve the harness-owned context once here
 # instead of making each model guess it.
 
+_WORKSPACE_SPELLINGS = ("", ".", "./", ".\\")
+
+
 def _resolve_project_path(path: str = "") -> tuple[str | None, str | None]:
     """Resolve vault paths against the exact request-scoped workspace."""
+    default = (path or "").strip() in _WORKSPACE_SPELLINGS
     try:
         return resolve_agent_path(path or ".", "path"), None
     except ValueError as exc:
+        if not default:
+            return None, _err("invalid_project", str(exc))
+        # "." names the workspace itself, so with none configured it is the same
+        # condition as an omitted path (contract Appendix G).
+        if any(root_value(k).strip() for k in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT")):
+            return None, _err("project_root_unavailable", str(exc))  # configured but unusable
         return None, _err(
-            "invalid_project" if path else "project_root_unavailable", str(exc))
+            "project_root_unavailable",
+            "this MCP session has no project folder configured (CHUDWARE_PROJECT_DIR "
+            "and CHUDWARE_FS_ROOT are unset), so path='.' has nothing to name. Pass the "
+            "project folder as an ABSOLUTE path, e.g. path='C:/Users/you/Projects/rover'; "
+            "every plm_* call takes that same folder as path.")
 
 
 def _with_project_path(fn: Any) -> Any:

@@ -682,8 +682,16 @@ class Vault:
         ``doc_type`` is auto-detected (:mod:`doctypes`) when omitted and is
         always user-retaggable. Returns the item view.
         """
-        rel = str(rel_path).replace("\\", "/")
-        abs_path = generic_snapshot.contained_path(self.project_dir, rel)
+        rel = generic_snapshot.project_relative(self.project_dir, str(rel_path))
+        try:
+            abs_path = generic_snapshot.contained_path(self.project_dir, rel)
+        except VaultError as e:
+            if "outside the project" not in e.hint:
+                raise
+            raise VaultError(
+                "invalid_item",
+                f"{rel_path} is outside the project folder {self.project_dir}; track a "
+                "file or folder inside it, by its path relative to that folder") from e
         detected_type = doctypes.detect_doc_type(str(abs_path))
         dt = doc_type or detected_type
         if (detected_type in doctypes.CONTAINER_DOC_TYPES
@@ -1814,9 +1822,13 @@ class Vault:
             thumb_entry = self._bind.entry_at(commit, prefix + "thumbnail.png")
             if thumb_entry is not None and thumb_entry[0] != 0o040000:
                 thumb_ref = prefix + "thumbnail.png"
-            sraw = self._bind.read_blob_at(commit, prefix + "summary.txt")
-            if sraw:
-                summary = sraw.decode("utf-8")
+            if item_id is not None:
+                sraw = self._bind.read_blob_at(commit, prefix + "summary.txt")
+                summary = sraw.decode("utf-8") if sraw else ""
+            else:
+                blobs = self._bind.child_blobs(commit, "items", "summary.txt")
+                summary = summarize.summarize_project(
+                    [blobs[k].decode("utf-8", "replace") for k in sorted(blobs)])
         return {
             "commit": commit, "kind": kind, "scope": scope,
             "authored_at": _iso(cmeta["authored_at"]),
@@ -1869,6 +1881,11 @@ class Vault:
             if snapshot.item_prefix(pick_iid) + "thumbnail.png" in tree:
                 thumb_ref = snapshot.item_prefix(pick_iid) + "thumbnail.png"
             summary = (tree.get(snapshot.item_prefix(pick_iid) + "summary.txt") or b"").decode("utf-8")
+        if item_id is None:
+            summary = summarize.summarize_project(
+                [data.decode("utf-8", "replace") for path, data in sorted(tree.items())
+                 if path.startswith("items/") and path.endswith("/summary.txt")
+                 and path.count("/") == 2])
         return {
             "commit": commit, "kind": kind, "scope": scope,
             "authored_at": _iso(cmeta["authored_at"]),

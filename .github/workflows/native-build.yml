@@ -112,7 +112,7 @@ jobs:
 
       - name: Configure and build core (windows-occt)
         run: |
-          cmake --preset windows-occt
+          cmake --preset windows-occt -DCHUDWARE_LTO=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build --preset windows-occt -- -k 0
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

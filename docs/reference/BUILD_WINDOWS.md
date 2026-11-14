@@ -81,6 +81,11 @@ cmake --preset windows-occt
 cmake --build --preset windows-occt
 ```
 
+The presets build without LTO: an MSVC LTCG relink of `libchudware.dll` takes ~9 minutes
+and each doc-level test exe ~6, versus 5-35 seconds without it. Release builds add
+`-DCHUDWARE_LTO=ON`. An existing tree keeps its cached value until reconfigured with
+`cmake --preset windows-occt`.
+
 The first configure downloads OCCT 7.9.3 (`core/cmake/ProvisionOCCT.cmake`) and the pinned
 BSD-3-Clause Polyhedral-FEA source under `third_party/`.
 

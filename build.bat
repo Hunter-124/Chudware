@@ -14,7 +14,9 @@ rem                         (re-downloads the wheelhouse; needs network).
 rem    build.bat clean      Wipe host\build-win and dist\, then default build.
 rem    build.bat shortcut   Install/refresh the user Start Menu shortcut only.
 rem ---------------------------------------------------------------------------
-rem  Close any running Chudware.exe first, or the exe/DLL copy will fail (lock).
+rem  Chudware.exe and chudware-hostd.exe may stay open: in-use files are swapped
+rem  in beside the running copy (scripts\stage_swap.ps1) and hostd hands off to
+rem  the new engine once its current work finishes.
 rem  Requires VS 2022/2025 Build Tools or Community with C++ workload.
 rem  Run from a normal shell; this script loads vcvars64 when needed.
 rem ===========================================================================
@@ -29,6 +31,7 @@ set "EXE=%BUILD%\bin\Chudware.exe"
 set "DIST=%ROOT%\dist\Chudware"
 set "CORE_BUILD=%ROOT%\build\windows-occt"
 set "CORE_BIN=%CORE_BUILD%\bin"
+set STAGE=powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\stage_swap.ps1"
 
 rem --- locate cmake (PATH, then VS-bundled) -----------------------------------
 set "CMAKE=cmake"
@@ -144,21 +147,17 @@ echo [build] syncing dist\Chudware\ ...
 if not exist "%DIST%" mkdir "%DIST%"
 
 if /i not "%MODE%"=="app" (
-  copy /y "%EXE%" "%DIST%\Chudware.exe" >nul || goto :fail
-  if exist "%BUILD%\bin\Chudware.pdb" copy /y "%BUILD%\bin\Chudware.pdb" "%DIST%\Chudware.pdb" >nul
-  rem Compat name for older scripts that still look for Chudware.exe
-  copy /y "%EXE%" "%DIST%\Chudware.exe" >nul 2>nul
+  %STAGE% -Source "%BUILD%\bin" -Dest "%DIST%" -Include Chudware.exe,Chudware.pdb || goto :fail
   rem CEF helper + runtime (libcef.dll, *.pak, locales/) when built with CHUDWARE_ENABLE_CEF
   if exist "%BUILD%\bin\ai_cad_cef_helper.exe" (
-    copy /y "%BUILD%\bin\ai_cad_cef_helper.exe" "%DIST%\ai_cad_cef_helper.exe" >nul
+    %STAGE% -Source "%BUILD%\bin" -Dest "%DIST%" -Include ai_cad_cef_helper.exe || goto :fail
   )
   if exist "%BUILD%\Release\ai_cad_cef_helper.exe" if not exist "%DIST%\ai_cad_cef_helper.exe" (
     copy /y "%BUILD%\Release\ai_cad_cef_helper.exe" "%DIST%\ai_cad_cef_helper.exe" >nul
   )
   if exist "%BUILD%\bin\libcef.dll" (
     echo [build] staging CEF runtime from %BUILD%\bin ...
-    robocopy "%BUILD%\bin" "%DIST%" libcef.dll chrome_elf.dll libEGL.dll libGLESv2.dll d3dcompiler_47.dll dxcompiler.dll dxil.dll vk_swiftshader.dll vulkan-1.dll icudtl.dat v8_context_snapshot.bin resources.pak chrome_100_percent.pak chrome_200_percent.pak vk_swiftshader_icd.json /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-    if errorlevel 8 goto :fail
+    %STAGE% -Source "%BUILD%\bin" -Dest "%DIST%" -Include libcef.dll,chrome_elf.dll,libEGL.dll,libGLESv2.dll,d3dcompiler_47.dll,dxcompiler.dll,dxil.dll,vk_swiftshader.dll,vulkan-1.dll,icudtl.dat,v8_context_snapshot.bin,resources.pak,chrome_100_percent.pak,chrome_200_percent.pak,vk_swiftshader_icd.json || goto :fail
     if exist "%BUILD%\bin\locales" (
       robocopy "%BUILD%\bin\locales" "%DIST%\locales" /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
       if errorlevel 8 goto :fail
@@ -178,20 +177,8 @@ if /i not "%MODE%"=="app" (
   rem CORE_BIN_STAGE is resolved ABOVE this block: %VAR% inside ( ... ) expands at parse time.
   if defined CORE_BIN_STAGE (
     echo [build] staging C++ core DLLs from %CORE_BIN_STAGE% ...
-    robocopy "%CORE_BIN_STAGE%" "%DIST%" *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-    if errorlevel 8 (
-      echo [build] ERROR: could not stage core DLLs -- a DLL is locked. Close Chudware.exe AND any
-      echo [build]        running Chudware MCP server, then rerun.
-      goto :fail
-    )
-    if exist "%CORE_BIN_STAGE%\chudware-hostd.exe" (
-      robocopy "%CORE_BIN_STAGE%" "%DIST%" chudware-hostd.exe chudware-hostd.pdb /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
-      if errorlevel 8 (
-        echo [build] ERROR: could not stage chudware-hostd.exe -- it is locked ^(daemon running^).
-        echo [build]        Stop it first:  "%DIST%\chudware-hostd.exe" --stop   then rerun.
-        goto :fail
-      )
-    ) else (
+    %STAGE% -Source "%CORE_BIN_STAGE%" -Dest "%DIST%" -Include *.dll,chudware-hostd.exe,chudware-hostd.pdb || goto :fail
+    if not exist "%CORE_BIN_STAGE%\chudware-hostd.exe" (
       echo [build] WARNING: chudware-hostd.exe not found in %CORE_BIN_STAGE% -- engine daemon NOT staged.
       echo [build]          Build it:  build.bat core
     )

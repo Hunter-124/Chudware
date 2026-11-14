@@ -28,7 +28,7 @@
       "binaryDir": "${sourceDir}/build/windows-core",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CHUDWARE_LTO": "ON",
+        "CHUDWARE_LTO": "OFF",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "OFF"
       },
@@ -41,12 +41,12 @@
     {
       "name": "windows-occt",
       "displayName": "Windows core + OCCT (libchudware, Ninja + MSVC, OCCT on)",
-      "description": "Configure the C++ core with OCCT and Polyhedral-FEA on MSVC. The first configure downloads OCCT and the pinned BSD-3-Clause mesher source. Run from an x64 Native Tools Command Prompt for VS 2022.",
+      "description": "Configure the C++ core with OCCT and Polyhedral-FEA on MSVC. The first configure downloads OCCT and the pinned BSD-3-Clause mesher source. Run from an x64 Native Tools Command Prompt for VS 2022. LTO is off so an edit relinks in seconds instead of minutes; release builds pass -DCHUDWARE_LTO=ON.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-occt",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CHUDWARE_LTO": "ON",
+        "CHUDWARE_LTO": "OFF",
         "CHUDWARE_BUILD_CORE": "ON",
         "CHUDWARE_WITH_OCCT": "ON",
         "CHUDWARE_WITH_POLYMESH": "ON"

@@ -18,7 +18,7 @@
 # Pin an immutable commit on the single public Polyhedral-FEA line (master). There is no
 # private fork: all polymesh work lands publicly, and CAD moves this pin to a master commit.
 # Local maintenance trees opt in through POLYMESH_SOURCE_DIR (CHUDWARE_POLYMESH_ROOT).
-set(POLYMESH_COMMIT "e3eba6535095a0b70d4a01bf32e076db4a5f42d6"
+set(POLYMESH_COMMIT "8416fa7993fac0ab707e581e0c00a6e827c4b96b"
     CACHE STRING "Polyhedral-FEA commit to build" FORCE)
 set(POLYMESH_REPOSITORY "https://github.com/Hunter-124/Polyhedral-FEA.git"
     CACHE STRING "Polyhedral-FEA fetch repository")

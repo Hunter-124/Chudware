@@ -27,11 +27,16 @@ EXPORT `export_solidworks(doc_id, path, method)`, a part or an assembly:
   also left beside every COM export.
 - Check `verified` and `checks` (volume, centre of mass, body count, inertia against
   Chudware's geometry). `notes` lists cuts that removed nothing (as in Chudware).
-- Part features exported: sketches on Top/Front/Right, an offset of one (sketch `offset`
-  too) or a principal-facing face; extrude/cut; revolve about a sketch centerline or a world
-  axis; fillet; equal chamfer; shell; linear and circular patterns; feature mirror;
-  box/cylinder/cone/sphere/torus primitives (any axis); transform (Move/Copy Body); boolean
-  (Combine). Multibody parts keep their bodies; a cut hits the one body Chudware cuts.
+- Part features exported: sketches on any plane or face (default planes, offsets,
+  point-normal datums, face queries via the engine's frame); 3D sketches (lines, arcs,
+  splines); extrude/cut; revolve about a sketch centerline or a world axis; sweep along a
+  sketch, 3D sketch or helix; loft; helix; fillet; equal chamfer; shell; linear and circular
+  patterns; feature mirror; box/cylinder/cone/sphere/torus primitives (any axis); transform
+  (Move/Copy Body); boolean (Combine). Multibody parts keep their bodies; a cut hits the one
+  body Chudware cuts and a boss fuses only with the bodies it touches.
+- Not exported (exact solid instead): `import` features (a part that IS imported geometry),
+  and anything SolidWorks cannot build, e.g. a sweep whose solid intersects itself (the
+  sweep feature warns about that in Chudware too).
 - Anything else is listed in `unsupported` and a part export refuses.
   `allow_body_fallback=True` sends the exact solid as one imported body instead
   (`fidelity="imported_body"`, no feature tree). `degraded`: sketch relations and dimensions

@@ -258,8 +258,10 @@ macro compares volume, centre of mass, body count and the centroidal inertia dia
 Chudware's uniform-density `eval_mass` and writes `<stem>.report.txt` beside itself.
 
 What maps: sketches on a default plane, an offset of one (including the sketch's own
-`offset`), or a principal-facing model face; extrude/cut; revolve about a sketch centerline or
-a world axis; fillet, chamfer, shell; linear and circular patterns; feature mirror; the
+`offset`), a point-normal datum, or a model face or query plane (placed with the engine's
+resolved frame from `doc_sketch_regions`); 3D sketches; extrude/cut; revolve about a sketch
+centerline or a world axis; sweep along a sketch, 3D sketch or helix; loft; helix; fillet,
+chamfer, shell; linear and circular patterns; feature mirror; the
 `box`/`cylinder`/`cone`/`sphere`/`torus` primitives (a profile sketch on a plane through the
 primitive's centre + a mid-plane extrude or a revolve); `transform` (Move/Copy Body, rotation
 about Z, Y, X then a separate translation); `boolean` (Combine). Bodies are named after the
@@ -273,7 +275,14 @@ as zeros unless it is passed by value (`(a)`); `Sqr(0)` raises error 5; a VBA `E
 `RunMacro2` run the macro a second time and leaves the instance unable to sketch; a pattern of a
 two-direction through-all cut gives a zero-volume body (a through-all cut from a model face is
 one-directional); `SelectByID2` at coordinates misses in a hidden window (edges and faces are
-found by their closest point). After a failed build the COM runner closes a hidden SolidWorks it
+found by their closest point); a 3D sketch drawn beside a solid snaps onto its edges (paths are
+created before any solid, and each new 3D sketch starts with nothing selected); a sweep path
+selected by name and type can select a datum plane instead (paths are selected as features);
+paths stored a few thousandths of a degree off tangent are refused (smooth joints are made
+exactly tangent, at most 0.05 mm of drift) and shallow arcs are built from their centre;
+`InsertHelix` starts 90 degrees from the engine's helix; in a multibody part a native merge
+also fuses bodies that only overlap each other (merges are a new body + Combine with the
+bodies the feature touches). After a failed build the COM runner closes a hidden SolidWorks it
 did not share with the user.
 
 **Assemblies** export to a folder (`assembly.py`): one macro per distinct part (feature tree,

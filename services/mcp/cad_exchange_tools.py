@@ -577,9 +577,9 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         """Send a part or an assembly to SolidWorks users as native, editable SolidWorks files.
 
         The export is ONE SolidWorks VBA macro that rebuilds the part feature by feature:
-        sketches (Top/Front/Right, an offset of one incl. the sketch `offset`, or a
-        principal-facing face); extrude/cut (blind, mid-plane, through-all, two-direction);
-        revolve about a sketch centerline or a world axis; constant fillet; equal chamfer;
+        sketches on any plane or face and 3D sketches; extrude/cut (blind, mid-plane,
+        through-all, two-direction); revolve about a sketch centerline or a world axis; sweep
+        along a sketch, 3D sketch or helix; loft; helix; constant fillet; equal chamfer;
         shell; linear and circular patterns; feature mirror across a default plane;
         box/cylinder/cone/sphere/torus primitives at any axis; transform (Move/Copy Body);
         boolean (Combine). Multibody parts keep their bodies, and a cut subtracts from the one

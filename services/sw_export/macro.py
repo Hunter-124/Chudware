@@ -1060,6 +1060,7 @@ Dim Silent As Boolean
 Dim Stage As String
 Dim Opened As Collection
 Dim Comps As Collection
+Dim Skipped As String
 
 Function Num(x As Double) As String
     Num = Trim(Str(x))
@@ -1102,8 +1103,14 @@ Sub EnsureBuilt(file As String, macro As String)
             Loop
             Close #fh
         End If
-        Fail macro & " did not save " & file & ": " & rep
+        ' One part SolidWorks cannot build must not lose the assembly: leave it out, say so.
+        Skip file & " (" & macro & ": " & rep & ")"
     End If
+End Sub
+
+Sub Skip(what As String)
+    If Skipped <> "" Then Skipped = Skipped & " | "
+    Skipped = Skipped & what
 End Sub
 
 ' The default assembly template, or the first .asmdot beside the part template (some installs
@@ -1131,9 +1138,16 @@ End Function
 
 Sub OpenComp(file As String)
     Dim d As Object, kind As Long
+    If Dir(Folder & "\" & file) = "" Then Exit Sub   ' skipped while building
+    ' Already open (a part shared with a sub-assembly built just before): use it.
+    Set d = swApp.GetOpenDocumentByName(Folder & "\" & file)
+    If Not d Is Nothing Then Exit Sub
     If LCase(Right(file, 7)) = ".sldasm" Then kind = 2 Else kind = 1
     Set d = swApp.OpenDoc6(Folder & "\" & file, kind, 1, "", errors, warnings)
-    If d Is Nothing Then Fail "could not open " & file & " (error " & errors & ")"
+    If d Is Nothing Then
+        Skip file & " (SolidWorks could not open it, error " & errors & ")"
+        Exit Sub
+    End If
     Opened.Add d.GetTitle()
 End Sub
 
@@ -1142,8 +1156,12 @@ End Sub
 Sub Place(file As String, t As Variant)
     Dim c As Object, a(15) As Double, i As Long
     Stage = "place " & file
+    If Dir(Folder & "\" & file) = "" Then Exit Sub
     Set c = Asm.AddComponent5(Folder & "\" & file, 0, "", False, "", 0, 0, 0)
-    If c Is Nothing Then Fail "could not add " & file
+    If c Is Nothing Then
+        Skip file & " (could not be added)"
+        Exit Sub
+    End If
     For i = 0 To 15
         a(i) = t(i)
     Next
@@ -1185,6 +1203,7 @@ Sub main()
     If mp.Mass > 0 Then k = mp.Volume / mp.Mass * 1E+15
     msg = "volume_mm3=" & Num(v) & vbCrLf & "com_sw_mm=" & Num(c(0) * 1000) & "," & Num(c(1) * 1000) & "," & Num(c(2) * 1000) _
         & vbCrLf & "inertia_sw_mm5=" & Num(mo(0) * k) & "," & Num(mo(4) * k) & "," & Num(mo(8) * k) & vbCrLf & "component_count=" & Comps.Count
+    If Skipped <> "" Then msg = msg & vbCrLf & "skipped=" & Skipped
     ok = True
 {checks}
     saved = Folder & "\{file}"

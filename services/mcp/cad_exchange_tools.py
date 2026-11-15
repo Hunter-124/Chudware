@@ -128,7 +128,8 @@ def _solidworks_export_assembly(d: str, tree: dict, path: Optional[str], method:
     return {**summary, "ok": all(r.get("ok") for r in rows),
             "verified": top_row.get("verified"),
             **{k: top_row[k] for k in ("checks", "volume_rel_error", "com_error_mm",
-                                       "inertia_rel_error", "error") if k in top_row},
+                                       "inertia_rel_error", "error", "skipped")
+               if k in top_row},
             "parts": parts,
             "fidelity_counts": {f: sum(1 for r in parts if r.get("fidelity") == f)
                                 for f in {r.get("fidelity") for r in parts}}}

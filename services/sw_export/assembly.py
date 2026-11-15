@@ -262,7 +262,7 @@ def run_all(order: list[_Source], out_dir: str, run_macro: Callable[[str], dict]
             row["ok"] = bool(rep.get("ok")) and os.path.isfile(os.path.join(out_dir, src.file))
             if rep.get("fidelity"):
                 row["fidelity"] = rep["fidelity"]
-            for k in ("error", "feature_error", "stage"):
+            for k in ("error", "feature_error", "stage", "skipped"):
                 if rep.get(k) and (k != "stage" or not rep.get("ok")):
                     row[k] = rep[k]
             expected = expected_in_sw(src.mass) if src.mass else {}

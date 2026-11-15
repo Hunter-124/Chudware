@@ -1820,10 +1820,12 @@ std::string stepplus_cache_engine_key() {
     // effective dimensions; older snapshots may contain partial or no-op blends.
     // /21 requires real cut/raised Thread geometry; older snapshots can certify a
     // successful unthreaded fallback or a silently shortened threaded run.
+    // /22 a profile region picked by a point inside it takes that region; older snapshots
+    // can hold a concentric pick's bore disc (a swept tube built as a solid rod).
     // The new refine feature has no prior successful compiled topology to invalidate:
     // failed/unknown features cannot produce a solved display cache. Its safety inputs
     // are keyed at the refine checkpoint itself, leaving old documents' warm caches valid.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/21";
+    static constexpr const char* kCacheSchema = "chudware-geomcache/22";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else

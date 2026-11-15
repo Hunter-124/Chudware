@@ -144,3 +144,15 @@ This section extends §4. `resolve_profile_faces` implements it.
 
 Before this rule, a pick snapped to the nearest surviving region and duplicates were dropped.
 A sketch edit that removed regions then removed cuts with `ok:true`.
+
+## Region picks inside concentric regions (append-only, 2026-11-15)
+
+Amends section 4 for regions that share a centroid (concentric loops):
+
+- A centroid pick whose point lies inside exactly one region resolves to that region, unless
+  the point is that region's centroid and another region shares it.
+- Remaining ties go to the region with the larger outer extent (its (u,v) bounding box), then
+  the larger area. The wall of a tube or washer therefore wins over its bore, including a
+  thin wall whose bore disc has the larger area. Before this rule the larger area won, and a
+  pick on a 19 x 1.6 mm tube wall swept the bore disc into a solid rod.
+- Geometry caches older than `chudware-geomcache/22` are recompiled.

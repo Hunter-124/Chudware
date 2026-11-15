@@ -1614,15 +1614,20 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
             const double cu = s["centroid"][0].get<double>();
             const double cv = s["centroid"][1].get<double>();
             // Nearest face centroid. When several faces share a centroid (concentric
-            // circles both report centre (0,0)), prefer the LARGER-area face so the
-            // default agent/guide pick {"centroid":[0,0],"hint_index":0} resolves to
-            // the washer (material), not the void inner disc. An explicit index still
+            // circles both report centre (0,0)), prefer the face with the larger outer
+            // extent so the default agent/guide pick {"centroid":[0,0],"hint_index":0}
+            // resolves to the washer (material), not the void inner disc. An explicit index still
             // addresses the inner disc. hint_index is only a seed; a strictly closer
             // face still wins.
             const bool has_hint = s.contains("hint_index") && s["hint_index"].is_number();
+            // Ties (concentric regions) go to the region with the larger OUTER extent: the
+            // washer/tube wall encloses its bore, while the bore can have the larger area
+            // (a thin-walled tube's bore disc outweighs its wall).
+            auto extent = [&](size_t i) { return (rows[i].hi - rows[i].lo).squaredNorm(); };
             int best = -1;
             double best_d2 = 0.0;
             double best_area = 0.0;
+            double best_ext = 0.0;
             if (has_hint) {
                 int hi = static_cast<int>(s["hint_index"].get<double>());
                 if (hi >= 0 && hi < static_cast<int>(rows.size())) {
@@ -1631,17 +1636,57 @@ std::vector<TopoDS_Face> resolve_profile_faces(const FeatureResultMap& results,
                     double dv = rows[static_cast<size_t>(hi)].uv.y() - cv;
                     best_d2 = du * du + dv * dv;
                     best_area = rows[static_cast<size_t>(hi)].area;
+                    best_ext = extent(static_cast<size_t>(hi));
                 }
             }
             for (size_t i = 0; i < rows.size(); ++i) {
                 double du = rows[i].uv.x() - cu;
                 double dv = rows[i].uv.y() - cv;
                 double d2 = du * du + dv * dv;
+                const double ext = extent(i);
+                const bool tie = std::abs(d2 - best_d2) <= 1e-18;
                 if (best < 0 || d2 < best_d2 - 1e-18 ||
-                    (std::abs(d2 - best_d2) <= 1e-18 && rows[i].area > best_area)) {
+                    (tie && ext > best_ext * (1 + 1e-9)) ||
+                    (tie && std::abs(ext - best_ext) <= best_ext * 1e-9 &&
+                     rows[i].area > best_area)) {
                     best = static_cast<int>(i);
                     best_d2 = d2;
                     best_area = rows[i].area;
+                    best_ext = ext;
+                }
+            }
+            // Concentric regions share a centroid, so "nearest centroid, then larger area"
+            // cannot tell a thin tube wall from its bore: for a 19/15.8 mm tube the bore disc
+            // is the larger region, and a sweep picked by a point ON the wall swept the bore
+            // into a solid rod (HERC BOM01a upper arm, 2026-11-15). A point that lies inside
+            // exactly one region picks that region, unless it sits on a centroid that several
+            // regions share (the {"centroid":[0,0]} washer pick keeps the rule above).
+            if (best >= 0) {
+                const gp_Pnt q(src.plane.origin.x() + cu * src.plane.uAxis.x() + cv * src.plane.vAxis.x(),
+                               src.plane.origin.y() + cu * src.plane.uAxis.y() + cv * src.plane.vAxis.y(),
+                               src.plane.origin.z() + cu * src.plane.uAxis.z() + cv * src.plane.vAxis.z());
+                int inside = -1, n_inside = 0;
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    BRepClass_FaceClassifier cls(rows[i].face, q, 1e-7);
+                    if (cls.State() == TopAbs_IN) {
+                        inside = static_cast<int>(i);
+                        ++n_inside;
+                    }
+                }
+                if (n_inside == 1 && inside != best) {
+                    const FaceRow& in_row = rows[static_cast<size_t>(inside)];
+                    bool at_shared_centroid = false;
+                    if ((in_row.uv - Eigen::Vector2d(cu, cv)).squaredNorm() <= 1e-12)
+                        for (size_t i = 0; i < rows.size(); ++i)
+                            if (static_cast<int>(i) != inside &&
+                                (rows[i].uv - in_row.uv).squaredNorm() <= 1e-12)
+                                at_shared_centroid = true;
+                    if (!at_shared_centroid) {
+                        best = inside;
+                        best_d2 = (in_row.uv - Eigen::Vector2d(cu, cv)).squaredNorm();
+                        best_area = in_row.area;
+                        best_ext = extent(static_cast<size_t>(inside));
+                    }
                 }
             }
             if (best < 0) continue;

@@ -7010,6 +7010,38 @@ TEST_CASE("op-path: two concentric circles extrude to an annular washer (untarge
     }
 }
 
+// A THIN-walled tube: its bore disc has a LARGER area than its wall, so "larger area" picked
+// the bore. Both the default centre pick and a pick on the wall must take the wall (HERC
+// BOM01a upper arm swept a 19 x 1.6 mm tube profile into a solid rod, 2026-11-15).
+TEST_CASE("op-path: a thin tube profile picked at its centre or on its wall is the wall") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    const double R = 9.5, r = 7.9, D = 5.0;
+    const double wall = PI * (R * R - r * r) * D;
+    auto build = [&](double cu) -> double {
+        json nr = doc_new("part", "OpTube");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "TS"},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}},
+            json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                 {"entity", {{"type", "circle"}, {"center", json::array({40, 0})}, {"radius", R}}}},
+            json{{"op", "sketch_add_entity"}, {"sketch", "$0"},
+                 {"entity", {{"type", "circle"}, {"center", json::array({40, 0})}, {"radius", r}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "TB"},
+                 {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(D)}}},
+                 {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "$0"},
+                     {"centroid", json::array({cu, 0})}, {"hint_index", 0}}})}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        return resp.value("volume", 0.0);
+    };
+    CHECK(build(40.0) == doctest::Approx(wall).epsilon(0.02));   // the shared centre
+    CHECK(build(48.7) == doctest::Approx(wall).epsilon(0.02));   // a point on the wall
+}
+
 // Reverse direction (params.flip): extrude along -plane.normal so the solid sits on the
 // opposite side of the sketch plane. Regression for the GUI "Reverse direction does nothing"
 // report — engine must actually flip, not just toggle a checkbox.

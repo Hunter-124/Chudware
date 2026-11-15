@@ -109,6 +109,8 @@ def _solidworks_export_assembly(d: str, tree: dict, path: Optional[str], method:
     summary = {"doc_id": d, "method": method, "path": out, "folder": out_dir,
                "macro": os.path.join(out_dir, top.macro), "components": top.note["components"],
                "files": len(job.order),
+               **({"skipped_components": job.skipped} if job.skipped else {}),
+               **({"warnings": job.warnings} if job.warnings else {}),
                "degraded": ["Chudware mates are not re-created as SolidWorks mates: every "
                             "component is placed at its Chudware position and fixed there"]}
     plan_rows = [{"file": s.file, "kind": s.kind, **{k: v for k, v in s.note.items()

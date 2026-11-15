@@ -119,6 +119,8 @@ class AssemblyExport:
         self.sources: dict[str, _Source] = {}
         self.order: list[_Source] = []       # build order: parts before their assemblies
         self.used: set[str] = set()
+        self.warnings: list[str] = []
+        self.skipped: list[dict] = []        # components whose source could not be exported
 
     def _stem(self, path: str) -> str:
         base = os.path.splitext(os.path.basename(path))[0]
@@ -170,7 +172,14 @@ class AssemblyExport:
 
     def _step(self, d: str, stem: str) -> str:
         step = os.path.join(self.out_dir, stem + ".step")
-        self.call("export_file", {"doc_id": d, "path": step, "format": "step"})
+        try:
+            self.call("export_file", {"doc_id": d, "path": step, "format": "step"})
+        except Exception as e:  # noqa: BLE001
+            # export_file writes the file, then refuses it when a re-read misses a solid. The
+            # SolidWorks macro measures what it opens, so keep it and say so.
+            if not os.path.isfile(step):
+                raise
+            self.warnings.append(f"{stem}.step: {e}")
         return step
 
     def _body(self, d: str, stem: str, note: dict) -> _Source:
@@ -214,7 +223,12 @@ class AssemblyExport:
     def _assembly(self, d: Optional[str], tree: dict, path: str, stem: str) -> _Source:
         comps, builds, inst = [], [], []
         for c in self._components(tree, path):
-            src = self.source(c["path"])
+            try:
+                src = self.source(c["path"])
+            except Exception as e:  # noqa: BLE001 — one bad part must not lose the assembly
+                self.skipped.append({"component": c["name"], "source": c["path"],
+                                     "error": str(e)})
+                continue
             comps.append({"file": src.file, "transform": sw_transform(c["transform"]),
                           "name": c["name"]})
             inst.append((src.mass, c["transform"]))

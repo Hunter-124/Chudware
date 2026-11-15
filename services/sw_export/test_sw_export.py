@@ -415,3 +415,38 @@ def test_solidworks_round_trip_rebuilds_the_same_part(fname, tmp_path):
         app.CloseDoc(model.GetTitle())
     assert abs(out["volume_mm3"] - vol) <= 1e-5 * vol
     assert max(abs(out["com_sw_mm"][i] - com[i]) for i in range(3)) <= 1e-2
+
+
+def test_assembly_export_skips_a_component_that_cannot_be_exported(tmp_path):
+    from contextlib import contextmanager
+
+    from services.sw_export.assembly import AssemblyExport
+    ident = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    tree = {"schema": "aicad.asm/1", "name": "Top", "components": [
+        {"name": "good", "source": {"path": str(tmp_path / "Good.step+")}, "transform": ident},
+        {"name": "bad", "source": {"path": str(tmp_path / "Bad.step+")}, "transform": ident}]}
+    part = {"schema": "aicad.part/1", "name": "Good",
+            "features": [_rect("f1", "plane.top", 0, 0, 1, 1), _extrude("f2", "f1", 1)]}
+
+    def call(method, params):
+        if method == "doc_tree":
+            return {"tree": tree if params["doc_id"] == "asm" else part}
+        if method == "eval_mass":
+            return {"volume_mm3": 1.0, "mass_g": 1.0, "com": [0.5, 0.5, 0.5],
+                    "inertia": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
+        if method == "export_file":   # written, then refused by the read-back check
+            open(params["path"], "w").close()
+            raise RuntimeError("re-reading it recovered 15/16 valid solids")
+        raise AssertionError(method)
+
+    @contextmanager
+    def open_part(path):
+        if path.endswith("Bad.step+"):
+            raise RuntimeError("engine could not open Bad.step+")
+        yield "part"
+
+    job = AssemblyExport(call, open_part, lambda d: (lambda fid: []), str(tmp_path))
+    top = job.export("asm", str(tmp_path / "Top.step+"), "Top")
+    assert top.note["components"] == 1
+    assert [s["component"] for s in job.skipped] == ["bad"]
+    assert job.warnings and "15/16" in job.warnings[0]

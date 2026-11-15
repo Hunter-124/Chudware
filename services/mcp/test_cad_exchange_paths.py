@@ -691,3 +691,40 @@ def test_scad_conversion_reports_real_blocker_and_preserves_native_geometry():
             mass["volume_mm3"])
     finally:
         M.cb.call("doc_close", {"doc_id": doc})
+
+
+def test_solidworks_assembly_part_that_rebuilds_differently_comes_in_as_its_exact_solid(
+        exchange, tmp_path, monkeypatch):
+    from services.sw_import import sw_feature_import, sw_translate
+    tools, calls = exchange
+    source = tmp_path / "frame.sldasm"
+    source.write_bytes(b"assembly")
+    monkeypatch.setattr(M.tempfile, "gettempdir", lambda: str(tmp_path))
+    shift = [1, 0, 0, 5, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    monkeypatch.setattr(sw_translate, "resolve", lambda _: {
+        "name": "frame", "blocking": [], "degraded": [], "is_assembly": True,
+        "components": [{"name": "plate-1", "part_key": "plate.sldprt", "kind": "part",
+                        "ops": [{"op": "add_feature"}], "blocking": [], "degraded": [],
+                        "sw_volume_mm3": 1000.0, "xform16": shift}]})
+    monkeypatch.setattr(sw_feature_import, "save_step",
+                        lambda key, out: Path(out).write_text("step") or out)
+    docs = iter(["rebuilt", "exact", "asm"])
+
+    def call(method, params):
+        calls.append((method, dict(params)))
+        if method in ("doc_new", "import_file"):
+            return {"doc_id": next(docs)}
+        if method == "eval_mass":
+            return {"volume_mm3": 900.0}      # the tree rebuilt into a different solid
+        if method == "doc_save":
+            return {"ok": True}
+        return {}
+    monkeypatch.setattr(M.cb, "call", call)
+    result = json.loads(tools["import_part"](str(source)))
+    assert result["ok"] is True and result["parts_with_feature_tree"] == 0
+    assert result["parts_as_exact_solid"][0]["file"] == "plate.sldprt"
+    assert "900.000" in result["parts_as_exact_solid"][0]["reason"]
+    assert ("doc_close", {"doc_id": "rebuilt"}) in calls
+    insert = next(p for m, p in calls if m == "doc_apply_ops" and p["doc_id"] == "asm")
+    # The exact solid stays in SolidWorks axes; its placement turns it Z-up (+90 about X).
+    assert insert["ops"][0]["transform"] == [1, 0, 0, 5, 0, 0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1]

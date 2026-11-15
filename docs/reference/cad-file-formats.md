@@ -283,4 +283,6 @@ missing, places every component at its Chudware pose, fixes it there and saves t
 Chudware mates are not re-created. SolidWorks `.sldprt`/`.sldasm` component sources are copied
 as they are. Importing a `.sldasm` through COM rebuilds every part it can as a feature tree and
 brings the rest in as exact solids, sub-assemblies as nested assemblies; one unsupported part no
-longer refuses the whole assembly.
+longer refuses the whole assembly. Every rebuilt part is checked against the volume SolidWorks
+reports for it (1e-4); a tree that rebuilds into a different solid is replaced by the exact
+solid, which SolidWorks itself writes as STEP and the component placement turns Z-up.

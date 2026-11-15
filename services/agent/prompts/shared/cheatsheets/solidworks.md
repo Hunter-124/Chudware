@@ -8,6 +8,8 @@ IMPORT `import_part(path)` (.sldprt, .sldasm, .x_t, .x_b). Lanes, best first:
    every part that can be rebuilt gets its feature tree, the others come in as their exact
    solid (`parts_as_exact_solid` names them and why), sub-assemblies come in as nested
    assemblies, every component at its SolidWorks position (mates are not converted).
+   Every rebuilt tree is checked against SolidWorks' volume for that part; one that
+   rebuilds differently is replaced by the exact solid (named with the reason).
 2. No SolidWorks, or COM failing: the part's own Parasolid body is read natively
    (`import_fidelity="exact_native_brep"`, SolidWorks 2011+ parts and Parasolid files;
    `solidworks_source.saved` names the release that saved it). Recon feature recognition then

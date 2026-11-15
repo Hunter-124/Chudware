@@ -1,9 +1,13 @@
-SOLIDWORKS interop: open teammates' parts, send parts back as native SolidWorks features.
+SOLIDWORKS interop: open teammates' parts and assemblies, send parts and assemblies back as
+native SolidWorks files.
 
 IMPORT `import_part(path)` (.sldprt, .sldasm, .x_t, .x_b). Lanes, best first:
 1. SolidWorks installed: the COM feature-tree import rebuilds sketches and features
-   (`feature_resolved=true`). A feature it cannot rebuild refuses the import with
-   `unsupported`. `resolve_features=False` imports the exact solid instead.
+   (`feature_resolved=true`). For a PART a feature it cannot rebuild refuses the import with
+   `unsupported`; `resolve_features=False` imports the exact solid instead. For an ASSEMBLY
+   every part that can be rebuilt gets its feature tree, the others come in as their exact
+   solid (`parts_as_exact_solid` names them and why), sub-assemblies come in as nested
+   assemblies, every component at its SolidWorks position (mates are not converted).
 2. No SolidWorks, or COM failing: the part's own Parasolid body is read natively
    (`import_fidelity="exact_native_brep"`, SolidWorks 2011+ parts and Parasolid files;
    `solidworks_source.saved` names the release that saved it). Recon feature recognition then
@@ -13,21 +17,28 @@ IMPORT `import_part(path)` (.sldprt, .sldasm, .x_t, .x_b). Lanes, best first:
 3. Assemblies without SolidWorks, or parts the native reader rejects: the saved display
    tessellation (`saved_display_tessellation`, approximate).
 
-EXPORT `export_solidworks(doc_id, path, method)`:
-- method="com" (SolidWorks on this machine): SolidWorks builds each feature and saves the
-  .SLDPRT. Check `verified` (volume and centre of mass against Chudware's).
-- method="macro": writes a .swb macro. The teammate runs Tools > Macro > Run and their
-  SolidWorks writes the part in THEIR release, then reports MATCHES / DOES NOT MATCH.
-  Use it for a teammate on an older SolidWorks: SolidWorks cannot save to an older release.
-- Exported: sketches on Top/Front/Right, an offset of one, or a principal-facing face (lines,
-  arcs, circles, points, splines); extrude/cut (blind, mid-plane, through-all, two
-  directions); revolve about the sketch's single centerline; constant fillet; equal chamfer;
-  shell; linear pattern along X/Y/Z; circular pattern about a world axis; feature mirror
-  across Top/Front/Right.
-- Anything else is listed in `unsupported` and the export refuses.
+EXPORT `export_solidworks(doc_id, path, method)`, a part or an assembly:
+- The export is ONE VBA macro (.swb). method="com" (SolidWorks on this machine) runs it here
+  and saves the .SLDPRT/.SLDASM; method="macro" only writes it, for a teammate to run
+  (Tools > Macro > Run) in THEIR SolidWorks, which saves the file in THEIR release. Use it for
+  a teammate on an older SolidWorks: SolidWorks cannot save to an older release. The macro is
+  also left beside every COM export.
+- Check `verified` and `checks` (volume, centre of mass, body count, inertia against
+  Chudware's geometry). `notes` lists cuts that removed nothing (as in Chudware).
+- Part features exported: sketches on Top/Front/Right, an offset of one (sketch `offset`
+  too) or a principal-facing face; extrude/cut; revolve about a sketch centerline or a world
+  axis; fillet; equal chamfer; shell; linear and circular patterns; feature mirror;
+  box/cylinder/cone/sphere/torus primitives (any axis); transform (Move/Copy Body); boolean
+  (Combine). Multibody parts keep their bodies; a cut hits the one body Chudware cuts.
+- Anything else is listed in `unsupported` and a part export refuses.
   `allow_body_fallback=True` sends the exact solid as one imported body instead
-  (`fidelity="imported_body"`, no feature tree). `degraded` notes exact geometry that carries
-  less intent: sketch relations and dimensions are not re-created yet.
+  (`fidelity="imported_body"`, no feature tree). `degraded`: sketch relations and dimensions
+  are not re-created yet.
+- ASSEMBLY: writes a folder (one macro + .step per part, one per sub-assembly, the top
+  macro). Each part is a feature tree when it maps and matches, else its exact solid
+  (`parts[].fidelity`, `fidelity_counts`); components are placed at their Chudware poses and
+  fixed (Chudware mates are not re-created). Share the whole folder; the teammate runs only
+  the top macro.
 
 3 common mistakes:
 1. Calling an exact native import "parametric": only `feature_resolved=true` is a feature tree.

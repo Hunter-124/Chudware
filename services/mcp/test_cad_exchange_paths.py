@@ -498,7 +498,7 @@ def test_export_solidworks_macro_writes_a_feature_macro(exchange, tmp_path, monk
     assert out["ok"] is True, out
     assert out["fidelity"] == "feature_tree" and out["steps"] == 2
     text = Path(out["path"]).read_text(encoding="cp1252")
-    assert "FM.FeatureExtrusion3(" in text and "(Chudware 8000)" in text
+    assert 'Extr "Sketch1", "f2", "Boss1"' in text and "If Abs(v - 8000#) >" in text
 
 
 def test_export_solidworks_refuses_unsupported_features_unless_body_fallback(
@@ -524,7 +524,9 @@ def test_solidworks_sidecar_save_refusal_retains_component(exchange, tmp_path, m
     monkeypatch.setattr(M.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(sw_translate, "resolve", lambda _: {
         "name": "assembly", "blocking": [], "degraded": [], "is_assembly": True,
-        "components": [{"part_key": "piece.sldprt", "ops": []}]})
+        "components": [{"name": "piece-1", "part_key": "piece.sldprt", "kind": "part",
+                        "ops": [], "blocking": [], "degraded": [],
+                        "xform16": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}]})
     def call(method, params):
         calls.append((method, dict(params)))
         if method == "doc_new":

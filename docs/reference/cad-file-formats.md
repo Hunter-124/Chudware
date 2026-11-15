@@ -230,7 +230,7 @@ transaction. See `contracts/doc_ops.md` §36 and `cad_guide('scad')`.
 |---|---|---|
 | `.sldprt` (SolidWorks 2011 OLE2 and 2015+) | native read of the part's stored Parasolid body → exact STEP → B-rep import; then SolidWorks COM → STEP; then the saved display tessellation | `exact_native_brep` / `solidworks_com_step` / `saved_display_tessellation` |
 | `.x_t`, `.x_b` | native Parasolid read; then SolidWorks COM | `exact_native_brep` / `solidworks_com_step` |
-| `.sldasm` | SolidWorks COM → STEP; then the saved display tessellation | `solidworks_com_step` / `saved_display_tessellation` |
+| `.sldasm` | SolidWorks COM: component feature trees (exact solids where a part cannot be rebuilt); then COM → STEP; then the saved display tessellation | assembly doc / `solidworks_com_step` / `saved_display_tessellation` |
 
 The native reader is the vendored [sldprt](https://github.com/blussyya/solidworks-converters)
 converter (`vendor/sldprt/`, Apache-2.0, pinned in `SLDPRT_ARTIFACT.lock`, upstream files
@@ -249,9 +249,38 @@ handed to Recon (`reverse_engineer`). The recognized tree replaces the exact bod
 
 **Export** (`export_solidworks`, `services/sw_export/`): the part's feature tree becomes one
 SolidWorks build plan (`plan.py`, model coordinates; engine `(x, y, z)` is SolidWorks
-`(x, z, -y)`). The plan is replayed through SolidWorks COM (`com_build.py`, saves `.SLDPRT` and
-compares volume and centre of mass), or written as a `.swb` VBA macro (`macro.py`) that a
-teammate runs in their own SolidWorks, which then saves the part in that release and runs
-the same check. SolidWorks' `SaveAs` has no older-release target (`swSaveAsVersion_e`), so the
-macro is how a part reaches an older SolidWorks. Features without an exact mapping refuse the
+`(x, z, -y)`), written as ONE `.swb` VBA macro (`macro.py`). That macro is the only rebuild
+implementation: with SolidWorks installed Chudware runs it through COM (`com_build.py`,
+`ISldWorks.RunMacro2`), and a teammate runs the same file in their own SolidWorks, which saves
+the part in that release. SolidWorks' `SaveAs` has no older-release target
+(`swSaveAsVersion_e`), so the macro is how a part reaches an older SolidWorks. At the end the
+macro compares volume, centre of mass, body count and the centroidal inertia diagonal with
+Chudware's uniform-density `eval_mass` and writes `<stem>.report.txt` beside itself.
+
+What maps: sketches on a default plane, an offset of one (including the sketch's own
+`offset`), or a principal-facing model face; extrude/cut; revolve about a sketch centerline or
+a world axis; fillet, chamfer, shell; linear and circular patterns; feature mirror; the
+`box`/`cylinder`/`cone`/`sphere`/`torus` primitives (a profile sketch on a plane through the
+primitive's centre + a mid-plane extrude or a revolve); `transform` (Move/Copy Body, rotation
+about Z, Y, X then a separate translation); `boolean` (Combine). Bodies are named after the
+Chudware feature that owns them, so a cut subtracts from the one body the engine cuts (a tool
+body + Combine in a multibody part) and a merge fuses into the bodies it touches. A cut that
+removes nothing is a note, as in the engine. Features without an exact mapping refuse the
 export; `allow_body_fallback` sends the exact STEP as one imported body instead.
+
+SolidWorks 2026 behaviours the macro works around: a late-bound call reads an array argument
+as zeros unless it is passed by value (`(a)`); `Sqr(0)` raises error 5; a VBA `End` makes
+`RunMacro2` run the macro a second time and leaves the instance unable to sketch; a pattern of a
+two-direction through-all cut gives a zero-volume body (a through-all cut from a model face is
+one-directional); `SelectByID2` at coordinates misses in a hidden window (edges and faces are
+found by their closest point). After a failed build the COM runner closes a hidden SolidWorks it
+did not share with the user.
+
+**Assemblies** export to a folder (`assembly.py`): one macro per distinct part (feature tree,
+falling back inside the macro to the part's exact STEP when SolidWorks refuses a feature or the
+rebuild does not match), one per sub-assembly, and the top assembly macro, which builds what is
+missing, places every component at its Chudware pose, fixes it there and saves the `.SLDASM`.
+Chudware mates are not re-created. SolidWorks `.sldprt`/`.sldasm` component sources are copied
+as they are. Importing a `.sldasm` through COM rebuilds every part it can as a feature tree and
+brings the rest in as exact solids, sub-assemblies as nested assemblies; one unsupported part no
+longer refuses the whole assembly.

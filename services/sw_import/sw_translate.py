@@ -437,31 +437,43 @@ def _component_xform16(comp: "SWComponent") -> list[float]:
             0.0, 0.0, 0.0, 1.0]
 
 
+def _split(unsupported: list[SWUnsupported]) -> tuple[list[dict], list[dict]]:
+    blocking, degraded = [], []
+    for u in unsupported:
+        rec = {"sw_name": u.sw_name, "sw_type": u.sw_type, "reason": u.reason}
+        (degraded if u.severity == "degraded" else blocking).append(rec)
+    return blocking, degraded
+
+
 def _translate_assembly(part: SWPart) -> dict:
-    """Rebuild an assembly the way the engine actually models them: each component is its OWN part
-    (built from its feature tree, saved to a .step+), placed in an ASSEMBLY document via
-    asm_insert_component with a 4x4 transform. Returns a per-component build plan; the MCP import
-    orchestrates the multi-doc build (build component -> save .step+ -> insert with transform)."""
-    unsupported: list[SWUnsupported] = list(part.unsupported)
+    """Rebuild an assembly the way the engine models them: each distinct component file is its
+    OWN document (a part rebuilt from its feature tree, or a sub-assembly, recursively), saved
+    to a .step+ and placed in an ASSEMBLY document via asm_insert_component with a 4x4
+    transform. A part whose features cannot all be rebuilt carries its own ``blocking`` list;
+    the importer brings that part in as its exact solid instead of refusing the assembly.
+
+    Returns {"is_assembly", "components": [{name, part_key, kind, xform16, ...}],
+    "unsupported"} where a part row has ``ops``/``blocking``/``degraded``/``feature_count`` and
+    an assembly row has ``sub`` (this structure again)."""
+    rows: dict[str, dict] = {}
     components: list[dict] = []
-    # Build each DISTINCT component part once; reuse the .step+ for repeated instances.
-    plan_by_path: dict[str, dict] = {}
     for comp in part.components:
         key = comp.part.path
-        if key not in plan_by_path:
-            sub_ops, sub_unsup = _translate_part_features(comp.part)
-            unsupported += sub_unsup
-            plan_by_path[key] = {"ops": sub_ops,
-                                 "feature_count": len(comp.part.features),
-                                 "ok": bool(sub_ops)}
-        plan = plan_by_path[key]
-        if not plan["ok"]:
-            unsupported.append(SWUnsupported(comp.name, "Component",
-                                             "component built no solid body to place"))
-            continue
-        components.append({"name": comp.name, "part_key": key, "ops": plan["ops"],
-                           "xform16": _component_xform16(comp)})
-    return {"is_assembly": True, "components": components, "unsupported": unsupported}
+        if key not in rows:
+            if comp.part.is_assembly:
+                rows[key] = {"kind": "assembly", "sub": _translate_assembly(comp.part)}
+            else:
+                ops, unsup = _translate_part_features(comp.part)
+                blocking, degraded = _split(list(comp.part.unsupported) + unsup)
+                if not ops and not blocking:
+                    blocking.append({"sw_name": comp.part.name, "sw_type": "Part",
+                                     "reason": "no feature built a solid"})
+                rows[key] = {"kind": "part", "ops": ops, "blocking": blocking,
+                             "degraded": degraded, "feature_count": len(comp.part.features)}
+        components.append({"name": comp.name, "part_key": key,
+                           "xform16": _component_xform16(comp), **rows[key]})
+    return {"is_assembly": True, "name": part.name, "components": components,
+            "unsupported": list(part.unsupported)}
 
 
 def resolve(path: str) -> dict:
@@ -476,15 +488,11 @@ def resolve(path: str) -> dict:
     Raises :class:`SolidWorksUnavailable` if SolidWorks/pywin32 can't be used here."""
     part = extract_part(path)
     t = translate(part)
-    blocking, degraded = [], []
-    for u in t["unsupported"]:
-        rec = {"sw_name": u.sw_name, "sw_type": u.sw_type, "reason": u.reason}
-        (degraded if u.severity == "degraded" else blocking).append(rec)
+    blocking, degraded = _split(t["unsupported"])
     out = {"name": part.name, "blocking": blocking, "degraded": degraded}
     if t.get("is_assembly"):
         out["is_assembly"] = True
-        out["components"] = t["components"]   # [{name, part_key, ops, xform16}]
-        out["feature_count"] = sum(len(c.part.features) for c in part.components)
+        out["components"] = t["components"]
     else:
         out["ops"] = t["ops"]
         out["feature_count"] = len(part.features)

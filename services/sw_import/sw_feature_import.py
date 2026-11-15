@@ -902,11 +902,13 @@ def _walk(model, part: SWPart) -> None:
 # Public entry point
 # ---------------------------------------------------------------------------
 def _walk_assembly(model, part: SWPart) -> None:
-    """Extract a top-level assembly: each component's part feature tree + its placement transform.
+    """Extract a top-level assembly: each component's feature tree + its placement transform.
 
-    Reconstructs every distinct component part (recursively) and records its rigid placement so the
-    translator can rebuild the assembly as a placed multi-body part. Sub-assemblies and mates are
-    not interpreted yet — geometry is fully determined by the resolved component transforms."""
+    Every distinct component file is extracted once: a part's feature tree, or a sub-assembly
+    recursively. A component whose own features cannot all be rebuilt keeps its unsupported
+    list on ITS part (the importer then brings that part in as its exact solid instead of
+    refusing the whole assembly). Mates are not interpreted: geometry is fully determined by
+    the resolved component transforms."""
     asm = _cast(model, "IAssemblyDoc")
     try:
         comps = list(asm.GetComponents(True) or [])   # True = top-level only
@@ -918,13 +920,16 @@ def _walk_assembly(model, part: SWPart) -> None:
     for c in comps:
         comp = _cast(c, "IComponent2")
         try:
+            if comp.IsSuppressed():
+                continue
             cname = comp.Name2
             cpath = comp.GetPathName()
         except Exception:  # noqa: BLE001
             continue
-        if not cpath or not cpath.lower().endswith(".sldprt"):
+        if not cpath or not cpath.lower().endswith((".sldprt", ".sldasm")):
             part.unsupported.append(SWUnsupported(
-                cname, "Component", "sub-assembly components not supported yet"))
+                cname, "Component", f"component file {cpath!r} is not a SolidWorks part or "
+                                    "assembly"))
             continue
         try:
             tr = comp.GetTotalTransform(True)
@@ -936,17 +941,17 @@ def _walk_assembly(model, part: SWPart) -> None:
                                                   f"could not read placement: {exc}"))
             continue
         if cpath not in cache:
-            # Recursively reconstruct the component part's feature tree.
-            cache[cpath] = extract_part(cpath)
-        cpart = cache[cpath]
-        # Surface the component part's own unsupported features (prefixed) on the assembly.
-        for u in cpart.unsupported:
-            part.unsupported.append(SWUnsupported(f"{cname}/{u.sw_name}", u.sw_type, u.reason,
-                                                  u.severity))
-        part.components.append(SWComponent(cname, cpart, rot, trans))
+            try:
+                cache[cpath] = extract_part(cpath)
+            except Exception as exc:  # noqa: BLE001 — an unreadable feature tree: exact solid
+                cache[cpath] = SWPart(name=Path(cpath).stem, path=cpath,
+                                      is_assembly=cpath.lower().endswith(".sldasm"))
+                cache[cpath].unsupported.append(SWUnsupported(
+                    cname, "Component", f"feature tree could not be read: {exc}"))
+        part.components.append(SWComponent(cname, cache[cpath], rot, trans))
     if not part.components:
         part.unsupported.append(SWUnsupported(part.name, "Assembly",
-                                              "no reconstructable part components found"))
+                                              "no placeable components found"))
 
 
 def extract_part(path: str | os.PathLike, *, visible: bool = False) -> SWPart:

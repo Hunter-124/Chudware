@@ -505,10 +505,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "export_solidworks": {
         "prompt_note": (
-            "For SolidWorks users: rebuilds the part's features in SolidWorks (method='com' "
-            "here, or method='macro' for a teammate to run in their own, possibly older, "
-            "SolidWorks). Read `verified`/`unsupported`; never claim an editable SolidWorks "
-            "tree when fidelity='imported_body'. cad_guide('solidworks')."
+            "For SolidWorks users: rebuilds a part's features, or a whole assembly, in "
+            "SolidWorks (method='com' here, or method='macro' for a teammate to run in their "
+            "own, possibly older, SolidWorks). Read `verified`/`checks`/`unsupported` (and "
+            "`parts[].fidelity` for an assembly); never claim an editable SolidWorks tree when "
+            "fidelity='imported_body'. cad_guide('solidworks')."
         ),
     },
     "export_flat_dxf": {

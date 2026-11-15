@@ -980,3 +980,27 @@ Amends `extrude`, `revolve`, `sweep`, `loft` and the primitives (`box`, `cylinde
 - `transform` errors name the body to target: an unknown `body` lists the live bodies; a
   consumed `body` names its live owner (the consumer chain, else the newest live body whose
   bounds hold it).
+
+## SolidWorks assemblies and export (append-only, 2026-11-15)
+
+Amends the SolidWorks import lanes above and adds the export contract (`services/sw_export/`):
+
+- `import_part` of a `.sldasm` through SolidWorks COM MUST NOT refuse the assembly because one
+  component part has a feature the importer cannot rebuild: that part imports as its exact
+  solid (the `.sldprt` lane order above) and is named in `parts_as_exact_solid`; sub-assemblies
+  import as nested assembly documents. Mates are not converted; components keep their
+  SolidWorks transforms. A single `.sldprt` keeps the strict refusal.
+- `export_solidworks` writes ONE `.swb` VBA macro per part (the only rebuild implementation;
+  `method="com"` runs it through `ISldWorks.RunMacro2`). The macro saves `<stem>.SLDPRT` beside
+  itself and `<stem>.report.txt` (`key=value` lines: `ok`, `stage`, `built`, `volume_mm3`,
+  `com_sw_mm`, `body_count`, `inertia_sw_mm5`, `close`, `match`, `fidelity`, `saved`,
+  `save_ok`, optional `notes`, `error`, `feature_error`). Expected values are the part's
+  `eval_mass` at `density_g_cm3: 1.0` in SolidWorks axes (engine `(x, y, z)` = SolidWorks
+  `(x, z, -y)`); `verified` holds at volume 1e-5 relative, centre of mass 0.01 mm, exact body
+  count and inertia diagonal 1e-4 of its largest entry; `close` at 100x those.
+- An exact-solid part (no feature tree) is Chudware's STEP opened by SolidWorks and turned -90
+  degrees about X into the same SolidWorks axes as a rebuilt part.
+- An assembly exports to a folder: one macro and one STEP per distinct part (the macro falls
+  back to the STEP solid when SolidWorks refuses a feature or the rebuild misses `close`), one
+  macro per sub-assembly, and the top macro, which saves `<stem>.SLDASM` with every component
+  fixed at its Chudware pose. Chudware mates are not re-created.

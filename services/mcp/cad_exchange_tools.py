@@ -85,6 +85,53 @@ def _feature_edge_points(doc_id: str):
     return points
 
 
+def _solidworks_export_assembly(d: str, tree: dict, path: Optional[str], method: str) -> dict:
+    """An assembly -> a folder of SolidWorks macros (and, with SolidWorks here, the .SLDASM
+    and every part). See services/sw_export/assembly.py."""
+    from services.formats.formats_solidworks import solidworks_available  # noqa: PLC0415
+    from services.mcp.cad_asm_tools import open_component_part  # noqa: PLC0415
+    from services.sw_export.assembly import AssemblyExport, run_all  # noqa: PLC0415
+    from services.sw_export.com_build import run_macro, verify  # noqa: PLC0415
+
+    if method == "auto":
+        method = "com" if solidworks_available() else "macro"
+    out = (_sanitize_output_path(os.path.expanduser(path)) if path
+           else _default_deliverable_path(d, ".SLDASM"))
+    out = os.path.splitext(out)[0] + ".SLDASM"
+    out_dir, stem = os.path.dirname(os.path.abspath(out)), os.path.splitext(os.path.basename(out))[0]
+    os.makedirs(out_dir, exist_ok=True)
+    asm_path = ""
+    for row in (cb.call("doc_list", {}) or {}).get("docs", []):
+        if isinstance(row, dict) and row.get("doc_id") == d and isinstance(row.get("path"), str):
+            asm_path = row["path"]
+    job = AssemblyExport(cb.call, open_component_part, _feature_edge_points, out_dir)
+    top = job.export(d, asm_path, stem)
+    summary = {"doc_id": d, "method": method, "path": out, "folder": out_dir,
+               "macro": os.path.join(out_dir, top.macro), "components": top.note["components"],
+               "files": len(job.order),
+               "degraded": ["Chudware mates are not re-created as SolidWorks mates: every "
+                            "component is placed at its Chudware position and fixed there"]}
+    plan_rows = [{"file": s.file, "kind": s.kind, **{k: v for k, v in s.note.items()
+                                                     if k != "degraded"}}
+                 for s in job.order if s.kind != "assembly"]
+    if method == "macro":
+        return {"ok": True, **summary, "parts": plan_rows, "verified": None,
+                "next_step": f"Share the whole folder. In SolidWorks run {top.macro} (Tools > "
+                             "Macro > Run): it builds every part and sub-assembly in that "
+                             f"SolidWorks version, then saves {stem}.SLDASM and reports whether "
+                             "it matches Chudware's assembly."}
+    rows = run_all(job.order, out_dir, run_macro, verify)
+    top_row = rows[-1]
+    parts = rows[:-1]
+    return {**summary, "ok": all(r.get("ok") for r in rows),
+            "verified": top_row.get("verified"),
+            **{k: top_row[k] for k in ("checks", "volume_rel_error", "com_error_mm",
+                                       "inertia_rel_error", "error") if k in top_row},
+            "parts": parts,
+            "fidelity_counts": {f: sum(1 for r in parts if r.get("fidelity") == f)
+                                for f in {r.get("fidelity") for r in parts}}}
+
+
 def _solidworks_export(d: str, path: Optional[str], method: str,
                        allow_body_fallback: bool) -> dict:
     from services.formats.formats_solidworks import solidworks_available  # noqa: PLC0415
@@ -95,11 +142,14 @@ def _solidworks_export(d: str, path: Optional[str], method: str,
     if method not in ("auto", "com", "macro"):
         raise ValueError("method must be 'auto', 'com' or 'macro'")
     tree = cb.call("doc_tree", {"doc_id": d}).get("tree") or {}
+    if tree.get("schema") == "aicad.asm/1":
+        return _solidworks_export_assembly(d, tree, path, method)
     if tree.get("schema") != "aicad.part/1":
-        raise ValueError("SolidWorks export takes a part document (export assemblies per part)")
+        raise ValueError("SolidWorks export takes a part or assembly document")
     name = str(tree.get("name") or "Part")
     try:
-        expected = cb.call("eval_mass", {"doc_id": d})
+        # Uniform density: SolidWorks measures the bare geometry (no Chudware materials).
+        expected = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 1.0})
     except CoreError:
         expected = None
     plan = build_plan(tree.get("features") or [], name=name,
@@ -119,31 +169,86 @@ def _solidworks_export(d: str, path: Optional[str], method: str,
                          "SolidWorks features yet",
                 "hint": "allow_body_fallback=True sends the exact solid as one imported "
                         "SolidWorks body instead (no feature tree)."}
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    stem = os.path.splitext(os.path.basename(out))[0]
     body_only = bool(plan["unsupported"])
-    if body_only:
-        step = os.path.splitext(out)[0] + ".step"
-        cb.call("export_file", {"doc_id": d, "path": step, "format": "step"})
-        summary["fidelity"] = "imported_body"
-        summary["step"] = step
-        if method == "macro":
-            from services.sw_export.macro import write_body_macro  # noqa: PLC0415
-            return {"ok": True, **summary, "path": write_body_macro(name, step, out)}
-        from services.sw_export.com_build import import_body  # noqa: PLC0415
-        return {**import_body(step, out), **summary}
-    summary["fidelity"] = "feature_tree"
-    if method == "macro":
-        from services.sw_export.macro import write_macro  # noqa: PLC0415
-        return {"ok": True, **summary, "path": write_macro(plan, out),
-                "verified": None,
-                "next_step": "Run the macro in SolidWorks (Tools > Macro > Run). It saves "
-                             f"{name}.SLDPRT beside itself, in that SolidWorks version, and "
-                             "reports whether its volume and centre of mass match Chudware's."}
-    from services.sw_export.com_build import build  # noqa: PLC0415
     try:
+        if body_only:
+            step = os.path.splitext(out)[0] + ".step"
+            cb.call("export_file", {"doc_id": d, "path": step, "format": "step"})
+            summary["fidelity"] = "imported_body"
+            summary["step"] = step
+            why = "; ".join(f"{u['type']} {u.get('name') or u['id']}: {u['reason']}"
+                            for u in plan["unsupported"][:3])
+            if method == "macro":
+                from services.sw_export.macro import write_body_macro  # noqa: PLC0415
+                return {"ok": True, **summary,
+                        "path": write_body_macro(name, step, out, expected=plan["expected"],
+                                                 reason=why)}
+            from services.sw_export.com_build import import_body  # noqa: PLC0415
+            return {**summary, **import_body(step, out, expected=plan["expected"], reason=why)}
+        summary["fidelity"] = "feature_tree"
+        if method == "macro":
+            from services.sw_export.macro import write_macro  # noqa: PLC0415
+            return {"ok": True, **summary, "path": write_macro(plan, out),
+                    "verified": None,
+                    "next_step": "Run the macro in SolidWorks (Tools > Macro > Run). It saves "
+                                 f"{stem}.SLDPRT beside itself, in that SolidWorks version, "
+                                 "and reports whether it matches Chudware's part (volume, "
+                                 "centre of mass, body count, inertia)."}
+        from services.sw_export.com_build import build  # noqa: PLC0415
         return {**summary, **build(plan, out)}
     except SolidWorksUnavailable as e:
         return {"ok": False, **summary, "error": str(e),
                 "hint": "method='macro' writes a macro a SolidWorks user can run instead."}
+
+
+class _SidecarSaveRefused(Exception):
+    def __init__(self, reply: dict):
+        super().__init__(reply.get("error") or reply.get("code") or "save refused")
+        self.reply = reply
+
+
+def _build_sw_assembly(plan: dict, sidecar: str, stats: dict, built: dict) -> str:
+    """Build a resolved SolidWorks assembly (sw_translate) as Chudware documents: each
+    distinct part once (its feature tree, or its exact solid when a feature cannot be rebuilt),
+    each sub-assembly recursively, every instance placed by its SolidWorks transform. Returns
+    the assembly doc_id; ``built`` maps a source file to its saved .step+."""
+    os.makedirs(sidecar, exist_ok=True)
+    for c in plan["components"]:
+        key = c["part_key"]
+        if key in built:
+            continue
+        stem = os.path.splitext(os.path.basename(key))[0]
+        cpath = os.path.join(sidecar, stem + ".step+")
+        if c["kind"] == "assembly":
+            stats["assemblies"] += 1
+            cd = _build_sw_assembly(c["sub"], os.path.join(sidecar, stem), stats, built)
+        elif c["blocking"]:
+            # Its features cannot all be rebuilt: bring in its exact solid (native reader).
+            cd = cb.call("import_file", {"path": key}).get("doc_id")
+            stats["exact_body"].append({"file": os.path.basename(key),
+                                        "unsupported": c["blocking"][:5]})
+        else:
+            cd = cb.call("doc_new", {"name": stem}).get("doc_id")
+            cb.call("doc_apply_ops", {"doc_id": cd, "ops": c["ops"]})
+            stats["feature_tree"].append(os.path.basename(key))
+        saved = cb.call("doc_save", {"doc_id": cd, "path": cpath, "if_no_human_dirty": True})
+        if saved.get("ok") is False:
+            raise _SidecarSaveRefused({**saved, "ok": False, "doc_id": cd, "path": cpath,
+                                       "hint": "Component save failed; its live document was "
+                                               "retained."})
+        cb.call("doc_close", {"doc_id": cd})
+        built[key] = cpath
+    ad = cb.call("doc_new", {"name": plan["name"], "kind": "assembly"}).get("doc_id")
+    cb.call("doc_apply_ops", {"doc_id": ad, "ops": [
+        {"op": "asm_insert_component", "name": c["name"], "source": {"path": built[c["part_key"]]},
+         "transform": c["xform16"]} for c in plan["components"]]})
+    try:
+        cb.call("doc_solve_mates", {"doc_id": ad})
+    except CoreError:
+        pass
+    return ad
 
 
 def register_cad_exchange_tools(mcp: FastMCP) -> None:
@@ -400,29 +505,40 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def export_solidworks(path: Optional[str] = None, doc_id: Optional[str] = None,
                           method: str = "auto", allow_body_fallback: bool = False) -> str:
-        """Send a part to SolidWorks users as a native, editable SolidWorks part.
+        """Send a part or an assembly to SolidWorks users as native, editable SolidWorks files.
 
-        The part's feature tree (sketches on Top/Front/Right or an offset of one or a
-        principal-facing face; extrude/cut blind, mid-plane, through-all and two-direction;
-        revolve about the sketch centerline; constant fillet; equal chamfer; shell; linear
-        pattern along X/Y/Z; circular pattern about a world axis; feature mirror across a
-        default plane) is rebuilt feature by feature IN SolidWorks:
+        The export is ONE SolidWorks VBA macro that rebuilds the part feature by feature:
+        sketches (Top/Front/Right, an offset of one incl. the sketch `offset`, or a
+        principal-facing face); extrude/cut (blind, mid-plane, through-all, two-direction);
+        revolve about a sketch centerline or a world axis; constant fillet; equal chamfer;
+        shell; linear and circular patterns; feature mirror across a default plane;
+        box/cylinder/cone/sphere/torus primitives at any axis; transform (Move/Copy Body);
+        boolean (Combine). Multibody parts keep their bodies, and a cut subtracts from the one
+        body Chudware cuts.
 
-          method="com"   (needs SolidWorks on this machine) SolidWorks builds and saves
-                         `<path>.SLDPRT`; the reply compares its volume and centre of mass with
-                         Chudware's (`verified`, `volume_rel_error`, `com_error_mm`).
-          method="macro" writes a SolidWorks VBA macro (`.swb`). A teammate runs it (Tools >
-                         Macro > Run) and THEIR SolidWorks writes the .SLDPRT in their own
-                         release (2014 or newer), then reports the same match check. Use this
-                         for teammates on an older SolidWorks than yours: SolidWorks cannot
-                         save to an older release.
+          method="com"   (needs SolidWorks on this machine) runs the macro here: SolidWorks
+                         saves `<path>.SLDPRT` (the macro stays beside it) and the reply
+                         compares volume, centre of mass, body count and inertia with
+                         Chudware's (`verified`, `checks`, `volume_rel_error`, ...).
+          method="macro" only writes the macro (`.swb`). A teammate runs it (Tools > Macro >
+                         Run) and THEIR SolidWorks writes the file in their own release
+                         (2014 or newer) and reports the same check. Use this for teammates
+                         on an older SolidWorks than yours: SolidWorks cannot save to an older
+                         release.
           method="auto"  com when SolidWorks is installed, else macro.
 
-        Strict fidelity: a feature it cannot rebuild exactly is listed in `unsupported` and the
-        export is refused; `allow_body_fallback=True` sends the exact solid instead as one
-        imported SolidWorks body (STEP beside the file; `fidelity="imported_body"`).
-        `degraded` lists what is exact in geometry but carries less intent (sketch relations and
-        dimensions are not re-created yet). Part documents only.
+        Part, strict fidelity: a feature it cannot rebuild exactly is listed in `unsupported`
+        and the export is refused; `allow_body_fallback=True` sends the exact solid instead as
+        one imported SolidWorks body (STEP beside the file; `fidelity="imported_body"`).
+        `degraded` lists what is exact in geometry but carries less intent (sketch relations
+        and dimensions are not re-created yet). `notes` lists cuts that removed nothing.
+
+        Assembly: `path` names the .SLDASM; its folder receives one macro and one exact STEP
+        per distinct part, one macro per sub-assembly and the top macro. Each part is rebuilt
+        as features when it maps and matches, else saved as its exact solid (`parts[]` with
+        `fidelity`, `fidelity_counts`); every component is placed at its Chudware pose and
+        fixed (Chudware mates are not re-created as SolidWorks mates). For method="macro",
+        share the whole folder; the teammate runs only the top macro.
         """
         try:
             return _dumps(_solidworks_export(_doc(doc_id), path, method, allow_body_fallback))
@@ -535,7 +651,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                     # not block the file: continue to the exact native import, reported.
                     plan = None
                     portable_fallback_reason = f"SolidWorks feature extraction failed: {e}"
-                if plan is not None and plan["blocking"]:
+                if plan is not None and plan["blocking"] and not plan.get("is_assembly"):
                     # Strict-fidelity contract: refuse rather than import a quietly-wrong model.
                     return _dumps({
                         "ok": False,
@@ -547,53 +663,30 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                 "rebuilt faithfully. Use import_part(resolve_features=False) to "
                                 "import the part's exact solid body in the meantime."})
                 if plan is not None and plan.get("is_assembly"):
-                    # Build each DISTINCT component part once -> save a .step+ (keeps its editable
-                    # feature tree) -> place every instance in an ASSEMBLY doc via
-                    # asm_insert_component with its 4x4 transform (the engine's native assembly model).
-                    comps = plan["components"]
-                    if not comps:
+                    if not plan["components"]:
                         return _dumps({"ok": False, "error":
-                                       "no reconstructable components in this assembly",
-                                       "degraded": plan["degraded"]})
-                    # Component .step+ sidecars live in a cache dir (NOT the user's source folder);
-                    # the assembly references them, so they must persist for the session.
+                                       "no placeable components in this assembly",
+                                       "skipped": plan["blocking"]})
+                    # Component .step+ sidecars live in a cache dir (NOT the user's source
+                    # folder); the assembly references them, so they must persist.
                     sidecar = os.path.join(tempfile.gettempdir(), "chudware_sw_components",
                                            plan["name"])
-                    os.makedirs(sidecar, exist_ok=True)
-                    built: dict = {}   # part_key -> .step+ path
-                    for c in comps:
-                        key = c["part_key"]
-                        if key in built:
-                            continue
-                        cd = cb.call("doc_new", {"name": os.path.basename(key)}).get("doc_id")
-                        cb.call("doc_apply_ops", {"doc_id": cd, "ops": c["ops"]})
-                        stem = os.path.splitext(os.path.basename(key))[0]
-                        cpath = os.path.join(sidecar, stem + ".step+")
-                        saved = cb.call("doc_save", {"doc_id": cd, "path": cpath,
-                                                     "if_no_human_dirty": True})
-                        if saved.get("ok") is False:
-                            return _dumps({**saved, "ok": False, "doc_id": cd,
-                                           "path": cpath,
-                                           "hint": "Component save failed; its live document was retained."})
-                        cb.call("doc_close", {"doc_id": cd})
-                        built[key] = cpath
-                    ad = cb.call("doc_new", {"name": plan["name"],
-                                             "kind": "assembly"}).get("doc_id")
-                    asm_ops = [{"op": "asm_insert_component", "name": c["name"],
-                                "source": {"path": built[c["part_key"]]},
-                                "transform": c["xform16"]} for c in comps]
-                    cb.call("doc_apply_ops", {"doc_id": ad, "ops": asm_ops})
+                    stats: dict = {"feature_tree": [], "exact_body": [], "assemblies": 0}
                     try:
-                        cb.call("doc_solve_mates", {"doc_id": ad})
-                    except CoreError:
-                        pass
+                        ad = _build_sw_assembly(plan, sidecar, stats, {})
+                    except _SidecarSaveRefused as e:
+                        return _dumps(e.reply)
                     _CUR["doc_id"] = ad
                     _publish_current(ad)
                     return _dumps({
                         "ok": True, "doc_id": ad, "imported_from": path, "format": "sldasm",
-                        "feature_resolved": True, "is_assembly": True,
-                        "component_count": len(comps), "distinct_parts": len(built),
-                        "feature_count": plan["feature_count"], "degraded": plan["degraded"]})
+                        "is_assembly": True,
+                        "feature_resolved": not stats["exact_body"],
+                        "component_count": len(plan["components"]),
+                        "parts_with_feature_tree": len(stats["feature_tree"]),
+                        "parts_as_exact_solid": stats["exact_body"],
+                        "sub_assemblies": stats["assemblies"],
+                        "skipped": plan["blocking"], "degraded": plan["degraded"]})
                 if plan is not None:
                     d = cb.call("doc_new", {"name": plan["name"]}).get("doc_id")
                     r = cb.call("doc_apply_ops", {"doc_id": d, "ops": plan["ops"]})

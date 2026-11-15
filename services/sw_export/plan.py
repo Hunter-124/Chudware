@@ -1,10 +1,9 @@
 """Chudware part feature tree -> a SolidWorks build plan (the inverse of services.sw_import).
 
-The plan is a plain list of steps in SolidWorks MODEL coordinates (millimetres, degrees), so
-the two backends stay thin: :mod:`services.sw_export.com_build` replays it through an installed
-SolidWorks, :mod:`services.sw_export.macro` writes it as a SolidWorks VBA macro that a teammate
-runs in their own SolidWorks release (which is what makes the result open in older versions:
-SolidWorks itself writes the file, in that teammate's version).
+The plan is a plain list of steps in SolidWorks MODEL coordinates (millimetres, degrees).
+:mod:`services.sw_export.macro` writes it as one SolidWorks VBA macro; Chudware runs that macro
+in an installed SolidWorks (:mod:`services.sw_export.com_build`) and a teammate runs the same file
+in their own SolidWorks release (SolidWorks itself writes the part, in that teammate's version).
 
 Strict-fidelity contract (same as the importer): a feature or parameter this cannot rebuild
 exactly is listed in ``unsupported`` with the Chudware feature id/name/type and the reason; the
@@ -12,9 +11,17 @@ caller refuses a parametric export with a non-empty list rather than write a qui
 part. ``degraded`` lists what is rebuilt with the exact geometry but less design intent (e.g.
 sketch relations and dimensions are not re-created yet).
 
+Bodies: every solid step carries ``body = {"mode": "merge"|"new"|"cut", "target": key|None}``
+with the engine's body policy (contracts/doc_schema.md "Solid feature modes"): a merging
+feature fuses into every body it touches, ``new`` (or ``merge:false``) adds a body, and a cut
+subtracts from ONE body, its ``body`` param or else the current (last-built) one. The macro
+names each SolidWorks body after the Chudware feature that owns it, so ``target`` is the
+Chudware feature id.
+
 Coordinates: a sketch on a principal plane keeps its 2D coordinates unchanged (the importer copies
 them verbatim; validated by SolidWorks center-of-mass on asymmetric parts). A world point maps
-engine (x, y, z) -> SolidWorks (x, z, -y): engine is Z-up, SolidWorks Y-up.
+engine (x, y, z) -> SolidWorks (x, z, -y): engine is Z-up, SolidWorks Y-up. Primitive profiles
+(``sketch3``) are given as 3D model points; the macro maps them into the sketch.
 """
 
 from __future__ import annotations
@@ -25,17 +32,28 @@ from typing import Any, Callable, Optional
 
 # Chudware principal datum -> SolidWorks default plane. Each pair's 2D sketch frames coincide.
 SW_PLANE = {"plane.top": "Top Plane", "plane.front": "Front Plane", "plane.right": "Right Plane"}
-# SolidWorks plane whose normal is +/- each engine world axis (for pattern directions).
-_AXIS_PLANE = {(1, 0, 0): ("Right Plane", False), (-1, 0, 0): ("Right Plane", True),
-               (0, 0, 1): ("Top Plane", False), (0, 0, -1): ("Top Plane", True),
-               (0, -1, 0): ("Front Plane", False), (0, 1, 0): ("Front Plane", True)}
-# The two default planes whose intersection is each engine world axis through the origin.
-_AXIS_PLANES = {0: ("Top Plane", "Front Plane"), 1: ("Top Plane", "Right Plane"),
-                2: ("Front Plane", "Right Plane")}
+# Engine 2D sketch frame (u, v) of each principal plane, in engine world axes.
+_PLANE_UV = {"plane.top": ((1, 0, 0), (0, 1, 0)), "plane.front": ((1, 0, 0), (0, 0, 1)),
+             "plane.right": ((0, 1, 0), (0, 0, 1))}
+_PLANE_N = {"plane.top": (0, 0, 1), "plane.front": (0, -1, 0), "plane.right": (1, 0, 0)}
 # Face-side words (contracts/selectors.md) -> engine outward normal.
 _SIDE_NORMAL = {"top": (0, 0, 1), "bottom": (0, 0, -1), "front": (0, -1, 0),
                 "back": (0, 1, 0), "right": (1, 0, 0), "left": (-1, 0, 0)}
 _SKETCH_ENTITIES = {"line", "circle", "arc", "point", "spline"}
+_PRIMITIVES = {"box", "cylinder", "cone", "sphere", "torus"}
+# swBodyOperationType_e for the Combine feature.
+COMBINE_OP = {"fuse": 15903, "cut": 15902, "common": 15901}
+_BOOLEAN_ALIAS = {"combine": "fuse", "union": "fuse", "add": "fuse", "subtract": "cut",
+                  "intersect": "common"}
+_SIGNED_AXIS = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
+SNAP_MM = 1e-3   # sketch endpoints closer than this become one point
+
+
+def _datum(ref: Any) -> Any:
+    """{"kind": "datum", "feature": "axis.z"} -> "axis.z"; any other ref unchanged."""
+    if isinstance(ref, dict) and ref.get("kind") == "datum" and isinstance(ref.get("feature"), str):
+        return ref["feature"]
+    return ref
 
 
 def _principal(ref: Any) -> Optional[str]:
@@ -50,13 +68,86 @@ def to_sw(p) -> list[float]:
     return [float(p[0]), float(p[2]), -float(p[1])]
 
 
+# Engine -> SolidWorks frame change as a matrix: sw = T . engine.
+_T = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))
+
+
+def _mm(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _mv(a, v):
+    return [sum(a[i][k] * v[k] for k in range(3)) for i in range(3)]
+
+
+def _add(*vs):
+    return [sum(v[i] for v in vs) for i in range(3)]
+
+
+def _scale(v, s):
+    return [x * s for x in v]
+
+
+def _cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+
+def _dot(a, b):
+    return sum(a[i] * b[i] for i in range(3))
+
+
+def _unit(v) -> Optional[list[float]]:
+    n = math.sqrt(_dot(v, v))
+    return [x / n for x in v] if n > 1e-12 else None
+
+
+def axis_angle(axis, angle_rad: float):
+    """Rotation matrix about a unit ``axis`` (right hand)."""
+    x, y, z = axis
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+    t = 1 - c
+    return [[t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+            [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+            [t * x * z - s * y, t * y * z + s * x, t * z * z + c]]
+
+
+def rot_z_to(axis) -> list[list[float]]:
+    """The engine's primitive orientation: the minimal rotation of local +Z onto ``axis``
+    (a half turn about +X for -Z), exactly as document.cpp builds it."""
+    cosang = axis[2]
+    if cosang >= 1.0 - 1e-12:
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    if cosang <= -1.0 + 1e-12:
+        return axis_angle((1.0, 0.0, 0.0), math.pi)
+    return axis_angle(_unit(_cross((0.0, 0.0, 1.0), axis)),
+                      math.acos(max(-1.0, min(1.0, cosang))))
+
+
+def sw_euler(r_sw) -> tuple[float, float, float]:
+    """(a, b, c) radians with ``r_sw = Rx(c) . Ry(b) . Rz(a)``: the angle arguments of
+    InsertMoveCopyBody2, which rotates about Z, then Y, then X (measured on SolidWorks 2026)."""
+    b = math.asin(max(-1.0, min(1.0, r_sw[0][2])))
+    if abs(math.cos(b)) > 1e-9:
+        a = math.atan2(-r_sw[0][1], r_sw[0][0])
+        c = math.atan2(-r_sw[1][2], r_sw[2][2])
+    else:   # gimbal lock: fold the X turn into Z
+        a, c = math.atan2(r_sw[1][0], r_sw[1][1]), 0.0
+    return a, b, c
+
+
+def engine_rotation_to_sw(r_eng):
+    """The same rigid rotation expressed in SolidWorks axes: T . R . T^-1."""
+    t_inv = [list(r) for r in zip(*_T)]
+    return _mm(_mm(_T, r_eng), t_inv)
+
+
 @dataclass
 class Plan:
     name: str
     steps: list[dict] = field(default_factory=list)
     unsupported: list[dict] = field(default_factory=list)
     degraded: list[dict] = field(default_factory=list)
-    expected: dict = field(default_factory=dict)   # {volume_mm3, com_sw_mm}
+    expected: dict = field(default_factory=dict)   # {volume_mm3, com_sw_mm, body_count, ...}
 
     def as_dict(self) -> dict:
         return {"name": self.name, "steps": self.steps, "unsupported": self.unsupported,
@@ -66,23 +157,25 @@ class Plan:
 def _dim(v: Any) -> Optional[float]:
     if isinstance(v, dict):
         v = v.get("value")
-    return float(v) if isinstance(v, (int, float)) else None
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
-def _unit_axis(d) -> Optional[tuple[int, int, int]]:
-    """The signed principal axis a direction lies on, or None."""
-    if not isinstance(d, (list, tuple)) or len(d) != 3:
-        return None
-    n = math.sqrt(sum(float(x) * float(x) for x in d))
-    if n < 1e-12:
-        return None
-    u = [float(x) / n for x in d]
-    for i in range(3):
-        if abs(abs(u[i]) - 1.0) < 1e-9:
-            out = [0, 0, 0]
-            out[i] = 1 if u[i] > 0 else -1
-            return tuple(out)
+def _vec3(v) -> Optional[list[float]]:
+    if isinstance(v, (list, tuple)) and len(v) >= 3 and \
+            all(isinstance(x, (int, float)) for x in v[:3]):
+        return [float(x) for x in v[:3]]
     return None
+
+
+def _parse_axis(v) -> Optional[list[float]]:
+    """[x,y,z] or "x"/"+y"/"-z" (document.cpp parse_signed_axis) -> unit vector."""
+    if isinstance(v, str):
+        s = v.strip().lower()
+        sign = -1.0 if s.startswith("-") else 1.0
+        s = s.lstrip("+-")
+        return _scale(list(_SIGNED_AXIS[s]), sign) if s in _SIGNED_AXIS else None
+    vec = _vec3(v)
+    return _unit(vec) if vec else None
 
 
 class _Builder:
@@ -94,6 +187,7 @@ class _Builder:
         self.by_id = {f.get("id"): f for f in self.features}
         self.sw_name: dict[str, str] = {}      # chudware feature id -> SolidWorks feature name
         self.sketch_ids: set[str] = set()
+        self.sketch_frames: dict[str, Optional[dict]] = {}   # sketch id -> principal frame
         self.used_names: set[str] = set()
 
     # -- reporting -------------------------------------------------------------------------
@@ -105,13 +199,14 @@ class _Builder:
         self.plan.degraded.append({"id": f.get("id"), "name": f.get("name"),
                                    "type": f.get("type"), "reason": reason})
 
-    def name_for(self, f: dict) -> str:
-        base = str(f.get("name") or f.get("id") or f.get("type"))
+    def name_for(self, f: dict, suffix: str = "") -> str:
+        base = str(f.get("name") or f.get("id") or f.get("type")) + suffix
         name, k = base, 2
         while name in self.used_names:
             name, k = f"{base}_{k}", k + 1
         self.used_names.add(name)
-        self.sw_name[f.get("id")] = name
+        if not suffix:
+            self.sw_name[f.get("id")] = name
         return name
 
     def ref_id(self, ref: Any) -> Optional[str]:
@@ -119,17 +214,52 @@ class _Builder:
         if isinstance(ref, str):
             return ref if ref in self.by_id else None
         if isinstance(ref, dict):
-            for k in ("feature", "sketch", "id"):
+            for k in ("feature", "sketch", "id", "owner_feature"):
                 if isinstance(ref.get(k), str) and ref[k] in self.by_id:
                     return ref[k]
         return None
 
+    def body_key(self, f: dict, ref: Any) -> Optional[str]:
+        """A body reference as the macro's body key (the owning feature id, "<fid>#k")."""
+        if isinstance(ref, dict) and ref.get("kind") == "body":
+            ref = ref.get("owner_feature")
+        if isinstance(ref, str):
+            base = ref.split("#", 1)[0]
+            if base in self.by_id:
+                return ref
+        self.refuse(f, f"body reference {ref!r} does not name a body-owning feature")
+        return None
+
+    def body_policy(self, f: dict, default_mode: str = "boss") -> Optional[dict]:
+        """The engine's body policy for a solid feature (document.cpp solid_mode)."""
+        p = f.get("params") or {}
+        mode = p.get("mode", default_mode)
+        if mode not in ("new", "boss", "add", "cut"):
+            self.refuse(f, f"mode {mode!r} has no SolidWorks export")
+            return None
+        if not p.get("merge", True) and mode != "cut":
+            mode = "new"
+        if mode == "cut":
+            target = None
+            if p.get("body") is not None:
+                target = self.body_key(f, p["body"])
+                if target is None:
+                    return None
+            return {"mode": "cut", "target": target}
+        return {"mode": "new" if mode == "new" else "merge", "target": None}
+
     # -- planes ------------------------------------------------------------------------------
     def sketch_plane(self, f: dict) -> Optional[dict]:
         ref = (f.get("refs") or {}).get("plane")
+        # The sketch's own `offset` shifts its plane along the normal (document.cpp).
+        extra = _dim((f.get("params") or {}).get("offset")) or 0.0
         if _principal(ref):
+            self.sketch_frames[f.get("id")] = {"plane": _principal(ref), "offset": extra}
             return {"kind": "principal", "plane": SW_PLANE[_principal(ref)]}
         if isinstance(ref, dict) and ref.get("of") == "face" and ref.get("side") in _SIDE_NORMAL:
+            if extra:
+                self.refuse(f, "a sketch offset from a model face is not exported yet")
+                return None
             return {"kind": "face", "normal": to_sw(_SIDE_NORMAL[ref["side"]])}
         pid = self.ref_id(ref)
         datum = self.by_id.get(pid) if pid else None
@@ -140,6 +270,8 @@ class _Builder:
             if p.get("method", "offset") == "offset" and base and off is not None:
                 if p.get("flip"):
                     off = -off
+                off += extra
+                self.sketch_frames[f.get("id")] = {"plane": base, "offset": off}
                 return {"kind": "offset", "base": SW_PLANE[base], "offset": off,
                         "name": f"{datum.get('name') or pid}"}
             self.refuse(f, "sketch is on a datum plane that is not a plain offset of "
@@ -149,7 +281,7 @@ class _Builder:
                        "principal-facing model face")
         return None
 
-    # -- features ----------------------------------------------------------------------------
+    # -- sketched features -------------------------------------------------------------------
     def sketch(self, f: dict) -> None:
         plane = self.sketch_plane(f)
         if plane is None:
@@ -185,16 +317,16 @@ class _Builder:
         if len(rows) > 1:
             self.degrade(f, "several profile regions: SolidWorks uses every closed contour of "
                             "the sketch")
-        return self.sw_name[next(iter(ids))]
+        return next(iter(ids))
 
     def extrude(self, f: dict) -> None:
         p = f.get("params") or {}
-        sketch = self.profile_sketch(f)
-        if sketch is None:
+        sid = self.profile_sketch(f)
+        if sid is None:
             return
-        mode = p.get("mode", "boss")
-        if mode not in ("boss", "cut", "new", "add"):
-            return self.refuse(f, f"extrude mode {mode!r} has no SolidWorks export")
+        body = self.body_policy(f)
+        if body is None:
+            return
         end = p.get("end", "blind")
         end2 = p.get("end2", "none")
         if end not in ("blind", "through_all", "mid_plane") or end2 not in ("none", "blind",
@@ -210,33 +342,213 @@ class _Builder:
         depth = _dim(p.get("depth"))
         depth = 10.0 if depth is None else depth
         depth2 = _dim(p.get("depth2"))
+        on_face = any(st.get("id") == sid and st["op"] == "sketch" and
+                      st["plane"]["kind"] == "face" for st in self.plan.steps)
         self.plan.steps.append({
-            "op": "extrude", "id": f.get("id"), "name": self.name_for(f), "sketch": sketch,
-            "mode": "cut" if mode == "cut" else "boss", "end": end, "depth": depth,
-            "flip": bool(p.get("flip")), "end2": end2,
-            "depth2": 10.0 if depth2 is None else depth2, "merge": p.get("merge", True)})
+            "op": "extrude", "id": f.get("id"), "name": self.name_for(f), "on_face": on_face,
+            "sketch": self.sw_name[sid], "mode": "cut" if body["mode"] == "cut" else "boss",
+            "body": body, "end": end, "depth": depth, "flip": bool(p.get("flip")),
+            "end2": end2, "depth2": 10.0 if depth2 is None else depth2})
+
+    def _axis_line_2d(self, sid: str, ref: Any) -> Optional[list]:
+        """A world axis as a 2D centerline in a principal (or offset) sketch, or None."""
+        frame = self.sketch_frames.get(sid)
+        if frame is None:
+            return None
+        ref = _datum(ref)
+        if isinstance(ref, str) and ref in ("axis.x", "axis.y", "axis.z"):
+            d, o = list(_SIGNED_AXIS[ref[-1]]), [0.0, 0.0, 0.0]
+        elif isinstance(ref, dict) and ref.get("kind") == "axis":
+            d, o = _parse_axis(ref.get("axis")), _vec3(ref.get("origin") or [0, 0, 0])
+            if d is None or o is None:
+                return None
+        else:
+            return None
+        n = _PLANE_N[frame["plane"]]
+        # The axis must lie in the sketch plane: along it, through a point on it.
+        if abs(_dot(d, n)) > 1e-9 or abs(_dot(o, n) - frame["offset"]) > 1e-6:
+            return None
+        u, v = _PLANE_UV[frame["plane"]]
+        p1 = [_dot(o, u), _dot(o, v)]
+        p2 = [p1[0] + 10 * _dot(d, u), p1[1] + 10 * _dot(d, v)]
+        return [p1, p2]
 
     def revolve(self, f: dict) -> None:
-        p = f.get("params") or {}
-        sketch_name = self.profile_sketch(f)
-        if sketch_name is None:
+        p, r = f.get("params") or {}, f.get("refs") or {}
+        sid = self.profile_sketch(f)
+        if sid is None:
             return
-        sid = next(k for k, v in self.sw_name.items() if v == sketch_name)
-        sk = self.by_id[sid]
-        lines = [e for e in (sk.get("params") or {}).get("entities") or []
-                 if e.get("type") == "line" and e.get("construction")]
-        if len(lines) != 1:
-            return self.refuse(f, "revolve axis must be the one construction line of its sketch "
-                                  f"(found {len(lines)})")
+        body = self.body_policy(f)
+        if body is None:
+            return
+        step = next(s for s in self.plan.steps if s.get("id") == sid and s["op"] == "sketch")
+        lines = [e for e in step["entities"] if e["type"] == "line" and e.get("construction")]
+        axis_line = self._axis_line_2d(sid, r.get("axis")) if r.get("axis") is not None \
+            else None
+        if axis_line is not None:
+            # The revolve names its axis: make it the sketch's only centerline.
+            step["entities"] = [e for e in step["entities"] if not e.get("construction")
+                                or e["type"] != "line"]
+            step["entities"].append({"type": "line", "construction": True,
+                                     "p1": axis_line[0], "p2": axis_line[1]})
+        elif len(lines) != 1:
+            return self.refuse(f, "revolve axis must be a world axis in the sketch plane or the "
+                                  f"one construction line of its sketch (found {len(lines)})")
         angle = _dim(p.get("angle"))
         angle = 360.0 if angle is None else angle
         if abs(angle) < 360.0 - 1e-9:
             self.degrade(f, "partial revolve: the side SolidWorks sweeps is checked by the "
                             "volume comparison")
         self.plan.steps.append({"op": "revolve", "id": f.get("id"), "name": self.name_for(f),
-                                "sketch": sketch_name, "mode": p.get("mode", "boss"),
+                                "sketch": self.sw_name[sid], "body": body,
                                 "angle": angle, "flip": bool(p.get("flip"))})
 
+    # -- primitives --------------------------------------------------------------------------
+    def primitive(self, f: dict) -> None:
+        """box/cylinder/cone/sphere/torus -> a profile sketch on a plane through the solid's
+        centre + a mid-plane extrude or a 360-degree revolve, at the engine's exact pose."""
+        t = f.get("type")
+        p = dict(f.get("refs") or {}, **(f.get("params") or {}))
+        body = self.body_policy(f)
+        if body is None:
+            return
+        at = p.get("at")
+        if at is None:
+            at = [0.0, 0.0, 0.0]
+        elif _vec3(at) is None:
+            return self.refuse(f, "relational `at` placement (a face/edge query) is not "
+                                  "exported yet; give `at` as [x, y, z]")
+        at = _vec3(at)
+        off = _vec3(p.get("at_offset")) or [0.0, 0.0, 0.0]
+        axis = [0.0, 0.0, 1.0]
+        for k in ("axis", "axis_dir"):
+            if p.get(k) is not None:
+                axis = _parse_axis(p[k])
+                if axis is None:
+                    return self.refuse(f, f"{t} axis {p[k]!r} is not a direction")
+                break
+        if t == "sphere":
+            axis = [0.0, 0.0, 1.0]
+        rot = rot_z_to(axis)
+        ex, ey, ez = (_mv(rot, e) for e in ((1, 0, 0), (0, 1, 0), (0, 0, 1)))
+        dims = {}
+        need = {"box": (("length", 20), ("width", 20), ("height", 20)),
+                "cylinder": (("radius", 10), ("height", 20)),
+                "cone": (("r1", 10), ("r2", 0), ("height", 20)),
+                "sphere": (("radius", 10),), "torus": (("major_r", 15), ("minor_r", 3))}[t]
+        for k, dflt in need:
+            v = _dim(p.get(k)) if p.get(k) is not None else float(dflt)
+            if v is None:
+                return self.refuse(f, f"{t} {k} {p.get(k)!r} is not a number")
+            dims[k] = v
+        base = [0.0, 0.0, 0.0]
+        if not p.get("centered", True):
+            if t == "box":
+                base = [dims["length"] / 2, dims["width"] / 2, dims["height"] / 2]
+            elif t in ("cylinder", "cone"):
+                base = [0.0, 0.0, dims["height"] / 2]
+        c = _add(at, _mv(rot, base), off)
+        ents: list[dict] = []
+        if t == "box":
+            hl, hw = dims["length"] / 2, dims["width"] / 2
+            q = [_add(c, _scale(ex, sx * hl), _scale(ey, sy * hw))
+                 for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            ents = [{"type": "line", "p1": to_sw(q[i]), "p2": to_sw(q[(i + 1) % 4])}
+                    for i in range(4)]
+            normal = ez
+        elif t == "cylinder":
+            ents = [{"type": "circle", "center": to_sw(c), "radius": dims["radius"]}]
+            normal = ez
+        else:
+            normal = ex   # the profile plane contains the axis (ez) and ey
+            h = dims.get("height", 0.0)
+            if t == "cone":
+                p0, p3 = _add(c, _scale(ez, -h / 2)), _add(c, _scale(ez, h / 2))
+                p1, p2 = _add(p0, _scale(ey, dims["r1"])), _add(p3, _scale(ey, dims["r2"]))
+                loop = [p0, p1, p2, p3] if dims["r2"] > 0 else [p0, p1, p3]
+                if dims["r1"] <= 0:
+                    loop = [p0, p2, p3]
+                ents = [{"type": "line", "p1": to_sw(loop[i]),
+                         "p2": to_sw(loop[(i + 1) % len(loop)])} for i in range(len(loop))]
+                axis_pts = (p0, p3)
+            elif t == "sphere":
+                r = dims["radius"]
+                p0, p1 = _add(c, _scale(ez, -r)), _add(c, _scale(ez, r))
+                ents = [{"type": "arc3", "p1": to_sw(p0), "p2": to_sw(p1),
+                         "pm": to_sw(_add(c, _scale(ey, r)))},
+                        {"type": "line", "p1": to_sw(p1), "p2": to_sw(p0)}]
+                axis_pts = (p0, p1)
+            else:   # torus
+                if dims["minor_r"] >= dims["major_r"]:
+                    return self.refuse(f, "self-intersecting torus (minor_r >= major_r) is not "
+                                          "exported")
+                ents = [{"type": "circle", "center": to_sw(_add(c, _scale(ey, dims["major_r"]))),
+                         "radius": dims["minor_r"]}]
+                axis_pts = (_add(c, _scale(ez, -dims["major_r"])),
+                            _add(c, _scale(ez, dims["major_r"])))
+            ents.append({"type": "line", "construction": True, "p1": to_sw(axis_pts[0]),
+                         "p2": to_sw(axis_pts[1])})
+        sketch = self.name_for(f, "_Sketch")
+        self.plan.steps.append({"op": "sketch3", "id": None, "name": sketch,
+                                "plane": {"origin": to_sw(c), "normal": to_sw(normal)},
+                                "entities": ents})
+        common = {"id": f.get("id"), "name": self.name_for(f), "sketch": sketch, "body": body}
+        if t in ("box", "cylinder"):
+            self.plan.steps.append({"op": "extrude", **common,
+                                    "mode": "cut" if body["mode"] == "cut" else "boss",
+                                    "end": "mid_plane", "depth": dims["height"], "flip": False,
+                                    "end2": "none", "depth2": 10.0})
+        else:
+            self.plan.steps.append({"op": "revolve", **common, "angle": 360.0, "flip": False})
+
+    # -- body operations ---------------------------------------------------------------------
+    def transform(self, f: dict) -> None:
+        p = dict(f.get("refs") or {}, **(f.get("params") or {}))
+        target = None
+        if p.get("body") is not None:
+            target = self.body_key(f, p["body"])
+            if target is None:
+                return
+        moves = []
+        angle = _dim(p.get("angle")) or 0.0
+        if abs(angle) > 1e-12:
+            ax = _parse_axis(p.get("rotate") if p.get("rotate") is not None
+                             else p.get("axis", [0, 0, 1]))
+            if ax is None:
+                return self.refuse(f, "transform rotation axis is not a direction")
+            pivot = _vec3(p.get("pivot") or [0, 0, 0])
+            if pivot is None:
+                return self.refuse(f, "transform pivot must be [x, y, z]")
+            r_sw = engine_rotation_to_sw(axis_angle(ax, math.radians(angle)))
+            moves.append({"rotate": [math.degrees(a) for a in sw_euler(r_sw)],
+                          "pivot": to_sw(pivot)})
+        tr = _vec3(p.get("translate") or [0, 0, 0])
+        if tr is None:
+            return self.refuse(f, "transform translate must be [x, y, z]")
+        if any(abs(x) > 1e-12 for x in tr):
+            moves.append({"translate": to_sw(tr)})
+        self.plan.steps.append({"op": "move_body", "id": f.get("id"), "name": self.name_for(f),
+                                "target": target, "copy": bool(p.get("copy")),
+                                "moves": moves})
+
+    def boolean(self, f: dict) -> None:
+        p = dict(f.get("refs") or {}, **(f.get("params") or {}))
+        op = _BOOLEAN_ALIAS.get(p.get("op"), p.get("op"))
+        if op not in COMBINE_OP:
+            return self.refuse(f, f"boolean op {p.get('op')!r} has no SolidWorks export")
+        if p.get("keep_tools"):
+            return self.refuse(f, "keep_tools booleans are not exported (SolidWorks Combine "
+                                  "consumes its tool bodies)")
+        a, b = p.get("a"), p.get("b")
+        if a is None or b is None:
+            return self.refuse(f, "boolean needs both operands (a, b)")
+        ka, kb = self.body_key(f, a), self.body_key(f, b)
+        if ka is None or kb is None:
+            return
+        self.plan.steps.append({"op": "combine", "id": f.get("id"), "name": self.name_for(f),
+                                "code": COMBINE_OP[op], "a": ka, "b": kb})
+
+    # -- dress-ups and patterns --------------------------------------------------------------
     def edge_op(self, f: dict, op: str, size_key: str) -> None:
         p = f.get("params") or {}
         size = _dim(p.get(size_key))
@@ -284,13 +596,14 @@ class _Builder:
             return None
         return out
 
-    def axis_of(self, ref: Any) -> Optional[tuple[int, int, int]]:
+    def axis_line(self, ref: Any) -> Optional[tuple[list[float], list[float]]]:
+        """(origin, unit direction) in engine coordinates for an axis ref."""
+        ref = _datum(ref)
         if isinstance(ref, dict) and ref.get("kind") == "axis":
-            if any(abs(float(x)) > 1e-9 for x in ref.get("origin") or [0, 0, 0]):
-                return None
-            return _unit_axis(ref.get("axis"))
+            d, o = _parse_axis(ref.get("axis")), _vec3(ref.get("origin") or [0, 0, 0])
+            return (o, d) if d is not None and o is not None else None
         if isinstance(ref, str) and ref in ("axis.x", "axis.y", "axis.z"):
-            return {"axis.x": (1, 0, 0), "axis.y": (0, 1, 0), "axis.z": (0, 0, 1)}[ref]
+            return [0.0, 0.0, 0.0], list(_SIGNED_AXIS[ref[-1]])
         return None
 
     def linear_pattern(self, f: dict) -> None:
@@ -301,16 +614,16 @@ class _Builder:
         dirs = []
         for key, ck, sk in (("dir1", "count1", "spacing1"), ("dir2", "count2", "spacing2")):
             count = int(p.get(ck, 1 if key == "dir2" else 2))
-            if key == "dir2" and (count <= 1 or r.get("dir2") is None):
+            if key == "dir2" and (count <= 1 or r.get(key) is None):
                 break
-            axis = self.axis_of(r.get(key))
+            line = self.axis_line(r.get(key))
             spacing = _dim(p.get(sk))
-            if axis is None or spacing is None:
-                return self.refuse(f, f"pattern {key} must be a world axis (X/Y/Z) direction")
-            plane, flip = _AXIS_PLANE[axis]
+            if line is None or spacing is None:
+                return self.refuse(f, f"pattern {key} must be an axis direction with a spacing")
+            d = line[1]
             if spacing < 0:
-                spacing, flip = -spacing, not flip
-            dirs.append({"plane": plane, "flip": flip, "count": count, "spacing": spacing})
+                spacing, d = -spacing, _scale(d, -1.0)
+            dirs.append({"dir": to_sw(d), "count": count, "spacing": spacing})
         self.plan.steps.append({"op": "linear_pattern", "id": f.get("id"),
                                 "name": self.name_for(f), "seeds": seeds, "dirs": dirs})
 
@@ -319,19 +632,16 @@ class _Builder:
         seeds = self.seeds(f)
         if seeds is None:
             return
-        axis = self.axis_of(r.get("axis"))
-        if axis is None:
-            return self.refuse(f, "circular pattern axis must be a world axis through the origin")
+        line = self.axis_line(r.get("axis"))
+        if line is None:
+            return self.refuse(f, "circular pattern axis must be an explicit axis "
+                                  "(origin + direction) or axis.x/y/z")
         angle = _dim(p.get("angle"))
         angle = 360.0 if angle is None else angle
-        idx = max(range(3), key=lambda i: abs(axis[i]))
-        # engine axis +/-X, +/-Y, +/-Z -> SolidWorks axis direction sign (Y maps to -Z).
-        sw_dir = to_sw(axis)
         self.plan.steps.append({"op": "circular_pattern", "id": f.get("id"),
                                 "name": self.name_for(f), "seeds": seeds,
-                                "axis_planes": list(_AXIS_PLANES[idx]),
-                                "axis_sw": sw_dir, "count": int(p.get("count", 4)),
-                                "angle": angle,
+                                "axis": {"origin": to_sw(line[0]), "dir": to_sw(line[1])},
+                                "count": int(p.get("count", 4)), "angle": angle,
                                 "equal_spacing": bool(p.get("equal_spacing", True)),
                                 "reverse": bool(p.get("reverse"))})
 
@@ -363,6 +673,12 @@ class _Builder:
                 self.extrude(f)
             elif t == "revolve":
                 self.revolve(f)
+            elif t in _PRIMITIVES:
+                self.primitive(f)
+            elif t == "transform":
+                self.transform(f)
+            elif t == "boolean":
+                self.boolean(f)
             elif t == "fillet":
                 self.edge_op(f, "fillet", "radius")
             elif t == "chamfer":
@@ -381,7 +697,73 @@ class _Builder:
                 self.degrade(f, "unused reference geometry is not exported")
             else:
                 self.refuse(f, f"feature type {t!r} has no SolidWorks export yet")
+        self.plan.steps = [self.to_3d(s) for s in self.plan.steps]
         return self.plan
+
+    def to_3d(self, s: dict) -> dict:
+        """A sketch on a default or offset plane as a ``sketch3`` step: its 2D entities placed
+        as 3D model points (exact whichever 2D frame SolidWorks gives the plane)."""
+        frame = self.sketch_frames.get(s.get("id")) if s["op"] == "sketch" else None
+        if frame is None:
+            return s
+        n = list(_PLANE_N[frame["plane"]])
+        u, v = _PLANE_UV[frame["plane"]]
+        origin = _scale(n, frame["offset"])
+
+        # Chudware closes a profile within its own tolerance; a SolidWorks sketch needs the
+        # endpoints to coincide, so endpoints closer than SNAP_MM share one point.
+        reps: list[list[float]] = []
+
+        def snap(q):
+            for r in reps:
+                if abs(r[0] - q[0]) <= SNAP_MM and abs(r[1] - q[1]) <= SNAP_MM:
+                    return r
+            reps.append([float(q[0]), float(q[1])])
+            return reps[-1]
+        for e in s["entities"]:
+            if e["type"] == "line":
+                snap(e["p1"])
+                snap(e["p2"])
+
+        def p3(q):
+            return to_sw(_add(origin, _scale(u, q[0]), _scale(v, q[1])))
+        ents = []
+        for e in s["entities"]:
+            t, cons = e["type"], bool(e.get("construction"))
+            if t == "line":
+                ents.append({"type": "line", "construction": cons, "p1": p3(snap(e["p1"])),
+                             "p2": p3(snap(e["p2"]))})
+            elif t == "circle":
+                ents.append({"type": "circle", "construction": cons,
+                             "center": p3(e["center"]), "radius": float(e["radius"])})
+            elif t == "arc":
+                a, b, m = arc_points(e)
+                ents.append({"type": "arc3", "construction": cons, "p1": p3(snap(a)),
+                             "p2": p3(snap(b)), "pm": p3(m)})
+            elif t == "point":
+                ents.append({"type": "point", "p": p3(e["p"])})
+            elif t == "spline":
+                ents.append({"type": "spline", "construction": cons,
+                             "points": [p3(q) for q in e["points"]]})
+        plane = {"origin": to_sw(origin), "normal": to_sw(n)}
+        if s["plane"]["kind"] == "offset":
+            plane["name"] = s["plane"]["name"]
+        return {"op": "sketch3", "id": s["id"], "name": s["name"], "plane": plane,
+                "entities": ents}
+
+
+def arc_points(e: dict):
+    """A 2D sketch arc (center, radius, start/end degrees, ccw) as (start, end, mid) points."""
+    (cx, cy), r = e["center"], float(e["radius"])
+    a0, a1 = float(e["start"]), float(e["end"])
+    if e.get("ccw", True):
+        am = a0 + ((a1 - a0) % 360.0 or 360.0) / 2
+    else:
+        am = a0 - ((a0 - a1) % 360.0 or 360.0) / 2
+
+    def pt(a):
+        return [cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a))]
+    return pt(a0), pt(a1), pt(am)
 
 
 def build_plan(features: list[dict], *, name: str,
@@ -391,10 +773,23 @@ def build_plan(features: list[dict], *, name: str,
 
     ``edge_points(feature_id)`` returns engine-space points ON each edge a fillet/chamfer
     selects (doc_feature_edges ``mid``). ``expected`` is the part's eval_mass
-    ({volume_mm3, com}) for the backends' verification."""
+    ({volume_mm3, com, body_count, inertia, mass_g}) for the macro's verification."""
     plan = _Builder(features, edge_points, name).run()
     if expected:
-        com = expected.get("com") or expected.get("com_mm")
-        plan.expected = {"volume_mm3": expected.get("volume_mm3"),
-                         "com_sw_mm": to_sw(com) if com else None}
+        plan.expected = expected_in_sw(expected)
     return plan
+
+
+def expected_in_sw(mass: dict) -> dict:
+    """eval_mass -> the macro's check values in SolidWorks axes: volume, centre of mass, body
+    count and the centroidal inertia diagonal per unit density (mm^5, density-independent)."""
+    com = mass.get("com") or mass.get("com_mm")
+    out = {"volume_mm3": mass.get("volume_mm3"), "com_sw_mm": to_sw(com) if com else None}
+    if isinstance(mass.get("body_count"), int):
+        out["body_count"] = mass["body_count"]
+    inertia, m, v = mass.get("inertia"), mass.get("mass_g"), mass.get("volume_mm3")
+    if isinstance(inertia, list) and len(inertia) == 9 and m and v:
+        k = v / m
+        # SolidWorks x, y, z = engine x, z, -y: the diagonal is (Ixx, Izz, Iyy).
+        out["inertia_sw_mm5"] = [inertia[0] * k, inertia[8] * k, inertia[4] * k]
+    return out

@@ -469,7 +469,8 @@ def _translate_assembly(part: SWPart) -> dict:
                     blocking.append({"sw_name": comp.part.name, "sw_type": "Part",
                                      "reason": "no feature built a solid"})
                 rows[key] = {"kind": "part", "ops": ops, "blocking": blocking,
-                             "degraded": degraded, "feature_count": len(comp.part.features)}
+                             "degraded": degraded, "feature_count": len(comp.part.features),
+                             "sw_volume_mm3": comp.part.volume_mm3}
         components.append({"name": comp.name, "part_key": key,
                            "xform16": _component_xform16(comp), **rows[key]})
     return {"is_assembly": True, "name": part.name, "components": components,
@@ -496,6 +497,7 @@ def resolve(path: str) -> dict:
     else:
         out["ops"] = t["ops"]
         out["feature_count"] = len(part.features)
+        out["sw_volume_mm3"] = part.volume_mm3
     return out
 
 

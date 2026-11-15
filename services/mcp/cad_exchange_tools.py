@@ -203,6 +203,44 @@ def _solidworks_export(d: str, path: Optional[str], method: str,
                 "hint": "method='macro' writes a macro a SolidWorks user can run instead."}
 
 
+def _then_z_up(xform16: list) -> list:
+    """A component placement for a part kept in SolidWorks axes (Y-up): first turn it +90
+    degrees about X (SolidWorks (x, y, z) -> engine (x, -z, y)), then place it."""
+    m = [list(map(float, xform16[i:i + 4])) for i in (0, 4, 8, 12)]
+    rx = [[1.0, 0, 0, 0], [0, 0, -1.0, 0], [0, 1.0, 0, 0], [0, 0, 0, 1.0]]
+    return [sum(m[i][k] * rx[k][j] for k in range(4)) for i in range(4) for j in range(4)]
+
+
+# A rebuilt SolidWorks part must reproduce SolidWorks' own volume this closely.
+_REBUILD_VOLUME_RTOL = 1e-4
+
+
+def _rebuild_mismatch(doc_id: str, ops: list, sw_volume: Optional[float]) -> Optional[str]:
+    """Apply a resolved feature tree to ``doc_id``; why it is not the SolidWorks part, or None.
+
+    The translator can produce ops that rebuild without error yet build a different solid (a
+    reference the engine reads differently), so the result is checked against the volume
+    SolidWorks reports for the source part."""
+    try:
+        r = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
+    except CoreError as e:
+        return f"feature rebuild failed: {e}"
+    failed = [s.get("id") for s in ((r.get("rebuild") or {}).get("feature_status") or [])
+              if isinstance(s, dict) and not s.get("ok")]
+    if failed:
+        return f"features {failed[:5]} failed to rebuild"
+    if not sw_volume:
+        return None
+    try:
+        v = cb.call("eval_mass", {"doc_id": doc_id, "density_g_cm3": 1.0}).get("volume_mm3")
+    except CoreError:
+        v = None
+    if not v or abs(v - sw_volume) > _REBUILD_VOLUME_RTOL * abs(sw_volume):
+        return (f"the rebuilt features have volume {v or 0:.3f} mm^3, SolidWorks' part "
+                f"{sw_volume:.3f} mm^3")
+    return None
+
+
 class _SidecarSaveRefused(Exception):
     def __init__(self, reply: dict):
         super().__init__(reply.get("error") or reply.get("code") or "save refused")
@@ -215,6 +253,7 @@ def _build_sw_assembly(plan: dict, sidecar: str, stats: dict, built: dict) -> st
     each sub-assembly recursively, every instance placed by its SolidWorks transform. Returns
     the assembly doc_id; ``built`` maps a source file to its saved .step+."""
     os.makedirs(sidecar, exist_ok=True)
+    sw_axes: set = built.setdefault("__sw_axes__", set())   # parts kept in SolidWorks axes
     for c in plan["components"]:
         key = c["part_key"]
         if key in built:
@@ -224,15 +263,26 @@ def _build_sw_assembly(plan: dict, sidecar: str, stats: dict, built: dict) -> st
         if c["kind"] == "assembly":
             stats["assemblies"] += 1
             cd = _build_sw_assembly(c["sub"], os.path.join(sidecar, stem), stats, built)
-        elif c["blocking"]:
-            # Its features cannot all be rebuilt: bring in its exact solid (native reader).
-            cd = cb.call("import_file", {"path": key}).get("doc_id")
-            stats["exact_body"].append({"file": os.path.basename(key),
-                                        "unsupported": c["blocking"][:5]})
         else:
-            cd = cb.call("doc_new", {"name": stem}).get("doc_id")
-            cb.call("doc_apply_ops", {"doc_id": cd, "ops": c["ops"]})
-            stats["feature_tree"].append(os.path.basename(key))
+            why = None
+            if not c["blocking"]:
+                cd = cb.call("doc_new", {"name": stem}).get("doc_id")
+                why = _rebuild_mismatch(cd, c["ops"], c.get("sw_volume_mm3"))
+                if why:
+                    cb.call("doc_close", {"doc_id": cd})
+            if c["blocking"] or why:
+                # Not rebuildable, or rebuilt into a different solid: SolidWorks' own exact
+                # solid (STEP, SolidWorks axes; the placement turns it Z-up below).
+                from services.sw_import.sw_feature_import import save_step  # noqa: PLC0415
+                step = save_step(key, os.path.join(sidecar, stem + ".step"))
+                cd = cb.call("import_file", {"path": step}).get("doc_id")
+                stats["exact_body"].append({"file": os.path.basename(key),
+                                            "reason": why or "; ".join(
+                                                f"{b['sw_type']} {b['sw_name']}: {b['reason']}"
+                                                for b in c["blocking"][:3])})
+                sw_axes.add(key)
+            else:
+                stats["feature_tree"].append(os.path.basename(key))
         saved = cb.call("doc_save", {"doc_id": cd, "path": cpath, "if_no_human_dirty": True})
         if saved.get("ok") is False:
             raise _SidecarSaveRefused({**saved, "ok": False, "doc_id": cd, "path": cpath,
@@ -243,7 +293,8 @@ def _build_sw_assembly(plan: dict, sidecar: str, stats: dict, built: dict) -> st
     ad = cb.call("doc_new", {"name": plan["name"], "kind": "assembly"}).get("doc_id")
     cb.call("doc_apply_ops", {"doc_id": ad, "ops": [
         {"op": "asm_insert_component", "name": c["name"], "source": {"path": built[c["part_key"]]},
-         "transform": c["xform16"]} for c in plan["components"]]})
+         "transform": _then_z_up(c["xform16"]) if c["part_key"] in sw_axes else c["xform16"]}
+        for c in plan["components"]]})
     try:
         cb.call("doc_solve_mates", {"doc_id": ad})
     except CoreError:
@@ -689,14 +740,19 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         "skipped": plan["blocking"], "degraded": plan["degraded"]})
                 if plan is not None:
                     d = cb.call("doc_new", {"name": plan["name"]}).get("doc_id")
-                    r = cb.call("doc_apply_ops", {"doc_id": d, "ops": plan["ops"]})
-                    _CUR["doc_id"] = d
-                    _publish_current(d)
-                    return _dumps({
-                        "ok": True, "doc_id": d, "imported_from": path, "format": "sldprt",
-                        "feature_resolved": True, "feature_count": plan["feature_count"],
-                        "degraded": plan["degraded"],
-                        **{k: r[k] for k in ("revision", "body_count", "volume_mm3") if k in r}})
+                    why = _rebuild_mismatch(d, plan["ops"], plan.get("sw_volume_mm3"))
+                    if why:
+                        # Never a quietly different part: continue to the exact solid below.
+                        cb.call("doc_close", {"doc_id": d})
+                        portable_fallback_reason = f"SolidWorks feature rebuild rejected: {why}"
+                    else:
+                        _CUR["doc_id"] = d
+                        _publish_current(d)
+                        return _dumps({
+                            "ok": True, "doc_id": d, "imported_from": path, "format": "sldprt",
+                            "feature_resolved": True, "feature_count": plan["feature_count"],
+                            "degraded": plan["degraded"],
+                            "volume_mm3": plan.get("sw_volume_mm3")})
             # A standalone drawing is its own native registry/session. It must never fall
             # through import_file (which would treat the ZIP as 3D geometry).
             if path_abs.lower().endswith(".draw+"):

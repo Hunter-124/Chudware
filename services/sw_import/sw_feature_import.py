@@ -32,7 +32,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
 # ---------------------------------------------------------------------------
 # SolidWorks enum maps (from swconst.tlb — swConstraintType_e / swEndConditions_e / swSelectType_e)
@@ -139,6 +139,8 @@ class SWPart:
     # name -> SWFeature, for the translator to resolve consume references (sketch used by extrude…)
     by_name: dict = field(default_factory=dict)
     components: list[SWComponent] = field(default_factory=list)  # assemblies only
+    # SolidWorks' own volume of the part (mm^3): the importer checks its rebuild against it.
+    volume_mm3: Optional[float] = None
 
 
 class SolidWorksUnavailable(RuntimeError):
@@ -392,6 +394,7 @@ KIND_BY_SWTYPE = {
     "ICE": "cut",                # cut-extrude
     "Blend": "loft",
     "Revolution": "revolve",     # boss OR cut (IsBossFeature distinguishes)
+    "RevCut": "revolve",         # cut-revolve
     "Fillet": "fillet",
     "Chamfer": "chamfer",
     "Shell": "shell",
@@ -982,12 +985,46 @@ def extract_part(path: str | os.PathLike, *, visible: bool = False) -> SWPart:
             _walk_assembly(model, part)
         else:
             _walk(model, part)
+            try:
+                part.volume_mm3 = float(model.Extension.CreateMassProperty().Volume) * 1e9
+            except Exception:  # noqa: BLE001 — no solid body
+                part.volume_mm3 = None
     finally:
         try:
             swApp.CloseDoc(model.GetTitle())
         except Exception:  # noqa: BLE001
             pass
     return part
+
+
+def save_step(path: str | os.PathLike, out_step: str) -> str:
+    """Have SolidWorks write a part's final solid as STEP (SolidWorks model axes, Y-up).
+
+    The exact-solid lane for a part whose feature tree cannot be rebuilt: SolidWorks' own
+    result, after every feature (the stored Parasolid partition can also hold bodies that a
+    later Move/Copy Body replaced)."""
+    import pythoncom
+    import win32com.client as win32
+
+    pythoncom.CoInitialize()
+    src = str(Path(path).resolve())
+    swApp = _cast(win32.Dispatch("SldWorks.Application"), "ISldWorks")
+    ret = swApp.OpenDoc6(src, 1, 1, "", 0, 0)
+    model = ret[0] if isinstance(ret, tuple) else ret
+    if model is None:
+        raise RuntimeError(f"SolidWorks could not open '{src}'")
+    model = _cast(model, "IModelDoc2")
+    try:
+        out = os.path.normpath(os.path.abspath(out_step))
+        model.Extension.SaveAs(out, 0, 1, None, 0, 0)
+        if not os.path.isfile(out):
+            raise RuntimeError(f"SolidWorks did not write {out}")
+        return out
+    finally:
+        try:
+            swApp.CloseDoc(model.GetTitle())
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def part_to_dict(part: SWPart) -> dict:

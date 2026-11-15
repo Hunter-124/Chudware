@@ -46,7 +46,25 @@ COMBINE_OP = {"fuse": 15903, "cut": 15902, "common": 15901}
 _BOOLEAN_ALIAS = {"combine": "fuse", "union": "fuse", "add": "fuse", "subtract": "cut",
                   "intersect": "common"}
 _SIGNED_AXIS = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
-SNAP_MM = 1e-3   # sketch endpoints closer than this become one point
+SNAP_MM = 1e-2   # sketch endpoints closer than this become one point (Chudware closes
+                 # profiles across such gaps; a SolidWorks contour needs them joined)
+
+
+def _frame(plane: str, offset: float) -> dict:
+    """A default plane shifted ``offset`` along its normal, as an explicit frame (engine)."""
+    n = [float(x) for x in _PLANE_N[plane]]
+    u, v = ([float(x) for x in a] for a in _PLANE_UV[plane])
+    return {"o": _scale(n, offset), "u": u, "v": v, "n": n}
+
+
+def point_normal_frame(origin, normal) -> dict:
+    """The engine's frame of a plane through ``origin`` with unit ``normal``
+    (geom/plane.cpp SketchPlane::from): u = +X projected onto the plane (+Y when the normal
+    is along X), v = normal x u."""
+    cand = [1.0, 0.0, 0.0] if abs(normal[0]) <= 1.0 - 1e-9 else [0.0, 1.0, 0.0]
+    u = _unit([cand[i] - _dot(cand, normal) * normal[i] for i in range(3)])
+    return {"o": [float(x) for x in origin], "u": u, "v": _cross(normal, u),
+            "n": [float(x) for x in normal]}
 
 
 def _datum(ref: Any) -> Any:
@@ -187,7 +205,8 @@ class _Builder:
         self.by_id = {f.get("id"): f for f in self.features}
         self.sw_name: dict[str, str] = {}      # chudware feature id -> SolidWorks feature name
         self.sketch_ids: set[str] = set()
-        self.sketch_frames: dict[str, Optional[dict]] = {}   # sketch id -> principal frame
+        self.sketch_frames: dict[str, Optional[dict]] = {}   # sketch id -> frame (o, u, v, n)
+        self.path_kind: dict[str, str] = {}    # path feature id -> SolidWorks selection type
         self.used_names: set[str] = set()
 
     # -- reporting -------------------------------------------------------------------------
@@ -254,7 +273,7 @@ class _Builder:
         # The sketch's own `offset` shifts its plane along the normal (document.cpp).
         extra = _dim((f.get("params") or {}).get("offset")) or 0.0
         if _principal(ref):
-            self.sketch_frames[f.get("id")] = {"plane": _principal(ref), "offset": extra}
+            self.sketch_frames[f.get("id")] = _frame(_principal(ref), extra)
             return {"kind": "principal", "plane": SW_PLANE[_principal(ref)]}
         if isinstance(ref, dict) and ref.get("of") == "face" and ref.get("side") in _SIDE_NORMAL:
             if extra:
@@ -271,11 +290,19 @@ class _Builder:
                 if p.get("flip"):
                     off = -off
                 off += extra
-                self.sketch_frames[f.get("id")] = {"plane": base, "offset": off}
+                self.sketch_frames[f.get("id")] = _frame(base, off)
                 return {"kind": "offset", "base": SW_PLANE[base], "offset": off,
                         "name": f"{datum.get('name') or pid}"}
-            self.refuse(f, "sketch is on a datum plane that is not a plain offset of "
-                           "Top/Front/Right")
+            if p.get("method") == "point_normal":
+                o, n = _vec3(p.get("origin") or r.get("origin")),                     _vec3(p.get("normal") or r.get("normal"))
+                n = _unit(n) if n else None
+                if o is not None and n is not None:
+                    fr = point_normal_frame(o, n)
+                    fr["o"] = _add(fr["o"], _scale(n, extra))
+                    self.sketch_frames[f.get("id")] = fr
+                    return {"kind": "offset", "name": f"{datum.get('name') or pid}"}
+            self.refuse(f, "sketch is on a datum plane that is not an offset of Top/Front/"
+                           "Right or a point-normal plane")
             return None
         self.refuse(f, f"sketch plane {ref!r} is not Top/Front/Right, an offset of one, or a "
                        "principal-facing model face")
@@ -364,12 +391,12 @@ class _Builder:
                 return None
         else:
             return None
-        n = _PLANE_N[frame["plane"]]
+        n, u, v = frame["n"], frame["u"], frame["v"]
+        rel = [o[i] - frame["o"][i] for i in range(3)]
         # The axis must lie in the sketch plane: along it, through a point on it.
-        if abs(_dot(d, n)) > 1e-9 or abs(_dot(o, n) - frame["offset"]) > 1e-6:
+        if abs(_dot(d, n)) > 1e-9 or abs(_dot(rel, n)) > 1e-6:
             return None
-        u, v = _PLANE_UV[frame["plane"]]
-        p1 = [_dot(o, u), _dot(o, v)]
+        p1 = [_dot(rel, u), _dot(rel, v)]
         p2 = [p1[0] + 10 * _dot(d, u), p1[1] + 10 * _dot(d, v)]
         return [p1, p2]
 
@@ -402,6 +429,107 @@ class _Builder:
         self.plan.steps.append({"op": "revolve", "id": f.get("id"), "name": self.name_for(f),
                                 "sketch": self.sw_name[sid], "body": body,
                                 "angle": angle, "flip": bool(p.get("flip"))})
+
+    # -- paths, sweeps and lofts -------------------------------------------------------------
+    def sketch3d(self, f: dict) -> None:
+        """A 3D sketch (lines and arcs through a mid point) as a SolidWorks 3D sketch."""
+        params = f.get("params") or {}
+        reps: list[list[float]] = []
+
+        def snap(q):   # join endpoints Chudware treats as connected (see SNAP_MM)
+            q = [float(x) for x in q]
+            for r in reps:
+                if all(abs(r[i] - q[i]) <= SNAP_MM for i in range(3)):
+                    return r
+            reps.append(q)
+            return q
+        ents = []
+        for e in params.get("entities") or []:
+            t = e.get("type")
+            if e.get("construction"):
+                continue
+            if t == "line" and _vec3(e.get("p1")) and _vec3(e.get("p2")):
+                ents.append({"type": "line", "p1": to_sw(snap(e["p1"])),
+                             "p2": to_sw(snap(e["p2"]))})
+            elif t == "arc" and all(_vec3(e.get(k)) for k in ("p1", "p2", "pm")):
+                ents.append({"type": "arc3", "p1": to_sw(snap(e["p1"])),
+                             "p2": to_sw(snap(e["p2"])), "pm": to_sw(e["pm"])})
+            elif t == "spline" and len(e.get("points") or []) >= 2 and                     all(_vec3(q) for q in e["points"]):
+                pts = [to_sw(q) for q in e["points"]]
+                ents.append({"type": "spline", "points": pts, "p1": pts[0], "p2": pts[-1]})
+                self.degrade(f, "a 3D spline is re-interpolated by SolidWorks through the same "
+                                "points (its shape between them is checked by the volume)")
+            else:
+                return self.refuse(f, f"3D sketch entity {e.get('id')} of type {t!r} has no "
+                                      "SolidWorks export yet (lines and 3-point arcs do)")
+        if not ents:
+            return self.refuse(f, "3D sketch has no exportable entities")
+        ents = tangent_fillets(ents)
+        if params.get("constraints"):
+            self.degrade(f, "3D sketch relations are not re-created in SolidWorks")
+        self.sketch_ids.add(f.get("id"))
+        self.path_kind[f.get("id")] = "3DSKETCH"
+        self.plan.steps.append({"op": "sketch3d", "id": f.get("id"), "name": self.name_for(f),
+                                "entities": ents})
+
+    def helix(self, f: dict) -> None:
+        p, r = dict(f.get("refs") or {}, **(f.get("params") or {})), f.get("refs") or {}
+        for k in ("pitch_table", "taper", "taper_angle", "spiral", "shape", "radius2"):
+            if p.get(k):
+                return self.refuse(f, f"helix {k} is not exported yet (constant-pitch helix is)")
+        base = _principal(r.get("base") if r.get("base") is not None else "plane.top")
+        if base is None:
+            return self.refuse(f, "helix base must be Top/Front/Right")
+        radius, pitch, height = (_dim(p.get(k)) for k in ("radius", "pitch", "height"))
+        if not (radius and pitch and height):
+            return self.refuse(f, "helix needs radius, pitch and height")
+        fr = _frame(base, 0.0)
+        start = math.radians(_dim(p.get("start_angle")) or 0.0)
+        p0 = _add(fr["o"], _scale(fr["u"], radius * math.cos(start)),
+                  _scale(fr["v"], radius * math.sin(start)))
+        self.path_kind[f.get("id")] = "REFERENCECURVES"
+        self.sketch_ids.add(f.get("id"))
+        self.plan.steps.append({"op": "helix", "id": f.get("id"), "name": self.name_for(f),
+                                "plane": SW_PLANE[base], "radius": radius, "pitch": pitch,
+                                "height": height, "ccw": bool(p.get("ccw", True)),
+                                "start": to_sw(p0), "centre": to_sw(fr["o"]),
+                                "normal": to_sw(fr["n"])})
+
+    def sweep(self, f: dict) -> None:
+        p, r = f.get("params") or {}, f.get("refs") or {}
+        for k in ("guides", "twist", "orientation"):
+            if r.get(k) or p.get(k):
+                return self.refuse(f, f"sweep {k} is not exported yet")
+        sid = self.profile_sketch(f)
+        if sid is None:
+            return
+        pid = self.ref_id(r.get("path"))
+        if pid is None or pid not in self.sketch_ids:
+            return self.refuse(f, "sweep path must be an exported sketch, 3D sketch or helix")
+        body = self.body_policy(f)
+        if body is None:
+            return
+        self.plan.steps.append({"op": "sweep", "id": f.get("id"), "name": self.name_for(f),
+                                "profile": self.sw_name[sid], "path": self.sw_name[pid],
+                                "path_kind": self.path_kind.get(pid, "SKETCH"), "body": body})
+
+    def loft(self, f: dict) -> None:
+        p, r = f.get("params") or {}, f.get("refs") or {}
+        for k in ("guides", "closed", "start_tangent", "end_tangent"):
+            if r.get(k) or p.get(k):
+                return self.refuse(f, f"loft {k} is not exported yet")
+        rows = r.get("sections") or r.get("profiles") or []
+        ids = [self.ref_id(x) for x in rows]
+        if len(ids) < 2 or any(i is None or i not in self.sketch_ids for i in ids):
+            return self.refuse(f, "loft sections must be two or more exported sketches")
+        if len(ids) > 2 and p.get("ruled"):
+            return self.refuse(f, "a ruled loft through more than two sections is not "
+                                  "exported yet")
+        body = self.body_policy(f, "new")
+        if body is None:
+            return
+        self.plan.steps.append({"op": "loft", "id": f.get("id"), "name": self.name_for(f),
+                                "sections": [self.sw_name[i] for i in ids], "body": body})
 
     # -- primitives --------------------------------------------------------------------------
     def primitive(self, f: dict) -> None:
@@ -677,6 +805,14 @@ class _Builder:
                 self.primitive(f)
             elif t == "transform":
                 self.transform(f)
+            elif t == "sketch3d":
+                self.sketch3d(f)
+            elif t == "helix":
+                self.helix(f)
+            elif t == "sweep":
+                self.sweep(f)
+            elif t == "loft":
+                self.loft(f)
             elif t == "boolean":
                 self.boolean(f)
             elif t == "fillet":
@@ -697,7 +833,11 @@ class _Builder:
                 self.degrade(f, "unused reference geometry is not exported")
             else:
                 self.refuse(f, f"feature type {t!r} has no SolidWorks export yet")
-        self.plan.steps = [self.to_3d(s) for s in self.plan.steps]
+        steps = [self.to_3d(s) for s in self.plan.steps]
+        # Paths first: a 3D sketch drawn after solids exist snaps its points onto their edges
+        # (SolidWorks 2026 builds metres-long arcs where a brake line runs beside another),
+        # and no path depends on a solid.
+        self.plan.steps = [s for s in steps if s["op"] == "sketch3d"] +             [s for s in steps if s["op"] != "sketch3d"]
         return self.plan
 
     def to_3d(self, s: dict) -> dict:
@@ -706,9 +846,7 @@ class _Builder:
         frame = self.sketch_frames.get(s.get("id")) if s["op"] == "sketch" else None
         if frame is None:
             return s
-        n = list(_PLANE_N[frame["plane"]])
-        u, v = _PLANE_UV[frame["plane"]]
-        origin = _scale(n, frame["offset"])
+        n, u, v, origin = frame["n"], frame["u"], frame["v"], frame["o"]
 
         # Chudware closes a profile within its own tolerance; a SolidWorks sketch needs the
         # endpoints to coincide, so endpoints closer than SNAP_MM share one point.
@@ -750,6 +888,122 @@ class _Builder:
             plane["name"] = s["plane"]["name"]
         return {"op": "sketch3", "id": s["id"], "name": s["name"], "plane": plane,
                 "entities": ents}
+
+
+def _arc_start_tangent(a, m, b) -> Optional[list[float]]:
+    """Unit tangent at ``a`` of the circle through ``a``, ``m``, ``b``, toward ``m``."""
+    n = _unit(_cross(_sub(m, a), _sub(b, a)))
+    if n is None:
+        return None
+    # centre: intersection of the perpendicular bisectors of a-m and a-b in the plane
+    am, ab = _sub(m, a), _sub(b, a)
+    d = 2 * _dot(_cross(am, ab), _cross(am, ab))
+    c = _add(a, _scale(_add(_scale(_cross(ab, _cross(am, ab)), _dot(am, am)),
+                            _scale(_cross(_cross(am, ab), am), _dot(ab, ab))), 1 / d))
+    t = _unit(_cross(n, _sub(a, c)))
+    if t is None:
+        return None
+    return t if _dot(t, am) > 0 else _scale(t, -1.0)
+
+
+def _tangent_arc(a, t, b, pm_hint) -> Optional[tuple]:
+    """The circular arc from ``a`` (leaving along unit ``t``) to ``b``, on the side of
+    ``pm_hint``: (mid point, unit tangent at b), or None if degenerate."""
+    ab = _sub(b, a)
+    n = _unit(_sub(ab, _scale(t, _dot(ab, t))))
+    if n is None or _dot(ab, n) < 1e-12:
+        return None
+    r = _dot(ab, ab) / (2 * _dot(ab, n))
+    c = _add(a, _scale(n, r))
+    e1, e2 = _unit(_sub(a, c)), t
+    cb = _sub(b, c)
+    th = math.atan2(_dot(cb, e2), _dot(cb, e1)) % (2 * math.pi)
+
+    def at(x):
+        return _add(c, _scale(e1, r * math.cos(x)), _scale(e2, r * math.sin(x)))
+    pm = at(th / 2)
+    if math.dist(pm, pm_hint) > 0.05 * max(r, 1.0):
+        return None
+    tb = _add(_scale(e1, -math.sin(th)), _scale(e2, math.cos(th)))
+    return pm, tb
+
+
+def _arc_shape(e: dict) -> Optional[tuple]:
+    """(radius, sweep angle, unit start tangent, unit start-to-centre) of a 3-point arc."""
+    t0 = _arc_start_tangent(e["p1"], e["pm"], e["p2"])
+    if t0 is None:
+        return None
+    ab = _sub(e["p2"], e["p1"])
+    n = _unit(_sub(ab, _scale(t0, _dot(ab, t0))))
+    if n is None or _dot(ab, n) < 1e-12:
+        return None
+    r = _dot(ab, ab) / (2 * _dot(ab, n))
+    c = _add(e["p1"], _scale(n, r))
+    e1, cb = _unit(_sub(e["p1"], c)), _sub(e["p2"], c)
+    th = math.atan2(_dot(cb, t0), _dot(cb, e1)) % (2 * math.pi)
+    return r, th, t0, n
+
+
+def _end_tangents(e: dict) -> tuple:
+    """(start, end) unit tangents of a line or a 3-point arc, or (None, None)."""
+    if e["type"] == "line":
+        d = _unit(_sub(e["p2"], e["p1"]))
+        return d, d
+    t0 = _arc_start_tangent(e["p1"], e["pm"], e["p2"])
+    fit = _tangent_arc(e["p1"], t0, e["p2"], e["pm"]) if t0 else None
+    return t0, (fit[1] if fit else None)
+
+
+def tangent_fillets(ents: list[dict]) -> list[dict]:
+    """Make a line/arc path exactly tangent where it is meant to be.
+
+    Stored coordinates are rounded, so arcs meet their lines a few thousandths of a degree
+    off tangent; Chudware sweeps such a path but SolidWorks refuses it. Joints within 0.05
+    degrees in the stored path are smooth: walking the chain, an arc after a smooth joint is
+    made tangent to the direction it starts from, and a line after one leaves along that
+    direction (same length). Real corners are kept. The repair is dropped if any point moves
+    more than 0.05 mm."""
+    if any(e["type"] not in ("line", "arc3") for e in ents):
+        return [dict(e) for e in ents]
+    tans = [_end_tangents(e) for e in ents]
+    smooth = [False] + [
+        tans[i - 1][1] is not None and tans[i][0] is not None and
+        _dot(tans[i - 1][1], tans[i][0]) > math.cos(math.radians(0.05))
+        for i in range(1, len(ents))]
+    out = [dict(e) for e in ents]
+    cur = None   # unit tangent at the end of the previous (repaired) entity
+    for i, e in enumerate(out):
+        if i:
+            e["p1"] = out[i - 1]["p2"]
+        if e["type"] == "line":
+            if smooth[i] and cur is not None:
+                e["p2"] = _add(e["p1"], _scale(cur, math.dist(ents[i]["p1"], ents[i]["p2"])))
+            cur = _unit(_sub(e["p2"], e["p1"]))
+        else:
+            # keep the arc's radius, sweep and bend direction; start it where the path now is
+            own = _arc_shape(ents[i])
+            if own is None:
+                return [dict(x) for x in ents]
+            r, th, t_own, n_own = own
+            t0 = cur if smooth[i] and cur is not None else t_own
+            n = _unit(_sub(n_own, _scale(t0, _dot(n_own, t0))))
+            if n is None:
+                return [dict(x) for x in ents]
+            c = _add(e["p1"], _scale(n, r))
+            e1 = _scale(n, -1.0)
+
+            def at(x, c=c, e1=e1, t0=t0, r=r):
+                return _add(c, _scale(e1, r * math.cos(x)), _scale(t0, r * math.sin(x)))
+            e["pm"], e["p2"] = at(th / 2), at(th)
+            cur = _add(_scale(e1, -math.sin(th)), _scale(t0, math.cos(th)))
+    pts = lambda es: [q for x in es for q in (x["p1"], x["p2"])]   # noqa: E731
+    if max((math.dist(q0, q1) for q0, q1 in zip(pts(ents), pts(out))), default=0.0) > 0.05:
+        return [dict(e) for e in ents]
+    return out
+
+
+def _sub(a, b):
+    return [a[i] - b[i] for i in range(3)]
 
 
 def arc_points(e: dict):

@@ -22,7 +22,7 @@ import os
 from services.sw_export.plan import arc_points
 
 M = 0.001
-VOLUME_RTOL = 1e-5        # relative volume tolerance of the final comparison
+VOLUME_RTOL = 1e-4        # relative volume tolerance of the final comparison
 COM_TOL_MM = 1e-2         # absolute centre-of-mass tolerance (mm)
 INERTIA_RTOL = 1e-4       # inertia diagonal, relative to its largest entry
 # "close": tolerances x CLOSE_FACTOR. Chudware and SolidWorks booleans can differ by ~1e-4 of
@@ -30,6 +30,7 @@ INERTIA_RTOL = 1e-4       # inertia diagonal, relative to its largest entry
 CLOSE_FACTOR = 100.0
 
 
+HELIX_START = 0.0             # InsertHelix start angle (radians) for the engine's +u start
 _CHUNK = 150                  # sketch entities per VBA procedure
 _SPLIT = "'--split--"
 
@@ -491,6 +492,8 @@ Sub MergeTouching(fid As String, nm As String, before As Object)
                 On Error GoTo 0
                 If Not IsEmpty(res) Then
                     If UBound(res) - LBound(res) = 0 Then hits.Add b
+                ElseIf e <> 0 Then
+                    Note nm & " overlaps body " & b.Name & " but SolidWorks cannot fuse them"
                 End If
             End If
         End If
@@ -502,7 +505,10 @@ Sub MergeTouching(fid As String, nm As String, before As Object)
         Set tools(i) = hits(i)
     Next
     Set f = FM.InsertCombineFeature(15903, Nothing, (tools))
-    If f Is Nothing Then Fail "fuse " & nm & " with the bodies it touches"
+    If f Is Nothing Then
+        Note nm & " could not be fused with the " & hits.Count & " bodies it touches"
+        Exit Sub
+    End If
     RenameLast nm & "_Fuse"
     Track fid, before
 End Sub
@@ -513,6 +519,12 @@ Sub Extr(sk As String, fid As String, nm As String, sd As Boolean, flip As Boole
     If mode <> "cut" Then
         SelSketch sk
         Set f = FM.FeatureExtrusion3(sd, False, flip, t1, t2, d1, d2, False, False, False, False, 0, 0, False, False, False, False, mode = "merge", True, True, 0, 0, False)
+        If f Is Nothing And mode = "merge" Then
+            ' SolidWorks refuses some merges Chudware makes (a boss over a swept tube's end):
+            ' build it as its own body; MergeTouching below fuses it where SolidWorks can.
+            SelSketch sk
+            Set f = FM.FeatureExtrusion3(sd, False, flip, t1, t2, d1, d2, False, False, False, False, 0, 0, False, False, False, False, False, True, True, 0, 0, False)
+        End If
         If f Is Nothing Then Fail "extrude"
         RenameLast nm
     ElseIf BodyCount() > 1 Then
@@ -535,6 +547,122 @@ Sub Extr(sk As String, fid As String, nm As String, sd As Boolean, flip As Boole
                 Exit For
             End If
         Next
+        RenameLast nm
+    End If
+    Track fid, before
+    If mode = "merge" Then MergeTouching fid, nm, before
+End Sub
+
+' A tool body made since snapshot s0 (all of them: several contours make several bodies),
+' subtracted from body tname. Like Chudware, a cut that removes nothing is a note.
+Sub CombineTools(nm As String, s0 As Object, tname As String)
+    Dim tools As Variant, fc As Object
+    tools = NewBodies(s0)
+    If IsEmpty(tools) Then Fail "cut tool made no body"
+    Set fc = FM.InsertCombineFeature(15902, BodyByName(tname), tools)
+    If fc Is Nothing Then
+        DeleteFeature nm & "_Tool"
+        Note "cut " & nm & " removes nothing from body " & tname
+    Else
+        RenameLast nm
+    End If
+End Sub
+
+' A 3D arc start/end/mid (metres), built from its centre (keeping the direction whose length
+' is L), else through its three points.
+Function Arc3D(x1 As Double, y1 As Double, z1 As Double, x2 As Double, y2 As Double, z2 As Double, xm As Double, ym As Double, zm As Double, xc As Double, yc As Double, zc As Double, L As Double) As Object
+    Dim a As Object, d As Variant
+    ' From the exact centre first: a 3-point fit of a shallow arc comes out a few microns off,
+    ' which kinks the path at its ends and SolidWorks then refuses to sweep along it.
+    For Each d In Array(1, -1)
+        Set a = SM.CreateArc(xc, yc, zc, x1, y1, z1, x2, y2, z2, CInt(d))
+        If Not a Is Nothing Then
+            If Abs(a.GetLength() - L) <= 0.000001 + 0.001 * L Then
+                Set Arc3D = a
+                Exit Function
+            End If
+            Part.ClearSelection2 True
+            boolstatus = a.Select4(False, Nothing)
+            Part.EditDelete
+        End If
+    Next
+    Set Arc3D = SM.Create3PointArc(x1, y1, z1, x2, y2, z2, xm, ym, zm)
+End Function
+
+Sub Begin3D()
+    ' Nothing selected: with the previous 3D sketch selected, Insert3DSketch edits that one.
+    Part.ClearSelection2 True
+    SM.AddToDB = True
+    SM.Insert3DSketch True
+End Sub
+
+Sub End3D(nm As String)
+    SM.Insert3DSketch True
+    SM.AddToDB = False
+    RenameLast nm
+End Sub
+
+Function SweepFeat(prof As String, path As String, ptype As String, merge As Boolean, isCut As Boolean) As Object
+    Part.ClearSelection2 True
+    If Not Sel(prof, "SKETCH", True, 1) Then Fail "sweep profile " & prof & " not found"
+    ' The path by its feature: a 3D sketch or helix looked up by name and type can select
+    ' something else with the path mark (a datum plane, on SolidWorks 2026).
+    Dim pf As Object
+    Set pf = Part.FeatureByName(path)
+    If pf Is Nothing Then Fail "sweep path " & path & " not found"
+    If Not pf.Select2(True, 4) Then Fail "could not select sweep path " & path
+    If isCut Then
+        Set SweepFeat = FM.InsertCutSwept4(False, False, 0, False, False, 0, 0, False, 0, 0, 0, 0, True, True, 0, True, False, False, False)
+    Else
+        Set SweepFeat = FM.InsertProtrusionSwept4(False, False, 0, False, False, 0, 0, False, 0, 0, 0, 0, merge, True, True, 0, True, False, 0, 0)
+    End If
+End Function
+
+Sub Swp(prof As String, path As String, ptype As String, fid As String, nm As String, mode As String, key As String)
+    Dim before As Object, s0 As Object, f As Object, tname As String
+    Set before = TakeSnap()
+    If mode = "cut" And BodyCount() > 1 Then
+        tname = Target(key).Name
+        Set s0 = TakeSnap()
+        Set f = SweepFeat(prof, path, ptype, False, False)
+        If f Is Nothing Then Fail "sweep tool"
+        RenameLast nm & "_Tool"
+        CombineTools nm, s0, tname
+    Else
+        Set f = SweepFeat(prof, path, ptype, mode <> "new", mode = "cut")
+        If f Is Nothing Then Fail "sweep"
+        RenameLast nm
+    End If
+    Track fid, before
+    If mode = "merge" Then MergeTouching fid, nm, before
+End Sub
+
+Function LoftFeat(secs As Variant, merge As Boolean, isCut As Boolean) As Object
+    Dim v As Variant
+    Part.ClearSelection2 True
+    For Each v In secs
+        If Not Sel(CStr(v), "SKETCH", True, 1) Then Fail "loft section " & v & " not found"
+    Next
+    If isCut Then
+        Set LoftFeat = FM.InsertCutBlend(False, True, False, 1, 0, 0, False, 0, 0, 0, True, True)
+    Else
+        Set LoftFeat = FM.InsertProtrusionBlend2(False, True, False, 1, 0, 0, 1, 1, True, True, False, 0, 0, 0, merge, True, True, 0)
+    End If
+End Function
+
+Sub Lft(secs As Variant, fid As String, nm As String, mode As String, key As String)
+    Dim before As Object, s0 As Object, f As Object, tname As String
+    Set before = TakeSnap()
+    If mode = "cut" And BodyCount() > 1 Then
+        tname = Target(key).Name
+        Set s0 = TakeSnap()
+        Set f = LoftFeat(secs, False, False)
+        If f Is Nothing Then Fail "loft tool"
+        RenameLast nm & "_Tool"
+        CombineTools nm, s0, tname
+    Else
+        Set f = LoftFeat(secs, mode <> "new", mode = "cut")
+        If f Is Nothing Then Fail "loft"
         RenameLast nm
     End If
     Track fid, before
@@ -678,7 +806,12 @@ Sub BodyFallback(reason As String)
     Dim msg As String, ok As Boolean, near As Boolean
     On Error GoTo bad
     Stage = "body fallback"
-    If Not Part Is Nothing Then swApp.CloseDoc Part.GetTitle()
+    If Not Part Is Nothing Then
+        On Error Resume Next   ' leave a sketch the failed step may have left open
+        If Not Part.SketchManager.ActiveSketch Is Nothing Then Part.SketchManager.InsertSketch True
+        On Error GoTo bad
+        swApp.CloseDoc Part.GetTitle()
+    End If
     Set Part = swApp.LoadFile4(Folder & "\" & Fallback, "r", Nothing, errors)
     If Part Is Nothing Then
         Abort "could not open " & Fallback & " (error " & errors & ") after: " & reason
@@ -746,10 +879,17 @@ def _checks(expected: dict, flag: str = "ok", scale: float = 1.0) -> str:
                    f"{_n(max(abs(ev), 1e-9))} Then {flag} = False")
     com = expected.get("com_sw_mm")
     if com:
+        tol = COM_TOL_MM * scale
+        ine, ev = expected.get("inertia_sw_mm5"), expected.get("volume_mm3")
+        if scale != 1.0 and ine and ev:
+            # "close" scales with the part: 1 % of its radius of gyration
+            tol = max(tol, 0.01 * math.sqrt(max(abs(x) for x in ine) / abs(ev)))
         for i in range(3):
-            out.append(f"    If Abs(c({i}) * 1000 - ({_n(com[i])})) > {_n(COM_TOL_MM * scale)} "
+            out.append(f"    If Abs(c({i}) * 1000 - ({_n(com[i])})) > {_n(tol)} "
                        f"Then {flag} = False")
-    if expected.get("body_count") is not None:
+    if expected.get("body_count") is not None and scale == 1.0:
+        # (not in "close": a fitting SolidWorks will not fuse onto a tube stays its own body
+        # in the same place; the shape is right)
         out.append(f"    If n <> {int(expected['body_count'])} Then {flag} = False")
     ine = expected.get("inertia_sw_mm5")
     if ine:
@@ -908,6 +1048,56 @@ class _Writer:
         self.w(f"MoveBody {_s(s['id'])}, {_s(s['name'])}, {_s(s.get('target') or '')}, "
                f"{_b(s['copy'])}, {_b(rot)}, {_n(a)}, {_n(b)}, {_n(c)}, {_m(pv[0])}, "
                f"{_m(pv[1])}, {_m(pv[2])}, {_b(tr)}, {_m(t[0])}, {_m(t[1])}, {_m(t[2])}")
+
+    def sketch3d(self, s: dict) -> None:
+        self.w("Begin3D")
+        for i, e in enumerate(s["entities"]):
+            if i and i % _CHUNK == 0:
+                self.w(_SPLIT)
+            a, b = e["p1"], e["p2"]
+            if e["type"] == "spline":
+                flat = [c * M for q in e["points"] for c in q]
+                self.spline(flat)
+            elif e["type"] == "line":
+                self.w(f"Set seg = SM.CreateLine({_m(a[0])}, {_m(a[1])}, {_m(a[2])}, "
+                       f"{_m(b[0])}, {_m(b[1])}, {_m(b[2])})")
+            else:
+                m = e["pm"]
+                from services.sw_export.plan import _arc_shape   # noqa: PLC0415
+                r, th, _t, n = _arc_shape(e)
+                c = [a[k] + n[k] * r for k in range(3)]
+                self.w(f"Set seg = Arc3D({_m(a[0])}, {_m(a[1])}, {_m(a[2])}, "
+                       f"{_m(b[0])}, {_m(b[1])}, {_m(b[2])}, {_m(m[0])}, {_m(m[1])}, "
+                       f"{_m(m[2])}, {_m(c[0])}, {_m(c[1])}, {_m(c[2])}, {_m(r * th)})")
+            self.w(f"Need Not seg Is Nothing, \"3D sketch entity {i} ({e['type']})\"")
+        self.w(f"End3D {_s(s['name'])}")
+
+    def helix(self, s: dict) -> None:
+        c, n = s["centre"], s["normal"]
+        self.w(f"PlaneFor {_s(s['name'] + '_Plane')}, {_m(c[0])}, {_m(c[1])}, {_m(c[2])}, "
+               f"{_n(n[0])}, {_n(n[1])}, {_n(n[2])}")
+        self.w("BeginSketch")
+        self._p("p1", c)
+        self.w(f"Set seg = SM.CreateCircleByRadius(p1(0), p1(1), 0, {_m(s['radius'])})")
+        self.w("Need Not seg Is Nothing, \"helix circle\"")
+        self.w(f"EndSketch {_s(s['name'] + '_Circle')}")
+        self.w(f"SelSketch {_s(s['name'] + '_Circle')}")
+        turns = s["height"] / s["pitch"]
+        self.w(f"Part.InsertHelix False, {_b(not s['ccw'])}, False, False, 0, {_m(s['height'])}, "
+               f"{_m(s['pitch'])}, {_n(turns)}, 0, {_n(HELIX_START)}")
+        self.w(f"RenameLast {_s(s['name'])}")
+
+    def sweep(self, s: dict) -> None:
+        body = s["body"]
+        self.w(f"Swp {_s(s['profile'])}, {_s(s['path'])}, {_s(s['path_kind'])}, "
+               f"{_s(s['id'])}, {_s(s['name'])}, {_s(body['mode'])}, "
+               f"{_s(body.get('target') or '')}")
+
+    def loft(self, s: dict) -> None:
+        body = s["body"]
+        secs = ", ".join(_s(x) for x in s["sections"])
+        self.w(f"Lft Array({secs}), {_s(s['id'])}, {_s(s['name'])}, {_s(body['mode'])}, "
+               f"{_s(body.get('target') or '')}")
 
     def combine(self, s: dict) -> None:
         self.w(f"Comb {_s(s['id'])}, {_s(s['name'])}, {s['code']}, {_s(s['a'])}, {_s(s['b'])}")

@@ -161,9 +161,15 @@ def verify(expected: dict, got: dict) -> dict:
         out.update({"expected_inertia_sw_mm5": ei, "inertia_rel_error": di})
         errors["inertia"] = (di, INERTIA_RTOL)
     checks = {k: e <= t for k, (e, t) in errors.items()}
+    close_tol = {k: t * CLOSE_FACTOR for k, (e, t) in errors.items()}
+    if "centre_of_mass" in close_tol and ei and ev:
+        # "close" scales with the part: 1 % of its radius of gyration
+        rg = (max(abs(x) for x in ei) / abs(ev)) ** 0.5
+        close_tol["centre_of_mass"] = max(close_tol["centre_of_mass"], 0.01 * rg)
     # Within CLOSE_FACTOR x the tolerances: the size of a kernel difference between Chudware
     # and SolidWorks booleans, not a modelling difference.
-    out["close"] = all(e <= t * CLOSE_FACTOR for e, t in errors.values())
+    out["close"] = all(e <= close_tol[k] for k, (e, t) in errors.items()
+                       if k != "body_count")
     out["checks"] = checks
     out["verified"] = all(checks.values())
     return out

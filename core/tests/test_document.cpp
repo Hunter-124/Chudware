@@ -2882,6 +2882,52 @@ TEST_CASE("guide curve scales a swept profile end-to-end (document layer)") {
 
 // 6a-guide-reject. A guide identical to the path is rejected loudly (not silently swept
 //    guide-blind), so the user gets a clear message instead of a confusing result.
+// A wide strap swept round a bend tighter than its half-width, IN the strap's own plane,
+// folds through itself yet stays B-rep valid and near the area x length volume estimate, so
+// the validity/volume guards can pass it. The full self-intersection check must warn (HERC
+// BOM07f harness: 50 mm straps round 20 mm bends, refused by SolidWorks, 2026-11-15).
+TEST_CASE("sweep warns when a wide profile folds through a tight bend") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto ent = [](json e) { return json{{"op", "sketch_add_entity"}, {"sketch", "$0"}, {"entity", e}}; };
+    auto pent = [](json e) { return json{{"op", "sketch_add_entity"}, {"sketch", "$1"}, {"entity", e}}; };
+    auto run = [&](double half_width) {
+        json nr = doc_new("part", "Strap");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        const double w = half_width;
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Prof"},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.top"}}}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Path"},
+                 {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+                 {"refs", {{"plane", "plane.front"}}}}}},
+            ent({{"type", "line"}, {"p1", {-w, -1}}, {"p2", {w, -1}}}),
+            ent({{"type", "line"}, {"p1", {w, -1}}, {"p2", {w, 1}}}),
+            ent({{"type", "line"}, {"p1", {w, 1}}, {"p2", {-w, 1}}}),
+            ent({{"type", "line"}, {"p1", {-w, 1}}, {"p2", {-w, -1}}}),
+            pent({{"type", "line"}, {"p1", {0, 0}}, {"p2", {0, 30}}}),
+            pent({{"type", "arc"}, {"center", {-5, 30}}, {"radius", 5}, {"start", 0}, {"end", 90},
+                  {"ccw", true}}),
+            pent({{"type", "line"}, {"p1", {-5, 35}}, {"p2", {-40, 35}}}),
+            json{{"op", "add_feature"}, {"feature", {{"type", "sweep"}, {"name", "Strap"},
+                 {"params", {{"mode", "new"}}},
+                 {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "$0"}}})},
+                           {"path", "$1"}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        std::string warning;
+        for (const auto& fst : resp["rebuild"]["feature_status"])
+            if (fst.contains("warning") && fst["warning"].is_string())
+                warning += fst["warning"].get<std::string>();
+        return warning;
+    };
+    // (this fold also trips the validity guard; the harness's folds pass it and are caught
+    // only by the self-intersection check, verified on that document)
+    CHECK(run(15.0).find("sweep:") != std::string::npos);   // 30 mm wide round an R5 bend
+    CHECK(run(2.0).empty());                                // 4 mm wide: a sound strap
+}
+
 TEST_CASE("sweep rejects a guide curve identical to the path") {
     const double R = 4.0, Hh = 20.0;
     json prof; prof["id"] = "prof"; prof["type"] = "sketch"; prof["plane"] = "top";

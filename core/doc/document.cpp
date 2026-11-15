@@ -6301,6 +6301,36 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         "sweep: result volume is well below profile_area * path_length — "
                         "the pipe may self-intersect (profile large for the path's bend "
                         "radius); verify the geometry";
+                else {
+                    // (3) A WIDE profile bent in its own plane folds through itself while
+                    // staying B-rep valid and near the volume estimate: a 50 mm strap round a
+                    // 20 mm bend (HERC BOM07f harness, 2026-11-15). Other CAD refuses to build
+                    // it and it meshes badly, so run the full self-intersection check.
+                    BOPAlgo_CheckerSI ck;
+                    TopTools_ListOfShape one;
+                    one.Append(solid);
+                    ck.SetArguments(one);
+                    ck.SetLevelOfCheck(9);
+                    ck.SetNonDestructive(Standard_True);
+                    ck.Perform();
+                    int si = 0;
+                    if (!ck.HasErrors() && ck.PDS() != nullptr) {
+                        const BOPDS_DS& ds = *ck.PDS();
+                        for (BOPDS_MapOfPair::Iterator it(ds.Interferences()); it.More();
+                             it.Next()) {
+                            Standard_Integer n1 = 0, n2 = 0;
+                            it.Value().Indices(n1, n2);
+                            if (!ds.IsNewShape(n1) && !ds.IsNewShape(n2)) ++si;
+                        }
+                    }
+                    if (si > 0)
+                        st.warning =
+                            "sweep: the swept solid intersects itself (" + std::to_string(si) +
+                            " self-interferences): the profile is wider than a bend of the "
+                            "path allows in that direction. Other CAD will not build it and it "
+                            "meshes badly; narrow the profile, ease the bend, or turn the "
+                            "profile so the path bends about its thin side";
+                }
 
                 const std::string smode = solid_mode(feat, "boss");
                 const BodyTargets targets = solid_targets(solid, smode, feat);

@@ -450,3 +450,75 @@ def test_assembly_export_skips_a_component_that_cannot_be_exported(tmp_path):
     assert top.note["components"] == 1
     assert [s["component"] for s in job.skipped] == ["bad"]
     assert job.warnings and "15/16" in job.warnings[0]
+
+
+def _path3d(fid, ents):
+    return {"id": fid, "type": "sketch3d", "name": f"Path{fid}", "params": {"entities": ents}}
+
+
+def test_sweep_along_a_3d_path_with_a_point_normal_profile_plane():
+    path = _path3d("f1", [
+        {"type": "line", "p1": [0, 0, 0], "p2": [-10, 0, 0]},
+        {"type": "arc", "p1": [-10, 0, 0], "p2": [-20, 10, 0],
+         "pm": [-10 - 10 * math.sin(math.pi / 4), 10 - 10 * math.cos(math.pi / 4), 0]},
+        {"type": "line", "p1": [-20, 10, 0], "p2": [-20, 30, 0]}])
+    plane = {"id": "f2", "type": "plane", "name": "ProfilePlane",
+             "params": {"method": "point_normal", "origin": [0, 0, 0], "normal": [-1, 0, 0]}}
+    prof = {"id": "f3", "type": "sketch", "name": "Profile", "refs": {"plane": "f2"},
+            "params": {"entities": [{"type": "circle", "center": [0, 0], "radius": 2.5}]}}
+    sweep = {"id": "f4", "type": "sweep", "name": "Pipe", "params": {"mode": "new"},
+             "refs": {"path": "f1", "profile": [{"kind": "region", "sketch": "f3"}]}}
+    plan = build_plan([path, plane, prof, sweep], name="p")
+    assert plan.unsupported == []
+    ops = [s["op"] for s in plan.steps]
+    assert ops == ["sketch3d", "sketch3", "sweep"]          # paths before any solid
+    sw = plan.steps[-1]
+    assert sw["path"] == "Pathf1" and sw["path_kind"] == "3DSKETCH" and sw["profile"] == "Profile"
+    # point_normal frame: normal along -X -> u = +Y; the circle sits on the path start
+    assert plan.steps[1]["plane"]["origin"] == pytest.approx([0, 0, 0])
+    assert plan.steps[1]["entities"][0]["center"] == pytest.approx([0, 0, 0])
+
+
+def test_path_joints_rounded_off_tangent_are_made_exactly_tangent():
+    from services.sw_export.plan import _end_tangents, tangent_fillets
+    r = 10.0
+    ents = [{"type": "line", "p1": [0, 0, 0], "p2": [10, 0, 0]},
+            {"type": "arc3", "p1": [10, 0, 0], "p2": [20, 10.0004, 0],
+             "pm": [10 + r * math.sin(math.pi / 4), r - r * math.cos(math.pi / 4), 0]},
+            {"type": "line", "p1": [20, 10.0004, 0], "p2": [20, 40, 0]}]
+    out = tangent_fillets(ents)
+    for a, b in zip(out, out[1:]):
+        ta, tb = _end_tangents(a)[1], _end_tangents(b)[0]
+        assert sum(x * y for x, y in zip(ta, tb)) == pytest.approx(1.0, abs=1e-12)
+    assert math.dist(ents[-1]["p2"], out[-1]["p2"]) < 0.05
+
+
+def test_loft_and_helix_map_to_solidworks_features():
+    sec = [_rect("f1", "plane.top", -5, -5, 5, 5), _rect("f2", "plane.top", -4, -4, 4, 4)]
+    sec[1]["params"]["offset"] = 10
+    loft = {"id": "f3", "type": "loft", "name": "Taper", "params": {"ruled": True},
+            "refs": {"sections": [{"kind": "region", "sketch": "f1"},
+                                  {"kind": "region", "sketch": "f2"}]}}
+    helix = {"id": "f4", "type": "helix", "name": "Coil",
+             "params": {"radius": 21, "pitch": 14.1, "height": 148}, "refs": {"base": "plane.top"}}
+    plan = build_plan(sec + [loft, helix], name="p")
+    assert plan.unsupported == []
+    lo = next(s for s in plan.steps if s["op"] == "loft")
+    assert lo["sections"] == ["Sketchf1", "Sketchf2"] and lo["body"]["mode"] == "new"
+    he = next(s for s in plan.steps if s["op"] == "helix")
+    assert he["plane"] == "Top Plane" and he["start"] == pytest.approx([21, 0, 0])
+
+
+def test_face_sketch_uses_the_engine_frame_and_flips_a_blind_extrude():
+    from services.sw_export.plan import frame_from_matrix
+    # engine plane_frame columns u, v, n, origin: a bottom face at z = -5, normal -Z
+    m = [1, 0, 0, 3, 0, -1, 0, 4, 0, 0, -1, -5, 0, 0, 0, 1]
+    sk = _rect("f2", {"of": "face", "near": [3, 4, -5]}, -1, -1, 1, 1)
+    ex = _extrude("f3", "f2", 2)
+    plan = build_plan([_rect("f1", "plane.top", -10, -10, 10, 10), _extrude("f4", "f1", 5), sk,
+                       ex], name="p",
+                      sketch_frame=lambda fid: frame_from_matrix(m) if fid == "f2" else None)
+    assert plan.unsupported == []
+    s3 = next(s for s in plan.steps if s.get("id") == "f2")
+    assert s3["op"] == "sketch3" and s3["plane"]["origin"] == pytest.approx([3, -5, -4])
+    assert next(s for s in plan.steps if s.get("id") == "f3")["plane_flip"] is True

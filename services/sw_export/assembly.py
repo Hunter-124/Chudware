@@ -113,8 +113,10 @@ class _Source:
 class AssemblyExport:
     def __init__(self, call: Callable[[str, dict], dict],
                  open_part: Callable[[str], AbstractContextManager],
-                 edge_points: Callable[[str], Callable[[str], list]], out_dir: str):
+                 edge_points: Callable[[str], Callable[[str], list]], out_dir: str,
+                 sketch_frames: Optional[Callable[[str], Callable]] = None):
         self.call, self.open_part, self.edge_points = call, open_part, edge_points
+        self.sketch_frames = sketch_frames
         self.out_dir = out_dir
         self.sources: dict[str, _Source] = {}
         self.order: list[_Source] = []       # build order: parts before their assemblies
@@ -196,7 +198,9 @@ class AssemblyExport:
     def _part(self, d: str, tree: dict, stem: str) -> _Source:
         mass = self._mass(d)
         plan = build_plan(tree.get("features") or [], name=str(tree.get("name") or stem),
-                          edge_points=self.edge_points(d), expected=mass).as_dict()
+                          edge_points=self.edge_points(d), expected=mass,
+                          sketch_frame=self.sketch_frames(d) if self.sketch_frames else None
+                          ).as_dict()
         if plan["unsupported"]:
             return self._body(d, stem, {"fidelity": "imported_body",
                                         "unsupported": plan["unsupported"]})

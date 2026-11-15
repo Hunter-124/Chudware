@@ -30,7 +30,9 @@ INERTIA_RTOL = 1e-4       # inertia diagonal, relative to its largest entry
 CLOSE_FACTOR = 100.0
 
 
-HELIX_START = 0.0             # InsertHelix start angle (radians) for the engine's +u start
+# InsertHelix measures its start angle 90 degrees from the engine's (whose 0 is the base
+# plane's +u); found on SolidWorks 2026 by matching the swept spring's volume.
+HELIX_START = math.pi / 2
 _CHUNK = 150                  # sketch entities per VBA procedure
 _SPLIT = "'--split--"
 
@@ -214,7 +216,7 @@ End Sub
 ' point every Chudware body key at the body it now lives in (the engine's merge/consume rule).
 Sub Track(fid As String, before As Object)
     Dim v As Variant, b As Variant, hit As New Collection, gone As Object, k As Variant
-    Dim nm As String, i As Long, old As String
+    Dim nm As String, i As Long, old As String, first As String
     Set gone = CreateObject("Scripting.Dictionary")
     For Each k In before.Keys
         gone(k) = True
@@ -238,15 +240,20 @@ Sub Track(fid As String, before As Object)
         If i = 1 Then nm = fid Else nm = fid & "#" & (i - 1)
         old = hit(i).Name
         If old <> nm Then
+            On Error Resume Next
             hit(i).Name = nm
+            On Error GoTo 0
+            ' SolidWorks can keep its own name (a name a consumed body still holds)
+            nm = hit(i).Name
             Repoint old, nm
         End If
+        If i = 1 Then first = nm
     Next
     For Each k In gone.Keys
-        Repoint CStr(k), fid
+        Repoint CStr(k), first
     Next
-    Own(fid) = fid
-    Cur = fid
+    Own(fid) = first
+    Cur = first
 End Sub
 
 Function Target(key As String) As Object
@@ -518,7 +525,9 @@ Sub Extr(sk As String, fid As String, nm As String, sd As Boolean, flip As Boole
     Set before = TakeSnap()
     If mode <> "cut" Then
         SelSketch sk
-        Set f = FM.FeatureExtrusion3(sd, False, flip, t1, t2, d1, d2, False, False, False, False, 0, 0, False, False, False, False, mode = "merge", True, True, 0, 0, False)
+        ' In a multibody part SolidWorks also merges bodies that only overlap each other;
+        ' Chudware fuses the feature with the bodies IT touches: MergeTouching does that.
+        Set f = FM.FeatureExtrusion3(sd, False, flip, t1, t2, d1, d2, False, False, False, False, 0, 0, False, False, False, False, mode = "merge" And BodyCount() <= 1, True, True, 0, 0, False)
         If f Is Nothing And mode = "merge" Then
             ' SolidWorks refuses some merges Chudware makes (a boss over a swept tube's end):
             ' build it as its own body; MergeTouching below fuses it where SolidWorks can.
@@ -539,12 +548,22 @@ Sub Extr(sk As String, fid As String, nm As String, sd As Boolean, flip As Boole
             SelSketch sk
             Set f = FM.FeatureCut4(sd, False, rev, t1, t2, d1, d2, False, False, False, False, 0, 0, False, False, False, False, False, True, True, True, True, False, 0, 0, False, False)
             If Not f Is Nothing Then
-                If (Not simple) Or attempt = 1 Or Abs(Vol() - v0) > 1E-15 Then Exit For
+                If Abs(Vol() - v0) > 1E-15 Then Exit For
+                If (Not simple) Or attempt = 1 Then
+                    ' SolidWorks made the cut but took nothing (an edge exactly tangent to a
+                    ' bore): try it as a tool body + Combine before calling it empty.
+                    DeleteFeature f.Name
+                    CutTool sk, nm, False, sd, flip, t1, t2, d1, d2, 0, key, simple
+                    Track fid, before
+                    Exit Sub
+                End If
                 DeleteFeature f.Name
             ElseIf (Not simple) Or attempt = 1 Then
-                ' Like Chudware, a cut that removes nothing is a warning, not a failure.
-                Note "cut " & nm & " removes nothing"
-                Exit For
+                ' SolidWorks refuses some cuts Chudware makes (an edge exactly tangent to a
+                ' bore): the same cut as a tool body + Combine, else a note.
+                CutTool sk, nm, False, sd, flip, t1, t2, d1, d2, 0, key, simple
+                Track fid, before
+                Exit Sub
             End If
         Next
         RenameLast nm
@@ -629,7 +648,7 @@ Sub Swp(prof As String, path As String, ptype As String, fid As String, nm As St
         RenameLast nm & "_Tool"
         CombineTools nm, s0, tname
     Else
-        Set f = SweepFeat(prof, path, ptype, mode <> "new", mode = "cut")
+        Set f = SweepFeat(prof, path, ptype, mode = "cut" Or (mode = "merge" And BodyCount() <= 1), mode = "cut")
         If f Is Nothing Then Fail "sweep"
         RenameLast nm
     End If
@@ -661,7 +680,7 @@ Sub Lft(secs As Variant, fid As String, nm As String, mode As String, key As Str
         RenameLast nm & "_Tool"
         CombineTools nm, s0, tname
     Else
-        Set f = LoftFeat(secs, mode <> "new", mode = "cut")
+        Set f = LoftFeat(secs, mode = "cut" Or (mode = "merge" And BodyCount() <= 1), mode = "cut")
         If f Is Nothing Then Fail "loft"
         RenameLast nm
     End If
@@ -676,7 +695,7 @@ Sub Revo(sk As String, fid As String, nm As String, mode As String, key As Strin
         CutTool sk, nm, True, True, rev, 0, 0, 0, 0, ang, key, False
     Else
         SelSketch sk
-        Set f = FM.FeatureRevolve2(True, True, False, mode = "cut", rev, False, 0, 0, ang, 0, False, False, 0, 0, 0, 0, 0, mode <> "new", True, True)
+        Set f = FM.FeatureRevolve2(True, True, False, mode = "cut", rev, False, 0, 0, ang, 0, False, False, 0, 0, 0, 0, 0, mode = "cut" Or (mode = "merge" And BodyCount() <= 1), True, True)
         If f Is Nothing Then Fail "revolve"
         RenameLast nm
     End If
@@ -1029,8 +1048,11 @@ class _Writer:
         sd, t1, t2, d1, d2 = self._end_args(s)
         body = s["body"]
         simple = (s["end"] == "blind" or (s["end"] == "through_all" and s.get("on_face")))             and s["end2"] == "none" and not s["flip"]
+        # The macro's plane can face against the engine's sketch normal (a sketch on a
+        # bottom face): a blind direction then reverses.
+        flip = bool(s["flip"]) ^ bool(s.get("plane_flip"))
         self.w(f"Extr {_s(s['sketch'])}, {_s(s['id'])}, {_s(s['name'])}, {_b(sd)}, "
-               f"{_b(s['flip'])}, {t1}, {t2}, {_n(d1)}, {_n(d2)}, {_s(body['mode'])}, "
+               f"{_b(flip)}, {t1}, {t2}, {_n(d1)}, {_n(d2)}, {_s(body['mode'])}, "
                f"{_s(body.get('target') or '')}, {_b(simple)}")
 
     def revolve(self, s: dict) -> None:
@@ -1084,7 +1106,7 @@ class _Writer:
         self.w(f"SelSketch {_s(s['name'] + '_Circle')}")
         turns = s["height"] / s["pitch"]
         self.w(f"Part.InsertHelix False, {_b(not s['ccw'])}, False, False, 0, {_m(s['height'])}, "
-               f"{_m(s['pitch'])}, {_n(turns)}, 0, {_n(HELIX_START)}")
+               f"{_m(s['pitch'])}, {_n(turns)}, 0, {_n(HELIX_START + s.get('start_angle', 0.0))}")
         self.w(f"RenameLast {_s(s['name'])}")
 
     def sweep(self, s: dict) -> None:

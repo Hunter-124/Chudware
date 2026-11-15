@@ -38,7 +38,9 @@ _PLANE_UV = {"plane.top": ((1, 0, 0), (0, 1, 0)), "plane.front": ((1, 0, 0), (0,
 _PLANE_N = {"plane.top": (0, 0, 1), "plane.front": (0, -1, 0), "plane.right": (1, 0, 0)}
 # Face-side words (contracts/selectors.md) -> engine outward normal.
 _SIDE_NORMAL = {"top": (0, 0, 1), "bottom": (0, 0, -1), "front": (0, -1, 0),
-                "back": (0, 1, 0), "right": (1, 0, 0), "left": (-1, 0, 0)}
+                "back": (0, 1, 0), "right": (1, 0, 0), "left": (-1, 0, 0),
+                "+z": (0, 0, 1), "-z": (0, 0, -1), "+y": (0, 1, 0), "-y": (0, -1, 0),
+                "+x": (1, 0, 0), "-x": (-1, 0, 0)}
 _SKETCH_ENTITIES = {"line", "circle", "arc", "point", "spline"}
 _PRIMITIVES = {"box", "cylinder", "cone", "sphere", "torus"}
 # swBodyOperationType_e for the Combine feature.
@@ -198,15 +200,18 @@ def _parse_axis(v) -> Optional[list[float]]:
 
 class _Builder:
     def __init__(self, features: list[dict], edge_points: Callable[[str], list],
-                 name: str):
+                 name: str, sketch_frame: Optional[Callable[[str], Optional[dict]]] = None):
         self.features = [f for f in features if not f.get("suppressed")]
         self.edge_points = edge_points
+        self.engine_frame = sketch_frame
         self.plan = Plan(name=name)
         self.by_id = {f.get("id"): f for f in self.features}
         self.sw_name: dict[str, str] = {}      # chudware feature id -> SolidWorks feature name
         self.sketch_ids: set[str] = set()
         self.sketch_frames: dict[str, Optional[dict]] = {}   # sketch id -> frame (o, u, v, n)
         self.path_kind: dict[str, str] = {}    # path feature id -> SolidWorks selection type
+        self.plane_flip: dict[str, bool] = {}  # sketch name -> SolidWorks plane faces -normal
+        self.face_sketches: set[str] = set()   # sketches on a model face (engine frame)
         self.used_names: set[str] = set()
 
     # -- reporting -------------------------------------------------------------------------
@@ -275,6 +280,12 @@ class _Builder:
         if _principal(ref):
             self.sketch_frames[f.get("id")] = _frame(_principal(ref), extra)
             return {"kind": "principal", "plane": SW_PLANE[_principal(ref)]}
+        fr = self.engine_frame(f.get("id")) if self.engine_frame and not _principal(ref)             and not (self.ref_id(ref) and self.by_id[self.ref_id(ref)].get("type") == "plane")             else None
+        if fr is not None:
+            # A face or query plane: the engine's own resolved frame (centred on the face).
+            self.sketch_frames[f.get("id")] = fr
+            self.face_sketches.add(f.get("id"))
+            return {"kind": "offset", "name": f"{f.get('name') or f.get('id')}_Plane"}
         if isinstance(ref, dict) and ref.get("of") == "face" and ref.get("side") in _SIDE_NORMAL:
             if extra:
                 self.refuse(f, "a sketch offset from a model face is not exported yet")
@@ -301,6 +312,10 @@ class _Builder:
                     fr["o"] = _add(fr["o"], _scale(n, extra))
                     self.sketch_frames[f.get("id")] = fr
                     return {"kind": "offset", "name": f"{datum.get('name') or pid}"}
+            fr = self.engine_frame(f.get("id")) if self.engine_frame else None
+            if fr is not None:
+                self.sketch_frames[f.get("id")] = fr
+                return {"kind": "offset", "name": f"{datum.get('name') or pid}"}
             self.refuse(f, "sketch is on a datum plane that is not an offset of Top/Front/"
                            "Right or a point-normal plane")
             return None
@@ -355,6 +370,8 @@ class _Builder:
         if body is None:
             return
         end = p.get("end", "blind")
+        if p.get("mid_plane") is True and end == "blind":   # the older boolean form
+            end = "mid_plane"
         end2 = p.get("end2", "none")
         if end not in ("blind", "through_all", "mid_plane") or end2 not in ("none", "blind",
                                                                               "through_all"):
@@ -369,8 +386,9 @@ class _Builder:
         depth = _dim(p.get("depth"))
         depth = 10.0 if depth is None else depth
         depth2 = _dim(p.get("depth2"))
-        on_face = any(st.get("id") == sid and st["op"] == "sketch" and
-                      st["plane"]["kind"] == "face" for st in self.plan.steps)
+        on_face = sid in self.face_sketches or any(
+            st.get("id") == sid and st["op"] == "sketch" and st["plane"]["kind"] == "face"
+            for st in self.plan.steps)
         self.plan.steps.append({
             "op": "extrude", "id": f.get("id"), "name": self.name_for(f), "on_face": on_face,
             "sketch": self.sw_name[sid], "mode": "cut" if body["mode"] == "cut" else "boss",
@@ -492,6 +510,7 @@ class _Builder:
         self.plan.steps.append({"op": "helix", "id": f.get("id"), "name": self.name_for(f),
                                 "plane": SW_PLANE[base], "radius": radius, "pitch": pitch,
                                 "height": height, "ccw": bool(p.get("ccw", True)),
+                                "start_angle": start,
                                 "start": to_sw(p0), "centre": to_sw(fr["o"]),
                                 "normal": to_sw(fr["n"])})
 
@@ -680,6 +699,8 @@ class _Builder:
     def edge_op(self, f: dict, op: str, size_key: str) -> None:
         p = f.get("params") or {}
         size = _dim(p.get(size_key))
+        if size is None and op == "chamfer":   # the engine reads `distance` too
+            size = _dim(p.get("distance"))
         if size is None:
             return self.refuse(f, f"{op} has no {size_key}")
         if op == "fillet" and _dim(p.get("radius2")) not in (None, 0.0, size):
@@ -834,6 +855,9 @@ class _Builder:
             else:
                 self.refuse(f, f"feature type {t!r} has no SolidWorks export yet")
         steps = [self.to_3d(s) for s in self.plan.steps]
+        for st in steps:
+            if st["op"] == "extrude":
+                st["plane_flip"] = self.plane_flip.get(st["sketch"], False)
         # Paths first: a 3D sketch drawn after solids exist snaps its points onto their edges
         # (SolidWorks 2026 builds metres-long arcs where a brake line runs beside another),
         # and no path depends on a solid.
@@ -881,9 +905,13 @@ class _Builder:
             elif t == "point":
                 ents.append({"type": "point", "p": p3(e["p"])})
             elif t == "spline":
+                pts = [list(q) for q in e["points"]]
+                if len(pts) >= 2:   # its ends join the profile like any other endpoint
+                    pts[0], pts[-1] = snap(pts[0]), snap(pts[-1])
                 ents.append({"type": "spline", "construction": cons,
-                             "points": [p3(q) for q in e["points"]]})
+                             "points": [p3(q) for q in pts]})
         plane = {"origin": to_sw(origin), "normal": to_sw(n)}
+        self.plane_flip[s["name"]] = plane_is_flipped(to_sw(n))
         if s["plane"]["kind"] == "offset":
             plane["name"] = s["plane"]["name"]
         return {"op": "sketch3", "id": s["id"], "name": s["name"], "plane": plane,
@@ -1006,6 +1034,24 @@ def _sub(a, b):
     return [a[i] - b[i] for i in range(3)]
 
 
+def plane_is_flipped(n_sw) -> bool:
+    """True when the plane the macro sketches on (PlaneFor: a default plane, an offset of one,
+    or normal to a 3D-sketch line along ``n``) faces against ``n``: only the default-plane
+    case can, when ``n`` is a negative principal axis."""
+    for i in range(3):
+        if abs(abs(n_sw[i]) - 1.0) < 1e-9:
+            return n_sw[i] < 0
+    return False
+
+
+def frame_from_matrix(m) -> Optional[dict]:
+    """doc_sketch_regions ``plane_frame`` (row-major 4x4, columns u, v, n, origin) -> frame."""
+    if not isinstance(m, list) or len(m) < 12:
+        return None
+    col = lambda j: [float(m[4 * i + j]) for i in range(3)]   # noqa: E731
+    return {"u": col(0), "v": col(1), "n": col(2), "o": col(3)}
+
+
 def arc_points(e: dict):
     """A 2D sketch arc (center, radius, start/end degrees, ccw) as (start, end, mid) points."""
     (cx, cy), r = e["center"], float(e["radius"])
@@ -1022,13 +1068,16 @@ def arc_points(e: dict):
 
 def build_plan(features: list[dict], *, name: str,
                edge_points: Callable[[str], list] = lambda _fid: [],
-               expected: Optional[dict] = None) -> Plan:
+               expected: Optional[dict] = None,
+               sketch_frame: Optional[Callable[[str], Optional[dict]]] = None) -> Plan:
     """Build the SolidWorks plan for a part document's ``features`` (doc_schema §2).
 
     ``edge_points(feature_id)`` returns engine-space points ON each edge a fillet/chamfer
-    selects (doc_feature_edges ``mid``). ``expected`` is the part's eval_mass
+    selects (doc_feature_edges ``mid``). ``sketch_frame(sketch_id)`` returns the engine's
+    resolved frame {o, u, v, n} of a sketch on a face or other plane the plan cannot resolve
+    itself (doc_sketch_regions ``plane_frame``). ``expected`` is the part's eval_mass
     ({volume_mm3, com, body_count, inertia, mass_g}) for the macro's verification."""
-    plan = _Builder(features, edge_points, name).run()
+    plan = _Builder(features, edge_points, name, sketch_frame).run()
     if expected:
         plan.expected = expected_in_sw(expected)
     return plan

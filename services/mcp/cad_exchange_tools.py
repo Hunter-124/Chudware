@@ -85,6 +85,19 @@ def _feature_edge_points(doc_id: str):
     return points
 
 
+def _sketch_frames(doc_id: str):
+    """The engine's resolved frame of a sketch (doc_sketch_regions plane_frame), or None."""
+    from services.sw_export.plan import frame_from_matrix  # noqa: PLC0415
+
+    def frame(fid: str):
+        try:
+            r = cb.call("doc_sketch_regions", {"doc_id": doc_id, "sketch": fid})
+        except CoreError:
+            return None
+        return frame_from_matrix(r.get("plane_frame"))
+    return frame
+
+
 def _solidworks_export_assembly(d: str, tree: dict, path: Optional[str], method: str) -> dict:
     """An assembly -> a folder of SolidWorks macros (and, with SolidWorks here, the .SLDASM
     and every part). See services/sw_export/assembly.py."""
@@ -104,7 +117,8 @@ def _solidworks_export_assembly(d: str, tree: dict, path: Optional[str], method:
     for row in (cb.call("doc_list", {}) or {}).get("docs", []):
         if isinstance(row, dict) and row.get("doc_id") == d and isinstance(row.get("path"), str):
             asm_path = row["path"]
-    job = AssemblyExport(cb.call, open_component_part, _feature_edge_points, out_dir)
+    job = AssemblyExport(cb.call, open_component_part, _feature_edge_points, out_dir,
+                         sketch_frames=_sketch_frames)
     top = job.export(d, asm_path, stem)
     summary = {"doc_id": d, "method": method, "path": out, "folder": out_dir,
                "macro": os.path.join(out_dir, top.macro), "components": top.note["components"],
@@ -156,7 +170,8 @@ def _solidworks_export(d: str, path: Optional[str], method: str,
     except CoreError:
         expected = None
     plan = build_plan(tree.get("features") or [], name=name,
-                      edge_points=_feature_edge_points(d), expected=expected).as_dict()
+                      edge_points=_feature_edge_points(d), expected=expected,
+                      sketch_frame=_sketch_frames(d)).as_dict()
     if method == "auto":
         method = "com" if solidworks_available() else "macro"
     ext = ".swb" if method == "macro" else ".SLDPRT"

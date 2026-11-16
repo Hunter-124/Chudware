@@ -239,11 +239,17 @@ build_python_sidecar() {
             --include-module=services.manufacturing.printers.worker_rpc
         )
     fi
+    # Nuitka puts the main script's directory on the import path. Compiling the entry in
+    # place would make services/ a root, so services/mcp would shadow the PyPI `mcp` SDK
+    # (`from mcp.server.fastmcp import FastMCP` then dies at startup). Compile a copy from
+    # an otherwise empty directory instead.
+    mkdir -p "$work/entry"
+    cp "$REPO/services/compiled_entry.py" "$work/entry/compiled_entry.py"
     (cd "$REPO" && release_python -m nuitka \
         --mode=onefile --remove-output \
         --output-dir="$work" --output-filename="$name" \
         --nofollow-import-to='*.tests' --nofollow-import-to='*.test_*' \
-        "${includes[@]}" services/compiled_entry.py)
+        "${includes[@]}" "$work/entry/compiled_entry.py")
     [ -x "$work/$name" ] || { echo "error: Nuitka did not produce $work/$name" >&2; exit 1; }
     cp "$work/$name" "$destination"
     chmod 0755 "$destination"

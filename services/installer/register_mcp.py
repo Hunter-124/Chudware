@@ -2,7 +2,8 @@
 
 Adds a "chudware" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
 in place on register — existing tooling references it — and removed on --unregister):
-  * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json, plus the Microsoft Store
+  * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json (~/.config/Claude on Linux,
+                     ~/Library/Application Support/Claude on macOS), plus the Microsoft Store
                      build's own config (%LOCALAPPDATA%/Claude-Data/claude_<id>/ or the
                      package's virtualized %APPDATA%) when that build is installed
   * Claude Code     : ~/.claude.json
@@ -60,12 +61,23 @@ def store_desktop_configs(localappdata: Path) -> list[Path]:
     return found
 
 
+def desktop_config_dir() -> Path:
+    """Claude Desktop's per-user config directory on this platform."""
+    home = Path.home()
+    if appdata := os.environ.get("APPDATA"):
+        return Path(appdata) / "Claude"
+    if sys.platform == "win32":
+        return home / "AppData" / "Roaming" / "Claude"
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Claude"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "Claude"
+
+
 def config_paths() -> dict[str, Path]:
     """Config file per target; Store installs add ``desktop:<dir>`` keys (target "desktop")."""
     home = Path.home()
-    appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
     localappdata = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-    out = {"desktop": appdata / "Claude" / DESKTOP_CONFIG}
+    out = {"desktop": desktop_config_dir() / DESKTOP_CONFIG}
     for path in store_desktop_configs(localappdata):
         out[f"desktop:{path.parent.name}"] = path
     out["code"] = home / ".claude.json"
@@ -156,7 +168,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--python", type=Path, default=default_python())
     ap.add_argument("--mcp-bin", type=Path, default=default_mcp_bin(),
                     help="compiled MCP executable (must be adjacent to --cwd)")
-    ap.add_argument("--cwd", type=Path, default=Path(__file__).resolve().parent.parent)
+    # Source default is the repository root: it becomes PYTHONPATH, which must hold the
+    # `services` package (pointing it at services/ itself shadows the PyPI `mcp` SDK).
+    ap.add_argument("--cwd", type=Path, default=Path(__file__).resolve().parents[2])
     ap.add_argument("--target", choices=["desktop", "code", "both"], default="both")
     ap.add_argument("--hostd-bin", type=Path, default=None,
                     help="installed chudware-hostd binary; written into the server env as "

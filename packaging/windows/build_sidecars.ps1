@@ -161,6 +161,15 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
         )
     }
 
+    # Nuitka puts the main script's directory on the import path. Compiling the entry in
+    # place would make services\ a root, so services\mcp would shadow the PyPI `mcp` SDK
+    # (`from mcp.server.fastmcp import FastMCP` then dies at startup). Compile a copy from
+    # an otherwise empty directory instead.
+    $entryDir = Join-Path $work "entry"
+    New-Item -ItemType Directory -Force -Path $entryDir | Out-Null
+    $isolatedEntry = Join-Path $entryDir "compiled_entry.py"
+    Copy-Item -LiteralPath $Entry -Destination $isolatedEntry -Force
+
     # --assume-yes-for-downloads: on Windows Nuitka refuses standalone/onefile
     # mode without Dependency Walker and asks interactively for permission to
     # fetch it. A CI shell answers "no (default non-interactive)" and the
@@ -170,7 +179,7 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
         "--assume-yes-for-downloads",
         "--output-dir=$work", "--output-filename=$Name.exe",
         "--nofollow-import-to=*.tests", "--nofollow-import-to=*.test_*"
-    ) + $includes + @($Entry)
+    ) + $includes + @($isolatedEntry)
     Push-Location $Root
     try {
         Write-Host "==> compiling $Name.exe"

@@ -73,3 +73,16 @@ def test_store_build_configs_are_targeted(tmp_path: Path, monkeypatch):
     assert set(result) == {"desktop", "desktop:claude_abc", "desktop:Claude"}
     cfg = json.loads((relocated / "claude_desktop_config.json").read_text())
     assert cfg["mcpServers"]["chudware"]["command"] == str(tmp_path / "python")
+
+
+def test_desktop_config_dir_follows_platform(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(register_mcp.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(register_mcp.sys, "platform", "linux")
+    assert register_mcp.desktop_config_dir() == tmp_path / ".config" / "Claude"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert register_mcp.desktop_config_dir() == tmp_path / "xdg" / "Claude"
+    monkeypatch.setattr(register_mcp.sys, "platform", "darwin")
+    assert register_mcp.desktop_config_dir() == (
+        tmp_path / "Library" / "Application Support" / "Claude")

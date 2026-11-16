@@ -265,8 +265,9 @@ chamfer, shell; linear and circular patterns; feature mirror; the
 `box`/`cylinder`/`cone`/`sphere`/`torus` primitives (a profile sketch on a plane through the
 primitive's centre + a mid-plane extrude or a revolve); `transform` (Move/Copy Body, rotation
 about Z, Y, X then a separate translation); `boolean` (Combine). Bodies are named after the
-Chudware feature that owns them, so a cut subtracts from the one body the engine cuts (a tool
-body + Combine in a multibody part) and a merge fuses into the bodies it touches. A cut that
+Chudware feature that owns them, so a cut subtracts from the one body the engine cuts (in a
+multibody part a Cut-Extrude scoped to that body, so patterns and mirrors of it work; a tool
+body + Combine when SolidWorks refuses the scoped cut) and a merge fuses into the bodies it touches. A cut that
 removes nothing is a note, as in the engine. Features without an exact mapping refuse the
 export; `allow_body_fallback` sends the exact STEP as one imported body instead.
 

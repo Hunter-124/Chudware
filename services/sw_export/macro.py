@@ -81,6 +81,8 @@ Dim Folder As String
 Dim Silent As Boolean
 Dim Fallback As String
 Dim Notes As String
+Dim CutTools As Object
+Dim SeedTargets As Collection
 
 Function Num(x As Double) As String
     Num = Trim(Str(x))
@@ -266,6 +268,51 @@ Function Target(key As String) As Object
     Set Target = BodyByName(nm)
     If Target Is Nothing Then Fail "body " & nm & " (Chudware " & key & ") not found"
 End Function
+
+' The Chudware body key whose SolidWorks body is `nm` (the body name itself when none is).
+Function OwnerKey(nm As String) As String
+    Dim k As Variant
+    OwnerKey = "=" & nm
+    For Each k In Own.Keys
+        If Own(k) = nm Then
+            OwnerKey = k
+            Exit Function
+        End If
+    Next
+End Function
+
+' Select a pattern/mirror seed. SolidWorks cannot pattern a Combine, so a cut made as a tool
+' body + Combine (CutTool) is seeded by its tool feature; SubtractSeedTools then cuts the
+' patterned tool bodies from the body the seed cut.
+Sub SelSeed(nm As String, mark As Long)
+    Dim k As String
+    If SeedTargets Is Nothing Then Set SeedTargets = New Collection
+    If CutTools.Exists(nm) Then
+        If Not Sel(nm & "_Tool", "BODYFEATURE", True, mark) Then Fail "seed " & nm & "_Tool"
+        k = CutTools(nm)
+        SeedTargets.Add k
+    ElseIf Not Sel(nm, "BODYFEATURE", True, mark) Then
+        Fail "seed " & nm
+    End If
+End Sub
+
+Sub SubtractSeedTools(nm As String, before As Object)
+    Dim k As String, tools As Variant, tb As Object
+    If SeedTargets Is Nothing Then Exit Sub
+    If SeedTargets.Count = 0 Then Exit Sub
+    k = SeedTargets(1)
+    Set SeedTargets = Nothing
+    tools = NewBodies(before)
+    If IsEmpty(tools) Then Fail "pattern of " & nm & " made no tool bodies"
+    RenameLast nm & "_Tools"
+    If Left(k, 1) = "=" Then
+        Set tb = BodyByName(Mid(k, 2))
+    Else
+        Set tb = Target(k)
+    End If
+    If tb Is Nothing Then Fail "body cut by the seed of " & nm & " not found"
+    If FM.InsertCombineFeature(15902, tb, tools) Is Nothing Then Fail "subtract " & nm
+End Sub
 
 ' The EDGE or FACE through (x, y, z) metres. A SelectByID2 pick at coordinates is a view pick
 ' and misses in a hidden window, so search the bodies geometrically.
@@ -466,6 +513,7 @@ Sub CutTool(sk As String, nm As String, isRev As Boolean, sd As Boolean, flip As
         If Not fc Is Nothing Then
             If (Not simple) Or attempt = 1 Or Abs(Vol() - v0) > 1E-15 Then
                 RenameLast nm
+                CutTools(nm) = OwnerKey(tname)
                 Exit Sub
             End If
             DeleteFeature Part.FeatureByPositionReverse(0).Name
@@ -537,7 +585,7 @@ Sub Extr(sk As String, fid As String, nm As String, sd As Boolean, flip As Boole
         If f Is Nothing Then Fail "extrude"
         RenameLast nm
     ElseIf BodyCount() > 1 Then
-        CutTool sk, nm, False, sd, flip, t1, t2, d1, d2, 0, key, simple
+        If Not ScopedCut(sk, nm, sd, flip, t1, t2, d1, d2, key, simple) Then CutTool sk, nm, False, sd, flip, t1, t2, d1, d2, 0, key, simple
     Else
         ' Chudware cuts run along the sketch normal (SolidWorks' reversed cut direction) and an
         ' unflipped one-sided blind cut that removes nothing goes into the material instead
@@ -571,6 +619,45 @@ Sub Extr(sk As String, fid As String, nm As String, sd As Boolean, flip As Boole
     Track fid, before
     If mode = "merge" Then MergeTouching fid, nm, before
 End Sub
+
+' A multibody cut as a real Cut-Extrude scoped to the Chudware target body: a patternable
+' feature, unlike a tool body + Combine. False (and nothing left behind) unless the cut took
+' material from that body alone.
+Function ScopedCut(sk As String, nm As String, sd As Boolean, flip As Boolean, t1 As Long, t2 As Long, d1 As Double, d2 As Double, key As String, simple As Boolean) As Boolean
+    Dim tname As String, attempt As Long, s0 As Object, f As Object, sdat As Object
+    Dim v As Variant, b As Variant, hitTarget As Boolean, hitOther As Boolean
+    tname = Target(key).Name
+    For attempt = 0 To 1
+        If attempt = 1 And Not simple Then Exit For
+        Set s0 = TakeSnap()
+        SelSketch sk
+        Set sdat = Part.SelectionManager.CreateSelectData()
+        sdat.Mark = 8
+        If Not Target(key).Select2(True, sdat) Then Exit Function
+        Set f = FM.FeatureCut4(sd, False, flip Xor (attempt = 0), t1, t2, d1, d2, False, False, False, False, 0, 0, False, False, False, False, False, True, False, True, True, False, 0, 0, False, False)
+        If f Is Nothing Then Exit Function
+        hitTarget = False
+        hitOther = False
+        v = Bodies()
+        If Not IsEmpty(v) Then
+            For Each b In v
+                If Not s0.Exists(b.Name) Then
+                    hitOther = True
+                ElseIf Changed(b, s0(b.Name)) Then
+                    If b.Name = tname Then hitTarget = True Else hitOther = True
+                End If
+            Next
+        End If
+        If BodyCount() <> s0.Count Then hitOther = True
+        If hitTarget And Not hitOther Then
+            RenameLast nm
+            ScopedCut = True
+            Exit Function
+        End If
+        DeleteFeature f.Name
+        If hitOther Then Exit Function
+    Next
+End Function
 
 ' A tool body made since snapshot s0 (all of them: several contours make several bodies),
 ' subtracted from body tname. Like Chudware, a cut that removes nothing is a note.
@@ -865,6 +952,7 @@ Sub main()
     Set MU = swApp.GetMathUtility()
     Set Own = CreateObject("Scripting.Dictionary")
     Set Planes = CreateObject("Scripting.Dictionary")
+    Set CutTools = CreateObject("Scripting.Dictionary")
     Set Part = swApp.NewDocument(swApp.GetUserPreferenceStringValue(8), 0, 0, 0)
     If Part Is Nothing Then Fail "SolidWorks could not create a part (no default part template)"
     Set FM = Part.FeatureManager
@@ -1168,8 +1256,7 @@ class _Writer:
 
     def _seeds(self, seeds: list, mark: int) -> None:
         for nm in seeds:
-            self.w(f"If Not Sel({_s(nm)}, \"BODYFEATURE\", True, {mark}) Then "
-                   f"Fail {_s('seed ' + nm)}")
+            self.w(f"SelSeed {_s(nm)}, {mark}")
 
     def linear_pattern(self, s: dict) -> None:
         d1 = s["dirs"][0]
@@ -1192,6 +1279,7 @@ class _Writer:
             self.w(f"If FM.FeatureLinearPattern4({d1['count']}, {_m(d1['spacing'])}, {n2}, "
                    f"{_m(s2)}, False, False, \"\", \"\", False, False, False, False, True, True, "
                    "False, False, False, False, 0, 0) Is Nothing Then Fail \"linear pattern\"")
+            self.w(f"SubtractSeedTools {_s(s['name'])}, before")
         self._tracked(s, go)
 
     def circular_pattern(self, s: dict) -> None:
@@ -1209,6 +1297,7 @@ class _Writer:
             self.w(f"If FM.FeatureCircularPattern4({s['count']}, {_n(spacing)}, "
                    f"{_b(s['reverse'])}, \"\", False, {_b(s['equal_spacing'])}, False) Is "
                    "Nothing Then Fail \"circular pattern\"")
+            self.w(f"SubtractSeedTools {_s(s['name'])}, before")
         self._tracked(s, go)
 
     def mirror(self, s: dict) -> None:
@@ -1218,6 +1307,7 @@ class _Writer:
             self._seeds(s["seeds"], 1)
             self.w("If FM.InsertMirrorFeature2(False, False, True, False, 0) Is Nothing Then "
                    "Fail \"mirror\"")
+            self.w(f"SubtractSeedTools {_s(s['name'])}, before")
         self._tracked(s, go)
 
 

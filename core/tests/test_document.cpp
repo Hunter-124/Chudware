@@ -2928,6 +2928,35 @@ TEST_CASE("sweep warns when a wide profile folds through a tight bend") {
     CHECK(run(2.0).empty());                                // 4 mm wide: a sound strap
 }
 
+TEST_CASE("a clamp slit that stops exactly at the bore warns of a line contact") {
+    using chudware::doc::doc_new;
+    using chudware::doc::doc_apply_ops;
+    auto run = [&](double slit_inner) {
+        json nr = doc_new("part", "Collar");
+        const std::string id = nr.at("doc_id").get<std::string>();
+        const double w = 20.5 - slit_inner;
+        json ops = json::array({
+            json{{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "OD"},
+                 {"params", {{"at", {0, 0, 0}}, {"centered", false}, {"height", 13},
+                             {"radius", 20}, {"mode", "new"}}}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "Bore"},
+                 {"params", {{"at", {0, 0, 0}}, {"centered", false}, {"height", 13},
+                             {"radius", 10}, {"mode", "cut"}}}}}},
+            json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Slit"},
+                 {"params", {{"at", {0, slit_inner + w / 2, 6.5}}, {"length", 1},
+                             {"width", w}, {"height", 13}, {"mode", "cut"}}}}}},
+        });
+        json resp = doc_apply_ops(id, -1, ops, false);
+        std::string warning;
+        for (const auto& fst : resp["rebuild"]["feature_status"])
+            if (fst.contains("warning") && fst["warning"].is_string())
+                warning += fst["warning"].get<std::string>();
+        return warning;
+    };
+    CHECK(run(10.0).find("non-manifold") != std::string::npos);  // tangent to the bore
+    CHECK(run(9.5).empty());                                     // cuts through into it
+}
+
 TEST_CASE("sweep rejects a guide curve identical to the path") {
     const double R = 4.0, Hh = 20.0;
     json prof; prof["id"] = "prof"; prof["type"] = "sketch"; prof["plane"] = "top";

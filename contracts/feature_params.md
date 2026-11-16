@@ -1004,3 +1004,10 @@ Amends the SolidWorks import lanes above and adds the export contract (`services
   back to the STEP solid when SolidWorks refuses a feature or the rebuild misses `close`), one
   macro per sub-assembly, and the top macro, which saves `<stem>.SLDASM` with every component
   fixed at its Chudware pose. Chudware mates are not re-created.
+
+## Cut line-contact warning (append-only, 2026-11-15)
+
+- A primitive, extrude or revolve cut whose result has more non-manifold edges (edges used by
+  more than two face boundaries) than its target had carries a `warning` naming the count: the
+  tool only touched a body face along a line (tangent or flush), leaving material that meets
+  itself with zero thickness. The cut still applies; other CAD systems (SolidWorks) refuse it.

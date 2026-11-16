@@ -1070,6 +1070,37 @@ void require_cut_removed_material(const std::string& what, double before_mm3,
     throw std::runtime_error(os.str());
 }
 
+int count_non_manifold_edges(const TopoDS_Shape& shape) {
+    try {
+        TopTools_IndexedMapOfShape emap;
+        TopExp::MapShapes(shape, TopAbs_EDGE, emap);
+        const auto uses = ::geom::edge_boundary_uses(shape, emap);
+        int n = 0;
+        for (int i = 1; i <= emap.Extent(); ++i)
+            if (uses[static_cast<std::size_t>(i)].boundary > 2) ++n;
+        return n;
+    } catch (const Standard_Failure&) {
+        return 0;
+    }
+}
+
+// A cut whose tool face is exactly tangent to (or flush with) a face of the body can leave two
+// regions joined along a line: an edge shared by four faces. The solid is BRepCheck-valid but
+// not a manifold, so meshing, offsets and other CAD systems refuse it (a split collar whose slit
+// stopped exactly at the bore radius; SolidWorks drops that cut). Warn instead of failing:
+// the geometry is what was asked for, but almost never what was meant.
+void warn_cut_line_contact(FeatureStatus& st, const std::string& what,
+                           const TopoDS_Shape& before, const TopoDS_Shape& after) {
+    const int added = count_non_manifold_edges(after) - count_non_manifold_edges(before);
+    if (added <= 0) return;
+    const std::string w = what + " leaves " + std::to_string(added) +
+        " non-manifold edge(s): the cut tool only touches a face of the body along a line "
+        "(tangent or flush), so the remaining material meets itself with zero thickness. "
+        "Extend the tool ~0.05 mm past that face to cut through, or pull it back to leave "
+        "material.";
+    st.warning = st.warning.empty() ? w : st.warning + "; " + w;
+}
+
 // Wrap closed shells as a solid, orienting each shell OUTWARD (positive enclosed
 // volume) first. BRepLib::OrientClosedSolid only flips the SOLID, which leaves the
 // shell's own flag — and therefore BRepCheck's shell-in-solid verdict — untouched;
@@ -5083,6 +5114,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                 "before changing its size.");
                         }
                         require_cut_removed_material(type + " cut", gb.Mass(), ga.Mass());
+                        warn_cut_line_contact(st, type + " cut", target, out);
                     } else {
                         // Symmetric buried-boss guard: a primitive boss merged into a body
                         // that adds NO volume lies entirely inside it. Report the
@@ -5801,6 +5833,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     if (std::abs(cut_mass - base_mass) < 1e-9)
                         throw std::runtime_error("extrude cut removed no material");
                     require_cut_removed_material("extrude cut", base_mass, cut_mass);
+                    warn_cut_line_contact(st, "extrude cut", tgt, out);
                     consumed.insert(tgt_id);
                     source_of[id] = tgt_id;  // owner-map: cut derives from the target body
                     results[id] = SolidResult{out};
@@ -6078,6 +6111,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         if (std::abs(ga.Mass() - gb.Mass()) < 1e-9)
                             throw std::runtime_error("revolve cut removed no material");
                         require_cut_removed_material("revolve cut", gb.Mass(), ga.Mass());
+                        warn_cut_line_contact(st, "revolve cut", target, out);
                     }
                     consumed.insert(targets.ids.begin(), targets.ids.end());
                     source_of[id] = rtgt;  // owner-map: result derives from the target body

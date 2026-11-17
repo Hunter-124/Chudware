@@ -1537,11 +1537,52 @@ def _default_project_dir_from_cwd() -> None:
         home = Path.home().resolve()
     except OSError:
         return
+    # An unwritable cwd is an install dir, not a project: Claude Desktop on Linux starts its
+    # servers in /usr/lib/claude-desktop-unofficial, and adopting that made every new_part
+    # unpersistable and every relative path resolve into the app (TBOT audit, 2026-11-17).
     if (cwd == Path(cwd.anchor) or cwd == home or cwd == repo or repo in cwd.parents
-            or cwd == system or system in cwd.parents):
+            or cwd == system or system in cwd.parents or not os.access(cwd, os.W_OK)):
         return
-    os.environ["CHUDWARE_PROJECT_DIR"] = str(cwd)
-    os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = str(cwd)
+    _adopt_project_dir(str(cwd))
+
+
+def _adopt_project_dir(path: str) -> None:
+    os.environ["CHUDWARE_PROJECT_DIR"] = path
+    os.environ["CHUDWARE_PROJECT_SAVE_DIR"] = path
+
+
+_roots_checked = False
+
+
+async def _default_project_dir_from_roots(server) -> None:
+    """Adopt the client's first writable file:// root when no project root is configured.
+
+    Runs once, on the first tool call: a server the client launched outside the project
+    (Claude Desktop's config, shared by its Code sessions) still learns the session's
+    folder from the MCP roots the client reports.
+    """
+    global _roots_checked
+    if _roots_checked:
+        return
+    _roots_checked = True
+    if any((os.environ.get(k) or "").strip() for k in _PROJECT_ROOT_VARS):
+        return
+    from urllib.parse import unquote, urlparse
+
+    try:
+        session = server.get_context().session
+        caps = session.client_params.capabilities if session.client_params else None
+        if caps is None or caps.roots is None:
+            return
+        roots = (await session.list_roots()).roots
+    except Exception:  # noqa: BLE001 — roots are optional; never fail the tool call
+        return
+    for root in roots:
+        uri = urlparse(str(root.uri))
+        path = unquote(uri.path) if uri.scheme == "file" else ""
+        if path and os.path.isdir(path) and os.access(path, os.W_OK):
+            _adopt_project_dir(os.path.normpath(path))
+            return
 
 
 def _client_call_budget_s() -> float:
@@ -1616,6 +1657,7 @@ def _install_threaded_dispatch(server) -> None:
 
         @functools.wraps(fn)
         async def run_off_loop(**kwargs):
+            await _default_project_dir_from_roots(server)
             abandoned = threading.Event()
 
             def body():

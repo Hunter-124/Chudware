@@ -1359,8 +1359,37 @@ float drawDocTabs(AppState& st, float availW) {
         const int idx = resolveCloseTab(st, s_closeConfirmed);
         s_closeConfirmed = {};
         if (idx >= 0 && !st.hasPendingHumanMutations(closeTabId(st.docTabs[idx])) &&
-            !hasUnsavedEmbeddedDrawing(st, st.docTabs[idx]))
-            st.closeDocTab(idx);
+            !hasUnsavedEmbeddedDrawing(st, st.docTabs[idx])) {
+            const AppState::DocTab& t = st.docTabs[idx];
+            // "Don't Save" means the unsaved state is thrown away. doc_close alone cannot
+            // do that while another client (an agent's MCP connection) still holds the doc:
+            // the daemon keeps it live and dirty, and reopening the file re-attaches to it.
+            // Revert a file-backed part/assembly to disk first, then close the now-clean doc.
+            const bool fileBacked = (t.kind == AppState::DocTab::TabKind::Part ||
+                                     t.kind == AppState::DocTab::TabKind::Assembly) &&
+                                    t.dirty && !t.path.empty() && !t.docId.empty();
+            if (!fileBacked) {
+                st.closeDocTab(idx);
+            } else {
+                const std::string docId = t.docId;
+                st.beginHumanMutation(docId);
+                st.rpc.callPrimary("doc_reload", {{"doc_id", docId}},
+                    [&st, chosen = closeTabIdentity(t), docId](const core::RpcResult& r) {
+                        st.endHumanMutation(docId);
+                        if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                            st.toast(ui::ToastLevel::Error, "Could not discard changes: " +
+                                     (r.ok && r.result.is_object()
+                                          ? r.result.value("message", std::string("engine error"))
+                                          : r.err));
+                            return;
+                        }
+                        const int at = resolveCloseTab(st, chosen);
+                        if (at < 0) return;
+                        st.markSaved(docId, r.result.value("revision", -1), {});
+                        st.closeDocTab(at);
+                    }, core::kLongEngineCallTimeoutMs);
+            }
+        }
     } else if (s_closeOthersIdx >= 0) {
         // Keep the clicked tab, close the rest. Make it active first so the close-index bookkeeping
         // keeps it selected; skip dirty tabs so unsaved work is never silently discarded. Iterate

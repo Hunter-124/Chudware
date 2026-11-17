@@ -9,6 +9,8 @@ Covers the daemon lifecycle contract from the hostd plan:
   4. kill -9 leaves a stale socket; the next connect-or-spawn recovers
   5. a turn whose requester disconnected (GUI crash) is stopped by its conversation's next
      turn instead of blocking it forever
+  6. after the GUI leaves, an MCP agent pausing between calls (no socket, no attachment)
+     keeps its docs and doc ids; the pause grace is bounded, so the daemon still exits
 
 Usage: scripts/hostd_smoke.py [path/to/chudware-hostd]
 Defaults to core/build-occt-linux/bin/chudware-hostd, then core/build-linux.
@@ -221,6 +223,50 @@ def orphaned_turn_superseded(hostd: str) -> tuple[bool, str]:
                     os.environ[k] = v
 
 
+def agent_pause_keeps_docs(hostd: str) -> tuple[bool, str]:
+    """GUI detaches (1 s exit grace), then an MCP client mints a doc and disconnects.
+    The daemon must outlive the GUI grace for the agent pause grace (6 s), serve the same
+    doc_id when the agent reconnects, and exit once the pause grace runs out."""
+    key = "smoke-" + uuid.uuid4().hex[:8]
+    saved = {k: os.environ.get(k) for k in (
+        "CHUDWARE_INSTANCE_KEY", "CHUDWARE_HOSTD_GUI_EXIT_GRACE_S",
+        "CHUDWARE_HOSTD_AGENT_PAUSE_GRACE_S")}
+    os.environ.update({"CHUDWARE_INSTANCE_KEY": key, "CHUDWARE_HOSTD_GUI_EXIT_GRACE_S": "1",
+                       "CHUDWARE_HOSTD_AGENT_PAUSE_GRACE_S": "6"})
+    try:
+        gui = Client(hostd, key)
+        gui.call("hello", {"client": "gui", "pid": os.getpid(), "proto": 1})
+        pid = gui.call("daemon_status")["result"]["pid"]
+        for _ in range(240):
+            if gui.call("daemon_status")["result"]["state"] != "loading":
+                break
+            time.sleep(0.5)
+        agent = Client(hostd, key)
+        agent.call("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
+        gui.close()
+        doc = agent.call("doc_new", {"name": "agent-pause"}).get("result", {}).get("doc_id")
+        agent.close()
+        time.sleep(3.0)  # well past the 1 s GUI exit grace
+        if wait_gone(pid, 0.1):
+            return False, "daemon exited during the agent's pause"
+        agent = Client(hostd, key, spawn=False)
+        agent.call("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
+        same_pid = agent.call("daemon_status")["result"]["pid"] == pid
+        rows = agent.call("doc_list").get("result", {})
+        rows = rows.get("docs", rows) if isinstance(rows, dict) else rows
+        ids = {r.get("doc_id") for r in rows if isinstance(r, dict)}
+        agent.close()
+        if not (doc and same_pid and doc in ids):
+            return False, f"doc={doc} same_pid={same_pid} ids={sorted(i for i in ids if i)}"
+        return wait_gone(pid, 15.0), f"pid={pid} doc={doc} (bounded exit)"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main() -> int:
     hostd = find_hostd()
     fails = []
@@ -302,6 +348,10 @@ def main() -> int:
     # --- 5. orphaned turn superseded ----------------------------------------
     ok, detail = orphaned_turn_superseded(hostd)
     check("orphaned turn superseded by next turn", ok, detail)
+
+    # --- 6. agent pause keeps docs ------------------------------------------
+    ok, detail = agent_pause_keeps_docs(hostd)
+    check("agent pause keeps docs and ids", ok, detail)
 
     if env_linger is None:
         os.environ.pop("CHUDWARE_HOSTD_LINGER_SECS", None)

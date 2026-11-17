@@ -889,6 +889,8 @@ int main(int argc, char** argv) {
     if (const char* g = std::getenv("CHUDWARE_HOSTD_GUI_EXIT_GRACE_S"); g && *g)
         guiExitGrace = std::max(1, std::atoi(g));
     server.setGuiExitGrace(guiExitGrace);
+    if (const char* a = std::getenv("CHUDWARE_HOSTD_AGENT_PAUSE_GRACE_S"); a && *a)
+        server.setAgentPauseGrace(std::atoi(a));
     server.run(linger);
 
     trayTickerStop.store(true);

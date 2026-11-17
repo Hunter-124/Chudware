@@ -161,6 +161,8 @@ public:
     // attachments, no in-flight call and no recent traffic is a PARKED connection, not
     // work: Server::idleExpired refuses to let one pin the daemon forever.
     bool hasAttachments(int clientId);
+    // True while any non-internal document is open (attached or not).
+    bool hasUserDocs();
     // Fail-closed read classification for cell (tenant) authorization. Methods not
     // listed here are treated as protected even when the engine does not know them.
     static bool isReadOnlyMethod(const std::string& method);

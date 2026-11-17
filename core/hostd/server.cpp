@@ -1026,6 +1026,12 @@ bool Server::idleExpired(int lingerSecs) {
     // staying up, so use the short grace rather than the full linger.
     const int idleLimitSecs = guiDetached_ ? guiExitGraceSecs_ : lingerSecs;
     if (pinningClients(idleLimitSecs) > 0 || status_.inflight > 0) return false;
+    // An agent between tool calls is still working: its documents and their ids must
+    // survive the pause. Bounded by the pause grace, so open documents alone (an agent
+    // that finished or died) never pin the daemon.
+    const long long lastAgentRpc = lastAgentRpcMs_.load();
+    if (lastAgentRpc > 0 && monoMs() - lastAgentRpc <= (long long)agentPauseGraceSecs_ * 1000 &&
+        registry_.hasUserDocs()) return false;
     // Never idle-exit under a running mission: children are the daemon's work
     // even with zero clients (GUI-close continuity).
     if (children_.aliveCount() > 0) return false;
@@ -1373,6 +1379,8 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
             }
             if (!c->controlOnly) touch();
             c->lastRpcMs = monoMs();  // this connection is doing work — see pinningClients
+            if (!c->controlOnly && (c->kind == "mcp" || c->kind == "agent"))
+                lastAgentRpcMs_ = c->lastRpcMs.load();  // see idleExpired
             if (cell_ && c->gateway) workspaceRelativePaths(payload, cellWork_);
             json resp = {{"id", id}};
             resp[isError ? "error" : "result"] = std::move(payload);

@@ -137,6 +137,11 @@ public:
     // continue in the background — none of those needs the full linger after the
     // GUI is gone.
     void setGuiExitGrace(int secs) { guiExitGraceSecs_ = std::max(1, secs); }
+    // How long an MCP/agent client's last call keeps the daemon up while non-internal
+    // documents are open (CHUDWARE_HOSTD_AGENT_PAUSE_GRACE_S). An agent pauses between
+    // tool calls, and its bridge may hold no attachment or even no socket meanwhile;
+    // exiting then re-issues its doc ids on the next spawn.
+    void setAgentPauseGrace(int secs) { agentPauseGraceSecs_ = std::max(1, secs); }
 
     Status& status() { return status_; }
     // Count of engine-side calls only (agent_admin_turn / doc_* via beginInflight).
@@ -249,6 +254,9 @@ private:
     // while set, so the daemon does not outlive the GUI without a reason.
     std::atomic<bool> guiDetached_{false};
     int guiExitGraceSecs_ = 10;
+    // Monotonic ms of the last non-control RPC from an "mcp" or "agent" client; 0 = none.
+    std::atomic<long long> lastAgentRpcMs_{0};
+    int agentPauseGraceSecs_ = 300;
     // Monotonic ms after which a HARD drain stops waiting and drops whatever is still
     // connected. 0 = no deadline (soft drain, or not draining at all).
     std::atomic<long long> drainDeadlineMs_{0};

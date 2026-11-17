@@ -412,6 +412,15 @@ bool DocRegistry::hasAttachments(int clientId) {
     return false;
 }
 
+bool DocRegistry::hasUserDocs() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (const auto& [id, d] : docs_) {
+        (void)id;
+        if (!d.internal) return true;
+    }
+    return false;
+}
+
 
 
 bool DocRegistry::reapToken(const std::string& docId, std::uint64_t& token) const {

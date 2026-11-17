@@ -58,6 +58,10 @@ rather than reopening on ordinary registry or change events.
   pinning client, in-flight RPC or agent child, it exits after
   `CHUDWARE_HOSTD_LINGER_SECS` (default **120 s**). After the last GUI detaches,
   `CHUDWARE_HOSTD_GUI_EXIT_GRACE_S` (default **10 s**) replaces the linger.
+  While any non-internal doc is open, the last RPC from an `mcp`/`agent` client
+  also holds the daemon for `CHUDWARE_HOSTD_AGENT_PAUSE_GRACE_S` (default **300 s**),
+  so an agent pausing between tool calls keeps its docs and doc ids even when its
+  bridge holds no attachment or socket meanwhile.
 - **Bounded explicit drains.** `daemon_drain` / `--stop` use
   `CHUDWARE_HOSTD_DRAIN_GRACE_S` (default **20 s**); tray Quit uses **5 s**.
   At the deadline stragglers are disconnected. Stale-binary self-drain is soft:
@@ -158,6 +162,7 @@ user/SYSTEM ACL, including elevated launches.
 | `CHUDWARE_HOSTD_LINGER_SECS` | Idle-exit linger, default 120. Tests/smokes use small values (5). |
 | `CHUDWARE_HOSTD_STALECHECK_S` | Stale-binary self-drain check interval, default 60. Tests use 1. |
 | `CHUDWARE_HOSTD_GUI_EXIT_GRACE_S` | Idle grace after the last GUI detaches, default 10 s. |
+| `CHUDWARE_HOSTD_AGENT_PAUSE_GRACE_S` | How long an MCP/agent client's last call keeps the daemon up while non-internal docs are open, default 300 s. |
 | `CHUDWARE_HOSTD_DRAIN_GRACE_S` | Explicit drain deadline, default 20 s, minimum 1 s. |
 | `CHUDWARE_HOSTD_CONNECT_BUDGET_S` | MCP bridge connect/spawn budget, default 15 s. |
 | `CHUDWARE_ENGINE_DAEMON_RETRY_MS` | GUI outer retry-wait budget, default 2850 ms; separate from the underlying IPC spawn budget. |

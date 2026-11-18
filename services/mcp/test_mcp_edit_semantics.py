@@ -157,6 +157,22 @@ def test_feature_rows_keep_small_data_and_the_fillet_report():
     assert "data" not in rows[2]
 
 
+
+def test_long_feature_lists_keep_only_touched_or_unhealthy_rows():
+    rows = [{"id": f"f{i}", "ok": True, "error": None, "warning": None, "rolled_back": False}
+            for i in range(1, 41)]
+    rows[5]["warning"] = "thin wall"            # f6: unhealthy, kept
+    rows[9].update(ok=False, error="no face")   # f10: failed, kept
+    out = {"features": rows}
+    ops = [{"op": "edit_feature", "id": "f3", "params": {"depth": 2}},
+           {"op": "add_feature", "feature": {"type": "box", "params": {}}}]
+    D._trim_untouched_rows(out, ops, {"$1": "f40"})
+    assert [r["id"] for r in out["features"]] == ["f3", "f6", "f10", "f40"]
+    assert out["unchanged_ok_features"] == 36
+    short = {"features": rows[:5]}
+    D._trim_untouched_rows(short, ops, {})
+    assert len(short["features"]) == 5 and "unchanged_ok_features" not in short
+
 def test_cut_safety_net():
     ops = [{"op": "add_feature", "feature": {"type": "sketch", "params": {}}},
            {"op": "add_feature", "feature": {"type": "cylinder", "params": {"mode": "cut"}}}]

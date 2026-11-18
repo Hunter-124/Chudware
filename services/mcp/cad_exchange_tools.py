@@ -846,6 +846,12 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 payload["features"] = [
                     {k: f.get(k) for k in ("id", "name", "type") if k in f}
                     for f in tree["features"] if isinstance(f, dict)]
+            # owner_map (every face/edge credited to its feature) was 22-33 KB of each
+            # TBOT import reply (2026-11-17) and is read by tools, not the agent: query_geometry
+            # and find-by-owner selectors resolve ownership on demand.
+            owner_map = payload.pop("owner_map", None)
+            if isinstance(owner_map, dict):
+                payload["owner_map_features"] = len(owner_map)
             if portable_fallback_reason and r.get("import_fidelity") == "saved_display_tessellation":
                 payload["feature_fallback_reason"] = portable_fallback_reason
             if (resolve_features and not into and new_id

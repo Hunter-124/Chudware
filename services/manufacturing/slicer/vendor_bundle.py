@@ -295,8 +295,16 @@ class ProfileCatalog:
         pk = self._key('printer', printer)
         print_ = print_ or self.default_print(printer)
         filament = filament or self.default_filament(printer)
-        if print_ not in self.compatible_prints(printer) or filament not in self.compatible_filaments(printer, print_):
-            raise ValueError('Incompatible printer/print/filament selection')
+        prints = self.compatible_prints(printer)
+        if print_ not in prints:
+            # Name the valid choices: a bare refusal sent agents guessing preset names.
+            raise ValueError(f'print preset {print_!r} is not compatible with {printer!r}; '
+                             f'choose one of: {", ".join(prints)} (or omit it for the default)')
+        filaments = self.compatible_filaments(printer, print_)
+        if filament not in filaments:
+            raise ValueError(f'filament preset {filament!r} is not compatible with {printer!r} and '
+                             f'{print_!r}; choose one of: {", ".join(filaments)} '
+                             '(or omit it for the default)')
         config = self._resolve(pk)
         config.update(self._resolve(self._key('print', print_)))
         config.update(self._resolve(self._key('filament', filament)))

@@ -14,10 +14,10 @@ def _big(n: int = 3000) -> dict:
             "blob": "y" * 200_000}
 
 
-def test_small_reply_is_untouched(monkeypatch):
+def test_small_reply_keeps_data_and_is_compacted(monkeypatch):
     monkeypatch.delenv(_envelopes.REPLY_BUDGET_ENV, raising=False)
     text = json.dumps({"ok": True, "rows": [1, 2, 3]}, indent=2)
-    assert _envelopes.tool_reply(text, "measure_part") == text
+    assert _envelopes.tool_reply(text, "measure_part") == '{"ok":true,"rows":[1,2,3]}'
     small = {"ok": True, "rows": [1, 2, 3]}
     assert _envelopes.tool_reply(small) == small
 

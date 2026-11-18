@@ -7799,6 +7799,42 @@ def _compact_feature_rows(rows: list) -> None:
         row["data_elided_chars"] = size
 
 
+#: A reply lists every feature row only up to this many; beyond it, healthy rows the batch
+#: did not touch collapse into `unchanged_ok_features`. TBOT audit (2026-11-17): an
+#: 86-feature part re-sent all 86 rows on every one-field edit (~17 KB per reply).
+_FEATURE_ROWS_FULL_MAX = 12
+
+
+def _batch_touched_ids(ops: list, id_map: dict) -> set:
+    """Feature ids a batch authored (id_map) or named in an op (edit/suppress/delete/...)."""
+    touched = {v for v in (id_map or {}).values() if isinstance(v, str)}
+    for op in ops or ():
+        if not isinstance(op, dict):
+            continue
+        for key in ("id", "feature_id", "target", "feature"):
+            value = op.get(key)
+            if isinstance(value, str):
+                touched.add((id_map or {}).get(value, value))
+        for value in op.get("ids") or ():
+            if isinstance(value, str):
+                touched.add((id_map or {}).get(value, value))
+    return touched
+
+
+def _trim_untouched_rows(out: dict, ops: list, id_map: dict) -> None:
+    """Drop healthy, untouched rows from a long features[] list (in place); count them."""
+    rows = out.get("features")
+    if not isinstance(rows, list) or len(rows) <= _FEATURE_ROWS_FULL_MAX:
+        return
+    touched = _batch_touched_ids(ops, id_map)
+    kept = [row for row in rows if not isinstance(row, dict) or row.get("id") in touched
+            or not row.get("ok", True) or row.get("error") or row.get("warning")
+            or row.get("rolled_back")]
+    if len(kept) < len(rows):
+        out["features"] = kept
+        out["unchanged_ok_features"] = len(rows) - len(kept)
+
+
 #: Ops a "cut-only" batch may carry besides its cut features, for the cut safety net.
 _CUT_CHECK_NEUTRAL_TYPES = frozenset({
     "sketch", "sketch3d", "datum", "datum_plane", "datum_axis", "datum_point",
@@ -8665,7 +8701,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         Replies stay compact: features[] rows carry id/name/type/ok/error/warning and small
         `data` (fillet radii); bulky per-feature data is elided (data_elided_chars), so use
-        get_part(feature_ids=[...]) or inspect_feature for the full record. A batch with a
+        get_part(feature_ids=[...]) or inspect_feature for the full record. On a long tree,
+        healthy rows this batch did not touch are counted in unchanged_ok_features instead
+        of listed; every touched, failed, warned or rolled-back feature is still listed. A batch with a
         mode:"cut" feature that removes ~no volume or splits the body adds a
         cut_warnings entry: the cut hit the most recent body, which may not be the one meant.
         Sketch mutations return sketch_readbacks: read them before further sketch edits.
@@ -9325,6 +9363,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         out["sketch_readbacks_error"] = (
                             f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
                 _compact_feature_rows(out.get("features") or [])
+                _trim_untouched_rows(out, ops, r.get("id_map") or {})
                 return out
 
             if background:

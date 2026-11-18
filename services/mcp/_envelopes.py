@@ -117,6 +117,13 @@ def tool_reply(value: Any, tool: str = "") -> Any:
                 # compact form then carries every byte of data and needs no note.
                 return json.dumps(shrunk or result, ensure_ascii=False, default=str,
                                   separators=(",", ":"))
+            # Compact whenever a reply budget applies: indent=2 roughly doubled every
+            # reply's tokens for no reader (TBOT audit, 2026-11-17: ~1.8 MB of tool
+            # results in one session). With the budget off (full_replies, an explicit 0)
+            # the caller wants the reply verbatim.
+            if budget:
+                return json.dumps(result, ensure_ascii=False, default=str,
+                                  separators=(",", ":"))
             if result is not parsed:
                 return json.dumps(result, ensure_ascii=False)
     return value

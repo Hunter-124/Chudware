@@ -21,6 +21,10 @@ function(chudware_apply_test_suites tree)
   string(JSON _overrides ERROR_VARIABLE _no_overrides GET "${_json}" "${tree}_targets")
   get_property(_registered DIRECTORY PROPERTY TESTS)
 
+  # Build trees configured before 2026-11-11 still hold a CTestCustom.cmake whose
+  # pre-test step runs the removed scripts/testbox_guard.py, failing every ctest run.
+  file(REMOVE "${CMAKE_BINARY_DIR}/CTestCustom.cmake")
+
   # Every declared suite gets a target in every tree, so `tests-<suite>` builds
   # (possibly nothing) in any configured tree. A combined root build configures
   # core and host into one project; both trees then add to the same target.

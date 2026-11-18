@@ -7715,7 +7715,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     Handle(BRepTools_History) copy_history = new BRepTools_History(args, copier);
                     ShapeUpgrade_UnifySameDomain unify(copier.Shape(), Standard_True,
                                                        Standard_True, Standard_False);
-                    ::geom::keep_degenerate_patches(unify, copier.Shape());
+                    ::geom::keep_unsafe_merges(unify, copier.Shape());
                     st.data["attempted"] = true;
                     unify.Build();
                     TopoDS_Shape out = unify.Shape();
@@ -8295,13 +8295,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     }
                 }
 
-                bool degenerate_patch = false;
-                if (unify_faces)
-                    for (TopExp_Explorer fe(out, TopAbs_FACE); fe.More() && !degenerate_patch; fe.Next())
-                        degenerate_patch = ::geom::is_degenerate_patch(TopoDS::Face(fe.Current()));
-                // Internal edges are allowed here, so a kept edge cannot isolate a corner
-                // patch: skip unification rather than crash (geom::keep_degenerate_patches).
-                if (unify_faces && !degenerate_patch) {
+                // Internal edges are allowed here, so a kept edge cannot isolate an unsafe
+                // merge: skip unification rather than crash or hang (geom::keep_unsafe_merges).
+                const bool unsafe_merge = unify_faces && ::geom::has_unsafe_merge(out);
+                if (unify_faces && !unsafe_merge) {
                     try {
                         ShapeUpgrade_UnifySameDomain uni(out, Standard_True, Standard_True,
                                                          Standard_True);
@@ -8406,9 +8403,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (fix_orientation)
                     st.data["orientation"] = json{{"faces_flipped", orient_flipped},
                                                   {"conflicts", orient_conflicts}};
-                if (unify_faces && degenerate_patch)
-                    st.warning = "heal: unify_faces skipped: a curved face has a degenerated edge "
-                                 "(a fillet corner patch), which the kernel cannot merge safely";
+                if (unsafe_merge)
+                    st.warning = "heal: unify_faces skipped: the body has a fillet corner patch or "
+                                 "opposed coaxial faces, which the kernel cannot merge safely";
                 if (rebuild_solid)
                     st.data["rebuild"] = json{{"lumps", rebuild_lumps},
                                               {"kept_volume_mm3", rebuild_kept},

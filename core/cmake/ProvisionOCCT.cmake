@@ -16,7 +16,7 @@
 #
 # Pinned to OCCT 7.9.3 on Windows (vc14/x64, VS2022-ABI-compatible). NOT 7.9.x->8.0:
 # OCCT 8.0 changed BRepMesh_IncrementalMesh's API that our tessellation path depends
-# on. On Linux we accept the distro's 7.9.x (Fedora 44 ships 7.9.3).
+# on. On Linux we accept the distro's 7.9.x (Fedora 44's "7.9.3" package is 7.9.1 code).
 
 set(OCCT_VERSION "7.9.3")
 include("${CMAKE_CURRENT_LIST_DIR}/AuthenticatedArchive.cmake")
@@ -108,6 +108,13 @@ else()
   # locates it with no OpenCASCADE_DIR hint needed.
   find_package(OpenCASCADE REQUIRED)
   message(STATUS "[occt] system ${OpenCASCADE_VERSION} @ ${OpenCASCADE_DIR} (inc ${OpenCASCADE_INCLUDE_DIR})")
+  # Fedora's opencascade 7.9.3-2 package carries 7.9.1 sources and reports 7.9.1 here. Its
+  # UnifySameDomain hangs and crashes on inputs 7.9.3 handles; geom::keep_unsafe_merges
+  # guards the known cases, but behaviour beyond them can still differ from the pin.
+  if(OpenCASCADE_VERSION VERSION_LESS OCCT_VERSION)
+    message(WARNING "[occt] system OCCT ${OpenCASCADE_VERSION} is older than the pinned "
+                    "${OCCT_VERSION} (contracts/licenses.md); kernel results can differ")
+  endif()
 
   # No DLL staging: OCCT + its 3rdparty libs resolve through the dynamic loader's
   # default search path. Leave the deploy helper as a no-op so call sites stay portable.

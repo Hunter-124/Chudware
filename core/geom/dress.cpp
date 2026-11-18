@@ -854,7 +854,7 @@ ContactJoin join_contact_edges(const TopoDS_Shape& shape, double r,
         BRepBuilderAPI_Copy copier(fuse.Shape(), Standard_False, Standard_False);
         ShapeUpgrade_UnifySameDomain unify(copier.Shape(), Standard_True, Standard_True,
                                            Standard_False);
-        keep_degenerate_patches(unify, copier.Shape());
+        keep_unsafe_merges(unify, copier.Shape());
         // Preserve every selected ordinary edge (and its endpoints) through
         // unification so a collinear neighbour cannot swallow a picked edge.
         if (!manifold.empty()) {

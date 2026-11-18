@@ -7,13 +7,17 @@
 #include <BRepTools_History.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <Geom_ElementarySurface.hxx>
+#include <Geom_RectangularTrimmedSurface.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopoDS.hxx>
+#include <gp_Lin.hxx>
 
 #include "geom/op_history.h"
 
@@ -217,21 +221,86 @@ bool is_degenerate_patch(const TopoDS_Face& face) {
     return false;
 }
 
-void keep_degenerate_patches(ShapeUpgrade_UnifySameDomain& unify, const TopoDS_Shape& input) {
-    // Upstream added a null-pcurve check in 7.9.3, but Fedora's 7.9.3-2 package does not carry
-    // it: keep this guard. OCCT 7.9 (through 7.9.3 as packaged by Fedora) evaluates every boundary pcurve of a
-    // merge on the reference face (ComputeMinEdgeSize) without a null check. A degenerated
-    // edge of another face in the merge has no pcurve there: a non-planar reference skips
-    // degenerated edges when transforming pcurves, and a planar reference derives pcurves
-    // from the 3D curve, which a degenerated edge lacks. Merging any face that has a
-    // degenerated edge (a fillet corner patch, or a planar face a fillet left one on)
-    // dereferences a null pcurve and kills the process. Keeping every edge of such a face
-    // leaves it unmerged; every other face still unifies.
+namespace {
+
+// The elementary surface under `face` with its axis in world coordinates, or null when the
+// face is not on a U-periodic elementary surface (cylinder, cone, sphere, torus).
+Handle(Geom_ElementarySurface) periodic_basis(const TopoDS_Face& face, gp_Ax1& axis) {
+    TopLoc_Location loc;
+    Handle(Geom_Surface) surface = BRep_Tool::Surface(face, loc);
+    while (auto trimmed = Handle(Geom_RectangularTrimmedSurface)::DownCast(surface))
+        surface = trimmed->BasisSurface();
+    Handle(Geom_ElementarySurface) basis = Handle(Geom_ElementarySurface)::DownCast(surface);
+    if (basis.IsNull() || !basis->IsUPeriodic()) return {};
+    axis = basis->Position().Axis().Transformed(loc.Transformation());
+    return basis;
+}
+
+// Two faces on distinct periodic surfaces that share an axis line but run it in opposite
+// directions. UnifySameDomain treats them as one domain and re-expresses the second face's
+// pcurves on the first one's reversed parameterisation; its contour walk
+// (RelocatePCurvesToNewUorigin) then finds no edge continuing the contour. OCCT 7.9.1, which
+// Fedora ships as its 7.9.3 package, never leaves that walk: a 2 mm pad arc made exactly
+// concentric with a hole spun one engine thread for over 20 minutes (TBOT btn_clamp_R,
+// 2026-11-17). Upstream 7.9.3 ends the contour there and leaves the pair unmerged, so not
+// merging it is the 7.9.3 result on every platform.
+bool reversed_coaxial(const TopoDS_Face& a, const TopoDS_Face& b) {
+    gp_Ax1 axis_a, axis_b;
+    const Handle(Geom_ElementarySurface) sa = periodic_basis(a, axis_a);
+    const Handle(Geom_ElementarySurface) sb = periodic_basis(b, axis_b);
+    if (sa.IsNull() || sb.IsNull() || sa == sb) return false;
+    constexpr double kAngular = 1e-6, kLinear = 1e-4;  // lenient: a false match only skips a merge
+    if (!axis_a.IsOpposite(axis_b, kAngular)) return false;
+    return gp_Lin(axis_a).Distance(axis_b.Location()) < kLinear;
+}
+
+// Visits every edge joining a reversed_coaxial pair until `visit` returns false.
+template <class F>
+void for_each_reversed_coaxial_edge(const TopoDS_Shape& input, F&& visit) {
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndUniqueAncestors(input, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    for (int i = 1; i <= edge_faces.Extent(); ++i) {
+        const TopTools_ListOfShape& faces = edge_faces(i);
+        if (faces.Extent() != 2) continue;
+        const TopoDS_Face& a = TopoDS::Face(faces.First());
+        const TopoDS_Face& b = TopoDS::Face(faces.Last());
+        if (reversed_coaxial(a, b) && !visit(edge_faces.FindKey(i))) return;
+    }
+}
+
+}  // namespace
+
+void keep_unsafe_merges(ShapeUpgrade_UnifySameDomain& unify, const TopoDS_Shape& input) {
+    // Degenerate patches: upstream added a null-pcurve check in 7.9.3, but Fedora's 7.9.3-2
+    // package does not carry it (its sources are 7.9.1): keep this guard. OCCT 7.9.1
+    // evaluates every boundary pcurve of a merge on the reference face (ComputeMinEdgeSize)
+    // without a null check. A degenerated edge of another face in the merge has no pcurve
+    // there: a non-planar reference skips degenerated edges when transforming pcurves, and a
+    // planar reference derives pcurves from the 3D curve, which a degenerated edge lacks.
+    // Merging any face that has a degenerated edge (a fillet corner patch, or a planar face
+    // a fillet left one on) dereferences a null pcurve and kills the process. Keeping every
+    // edge of such a face leaves it unmerged; every other face still unifies.
     for (TopExp_Explorer fx(input, TopAbs_FACE); fx.More(); fx.Next()) {
         if (!is_degenerate_patch(TopoDS::Face(fx.Current()))) continue;
         for (TopExp_Explorer ex(fx.Current(), TopAbs_EDGE); ex.More(); ex.Next())
             unify.KeepShape(ex.Current());
     }
+    // Reversed coaxial periodic faces: keeping their shared edges keeps them apart.
+    for_each_reversed_coaxial_edge(input, [&](const TopoDS_Shape& edge) {
+        unify.KeepShape(edge);
+        return true;
+    });
+}
+
+bool has_unsafe_merge(const TopoDS_Shape& input) {
+    for (TopExp_Explorer fx(input, TopAbs_FACE); fx.More(); fx.Next())
+        if (is_degenerate_patch(TopoDS::Face(fx.Current()))) return true;
+    bool found = false;
+    for_each_reversed_coaxial_edge(input, [&](const TopoDS_Shape&) {
+        found = true;
+        return false;
+    });
+    return found;
 }
 
 TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
@@ -258,7 +327,7 @@ TopoDS_Shape unify_same_domain(const TopoDS_Shape& s) {
         // Unify faces AND edges sharing a domain (concatBSplines=false): the seam between
         // two flush coplanar faces collapses to one face, matching build123d's clean().
         ShapeUpgrade_UnifySameDomain up(work, Standard_True, Standard_True, Standard_False);
-        keep_degenerate_patches(up, work);
+        keep_unsafe_merges(up, work);
         up.Build();
         TopoDS_Shape r = up.Shape();
         if (r.IsNull()) return s;

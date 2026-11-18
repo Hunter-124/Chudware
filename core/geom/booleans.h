@@ -74,13 +74,16 @@ PairSplit split_pair(const TopoDS_Shape& a, const TopoDS_Shape& b, double fuzzy,
 // instead of two with a seam edge. Returns `s` unchanged on failure (best-effort).
 TopoDS_Shape unify_same_domain(const TopoDS_Shape& s);
 
-// Every UnifySameDomain call must pass its input through keep_degenerate_patches before
-// Build(): it keeps faces with degenerated edges (fillet corner patches, see
-// is_degenerate_patch) out of any merge, which in OCCT 7.9 dereferences a null pcurve
-// and crashes the process. KeepShape cannot isolate a face when internal edges are
-// allowed; such a caller must skip unification if any face is a degenerate patch.
+// Every UnifySameDomain call must pass its input through keep_unsafe_merges before
+// Build(). It keeps two kinds of face out of any merge, both of which break the OCCT 7.9.1
+// sources Fedora ships as 7.9.3: faces with degenerated edges (fillet corner patches, see
+// is_degenerate_patch), whose merge dereferences a null pcurve and crashes the process,
+// and pairs of coaxial periodic faces whose axes run in opposite directions, whose merge
+// never returns. KeepShape cannot isolate a face when internal edges are allowed; such a
+// caller must skip unification when has_unsafe_merge(input) is true.
 bool is_degenerate_patch(const TopoDS_Face& face);
-void keep_degenerate_patches(ShapeUpgrade_UnifySameDomain& unify, const TopoDS_Shape& input);
+void keep_unsafe_merges(ShapeUpgrade_UnifySameDomain& unify, const TopoDS_Shape& input);
+bool has_unsafe_merge(const TopoDS_Shape& input);
 
 // Fuse then UnifySameDomain, skipping the unify pass when the BOP reports no
 // section edges. Disjoint / non-touching operands produce an empty

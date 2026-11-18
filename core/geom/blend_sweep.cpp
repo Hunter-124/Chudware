@@ -1,4 +1,5 @@
 #include "geom/blend_sweep.h"
+#include "geom/booleans.h"
 
 #include <algorithm>
 #include <array>
@@ -807,6 +808,7 @@ TopoDS_Shape merge_end_faces(const TopoDS_Shape& shape, BRepAlgoAPI_BooleanOpera
         if (seams == 0) return {};
         for (TopExp_Explorer v(work, TopAbs_VERTEX); v.More(); v.Next())
             if (!free_vertices.Contains(v.Current())) unify.KeepShape(v.Current());
+        keep_unsafe_merges(unify, work);
         unify.Build();
         const TopoDS_Shape merged = unify.Shape();
         if (merged.IsNull() || solid_count(merged) != 1 || !is_watertight(merged) ||

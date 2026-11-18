@@ -269,6 +269,47 @@ TEST_CASE("unify_same_domain survives a planar face with a degenerated edge") {
     CHECK(volume(unified) == doctest::Approx(volume(body)).epsilon(1e-9));
 }
 
+// Two coaxial R3 cylinder faces whose axes run in opposite directions, cut from the TBOT
+// btn_clamp_R pad after a sketch edit made the pad arc exactly concentric with a hole.
+// Merging them never returned on Fedora's OCCT (7.9.1 sources): one engine thread spun
+// in RelocatePCurvesToNewUorigin for over 20 minutes. They must stay two faces.
+TEST_CASE("unify_same_domain keeps reversed coaxial cylinders apart instead of hanging") {
+    TopoDS_Shape pair;
+    BRep_Builder builder;
+    const auto fixture = std::filesystem::path(__FILE__).parent_path() /
+                         "fixtures/reversed_coaxial_cylinders.brep";
+    REQUIRE(BRepTools::Read(pair, fixture.string().c_str(), builder));
+    CHECK(geom::has_unsafe_merge(pair));
+    const auto area = [](const TopoDS_Shape& shape) {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(shape, props);
+        return props.Mass();
+    };
+    const TopoDS_Shape unified = geom::unify_same_domain(pair);
+    REQUIRE_FALSE(unified.IsNull());
+    int faces = 0;
+    for (TopExp_Explorer fx(unified, TopAbs_FACE); fx.More(); fx.Next()) ++faces;
+    CHECK(faces == 2);
+    CHECK(area(unified) == doctest::Approx(area(pair)).epsilon(1e-9));
+}
+
+// The guard above must not cost ordinary merges: stacked coaxial cylinders running the
+// same way still fuse into one lateral face.
+TEST_CASE("unify_same_domain still merges coaxial cylinders that run the same way") {
+    const TopoDS_Shape lower =
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 3.0, 5.0).Shape();
+    const TopoDS_Shape upper =
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0, 0, 5), gp_Dir(0, 0, 1)), 3.0, 5.0).Shape();
+    const TopoDS_Shape fused = geom::fuse_unify(lower, upper);
+    REQUIRE_FALSE(fused.IsNull());
+    CHECK_FALSE(geom::has_unsafe_merge(fused));
+    int cylinders = 0;
+    for (TopExp_Explorer fx(fused, TopAbs_FACE); fx.More(); fx.Next())
+        if (BRepAdaptor_Surface(TopoDS::Face(fx.Current())).GetType() == GeomAbs_Cylinder)
+            ++cylinders;
+    CHECK(cylinders == 1);
+}
+
 // 1. FUSE two overlapping boxes. Box A: 20x20x20 at the origin. Box B: 20x20x20
 //    translated by (+10,+10,+10) -> the two overlap in a 10x10x10 cube. The union
 //    volume must be V_A + V_B - V_overlap = 8000 + 8000 - 1000 = 15000, and the

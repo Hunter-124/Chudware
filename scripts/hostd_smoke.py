@@ -11,6 +11,7 @@ Covers the daemon lifecycle contract from the hostd plan:
      turn instead of blocking it forever
   6. after the GUI leaves, an MCP agent pausing between calls (no socket, no attachment)
      keeps its docs and doc ids; the pause grace is bounded, so the daemon still exits
+  7. a GUI's doc_discard of a saved part an agent still holds reverts it to its file
 
 Usage: scripts/hostd_smoke.py [path/to/chudware-hostd]
 Defaults to core/build-occt-linux/bin/chudware-hostd, then core/build-linux.
@@ -267,6 +268,59 @@ def agent_pause_keeps_docs(hostd: str) -> tuple[bool, str]:
                 os.environ[k] = v
 
 
+def _box(name: str, mm: float) -> dict:
+    size = {"value": mm, "expr": None}
+    return {"op": "add_feature", "feature": {"type": "box", "name": name, "refs": {},
+                                             "params": {"width": size, "length": size,
+                                                        "height": size}}}
+
+
+def discard_reverts_held_doc(hostd: str) -> tuple[bool, str]:
+    """Quit Without Saving / Don't Save on a part an agent keeps open: hostd cannot close
+    the doc, so it must revert it to its saved file instead of leaving the edits live."""
+    import tempfile
+    key = "smoke-" + uuid.uuid4().hex[:8]
+    saved = os.environ.get("CHUDWARE_INSTANCE_KEY")
+    os.environ["CHUDWARE_INSTANCE_KEY"] = key
+    pid = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = Client(hostd, key)
+            agent.call("hello", {"client": "mcp", "pid": os.getpid(), "proto": 1})
+            pid = agent.call("daemon_status")["result"]["pid"]
+            for _ in range(240):
+                if agent.call("daemon_status")["result"]["state"] != "loading":
+                    break
+                time.sleep(0.5)
+            doc = agent.call("doc_new", {"name": "discard-me"})["result"]["doc_id"]
+            agent.call("attach_doc", {"doc_id": doc, "mode": "rw"})
+            agent.call("doc_apply_ops", {"doc_id": doc, "ops": [_box("Kept", 10)]})
+            path = os.path.join(tmp, "discard-me.step+")
+            saved_rev = agent.call("doc_save", {"doc_id": doc, "path": path})["result"]["saved_revision"]
+            agent.call("doc_apply_ops", {"doc_id": doc, "ops": [_box("Unsaved", 20)]})
+            gui = Client(hostd, key)
+            gui.call("hello", {"client": "gui", "pid": os.getpid(), "proto": 1})
+            gui.call("attach_doc", {"doc_id": doc, "mode": "ro"})
+            out = gui.call("doc_discard", {"doc_id": doc}).get("result", {})
+            rows = agent.call("doc_list").get("result", {})
+            rows = rows.get("docs", rows) if isinstance(rows, dict) else rows
+            row = next((r for r in rows if isinstance(r, dict) and r.get("doc_id") == doc), {})
+            gui.close()
+            agent.call("doc_close", {"doc_id": doc})
+            agent.close()
+            ok = (out.get("reverted") is True and row.get("dirty") is False and
+                  row.get("feature_count") == 1)
+            return ok, (f"discard={out} dirty={row.get('dirty')} "
+                        f"features={row.get('feature_count')} saved_rev={saved_rev}")
+    finally:
+        if pid:
+            wait_gone(pid, 15.0)
+        if saved is None:
+            os.environ.pop("CHUDWARE_INSTANCE_KEY", None)
+        else:
+            os.environ["CHUDWARE_INSTANCE_KEY"] = saved
+
+
 def main() -> int:
     hostd = find_hostd()
     fails = []
@@ -352,6 +406,10 @@ def main() -> int:
     # --- 6. agent pause keeps docs ------------------------------------------
     ok, detail = agent_pause_keeps_docs(hostd)
     check("agent pause keeps docs and ids", ok, detail)
+
+    # --- 7. discard reverts a doc another client holds ----------------------
+    ok, detail = discard_reverts_held_doc(hostd)
+    check("discard reverts a held doc to its file", ok, detail)
 
     if env_linger is None:
         os.environ.pop("CHUDWARE_HOSTD_LINGER_SECS", None)

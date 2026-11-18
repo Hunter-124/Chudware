@@ -1752,6 +1752,31 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
             return json{{"code", "invalid_params"}, {"message", "doc_id required"}};
         }
         const bool blocked = registry_.closeBlockedBy(docId, c.id);
+        // Discarding means the unsaved changes go, even when another client (an agent's
+        // MCP connection) keeps the document open: detaching alone left them live, and the
+        // next open of that file showed them again. A file-backed document reverts to its
+        // file instead; an untitled one has nothing to revert to and stays as it is.
+        bool reverted = false;
+        // The discarding client may be attached read-only (a GUI mirror of an agent's part),
+        // so this is the daemon's revert, not a client edit: it takes the doc's mutation
+        // lock like any write and publishes through the registry as a reload.
+        if (method == "doc_discard" && blocked && registry_.hasUnsavedChanges(docId)) {
+            auto guard = registry_.lockMutation(docId);
+            const json reloadParams{{"doc_id", docId}};
+            json reload;
+            std::string reloadErr;
+            reverted = core::cpp_core().call("doc_reload", reloadParams, reload, reloadErr) &&
+                       reload.is_object() && !reload.contains("code") &&
+                       reload.value("ok", true);
+            if (reverted)
+                registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, "doc_reload",
+                                   reloadParams, reload);
+            else
+                log().line("doc_discard: %s kept its changes (reload failed: %s)", docId.c_str(),
+                           !reloadErr.empty() ? reloadErr.c_str()
+                           : reload.is_object() ? reload.value("message", reload.dump()).c_str()
+                                                : "no result");
+        }
         json det;
         bool de = false;
         registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
@@ -1759,8 +1784,14 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
                             method == "doc_discard" ? "discarded" : "closed",
                             c.id, c.kind, method.c_str());
         json out{{"ok", true}, {"detached", !closed}};
-        if (method == "doc_discard") out["discarded"] = closed;
-        if (!closed) out["note"] = "document remains open for another client, an active agent run, or recovery";
+        if (method == "doc_discard") {
+            out["discarded"] = closed || reverted;
+            if (reverted) out["reverted"] = true;
+        }
+        if (!closed)
+            out["note"] = reverted
+                ? "unsaved changes reverted to the saved file; the document stays open for another client"
+                : "document remains open for another client, an active agent run, or recovery";
         return out;
     }
 

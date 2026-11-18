@@ -704,6 +704,19 @@ TabSaveResult saveCadDocument(AppState& st, const std::string& docId,
     return TabSaveResult::Pending;
 }
 
+// Save As for a part or assembly: the user picks the destination.
+static TabSaveResult saveCadDocumentAs(AppState& st, const std::string& docId,
+                                       const std::string& name, TabSaveDone done) {
+    if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
+        st.toast(ui::ToastLevel::Info, "File dialogs disabled");
+        return finishSave(done, TabSaveResult::Cancelled);
+    }
+    const std::string path = ui::saveFileDialog(
+        "Chudware part (*.step+)\0*.step+\0All files (*.*)\0*.*\0", "step+", name.c_str());
+    if (path.empty()) return finishSave(done, TabSaveResult::Cancelled);
+    return saveCadDocument(st, docId, path, false, std::move(done));
+}
+
 TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog, TabSaveDone done) {
     if (idx < 0 || idx >= (int)st.docTabs.size())
         return finishSave(done, TabSaveResult::Nothing);
@@ -723,19 +736,33 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog, TabSaveDone do
             st.toast(ui::ToastLevel::Warn, "File changed on disk. Choose Reload or Keep mine first.");
             return finishSave(done, TabSaveResult::Failed);
         }
-        std::string path = tab.path;
-        if (forceDialog || path.empty()) {
-            if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
-                st.toast(ui::ToastLevel::Info, "File dialogs disabled");
-                return finishSave(done, TabSaveResult::Cancelled);
-            }
-            const std::string name = tab.displayTitle().empty() ? "Part" : tab.displayTitle();
-            path = ui::saveFileDialog(
-                "Chudware part (*.step+)\0*.step+\0All files (*.*)\0*.*\0",
-                "step+", name.c_str());
-            if (path.empty()) return finishSave(done, TabSaveResult::Cancelled);
+        const std::string name = tab.displayTitle().empty() ? "Part" : tab.displayTitle();
+        if (!forceDialog && !tab.path.empty())
+            return saveCadDocument(st, docId, tab.path, false, std::move(done));
+        // A tab can lack the path its document is bound to: a mirror of an agent's part
+        // (opened from the agent's import or save) learns only the doc id. Save writes back
+        // to the engine's bound file, so ask the engine before treating it as untitled.
+        if (!forceDialog) {
+            st.rpc.call("doc_list", nlohmann::json::object(),
+                [&st, docId, name, done = std::move(done)](const core::RpcResult& r) mutable {
+                    std::string bound;
+                    if (r.ok && r.result.is_object() && r.result.contains("docs") &&
+                        r.result["docs"].is_array())
+                        for (const auto& row : r.result["docs"])
+                            if (row.is_object() && row.value("doc_id", std::string()) == docId &&
+                                row.contains("path") && row["path"].is_string())
+                                bound = row["path"].get<std::string>();
+                    if (bound.empty()) {
+                        saveCadDocumentAs(st, docId, name, std::move(done));
+                        return;
+                    }
+                    if (const int i = partTabIndexForDoc(st, docId); i >= 0 && st.docTabs[i].path.empty())
+                        st.docTabs[i].path = bound;
+                    saveCadDocument(st, docId, bound, false, std::move(done));
+                });
+            return TabSaveResult::Pending;
         }
-        return saveCadDocument(st, docId, path, false, std::move(done));
+        return saveCadDocumentAs(st, docId, name, std::move(done));
     }
 
     AppState::DocTab& t = st.docTabs[idx];
@@ -1364,11 +1391,13 @@ float drawDocTabs(AppState& st, float availW) {
             // "Don't Save" means the unsaved state is thrown away. doc_close alone cannot
             // do that while another client (an agent's MCP connection) still holds the doc:
             // the daemon keeps it live and dirty, and reopening the file re-attaches to it.
-            // Revert a file-backed part/assembly to disk first, then close the now-clean doc.
-            const bool fileBacked = (t.kind == AppState::DocTab::TabKind::Part ||
-                                     t.kind == AppState::DocTab::TabKind::Assembly) &&
-                                    t.dirty && !t.path.empty() && !t.docId.empty();
-            if (!fileBacked) {
+            // Revert a part/assembly to its bound file first, then close the now-clean doc.
+            // The engine knows the bound file even when this tab does not (an agent's part
+            // mirrored into a tab); an untitled doc has none and just closes.
+            const bool revert = (t.kind == AppState::DocTab::TabKind::Part ||
+                                 t.kind == AppState::DocTab::TabKind::Assembly) &&
+                                t.dirty && !t.docId.empty();
+            if (!revert) {
                 st.closeDocTab(idx);
             } else {
                 const std::string docId = t.docId;
@@ -1376,6 +1405,15 @@ float drawDocTabs(AppState& st, float availW) {
                 st.rpc.callPrimary("doc_reload", {{"doc_id", docId}},
                     [&st, chosen = closeTabIdentity(t), docId](const core::RpcResult& r) {
                         st.endHumanMutation(docId);
+                        const std::string message = r.ok && r.result.is_object()
+                            ? r.result.value("message", std::string()) : std::string();
+                        if (r.ok && r.result.is_object() &&
+                            message.find("no bound path") != std::string::npos) {
+                            // Untitled: nothing on disk to revert to.
+                            if (const int at = resolveCloseTab(st, chosen); at >= 0)
+                                st.closeDocTab(at);
+                            return;
+                        }
                         if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
                             st.toast(ui::ToastLevel::Error, "Could not discard changes: " +
                                      (r.ok && r.result.is_object()

@@ -1192,6 +1192,15 @@ bool DocRegistry::humanDirty(const std::string& docId) const {
     return it != docs_.end() && it->second.humanDirty;
 }
 
+bool DocRegistry::hasUnsavedChanges(const std::string& docId) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const auto it = docs_.find(docId);
+    if (it == docs_.end()) return false;
+    const DocState& d = it->second;
+    return d.humanDirty || d.revision > d.savedRevision ||
+           d.metadataRevision > d.savedMetadataRevision;
+}
+
 int DocRegistry::savedRevision(const std::string& docId) const {
     std::lock_guard<std::mutex> lk(mtx_);
     const auto it = docs_.find(docId);

@@ -102,6 +102,8 @@ public:
     void annotateDocList(nlohmann::json& result, int clientId);
 
     bool humanDirty(const std::string& docId) const;
+    // Any edit (human or agent) newer than the last save.
+    bool hasUnsavedChanges(const std::string& docId) const;
     int savedRevision(const std::string& docId) const;
     bool closeBlockedBy(const std::string& docId, int requester) const;
     void restoreRecoveryState(const std::string& docId, const std::string& originKind,

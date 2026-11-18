@@ -429,6 +429,37 @@ TEST_CASE("STL refusal identifies the source solid and serialized offending edge
     }
 }
 
+// A valid 0.2 mm wide planar sliver between nearly tangent edges (TBOT trig_clamp_R rev AC).
+// At the default deflection BRepMesh reports its boundary polygon self-intersecting and
+// leaves it with no triangles, which failed every STL export of the part. The exporter
+// re-meshes finer until the face triangulates, covering its whole area.
+TEST_CASE("STL meshes a near-tangent sliver face that fails at the default deflection") {
+    TopoDS_Shape sliver;
+    BRep_Builder builder;
+    const auto fixture = std::filesystem::path(__FILE__).parent_path() /
+                         "fixtures/stl_sliver_face.brep";
+    REQUIRE(BRepTools::Read(sliver, fixture.string().c_str(), builder));
+    BRepTools::Clean(sliver);
+    BRepMesh_IncrementalMesh(sliver, chudware::doc::TessOptions{}.lin_deflection, Standard_False,
+                             chudware::doc::TessOptions{}.ang_deflection, Standard_True);
+    TopLoc_Location loc;
+    const auto& coarse = BRep_Tool::Triangulation(TopoDS::Face(sliver), loc);
+    REQUIRE((coarse.IsNull() || coarse->NbTriangles() == 0));  // the fixture still fails by default
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(sliver, props);
+    StlFile output;
+    chudware::doc::export_bodies({sliver}, output.path.string(), "stl");
+    double area = 0;
+    for (const auto& facet : raw_stl(output.path, false)) {
+        const gp_Vec ab(gp_Pnt(facet[0][0], facet[0][1], facet[0][2]),
+                        gp_Pnt(facet[1][0], facet[1][1], facet[1][2]));
+        const gp_Vec ac(gp_Pnt(facet[0][0], facet[0][1], facet[0][2]),
+                        gp_Pnt(facet[2][0], facet[2][1], facet[2][2]));
+        area += 0.5 * ab.Crossed(ac).Magnitude();
+    }
+    CHECK(area == doctest::Approx(props.Mass()).epsilon(1e-3));
+}
+
 TEST_CASE("STL continues to export ordinary open surface bodies") {
     const auto wire = BRepBuilderAPI_MakeWire(
         BRepBuilderAPI_MakeEdge(gp_Pnt(0,0,0), gp_Pnt(4,0,0)).Edge(),

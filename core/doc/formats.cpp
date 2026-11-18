@@ -428,19 +428,40 @@ private:
     }
 };
 
+bool every_face_triangulated(const TopoDS_Shape& shape) {
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        TopLoc_Location loc;
+        const auto& tri = BRep_Tool::Triangulation(TopoDS::Face(ex.Current()), loc);
+        if (tri.IsNull() || tri->NbTriangles() == 0) return false;
+    }
+    return true;
+}
+
 // Tessellate a shape in place at the requested quality so a mesh writer has a
 // triangulation to emit. The prior triangulation is cleared first so the exact
 // requested deflection is honored even if the shape was already meshed at another
 // quality (e.g. a finer dialog "estimate" preceding a coarser export).
+//
+// BRepMesh leaves a face with no triangles when its boundary polygon crosses itself at
+// the requested deflection: a valid sliver whose edges are nearly tangent (TBOT
+// trig_clamp_R rev AC, a 0.2 mm wide planar strip, failed at 0.05 and 0.005 mm and
+// meshed at 0.003 mm). The whole shape is re-meshed finer, never one face, so shared edges
+// keep one polygon and the mesh stays watertight. Three quarter-steps reach 1/64 of
+// the request; a face still empty after that reaches the writer's own diagnostic.
 void mesh_shape(const TopoDS_Shape& shape, const TessOptions& tess = TessOptions{}) {
-    BRepTools::Clean(shape);
-    BRepMesh_IncrementalMesh m;
-    m.SetShape(shape);
-    m.ChangeParameters().Deflection = tess.lin_deflection;
-    m.ChangeParameters().Relative = tess.relative;
-    m.ChangeParameters().Angle = tess.ang_deflection;
-    m.ChangeParameters().InParallel = Standard_True;
-    m.Perform(new ExportMeshContext);
+    double deflection = tess.lin_deflection;
+    for (int attempt = 0;; ++attempt) {
+        BRepTools::Clean(shape);
+        BRepMesh_IncrementalMesh m;
+        m.SetShape(shape);
+        m.ChangeParameters().Deflection = deflection;
+        m.ChangeParameters().Relative = tess.relative;
+        m.ChangeParameters().Angle = tess.ang_deflection;
+        m.ChangeParameters().InParallel = Standard_True;
+        m.Perform(new ExportMeshContext);
+        if (attempt == 3 || every_face_triangulated(shape)) return;
+        deflection /= 4.0;
+    }
 }
 
 std::string abs_path(const std::string& path) {
@@ -2334,8 +2355,19 @@ namespace {
 std::vector<Poly_Triangle> stl_face_facets(const TopoDS_Face& face) {
     TopLoc_Location loc;
     const auto& tri = BRep_Tool::Triangulation(face, loc);
-    if (tri.IsNull() || tri->NbTriangles() == 0)
-        throw OpError("export_failed", "STL source face has no triangulation");
+    if (tri.IsNull() || tri->NbTriangles() == 0) {
+        GProp_GProps props;
+        BRepGProp::SurfaceProperties(face, props);
+        const gp_Pnt at = props.CentreOfMass();
+        throw OpError("export_failed",
+                      "STL export: the mesher could not triangulate a face even at 1/64 of the "
+                      "requested deflection; its boundary crosses itself, which usually means a "
+                      "sliver face between nearly tangent edges. Inspect the face at the "
+                      "reported point and remove the sliver (adjust the tangent dimension or "
+                      "fillet), then export again.",
+                      {{"face_area_mm2", props.Mass()},
+                       {"face_center_mm", {at.X(), at.Y(), at.Z()}}});
+    }
     // pole[d][node]: the node lies on the polygon of degenerate edge d.
     std::vector<std::vector<bool>> pole;
     for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next()) {

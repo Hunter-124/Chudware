@@ -181,6 +181,10 @@ restart, recover_parts() reloads auto-saved docs.
 get_job/wait_job status="done" means execution finished, NOT success. A completed
 result with ok:false also sets the polling reply's ok:false; error/code/reason/detail
 are exposed at the top level and the complete result remains under result.
+Both report elapsed_s. A running add_features/simplify_part job past 5 min sets
+overdue:true: the kernel is stuck on that edit and cannot be interrupted, and later edits
+to that document queue behind it. Stop waiting, tell the user which edit stuck
+(restarting Chudware ends it), and continue on another document.
 add_features can also hand off automatically with status="running", auto_backgrounded:true
 and job_id. That reply is acceptance, not completed geometry. The edit-part checked
 helper joins it and checks the completed result; without the helper, wait for the job

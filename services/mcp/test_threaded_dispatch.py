@@ -190,3 +190,37 @@ def test_project_dir_never_adopts_the_checkout_or_an_explicit_setting(monkeypatc
     monkeypatch.chdir(tmp_path)
     srv._default_project_dir_from_cwd()
     assert "CHUDWARE_PROJECT_DIR" not in os.environ
+
+
+def _get_job(job_id: str) -> dict:
+    import asyncio
+    import json
+
+    result = asyncio.run(srv.mcp.call_tool("get_job", {"job_id": job_id}))
+    content, structured = result if isinstance(result, tuple) else (list(result), None)
+    text = structured.get("result") if isinstance(structured, dict) else content[0].text
+    return json.loads(text)
+
+
+@pytest.mark.parametrize("kind,age_s,overdue", [
+    ("add_features", 900.0, True),     # a rebuild 15 min in: the TBOT kernel hang
+    ("add_features", 30.0, False),     # an ordinary slow rebuild
+    ("fea_convergence", 900.0, False),  # long solves are expected to take long
+])
+def test_get_job_reports_elapsed_and_flags_an_overdue_rebuild(kind, age_s, overdue):
+    from services.mcp import cad_common as cc
+
+    jid = "job-overduetest"
+    with cc._JOB_LOCK:
+        cc._JOBS[jid] = {"status": "running", "kind": kind, "result": None, "error": None,
+                         "progress": {}, "started_at": time.time() - age_s, "done_at": None,
+                         "queued_behind": None}
+    try:
+        out = _get_job(jid)
+    finally:
+        with cc._JOB_LOCK:
+            cc._JOBS.pop(jid, None)
+    assert out["status"] == "running"
+    assert out["elapsed_s"] == pytest.approx(age_s, abs=5)
+    assert out.get("overdue", False) is overdue
+    assert ("cannot interrupt" in out.get("note", "")) is overdue

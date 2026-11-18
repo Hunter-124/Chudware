@@ -10147,12 +10147,17 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             return _err(e)
 
 
+    # Document edit jobs: their work is one engine rebuild, unlike a long simulation solve.
+    _DOC_REBUILD_JOBS = frozenset({"add_features", "simplify_part"})
+    _DOC_REBUILD_OVERDUE_S = 300.0
+
     @mcp.tool()
     @result_contract("Job completion does not imply operation success; inspect the nested result.")
     def get_job(job_id: str) -> str:
         """Poll a background job started by run_cfd_flow/run_fea_*(background=True).
 
-        Returns {status: "running"|"done"|"error"}; when done, the solve `result` is included.
+        Returns {status: "running"|"done"|"error", elapsed_s}; when done, the solve `result`
+        is included. A document edit job still running after 5 min sets overdue:true.
         "done" means execution finished, not that it succeeded: a result with ok:false
         also sets this reply's ok:false and exposes its error, code, reason and detail.
         Polling a long solve this way never trips the per-call transport timeout that would
@@ -10187,6 +10192,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                              "survive restarts.")})
             return _dumps({"ok": False, "error": f"unknown job_id {job_id!r}"})
         out = {"ok": True, "job_id": job_id, "status": snap["status"], "kind": snap["kind"]}
+        if snap.get("started_at"):
+            out["elapsed_s"] = round((snap.get("done_at") or time.time()) - snap["started_at"], 1)
+            if (snap["status"] == "running" and snap["kind"] in _DOC_REBUILD_JOBS
+                    and out["elapsed_s"] > _DOC_REBUILD_OVERDUE_S):
+                out["overdue"] = True
+                out["note"] = (
+                    f"This document rebuild has run {out['elapsed_s'] / 60:.0f} min; rebuilds "
+                    "normally take seconds. The engine cannot interrupt a kernel operation, so "
+                    "waiting longer rarely helps, and later edits to this document queue "
+                    "behind it. Tell the user which edit is stuck (restarting Chudware ends "
+                    "it); meanwhile work on another document, e.g. import_part(copy=True) of "
+                    "the last saved file.")
         if snap.get("progress"):
             progress = dict(snap["progress"])  # retain the final phase on done/error, too
             # LBM reports progress via a file the engine writes each checkpoint — fold it in so the

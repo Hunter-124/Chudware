@@ -3256,8 +3256,8 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
     Always runs on a worker thread (via _start_job), under this turn's connection lease. For a
     synchronous request we poll the job up to `budget_s`; if it finishes we return the result
     inline (small solves behave exactly as before). If it overruns, we LEAVE it running and
-    return the job_id for polling with get_job(). The job stops with the turn (Stop aborts its
-    socket) but is not restart-durable. `doc_id` applies jobs on one document in start order.
+    return the job_id for polling with get_job(). Stop aborts the turn's socket, but engine
+    work already dispatched runs to completion; the job is not restart-durable. `doc_id` applies jobs on one document in start order.
     A cancelled call returns at once with cancelled:true; work already sent to the engine may
     still have been applied, so the document must be read before retrying.
     """
@@ -3288,7 +3288,8 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
             interval = min(0.1, interval * 1.5)
     out = {"ok": True, "job_id": jid, "status": "running", "auto_backgrounded": True,
            "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
-                    f"to keep the tool reply responsive. It stops with this turn but is not "
+                    f"to keep the tool reply responsive. Ending the turn drops the reply, but "
+                    f"engine work already running finishes first, and it is not "
                     f"restart-durable. Poll get_job('{jid}').")}
     if snap.get("queued_behind"):
         out["queued_behind"] = snap["queued_behind"]

@@ -1390,9 +1390,11 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         d = _doc(doc_id)
         if display_quality is not None:
             # Persists on the document (view setting, no revision bump) — nothing to restore.
-            # Let a bad tier name surface: the engine refuses instead of guessing.
+            # Let a bad tier name surface: the engine refuses instead of guessing. A
+            # JSON-quoted tier ('"fine"') is the tier, as it is for a named view.
             cb.call("doc_set_display_quality",
-                    {"doc_id": d, "quality": str(display_quality).strip().lower()})
+                    {"doc_id": d,
+                     "quality": str(coerce_json_or_repr(display_quality)).strip().lower()})
         view = coerce_json_or_repr(view)  # a JSON-string view is a dict view, not a named view
         view_spec, cam_opts = _split_view(view)
         view_name = view if isinstance(view, str) else "custom"

@@ -86,6 +86,8 @@ def test_auto_orientation_finds_a_pose_that_needs_no_support(tmp_path):
     manifest = json.loads(Path(result["manifest_path"]).read_text())
     assert manifest["printer"]["name"] == "Creality Ender-3 (0.4 mm nozzle)"
     assert manifest["print_ready"] is True and manifest["gcode_sha256"]
+    # The job folder is portable: the manifest names its G-code by file name, not by path.
+    assert manifest["gcode"] == gcode.name
     assert result["stats"]["print_time_s"] > 0 and result["stats"]["filament_g"] > 0
 
 

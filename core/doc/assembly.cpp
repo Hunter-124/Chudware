@@ -553,7 +553,7 @@ std::vector<TopoDS_Shape> load_bodies(
                 (verified || !native_policy::recomputing_cache)) {
                 try {
                     json header = json::parse(cj->second);
-                    if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                    if (stepplus_cache_engine_matches(header.value("engine", std::string())) &&
                         header.value("doc_hash", std::string()) ==
                             stepplus_doc_hash(source_doc) &&
                         header.value("solved", false)) {
@@ -844,7 +844,7 @@ std::string invalid_component_cache_stamp(const std::string& path, const std::st
             const auto header = loaded.extra.find("cache.json");
             if (header != loaded.extra.end()) {
                 const json cache = json::parse(header->second);
-                valid = cache.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                valid = stepplus_cache_engine_matches(cache.value("engine", std::string())) &&
                         cache.value("doc_hash", std::string()) == doc_hash &&
                         cache.value("solved", false) &&
                         stepplus_cache_verified(loaded.doc, loaded.extra, true);
@@ -2039,6 +2039,22 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     return res;
 }
 
+// The spelling a dependency row stores: relative to the assembly's folder, with POSIX
+// separators, whenever the two share a folder ("parts/a.step+", "../parts/a.step+"), so a
+// saved assembly's dependency list still matches after the project folder is copied to
+// another machine or OS. Only a source on another drive, or one whose sole common
+// ancestor is the filesystem root, keeps its absolute path.
+std::string asm_fingerprint_path(const std::filesystem::path& absolute,
+                                 const std::filesystem::path& root) {
+    if (root.empty()) return absolute.string();
+    const auto local = absolute.lexically_relative(root);
+    if (local.empty() || *local.begin() == ".") return absolute.string();
+    std::size_t up = 0, depth = 0;
+    for (const auto& part : local) if (part == "..") ++up;
+    for (const auto& part : root.relative_path()) if (!part.empty()) ++depth;
+    return up < depth ? local.generic_string() : absolute.string();
+}
+
 static json component_fingerprints(const json& doc, const std::string& base_dir, bool use_live) {
     json fp = json::array();
     const auto root = base_dir.empty() ? std::filesystem::path()
@@ -2051,11 +2067,7 @@ static json component_fingerprints(const json& doc, const std::string& base_dir,
             return;
         }
         const auto absolute = std::filesystem::absolute(source_path).lexically_normal();
-        const auto local = root.empty() ? std::filesystem::path()
-            : absolute.lexically_relative(root);
-        const auto first = local.begin();
-        const std::string stored = !local.empty() && first != local.end() &&
-            *first != ".." && *first != "." ? local.generic_string() : absolute.string();
+        const std::string stored = asm_fingerprint_path(absolute, root);
         uint64_t size = 0;
         long long mtime = 0;
         std::error_code ec;

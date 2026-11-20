@@ -4569,7 +4569,8 @@ def test_asm_mate_on_a_saved_assembly_resolves_relative_component_sources(
     try:
         comps = cb.call("doc_tree", {"doc_id": reopened})["tree"]["components"]
         sources = [(c.get("source") or {}).get("path") for c in comps]
-        assert sources == [plate_path, pin_path], sources
+        # A save writes sibling-folder sources relative to the assembly file.
+        assert sources == ["../Frame/rel_plate.step+", "../Frame/rel_pin.step+"], sources
         r, _ = _call("describe_assembly", {"doc_id": reopened})
         assert len(r["bodies"]) == 2, r
     finally:
@@ -4731,8 +4732,10 @@ def test_saved_assembly_rebases_component_sources_when_project_moves(tmp_path, m
         with zipfile.ZipFile(source_file) as archive:
             stored = json.loads(archive.read("document.json"))
             paths = {c["name"]: c["source"]["path"] for c in stored["components"]}
+            # Both are stored relative to the assembly, the project folder's sibling too,
+            # so the saved dependency rows still match after the move below.
             assert paths == {"inside": "parts/portable_box.step+",
-                             "external": str(external)}, paths
+                             "external": "../external.step+"}, paths
             assert "cache.json" in archive.namelist()
             cache = json.loads(archive.read("cache.json"))
             assert cache["components"][0]["path"] == paths["inside"]

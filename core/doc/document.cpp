@@ -129,6 +129,7 @@
 #include "doc/formats.h"  // import_bodies / detect_format (the import feature)
 #include "doc/picks.h"
 #include "doc/selectors.h"
+#include "doc/stepplus.h"  // stepplus_cache_engine_matches (checkpoint engine key)
 #include "doc/session.h"  // OpError (plan_push_pull's structured out-of-range errors)
 #include "geom/booleans.h"
 #include "geom/dress.h"
@@ -12278,7 +12279,7 @@ std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob, cons
             report["reason"] = "decode_error";
             return nullptr;
         }
-        if (root.at("engine").get<std::string>() != engine_key) {
+        if (!stepplus_cache_engine_matches(root.at("engine").get<std::string>(), engine_key)) {
             report["reason"] = "engine_key";
             return nullptr;
         }

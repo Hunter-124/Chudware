@@ -1046,14 +1046,15 @@ TEST_CASE("stale fillet epoch rebuilds once without rewriting authored archive m
         feature["params"]["radius"]["value"] = 100.0;
         feature["data"] = {{"custom", "retained"}};
         auto header = json::parse(stored.extra.at("cache.json"));
-        header["engine"] = "chudware-geomcache/19;occt=" OCC_VERSION_COMPLETE;
+        header["engine"] = "chudware-geomcache/19;occt=" OCC_VERSION_STRING;
         header["doc_hash"] = stepplus_doc_hash(stored.doc);
         stored.extra["cache.json"] = header.dump();
         auto& checkpoint = stored.extra.at("cache.ckpt");
         const std::string current = stepplus_cache_engine_key();
         const auto pos = checkpoint.find(current);
         REQUIRE(pos != std::string::npos);
-        checkpoint.replace(pos, current.size(), "chudware-geomcache/19;occt=" OCC_VERSION_COMPLETE);
+        // Same length as the current key: the checkpoint's CBOR string header stays valid.
+        checkpoint.replace(pos, current.size(), "chudware-geomcache/19;occt=" OCC_VERSION_STRING);
         stored.extra["notes/user.txt"] = "do not replace";
     });
     const auto authored = zip_members(path);

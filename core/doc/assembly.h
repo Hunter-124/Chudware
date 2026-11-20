@@ -27,6 +27,7 @@
 // Canonical units: mm / degrees / grams.
 #pragma once
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -154,6 +155,11 @@ public:
 private:
     std::shared_ptr<const AssemblyLiveSources> previous_;
 };
+
+// The path a dependency fingerprint row stores for `absolute`, seen from the assembly
+// folder `root`: POSIX-relative when they share a folder, absolute otherwise.
+std::string asm_fingerprint_path(const std::filesystem::path& absolute,
+                                 const std::filesystem::path& root);
 
 // In-memory source identities use live documents (including nested assemblies),
 // while the persisted fingerprint API below always describes files on disk.

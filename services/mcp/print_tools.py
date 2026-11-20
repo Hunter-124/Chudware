@@ -494,6 +494,16 @@ _REPAIR_KEYS = ("edges_fixed", "degenerate_facets", "facets_removed", "facets_re
                 "backwards_edges")
 
 
+def _beside_manifest(path, manifest_path) -> str:
+    """`path` as the manifest stores it: POSIX-relative to the manifest's folder when it
+    lies inside that folder, the absolute path otherwise."""
+    target = Path(os.path.abspath(path))
+    try:
+        return target.relative_to(Path(os.path.abspath(manifest_path)).parent).as_posix()
+    except ValueError:
+        return str(target)
+
+
 def _slicer_mesh_repairs(project_3mf: Optional[Path], volumes: int) -> dict:
     """PrusaSlicer's load-time repair record from the review 3MF.
 
@@ -1116,8 +1126,13 @@ def register_print_tools(mcp: FastMCP) -> None:
                 "slicer": install.to_dict(),
                 "config_sha256": _sha256_file(Path(run.config_path)),
                 "mesh_sha256": mesh_sha,
-                "gcode": str(run.gcode_path), "gcode_sha256": _sha256_file(Path(run.gcode_path)),
-                "project_3mf": str(run.project_3mf) if run.project_3mf else None,
+                # Named relative to this manifest (they are written beside it), so the job
+                # folder still reads on another machine; publish_print_media resolves them
+                # against the manifest's folder.
+                "gcode": _beside_manifest(run.gcode_path, manifest_path),
+                "gcode_sha256": _sha256_file(Path(run.gcode_path)),
+                "project_3mf": (_beside_manifest(run.project_3mf, manifest_path)
+                                if run.project_3mf else None),
                 "stats": stats, "estimate": estimate,
                 "printability": printability,
                 "gcode_check": {"status": check.get("status"), "issues": gcode_issues},

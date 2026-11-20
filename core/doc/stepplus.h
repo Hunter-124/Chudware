@@ -103,6 +103,14 @@ std::string stepplus_doc_hash(const nlohmann::json& doc);
 // stale caches from older engines are rejected. Mismatch on open -> full rebuild.
 std::string stepplus_cache_engine_key();
 
+// Does a saved cache's engine string name this engine? Equal to `current`, or `current`
+// followed by an OCCT maintenance number ("…;occt=7.9" accepts "…;occt=7.9.3"): keys
+// written before the maintenance number was dropped still serve, on any machine.
+bool stepplus_cache_engine_matches(const std::string& stored, const std::string& current);
+inline bool stepplus_cache_engine_matches(const std::string& stored) {
+    return stepplus_cache_engine_matches(stored, stepplus_cache_engine_key());
+}
+
 // Cache authority is process/cell state, never document-controlled.
 void configure_native_policy(const std::string& root, const std::string& state_dir);
 // Component loads authenticate the signed manifest and only hash the BREP/header

@@ -664,6 +664,26 @@ def test_engine_routes_around_box_and_checks_clearance(engine_doc, tools):
     assert rebuilt["geometry"]["feature_ids"] == ids
 
 
+def test_harness_companion_part_is_found_through_its_component(tmp_path, monkeypatch):
+    """The study stores no file path: the companion part is the assembly component's
+    source, resolved against the assembly's own folder wherever the project now lives."""
+    from services.mcp import harness_tools as ht
+
+    (tmp_path / "asm").mkdir()
+    (tmp_path / "refs").mkdir()
+    part = tmp_path / "refs" / "front_harness.step+"
+    part.write_bytes(b"x")
+    tree = {"components": [{"id": "k7", "source": {"path": "../refs/front_harness.step+"}},
+                           {"id": "k8", "source": {"path": str(part)}}]}
+    docs = {"docs": [{"doc_id": "asm1", "path": str(tmp_path / "asm" / "full.step+")},
+                     {"doc_id": "unsaved", "path": None}]}
+    monkeypatch.setattr(ht.cb, "call", lambda method, params: docs)
+    assert ht._component_file("asm1", tree, "k7").resolve() == part
+    assert ht._component_file("asm1", tree, "k8") == part
+    assert ht._component_file("asm1", tree, "missing") is None
+    assert ht._component_file("unsaved", tree, "k7") is None
+
+
 def add_engine_connector(tools, doc, harness, ref, origin, normal, pins=2):
     added = invoke(tools, "harness_add_connector", doc_id=doc, harness_id=harness, ref=ref,
                    family="generic", pins=pins, frame={"origin": origin, "normal": normal})

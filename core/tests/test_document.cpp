@@ -90,6 +90,7 @@
 #include "doc/selectors.h"
 #include "doc/validate.h"  // validate_document (explicit-axis acceptance regression)
 #include "doc/session.h"   // doc_new/doc_apply_ops (top-level-option hoist regression)
+#include <Standard_Version.hxx>  // OCC_VERSION_COMPLETE (cache engine key test)
 #include "doc/stepplus.h"  // stepplus_save (craft a persisted broken-import doc on disk)
 #include "doc/asm_disk_cache.h"  // persistent assembly mesh / nested-solve cache
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
@@ -6704,6 +6705,34 @@ TEST_CASE("relocateComponentRef prefers the nearest folder and never matches a b
     CHECK(chudware::util::relocateComponentRef("/home/me/b.step+", base).empty());
     CHECK(chudware::util::relocateComponentRef("../parts/a.step+", base).empty());
     fs::remove_all(root);
+}
+
+TEST_CASE("assembly dependency rows are stored relative to the assembly folder") {
+    namespace fs = std::filesystem;
+    using chudware::doc::asm_fingerprint_path;
+    const auto project = fs::temp_directory_path() / "chudware-fingerprint-path" / "proj";
+    // A sibling folder is the usual layout (asm/ beside parts/): the row must not carry
+    // this machine's absolute path, or the saved assembly never matches anywhere else.
+    CHECK(asm_fingerprint_path(project / "asm" / "a.step+", project / "asm") == "a.step+");
+    CHECK(asm_fingerprint_path(project / "parts" / "sub" / "a.step+", project / "asm") ==
+          "../parts/sub/a.step+");
+    // No assembly folder, or nothing shared but the filesystem root: absolute.
+    const auto outside = project.root_path() / "elsewhere" / "a.step+";
+    CHECK(asm_fingerprint_path(outside, {}) == outside.string());
+    CHECK(asm_fingerprint_path(outside, project.root_path() / "other") == outside.string());
+}
+
+TEST_CASE("a cache built by another maintenance release of the same OCCT still serves") {
+    using chudware::doc::stepplus_cache_engine_matches;
+    const std::string key = chudware::doc::stepplus_cache_engine_key();
+    CHECK(key.find(";occt=" OCC_VERSION_COMPLETE) == std::string::npos);
+    CHECK(stepplus_cache_engine_matches(key));
+    CHECK(stepplus_cache_engine_matches(key + ".1"));
+    CHECK(stepplus_cache_engine_matches(key + ".12"));
+    CHECK_FALSE(stepplus_cache_engine_matches(key + "."));
+    CHECK_FALSE(stepplus_cache_engine_matches(key + "1"));
+    CHECK_FALSE(stepplus_cache_engine_matches(key + ".1.2"));
+    CHECK_FALSE(stepplus_cache_engine_matches("chudware-geomcache/0;occt=" OCC_VERSION_COMPLETE));
 }
 
 TEST_CASE("a recovered unsaved part revision in an assembly reuses the file's checkpoints") {

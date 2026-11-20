@@ -8090,10 +8090,7 @@ json rebase_assembly_fingerprints(json sources, const std::string& old_base,
         if (path.empty()) continue;
         const auto absolute = std::filesystem::absolute(
             old_root / std::filesystem::u8path(path)).lexically_normal();
-        const auto local = root.empty() ? std::filesystem::path() : absolute.lexically_relative(root);
-        const auto first = local.begin();
-        row["path"] = !local.empty() && first != local.end() && *first != ".." && *first != "."
-                          ? local.generic_string() : absolute.string();
+        row["path"] = asm_fingerprint_path(absolute, root);
     }
     return sources;
 }
@@ -24549,7 +24546,7 @@ static json save_recovery_snapshot(const std::string& doc_id, const std::string&
                 json cached = json::parse(header->second);
                 if (cached.value("solved", false) &&
                     cached.contains("response") && cached["response"].is_object() &&
-                    cached.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                    stepplus_cache_engine_matches(cached.value("engine", std::string())) &&
                     cached.value("doc_hash", std::string()) == stepplus_doc_hash(snapshot.doc) &&
                     asm_live_fingerprints_match(snapshot.doc, old_base, snapshot.asm_sources)) {
                     cached["doc_hash"] = stepplus_doc_hash(saved_doc);
@@ -25055,7 +25052,8 @@ static PartCacheOpen open_part_from_caches(Session& s,
         }
     }
     if (miss.empty()) {
-        if (header.value("engine", std::string()) != engine) miss = "engine_key";
+        if (!stepplus_cache_engine_matches(header.value("engine", std::string()), engine))
+            miss = "engine_key";
         else if (header.value("doc_hash", std::string()) != doc_hash) miss = "doc_hash";
         else if (!header.value("solved", false)) miss = "unsolved";
         else if (!header.contains("response") || !header["response"].is_object() ||
@@ -25908,7 +25906,7 @@ static json doc_open_impl(const std::string& path, bool as_solid, bool detach_pa
                 if (!header.is_object() || !header.contains("response") ||
                     !header["response"].is_object())
                     miss_reason = "decode_error";
-                else if (header.value("engine", std::string()) != stepplus_cache_engine_key() ||
+                else if (!stepplus_cache_engine_matches(header.value("engine", std::string())) ||
                          header.value("assembly_appearance", 0) != 1)
                     miss_reason = "engine_key";
                 else if (header.value("doc_hash", std::string()) != persisted_assembly_hash)

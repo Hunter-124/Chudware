@@ -56,6 +56,24 @@ def _rpc(method: str, params: dict) -> dict:
     return result
 
 
+def _component_file(doc_id: str, tree: dict, component_id: Optional[str]) -> Optional[Path]:
+    """The file behind an assembly component, resolved against the assembly's own folder.
+
+    The harness study names its companion part by component id only: a stored absolute
+    path would be dead on any other machine and force a rebuild of unchanged geometry.
+    """
+    ref = next(((c.get("source") or {}).get("path") for c in tree.get("components", [])
+                if c.get("id") == component_id), None)
+    if not ref:
+        return None
+    path = Path(ref)
+    if path.is_absolute():
+        return path
+    owner = next((e.get("path") for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                  if e.get("doc_id") == doc_id), None)
+    return Path(owner).parent / path if owner else None
+
+
 def _save(doc_id: str, h: dict) -> dict:
     M.recompute_derived(h)
     return M.save_harness(doc_id, h)
@@ -946,7 +964,8 @@ def register_harness_tools(mcp) -> None:
             if assembly:
                 if old.get("component_id") and old["component_id"] not in components:
                     raise M.HarnessError("geometry_ownership_incomplete", "previous harness component is missing; refusing a potentially duplicating rebuild")
-                if old.get("signature") == signature and old.get("component_id") in components and Path(old.get("path", "")).is_file():
+                if old.get("signature") == signature and old.get("component_id") in components and (
+                        (_component_file(doc_id, tree, old["component_id"]) or Path()).is_file()):
                     return _paged({"ok": True, "harness_id": h["id"], "unchanged": True, "geometry": old,
                                    "warnings": geometry_warnings}, offset, limit, page_offsets)
                 ops = []
@@ -1000,7 +1019,7 @@ def register_harness_tools(mcp) -> None:
                 component_id = (applied.get("id_map") or {}).get(f"${index}")
                 if not component_id:
                     raise M.HarnessError("geometry_ids_missing", "assembly operation did not report the inserted component id", path=target, detail=applied)
-                h["geometry"] = {"signature": signature, "component_id": component_id, "path": target}
+                h["geometry"] = {"signature": signature, "component_id": component_id}
             else:
                 applied = _apply_ops(doc_id, ops)
                 ids = [(applied.get("id_map") or {}).get(f"${i}") for i in indexes]
@@ -1011,7 +1030,9 @@ def register_harness_tools(mcp) -> None:
                 saved = _save(doc_id, h)
             except Exception as e:
                 raise M.HarnessError("geometry_not_recorded", f"geometry was built but harness study was not saved: {e}", geometry=h["geometry"], hint="Do not rebuild until these features are reconciled.") from e
-            return _paged({"ok": True, "harness_id": h["id"], "geometry": h["geometry"],
+            # The reply still says where the companion part went; the study does not store it.
+            reported = {**h["geometry"], "path": target} if assembly else h["geometry"]
+            return _paged({"ok": True, "harness_id": h["id"], "geometry": reported,
                            "warnings": geometry_warnings, **saved}, offset, limit, page_offsets)
         except Exception as e:
             return _error(e)

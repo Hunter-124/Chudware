@@ -514,3 +514,19 @@ the assembly document lock. Its build-state report may say
 is pending. Pending writebacks keep the engine active and retain the same
 authored-hash and file-stamp guards; an intervening file save wins. A warm
 component-cache hit does not schedule a writeback.
+
+## 29. Machine-portable build state (additive)
+
+The engine key names the OCCT kernel by `major.minor` only
+(`chudware-geomcache/22;occt=7.9`). A reader accepts a stored key equal to its own, or its
+own followed by one maintenance number (`…;occt=7.9.3`, the spelling written before this
+section): maintenance releases read the same B-rep, and keying on them rebuilt every part
+of a project, and rewrote every file, each time it moved between two machines. A different
+epoch or a different `major.minor` remains a cache miss (`engine_key`).
+
+An assembly's `cache.json` `components` rows store each dependency `path` relative to the
+assembly's folder with POSIX separators whenever the two share a folder
+(`parts/a.step+`, `../parts/a.step+`), matching the component `source.path` rule of a
+save. Only a source on another drive, or one whose sole common ancestor is the filesystem
+root, is stored absolute. Rows written with an absolute path by an older engine do not
+match and the assembly display is rebuilt once.

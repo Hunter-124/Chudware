@@ -13,8 +13,10 @@
 #endif
 #include "doc/stepplus.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -543,7 +545,8 @@ bool stepplus_cache_verified(const json& doc,
         if (envelope.value("schema", std::string()) != "chudware-cache-provenance/1") return false;
         const json expected_identity = cache_manifest(util::sha256_hex(editable_document_json(doc)));
         const auto& manifest = envelope.at("manifest");
-        if (manifest.at("engine") != expected_identity["engine"] ||
+        if (!manifest.at("engine").is_string() ||
+            !stepplus_cache_engine_matches(manifest.at("engine").get<std::string>()) ||
             manifest.at("doc_hash") != expected_identity["doc_hash"] ||
             !manifest.at("members").is_object()) return false;
         // Bounded readers can omit unrelated members. Authenticate the complete signed
@@ -1825,12 +1828,23 @@ std::string stepplus_cache_engine_key() {
     // The new refine feature has no prior successful compiled topology to invalidate:
     // failed/unknown features cannot produce a solved display cache. Its safety inputs
     // are keyed at the refine checkpoint itself, leaving old documents' warm caches valid.
+    // The kernel is named by major.minor only. A maintenance release ("7.9.1" on one
+    // machine, "7.9.3" on another) reads the same BREP, and keying on it made a project
+    // rebuild every part, and rewrite every file, each time it moved between two machines.
     static constexpr const char* kCacheSchema = "chudware-geomcache/22";
-#ifdef OCC_VERSION_COMPLETE
-    return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
+#ifdef OCC_VERSION_STRING
+    return std::string(kCacheSchema) + ";occt=" OCC_VERSION_STRING;
 #else
     return std::string(kCacheSchema) + ";occt=none";
 #endif
+}
+
+bool stepplus_cache_engine_matches(const std::string& stored, const std::string& current) {
+    if (stored == current) return true;
+    if (stored.size() < current.size() + 2 || stored.compare(0, current.size(), current) != 0 ||
+        stored[current.size()] != '.') return false;
+    return std::all_of(stored.begin() + static_cast<std::ptrdiff_t>(current.size()) + 1,
+                       stored.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
 }
 
 // --- build-state write-back (contracts/stepplus.md §17) -----------------------------

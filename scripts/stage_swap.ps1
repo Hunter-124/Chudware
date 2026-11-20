@@ -20,6 +20,9 @@ param(
     [Parameter(Mandatory)][string[]]$Include
 )
 $ErrorActionPreference = 'Stop'
+# `powershell -File` (how build.bat calls this) passes "a,b,c" as ONE string, not a list:
+# unsplit, the filter matched no file and nothing was ever staged.
+$Include = @($Include | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
 if (-not (Test-Path -LiteralPath $Dest)) { New-Item -ItemType Directory -Path $Dest | Out-Null }
 

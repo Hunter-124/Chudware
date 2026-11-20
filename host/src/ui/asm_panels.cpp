@@ -1770,13 +1770,11 @@ void AsmPanels::refreshBom(AppState& st) {
         bomNote_ = "No assembly components.";
         return;
     }
-    // Qty rollup by source path; first occurrence holds the name + ordinal (for eval_mass).
+    // Qty rollup by source path; first occurrence holds the name + component id (for eval_mass).
     std::map<std::string, int> rowIndexBySource;
-    std::vector<int> ordinalForRow;   // 1-based component ordinal of the first occurrence
-    int ordinal = 0;
+    std::vector<std::string> componentForRow;   // id of the row's first occurrence
     for (const auto& c : tree["components"]) {
         if (!c.is_object()) continue;
-        ++ordinal;
         std::string source = (c.contains("source") && c["source"].is_object())
             ? c["source"].value("path", std::string()) : std::string();
         std::string name = c.value("name", std::string());
@@ -1784,31 +1782,46 @@ void AsmPanels::refreshBom(AppState& st) {
         if (it == rowIndexBySource.end()) {
             BomRow row; row.name = name; row.source = source; row.qty = 1;
             rowIndexBySource[source] = (int)bomRows_.size();
-            ordinalForRow.push_back(ordinal);
+            componentForRow.push_back(c.value("id", std::string()));
             bomRows_.push_back(row);
         } else {
             bomRows_[it->second].qty += 1;
         }
     }
-    // Mass per distinct source via eval_mass on its component ordinal. C39: the rows draw
-    // immediately; each mass fills in as its async call drains (the old sync loop froze the
-    // window for rows x call-time). Failures just leave haveMass=false (blank cell), as before.
-    for (size_t i = 0; i < bomRows_.size(); ++i) {
-        nlohmann::json params = {{"doc_id", st.docMirror.docId()}, {"body", ordinalForRow[i]}};
-        ++bomPending_;
-        ++st.rebuildsInFlight;
-        st.rpc.call("eval_mass", params, [this, &st, gen, i](const core::RpcResult& r) {
-            --st.rebuildsInFlight;
-            if (gen != bomGen_) return;  // a newer refresh rebuilt the rows
-            --bomPending_;
-            if (r.ok && r.result.is_object() && !r.result.contains("code") &&
-                i < bomRows_.size()) {
-                bomRows_[i].volMm3 = r.result.value("volume_mm3", 0.0);
-                bomRows_[i].massG = r.result.value("mass_g", 0.0);
-                bomRows_[i].haveMass = true;
-            }
-        }, 60000);
-    }
+    // Mass per distinct source: ONE eval_mass on the assembly, whose bodies[] each name the
+    // component that placed them and carry that part's own material. A component's mass is
+    // the sum of its bodies (a multi-body part is several entries, so body N is not component
+    // N). The rows draw immediately and fill in when the call drains (C39); a component with
+    // no bodies in the result (suppressed, failed) keeps haveMass=false (blank cell).
+    ++bomPending_;
+    ++st.rebuildsInFlight;
+    st.rpc.call("eval_mass", {{"doc_id", st.docMirror.docId()}},
+                [this, &st, gen, componentForRow](const core::RpcResult& r) {
+        --st.rebuildsInFlight;
+        if (gen != bomGen_) return;  // a newer refresh rebuilt the rows
+        --bomPending_;
+        if (!r.ok || !r.result.is_object() || r.result.contains("code")) return;
+        std::map<std::string, std::pair<double, double>> byComponent;  // id -> {mass, volume}
+        auto add = [&](const nlohmann::json& body) {
+            if (!body.is_object() || !body.contains("component") ||
+                !body["component"].is_object())
+                return;
+            auto& acc = byComponent[body["component"].value("id", std::string())];
+            acc.first += body.value("mass_g", 0.0);
+            acc.second += body.value("volume_mm3", 0.0);
+        };
+        if (r.result.contains("bodies") && r.result["bodies"].is_array())
+            for (const auto& b : r.result["bodies"]) add(b);
+        else
+            add(r.result);
+        for (size_t i = 0; i < bomRows_.size() && i < componentForRow.size(); ++i) {
+            const auto it = byComponent.find(componentForRow[i]);
+            if (componentForRow[i].empty() || it == byComponent.end()) continue;
+            bomRows_[i].massG = it->second.first;
+            bomRows_[i].volMm3 = it->second.second;
+            bomRows_[i].haveMass = true;
+        }
+    }, 60000);
 }
 
 void AsmPanels::drawBom(AppState& st) {

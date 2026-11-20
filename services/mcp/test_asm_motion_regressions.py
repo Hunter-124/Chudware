@@ -138,3 +138,29 @@ def test_motion_dynamics_uses_live_component_material(tmp_path):
     finally:
         cb.call("doc_close", {"doc_id": assembly})
         cb.call("doc_close", {"doc_id": part})
+
+
+@pytest.mark.skipif(not cb.available(), reason="CAD engine unavailable")
+def test_assembly_mass_names_each_bodys_component_and_material(tmp_path):
+    from services.mcp.test_cad_tools import _build_sliding_block_assembly, _call
+
+    assembly, _, moving = _build_sliding_block_assembly(tmp_path)
+    tree = cb.call("doc_tree", {"doc_id": assembly})["tree"]
+    ids = {c["id"] for c in tree["components"]}
+    source = next(c["source"]["path"] for c in tree["components"] if c["id"] == moving)
+    part = cb.call("doc_open", {"path": source, "internal": True})["doc_id"]
+    try:
+        changed, _ = _call("set_material", {"doc_id": part, "material": "6061-T6"})
+        assert changed["ok"], changed
+        mass = cb.call("eval_mass", {"doc_id": assembly})
+        bodies = mass.get("bodies") or [mass]
+        # Every assembly body says which component placed it, so the BOM and the Mass
+        # Properties panel can roll mass up per component instead of per body ordinal.
+        assert {b["component"]["id"] for b in bodies} == ids
+        moved = [b for b in bodies if b["component"]["id"] == moving]
+        assert moved and all(b["material"]["source"] == "component_material" for b in moved)
+        assert all(b["material"]["density_g_cm3"] == pytest.approx(2.7, rel=0.02) for b in moved)
+        assert mass["mass_g"] == pytest.approx(sum(b["mass_g"] for b in bodies))
+    finally:
+        cb.call("doc_close", {"doc_id": assembly})
+        cb.call("doc_close", {"doc_id": part})

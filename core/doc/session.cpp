@@ -16839,7 +16839,8 @@ json doc_bbox(const std::string& doc_id) {
 // body with no material, or a key the registry has no density for, falls back to 7.85 g/cm^3
 // steel. Every result names its density's `source` (explicit | body_material |
 // document_material | component_material | default); mixed densities weight the combined
-// mass, centre of mass and inertia per body.
+// mass, centre of mass and inertia per body. An assembly body also names the component that
+// placed it (`component`: {id, name}), so callers can roll mass up per component.
 json doc_eval_mass(const std::string& doc_id, int body_id,
                    std::optional<double> density_g_cm3) {
     DocLock lk;
@@ -16888,16 +16889,19 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
     struct MassSolid {
         TopoDS_Shape shape;
         json material;
+        json component;
     };
     std::vector<MassSolid> solids;
-    auto add_exploded = [&](const TopoDS_Shape& sh, const json& material) {
+    auto add_exploded = [&](const TopoDS_Shape& sh, const json& material,
+                            const json& component = nullptr) {
         TopTools_IndexedMapOfShape smap;
         TopExp::MapShapes(sh, TopAbs_SOLID, smap);
         if (smap.Extent() == 0) {
-            solids.push_back({sh, material});  // surface / degenerate body — counts as one
+            solids.push_back({sh, material, component});  // surface / degenerate body — one
             return;
         }
-        for (int i = 1; i <= smap.Extent(); ++i) solids.push_back({smap.FindKey(i), material});
+        for (int i = 1; i <= smap.Extent(); ++i)
+            solids.push_back({smap.FindKey(i), material, component});
     };
 
     CompileResult r;
@@ -16910,15 +16914,19 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
             const TopoDS_Shape& world = r.shapes[i];
             const std::vector<std::string> keys =
                 i < ar.bodies.size() ? ar.bodies[i].body_material_keys : std::vector<std::string>();
+            const json component = i < ar.bodies.size()
+                ? json{{"id", ar.bodies[i].component_id}, {"name", ar.bodies[i].name}}
+                : json(nullptr);
             std::vector<TopoDS_Shape> parts;
             if (keys.size() > 1)
                 for (TopoDS_Iterator it(world); it.More(); it.Next()) parts.push_back(it.Value());
             if (keys.size() > 1 && parts.size() == keys.size()) {
                 for (std::size_t j = 0; j < parts.size(); ++j)
-                    add_exploded(parts[j], material_for(keys[j], "component_material"));
+                    add_exploded(parts[j], material_for(keys[j], "component_material"), component);
             } else {
                 add_exploded(world, material_for(keys.size() == 1 ? keys.front() : std::string(),
-                                                 "component_material"));
+                                                 "component_material"),
+                             component);
             }
         }
     } else {
@@ -17013,6 +17021,7 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
         out["body_count"] = 1;
         stamp_units(out);
         out["material"] = one->material;
+        if (!one->component.is_null()) out["component"] = one->component;
         // Bug J4: VolumeProperties on a non-closed solid returns a meaningless CoM/inertia
         // (the integral over an unbounded volume). Don't report it as if trustworthy — flag it.
         if (!::geom::is_watertight(shape)) {
@@ -17061,6 +17070,7 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
             have_total = true;
         }
         entry["material"] = solids[i].material;
+        if (!solids[i].component.is_null()) entry["component"] = solids[i].component;
         bodies.push_back(std::move(entry));
     }
 

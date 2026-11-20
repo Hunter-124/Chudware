@@ -840,6 +840,40 @@ void EvaluateDialogs::drawGeometryAnalysis(AppState& st) {
     }
 }
 
+// Group an eval_mass result's bodies by the material the engine applied to each (a single-body
+// result is its own one body). Heaviest material first.
+static std::vector<EvaluateDialogs::MassMaterialRow> massMaterialRows(const nlohmann::json& result) {
+    std::vector<EvaluateDialogs::MassMaterialRow> rows;
+    auto add = [&](const nlohmann::json& body) {
+        if (!body.is_object()) return;
+        const auto m = body.find("material");
+        if (m == body.end() || !m->is_object()) return;
+        const std::string key = m->value("key", std::string());
+        const bool fallback = m->value("source", std::string()) == "default";
+        auto it = std::find_if(rows.begin(), rows.end(), [&](const auto& r) {
+            return r.key == key && r.fallback == fallback;
+        });
+        if (it == rows.end()) {
+            EvaluateDialogs::MassMaterialRow row;
+            row.key = key;
+            row.name = key.empty() ? std::string("No material") : materialDisplayName(key);
+            row.density_g_cm3 = m->value("density_g_cm3", 0.0);
+            row.fallback = fallback;
+            rows.push_back(row);
+            it = rows.end() - 1;
+        }
+        it->mass_g += body.value("mass_g", 0.0);
+        it->bodies += 1;
+    };
+    if (result.contains("bodies") && result["bodies"].is_array())
+        for (const auto& b : result["bodies"]) add(b);
+    else
+        add(result);
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const auto& a, const auto& b) { return a.mass_g > b.mass_g; });
+    return rows;
+}
+
 // Dedicated mass eval slot so Mass Properties can stay open while exclusive tools use result_.
 void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
     const int gen = ++massGen_;
@@ -851,6 +885,7 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
     massSegs_.clear();
     massErrorText_.clear();
     massResult_ = nlohmann::json::object();
+    massMaterials_.clear();
     massPending_ = false;
     if (!st.docMirror.hasDoc()) {
         massErrorText_ = "No document loaded.";
@@ -888,6 +923,7 @@ void EvaluateDialogs::runMassEval(AppState& st, const nlohmann::json& extra) {
             return;
         }
         massResult_ = r.result;
+        massMaterials_ = massMaterialRows(r.result);
         if (!massCustomDensity_ && r.result.contains("material") &&
             r.result["material"].is_object() &&
             r.result["material"].value("density_g_cm3", 0.0) > 0.0)
@@ -2164,8 +2200,47 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
         const bool ips = st.ips();
         const char* densityUnit = kit::unitText(ips ? kit::Unit::lb_in3 : kit::Unit::g_cm3);
         // Material + density share one card so the inputs sit on the same surface as the results.
+        // An assembly carries no material of its own: each component body is weighed with its
+        // source part's material, so the card lists those instead of offering a part combo.
+        const bool massAsm = st.docMirror.hasDoc() && st.docMirror.tree().is_object() &&
+                             st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1";
+        // What the engine actually applied. More than one material (per-body overrides, mixed
+        // components) or a body that fell back to steel gets a per-material breakdown.
+        const bool mixedMaterials = massMaterials_.size() > 1;
+        const bool anyFallback = std::any_of(massMaterials_.begin(), massMaterials_.end(),
+                                             [](const MassMaterialRow& r) { return r.fallback; });
+        auto drawMaterialBreakdown = [&]() {
+            for (size_t i = 0; i < massMaterials_.size(); ++i) {
+                const MassMaterialRow& row = massMaterials_[i];
+                char dens[64];
+                std::snprintf(dens, sizeof(dens), "%.4g %s",
+                              ips ? row.density_g_cm3 * kLbPerIn3PerGcm3 : row.density_g_cm3,
+                              densityUnit);
+                const std::string value = evalQty(ips, EvalQty::Mass, row.mass_g) +
+                                          " \xc2\xb7 " + std::to_string(row.bodies) +
+                                          (row.bodies == 1 ? " body" : " bodies") +
+                                          " \xc2\xb7 " + dens;
+                const std::string label = row.fallback && !row.key.empty()
+                                              ? row.name + " (no density)" : row.name;
+                ImGui::PushID((int)i);
+                kit::keyValueRowId("m", label.c_str(), value.c_str());
+                ImGui::PopID();
+            }
+            if (anyFallback)
+                kit::inlineStatus("Bodies without a material are weighed as steel "
+                                  "(7.85 g/cm\xc2\xb3). Assign one in the part to weigh them "
+                                  "correctly.",
+                                  kit::Tone::Warn);
+        };
         if (kit::cardBegin("mass_material", "Material", "material")) {
             kit::FieldGroup g("mass_material", "Material");
+            if (massAsm) {
+                if (massMaterials_.empty() && massPending_)
+                    kit::dimText("Reading component materials\xe2\x80\xa6");
+                else if (!massCustomDensity_)
+                    drawMaterialBreakdown();
+                kit::dimText("Each component uses the material set in its part.");
+            }
             static const std::vector<std::string> kNames = [] {
                 std::vector<std::string> v;
                 for (int i = 0; i < kPhysicalMaterialsCount; ++i) v.emplace_back(kPhysicalMaterials[i].name);
@@ -2178,28 +2253,36 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
                 "The part material. Choosing one updates the part, so mass, simulation and the "
                 "feature tree all use it.");
             if (sel < 0 && !massDocKey_.empty()) mo.withPreview(massDocName_.c_str());
-            if (kit::fieldCombo("material", "Material", &sel, kNames, mo) && sel >= 0 &&
-                sel < kPhysicalMaterialsCount)
-                applyMassMaterial(kPhysicalMaterials[sel].key);
+            if (!massAsm) {
+                if (kit::fieldCombo("material", "Material", &sel, kNames, mo) && sel >= 0 &&
+                    sel < kPhysicalMaterialsCount)
+                    applyMassMaterial(kPhysicalMaterials[sel].key);
+                // Per-body overrides (or bodies with no material) weigh differently from the
+                // part material above: show what each body was weighed with.
+                if (!massCustomDensity_ && (mixedMaterials || anyFallback))
+                    drawMaterialBreakdown();
+            }
 
             double density = massDensity_;
-            if (kit::fieldNumber("density", "Density", &density,
+            if (kit::fieldNumber("density",
+                                 mixedMaterials && !massCustomDensity_ ? "Average density"
+                                                                       : "Density",
+                                 &density,
                                  kit::FieldOpts()
                                      .withUnit(densityUnit)
                                      .withScale(ips ? kLbPerIn3PerGcm3 : 1.0)
                                      .withRange(0.0, 25.0)
-                                     .withTip("Overrides the density for this readout only. The "
-                                              "part material is unchanged."))) {
+                                     .withTip("Overrides the density of every body for this "
+                                              "readout only. The materials are unchanged."))) {
                 massDensity_ = (float)density;
                 massCustomDensity_ = true;
                 runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
             }
             if (massCustomDensity_) {
-                kit::inlineStatus("Custom density. The part material is unchanged.", kit::Tone::Info);
-                if (!massDocKey_.empty() &&
-                    kit::secondaryButton("Use material density###mass_reset_density")) {
+                kit::inlineStatus("Custom density. The materials are unchanged.", kit::Tone::Info);
+                if (kit::secondaryButton("Use material density###mass_reset_density")) {
                     massCustomDensity_ = false;
-                    massDensity_ = materialDensityGcm3(massDocKey_);
+                    massDensity_ = massDocKey_.empty() ? 7.85f : materialDensityGcm3(massDocKey_);
                     runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
                 }
             }

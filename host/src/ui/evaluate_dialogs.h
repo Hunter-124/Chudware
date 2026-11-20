@@ -208,6 +208,19 @@ private:
     float massDensity_  = 7.85f;
     std::string massDocKey_;
     std::string massDocName_;
+public:
+    // Materials the engine actually weighed, grouped from the last eval_mass result (per body,
+    // per-body overrides and assembly components included). Rebuilt with every result.
+    struct MassMaterialRow {
+        std::string key;        // "" when the body has no material (weighed as default steel)
+        std::string name;
+        double density_g_cm3 = 0.0;
+        double mass_g = 0.0;
+        int bodies = 0;
+        bool fallback = false;  // no material, or a key without a registry density
+    };
+private:
+    std::vector<MassMaterialRow> massMaterials_;
 
     // Mass design checkboxes (viewport + dialog).
     bool showCom_ = true;

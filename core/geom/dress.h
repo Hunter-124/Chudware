@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <Eigen/Dense>
+#include <BOPAlgo_CheckerSI.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Vertex.hxx>
@@ -63,6 +64,26 @@ bool is_watertight(const TopoDS_Shape& shape);
 // Parallel mode gives every thread its own intersection context, so on ordinary part bodies
 // (measured: 34-168 faces) it is 25-40% slower than serial; much larger bodies still gain.
 bool self_check_parallel(const TopoDS_Shape& shape);
+
+// BOPAlgo_CheckerSI with one change to its per-face self-intersection pass. OCCT checks
+// a B-spline face against itself by meshing it and walking from every pair of touching
+// mesh triangles. Where a boundary row of poles collapses to one point (the corner
+// patch of a fillet that meets two others), the mesh triangles along that row coincide,
+// and OCCT walks from each coincident pair along the singular edge: one 1.3 mm² corner
+// patch of a part took 40-180 s to clear here, while the whole body checked in 2 s.
+// Such a face is checked with the same OCCT intersector on the same surface, with
+// its U direction reversed and then with its V direction reversed. Over the face's
+// parameter box, which is the domain that pass uses, that is the same point set and
+// self-intersection locus without the coincident triangles, and the face is
+// rejected if either one finds a curve or point. If either one fails to finish,
+// the face gets OCCT's own check. Every other face and every other check is OCCT's.
+class SelfIntersectionChecker : public BOPAlgo_CheckerSI {
+public:
+    void Perform(const Message_ProgressRange& range = Message_ProgressRange()) override;
+
+private:
+    void check_face_self_intersection(const Message_ProgressRange& range);
+};
 
 enum class FilletFailure {
     none,

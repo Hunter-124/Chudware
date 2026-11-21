@@ -24,9 +24,11 @@
 #include <vector>
 
 #include <Bnd_Box.hxx>
+#include <BOPAlgo_Alerts.hxx>
 #include <BOPAlgo_CheckerSI.hxx>
 #include <BOPDS_DS.hxx>
 #include <BOPDS_MapOfPair.hxx>
+#include <BOPDS_Pair.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Curve2d.hxx>
@@ -36,6 +38,7 @@
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_FindPlane.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepTools.hxx>
 #include <BRepTools_History.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
@@ -77,11 +80,16 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomLProp_SLProps.hxx>
 #include <Geom_BSplineCurve.hxx>
+#include <Geom_BSplineSurface.hxx>
 #include <Geom_Plane.hxx>
 #include <Geom_Surface.hxx>
 #include <Geom_SurfaceOfLinearExtrusion.hxx>
+#include <IntTools_FaceFace.hxx>
 #include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressScope.hxx>
+#include <OSD_Parallel.hxx>
 #include <Precision.hxx>
+#include <Standard_ErrorHandler.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <TopExp.hxx>
@@ -134,6 +142,167 @@ bool self_check_parallel(const TopoDS_Shape& shape) {
     for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More() && faces < kParallelMinFaces; ex.Next())
         ++faces;
     return faces >= kParallelMinFaces;
+}
+
+namespace {
+
+bool pole_row_collapsed(const Handle(Geom_BSplineSurface)& surface, bool along_u, int index) {
+    const int count = along_u ? surface->NbUPoles() : surface->NbVPoles();
+    const gp_Pnt first = along_u ? surface->Pole(1, index) : surface->Pole(index, 1);
+    for (int k = 2; k <= count; ++k) {
+        const gp_Pnt pole = along_u ? surface->Pole(k, index) : surface->Pole(index, k);
+        if (pole.Distance(first) > Precision::Confusion()) return false;
+    }
+    return true;
+}
+
+bool has_collapsed_boundary_row(const Handle(Geom_BSplineSurface)& surface) {
+    return pole_row_collapsed(surface, true, 1) ||
+           pole_row_collapsed(surface, true, surface->NbVPoles()) ||
+           pole_row_collapsed(surface, false, 1) ||
+           pole_row_collapsed(surface, false, surface->NbUPoles());
+}
+
+// The face's parameter box on `surface` with one direction reversed, at the face's tolerance
+// (which sets the intersector's tolerances). Null if the face cannot be made.
+TopoDS_Face reversed_parameter_face(const TopoDS_Face& face,
+                                    const Handle(Geom_BSplineSurface)& surface, bool reverse_u) {
+    double u0 = 0.0, u1 = 0.0, v0 = 0.0, v1 = 0.0;
+    BRepTools::UVBounds(face, u0, u1, v0, v1);
+    Handle(Geom_BSplineSurface) reversed = Handle(Geom_BSplineSurface)::DownCast(surface->Copy());
+    if (reverse_u) {
+        const double first = surface->UReversedParameter(u1), last = surface->UReversedParameter(u0);
+        reversed->UReverse();
+        u0 = first;
+        u1 = last;
+    } else {
+        const double first = surface->VReversedParameter(v1), last = surface->VReversedParameter(v0);
+        reversed->VReverse();
+        v0 = first;
+        v1 = last;
+    }
+    BRepBuilderAPI_MakeFace make(reversed, u0, u1, v0, v1, Precision::Confusion());
+    if (!make.IsDone()) return {};
+    TopoDS_Face out = make.Face();
+    BRep_Builder().UpdateFace(out, BRep_Tool::Tolerance(face));
+    return out;
+}
+
+// One face-against-itself intersection, as BOPAlgo_CheckerSI runs it.
+struct FaceSelfCheck {
+    int index = -1;
+    TopoDS_Face face;
+    Message_ProgressRange range;
+    bool parallel = false;
+    bool done = false;
+    bool found = false;
+    void run() {
+        Message_ProgressScope scope(range, nullptr, 1);
+        if (scope.UserBreak()) return;
+        IntTools_FaceFace intersect;
+        intersect.Perform(face, face, parallel ? Standard_True : Standard_False);
+        done = intersect.IsDone();
+        found = done && (intersect.Lines().Length() > 0 || intersect.Points().Length() > 0);
+    }
+};
+
+}  // namespace
+
+// BOPAlgo_CheckerSI::Perform (unchanged from OCCT 7.9.1 through 7.9.3) with the face pass replaced.
+void SelfIntersectionChecker::Perform(const Message_ProgressRange& range) {
+    try {
+        OCC_CATCH_SIGNALS
+        if (myArguments.Extent() != 1) {
+            AddError(new BOPAlgo_AlertMultipleArguments);
+            return;
+        }
+        Message_ProgressScope scope(range, "Checking shape on self-intersection", 10);
+        BOPAlgo_PaveFiller::Perform(scope.Next(8));
+        if (UserBreak(scope)) return;
+        check_face_self_intersection(scope.Next());
+        Message_ProgressScope solids(scope.Next(), nullptr, 4);
+        if (!HasErrors()) PerformVZ(solids.Next());
+        if (!HasErrors()) PerformEZ(solids.Next());
+        if (!HasErrors()) PerformFZ(solids.Next());
+        if (!HasErrors()) PerformZZ(solids.Next());
+        if (HasErrors()) return;
+        PostTreat();
+    } catch (const Standard_Failure&) {
+        AddError(new BOPAlgo_AlertIntersectionFailed);
+    }
+}
+
+// BOPAlgo_CheckerSI::CheckFaceSelfIntersection, except for faces with a collapsed pole row
+// (see the class comment).
+void SelfIntersectionChecker::check_face_self_intersection(const Message_ProgressRange& range) {
+    if (myLevelOfCheck < 5) return;
+    BOPDS_MapOfPair& pairs = *const_cast<BOPDS_MapOfPair*>(&myDS->Interferences());
+    pairs.Clear();
+    const int count = myDS->NbSourceShapes();
+    std::vector<FaceSelfCheck> checks;
+    for (int i = 0; i < count; ++i) {
+        const BOPDS_ShapeInfo& info = myDS->ShapeInfo(i);
+        if (info.ShapeType() != TopAbs_FACE) continue;
+        const TopoDS_Face& face = TopoDS::Face(info.Shape());
+        BRepAdaptor_Surface adaptor(face, Standard_False);
+        const GeomAbs_SurfaceType type = adaptor.GetType();
+        if (type == GeomAbs_Plane || type == GeomAbs_Cylinder || type == GeomAbs_Cone ||
+            type == GeomAbs_Sphere)
+            continue;
+        if (type == GeomAbs_Torus) {
+            const gp_Torus torus = adaptor.Torus();
+            if (torus.MajorRadius() > torus.MinorRadius() + Precision::Confusion()) continue;
+        }
+        const Handle(Geom_BSplineSurface) spline =
+            Handle(Geom_BSplineSurface)::DownCast(BRep_Tool::Surface(face));
+        if (!spline.IsNull() && !spline->IsUPeriodic() && !spline->IsVPeriodic() &&
+            has_collapsed_boundary_row(spline)) {
+            const TopoDS_Face u = reversed_parameter_face(face, spline, true);
+            const TopoDS_Face v = reversed_parameter_face(face, spline, false);
+            if (!u.IsNull() && !v.IsNull()) {
+                checks.push_back({i, u});
+                checks.push_back({i, v});
+                continue;
+            }
+        }
+        checks.push_back({i, face});
+    }
+    Message_ProgressScope outer(range, nullptr, 1);
+    Message_ProgressScope each(outer.Next(), "Checking surface on self-intersection",
+                               static_cast<int>(checks.size()));
+    for (FaceSelfCheck& check : checks) {
+        check.range = each.Next();
+        check.parallel = myRunParallel;
+    }
+    OSD_Parallel::For(0, static_cast<int>(checks.size()),
+                      [&](int k) { checks[static_cast<std::size_t>(k)].run(); },
+                      !myRunParallel);
+    if (UserBreak(outer)) return;
+    std::vector<char> interfering(static_cast<std::size_t>(count), 0);
+    std::vector<char> unfinished(static_cast<std::size_t>(count), 0);
+    for (const FaceSelfCheck& check : checks) {
+        if (check.found) interfering[check.index] = 1;
+        else if (!check.done) unfinished[check.index] = 1;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (!unfinished[i] || interfering[i]) continue;
+        const TopoDS_Face& face = TopoDS::Face(myDS->Shape(i));
+        // An unfinished stock check stays unfinished, as in OCCT.
+        if (std::any_of(checks.begin(), checks.end(), [&](const FaceSelfCheck& check) {
+                return check.index == i && check.face.IsSame(face);
+            }))
+            continue;
+        FaceSelfCheck stock{i, face};
+        stock.parallel = myRunParallel;
+        stock.run();
+        if (stock.found) interfering[i] = 1;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (!interfering[i]) continue;
+        BOPDS_Pair pair;
+        pair.SetIndices(i, i);
+        pairs.Add(pair);
+    }
 }
 
 // An OCCT blend can report IsDone despite leaving an open B-rep, so every blend result is
@@ -978,7 +1147,7 @@ std::string fillet_solid_rejection(const TopoDS_Shape& shape,
     }
     Handle(FilletValidityBudget) budget = new FilletValidityBudget(deadline);
     for (int i = 1; i <= solids.Extent(); ++i) {
-        BOPAlgo_CheckerSI checker;
+        SelfIntersectionChecker checker;
         TopTools_ListOfShape args;
         args.Append(solids(i));
         checker.SetArguments(args);

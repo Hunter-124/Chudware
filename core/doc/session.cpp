@@ -19155,7 +19155,7 @@ json doc_eval_solid_health(const std::string& doc_id, int body_id) {
             std::set<std::string> si_kinds;
             try {
                 for (int unit = 1; unit <= si_units; ++unit) {
-                    BOPAlgo_CheckerSI ck;
+                    ::geom::SelfIntersectionChecker ck;
                     TopTools_ListOfShape one;
                     const TopoDS_Shape& constituent = has_solid ? somap.FindKey(unit) : shape;
                     // Self-intersection is invariant under a proper rigid motion of the

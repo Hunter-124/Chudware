@@ -49,6 +49,8 @@ extern char** environ;
 #endif
 
 #include <Bnd_Box.hxx>
+#include <BOPDS_DS.hxx>
+#include <BOPDS_MapOfPair.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Curve2d.hxx>
 #include <BRepAdaptor_Surface.hxx>
@@ -72,9 +74,17 @@ extern char** environ;
 #include <GProp_GProps.hxx>
 #include <GeomConvert.hxx>
 #include <Geom_BSplineCurve.hxx>
+#include <Geom_BSplineSurface.hxx>
 #include <Geom_BezierCurve.hxx>
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressScope.hxx>
+#include <Precision.hxx>
 #include <Standard_Failure.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColStd_Array2OfReal.hxx>
 #include <TColgp_Array1OfPnt.hxx>
+#include <TColgp_Array2OfPnt.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Compound.hxx>
@@ -2691,4 +2701,179 @@ TEST_CASE("both top edges of a wall rounded at half its thickness make a full ro
         round_area += props.Mass();
     }
     CHECK(round_area == doctest::Approx(PI * kRadius * kLength).epsilon(1e-4));
+}
+
+namespace {
+
+// The corner patch MSVC's OCCT 7.9.3 builds where fillet f106 of the TBOT carrier_R part
+// meets two earlier rounds: a rational B-spline whose last V row of poles is one point.
+// OCCT's own face self-intersection pass spends 40-180 s on it (the GCC build of the same
+// fillet yields a patch it clears in 0.02 s), which ran out the fillet's validation budget.
+TopoDS_Face collapsed_row_corner_patch() {
+    constexpr double kTolerance = 2.5413692496934157e-05;
+    constexpr double kPoles[3][16][4] = {
+        {{430.40000000000003, -37.800000000000097, 41.199999999999996, 1},
+         {430.39999999999992, -37.819634864198704, 41.199999999999996, 0.99999999999999367},
+         {430.40567777127262, -37.839404060171994, 41.199554794035777, 1.0000000000000222},
+         {430.41744212491602, -37.860759440298153, 41.198669486298257, 0.99999999999996725},
+         {430.43168168950677, -37.88991841985996, 41.197179331749403, 1.0000000000000291},
+         {430.4486367257428, -37.922772749956124, 41.193503504819937, 0.99999999999998335},
+         {430.45482225334649, -37.981069736288823, 41.189072162223596, 1.0000000000000062},
+         {430.45593370732831, -38.065700905302663, 41.170124016815855, 0.99999999999999878},
+         {430.45768215429291, -38.26730388582763, 41.090710198309175, 1.0000000000000018},
+         {430.45822810578585, -38.384405934458705, 41.030304636726385, 0.99999999999999367},
+         {430.46412995150723, -38.508319709554428, 40.941509617986647, 1.0000000000000087},
+         {430.48018914989598, -38.619615184235357, 40.823692974863228, 0.99999999999998745},
+         {430.50490128035358, -38.707933945417686, 40.682918341388039, 1.0000000000000129},
+         {430.53446330870349, -38.769489439577733, 40.527327967204037, 0.99999999999999156},
+         {430.56727522633543, -38.799999999999997, 40.363623868322925, 1.0000000000000027},
+         {430.60000000000002, -38.799999999999997, 40.199999999999996, 1}},
+        {{429.60000000000002, -37.79999999999945, 41.199999999999996, 0.70710678118654757},
+         {429.60000000000002, -37.898174320993213, 41.200000000000003, 0.70710678118657699},
+         {429.60409515298574, -37.997562525986851, 41.195904847014504, 0.70257022387720103},
+         {429.61165658433606, -38.102572078289214, 41.188343415662573, 0.69245644675702156},
+         {429.62736015642173, -38.212479368505683, 41.172639843580832, 0.68219523928991899},
+         {429.64820401767912, -38.33668937274993, 41.151795982318731, 0.66676542884026568},
+         {429.69078736156877, -38.447851391802082, 41.109212638432048, 0.66598861376932872},
+         {429.75807530883236, -38.537841345216684, 41.041924691167644, 0.68496804956062629},
+         {429.92047094214087, -38.669709765974588, 40.879529057859123, 0.75147366845140584},
+         {430.00750757313585, -38.710610927141801, 40.792492426864442, 0.79914410903211586},
+         {430.09991313012159, -38.736919575254539, 40.700086869878149, 0.85652869269493193},
+         {430.19699552022405, -38.760780715134587, 40.603004479775841, 0.91038047909706532},
+         {430.29814077249688, -38.781193362883904, 40.501859227503296, 0.95387794142904092},
+         {430.40058533681957, -38.793641053180345, 40.399414663180423, 0.98477397892339524},
+         {430.50182567900623, -38.799999999999997, 40.298174320993745, 0.99999999999999956},
+         {430.60000000000002, -38.799999999999997, 40.199999999999996, 1}},
+        {{429.60000000000002, -37.799999999999898, 40.399999999999991, 1},
+         {429.60000000000002, -37.819634864198683, 40.400000000000041, 0.99999999999999367},
+         {429.60044520596398, -37.839404060171915, 40.394322228727468, 1.0000000000000222},
+         {429.60133051370241, -37.860759440298331, 40.382557875084011, 0.99999999999996725},
+         {429.60282066824982, -37.889918419859775, 40.368318310492981, 1.0000000000000291},
+         {429.60649649518058, -37.922772749956287, 40.351363274257558, 0.99999999999998335},
+         {429.61092783777627, -37.981069736288767, 40.34517774665332, 1.0000000000000062},
+         {429.62987598318421, -38.065700905302656, 40.344066292671769, 0.99999999999999878},
+         {429.70928980169083, -38.267303885827623, 40.342317845707129, 1.0000000000000018},
+         {429.76969536327351, -38.384405934458655, 40.341771894213856, 0.99999999999999367},
+         {429.85849038201349, -38.508319709554442, 40.335870048493099, 1.0000000000000087},
+         {429.97630702513675, -38.619615184235357, 40.319810850104126, 0.99999999999998745},
+         {430.11708165861182, -38.707933945417679, 40.295098719646148, 1.0000000000000129},
+         {430.27267203279615, -38.769489439577747, 40.265536691296688, 0.99999999999999156},
+         {430.43637613167709, -38.799999999999997, 40.232724773664565, 1.0000000000000027},
+         {430.60000000000002, -38.799999999999997, 40.199999999999996, 1}},
+    };
+    constexpr double kUKnots[] = {0, 1.9100988945193293};
+    constexpr int kUMults[] = {3, 3};
+    constexpr double kVKnots[] = {55.04136849859853, 55.996417945858198, 56.951467393117859};
+    constexpr int kVMults[] = {9, 7, 9};
+    TColgp_Array2OfPnt poles(1, 3, 1, 16);
+    TColStd_Array2OfReal weights(1, 3, 1, 16);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 16; ++j) {
+            poles(i + 1, j + 1) = gp_Pnt(kPoles[i][j][0], kPoles[i][j][1], kPoles[i][j][2]);
+            weights(i + 1, j + 1) = kPoles[i][j][3];
+        }
+    TColStd_Array1OfReal u_knots(1, 2), v_knots(1, 3);
+    TColStd_Array1OfInteger u_mults(1, 2), v_mults(1, 3);
+    for (int i = 0; i < 2; ++i) { u_knots(i + 1) = kUKnots[i]; u_mults(i + 1) = kUMults[i]; }
+    for (int i = 0; i < 3; ++i) { v_knots(i + 1) = kVKnots[i]; v_mults(i + 1) = kVMults[i]; }
+    Handle(Geom_BSplineSurface) surface =
+        new Geom_BSplineSurface(poles, weights, u_knots, v_knots, u_mults, v_mults, 2, 8);
+    TopoDS_Face face = BRepBuilderAPI_MakeFace(surface, Precision::Confusion()).Face();
+    BRep_Builder().UpdateFace(face, kTolerance);
+    return face;
+}
+
+// A cone from a looped planar cubic to an apex: the sheet crosses itself along the
+// segment from the loop's crossing to the apex, and its apex row of poles is collapsed.
+TopoDS_Face looped_cone(bool apex_first) {
+    const double x[] = {-6, 6, 6, -6, -6, 6};
+    const double y[] = {-3, 3, -3, 3, -3, 3};
+    TColgp_Array2OfPnt poles(1, 6, 1, 2);
+    for (int i = 1; i <= 6; ++i) {
+        poles(i, apex_first ? 2 : 1) = gp_Pnt(x[i - 1], y[i - 1] + (i - 1) * 0.4, 0);
+        poles(i, apex_first ? 1 : 2) = gp_Pnt(0, 1, 8);
+    }
+    TColStd_Array1OfReal u_knots(1, 4), v_knots(1, 2);
+    TColStd_Array1OfInteger u_mults(1, 4), v_mults(1, 2);
+    for (int i = 1; i <= 4; ++i) u_knots(i) = i - 1;
+    u_mults(1) = u_mults(4) = 4;
+    u_mults(2) = u_mults(3) = 1;
+    v_knots(1) = 0; v_knots(2) = 1;
+    v_mults(1) = v_mults(2) = 2;
+    Handle(Geom_BSplineSurface) surface =
+        new Geom_BSplineSurface(poles, u_knots, v_knots, u_mults, v_mults, 3, 1);
+    return BRepBuilderAPI_MakeFace(surface, Precision::Confusion()).Face();
+}
+
+class SelfCheckDeadline : public Message_ProgressIndicator {
+public:
+    explicit SelfCheckDeadline(std::chrono::seconds budget)
+        : deadline_(std::chrono::steady_clock::now() + budget) {}
+    bool broke() const { return broke_.load(); }
+protected:
+    Standard_Boolean UserBreak() override {
+        if (std::chrono::steady_clock::now() < deadline_) return Standard_False;
+        broke_.store(true);
+        return Standard_True;
+    }
+    void Show(const Message_ProgressScope&, const Standard_Boolean) override {}
+private:
+    std::chrono::steady_clock::time_point deadline_;
+    std::atomic<bool> broke_{false};
+};
+
+struct SelfCheckOutcome { bool errors = false, broke = false; int face_self = 0, other = 0; };
+
+template <class Checker>
+SelfCheckOutcome self_check(const TopoDS_Shape& shape, std::chrono::seconds budget) {
+    Checker checker;
+    TopTools_ListOfShape args;
+    args.Append(shape);
+    checker.SetArguments(args);
+    checker.SetLevelOfCheck(9);
+    checker.SetNonDestructive(Standard_True);
+    Handle(SelfCheckDeadline) deadline = new SelfCheckDeadline(budget);
+    checker.Perform(deadline->Start());
+    SelfCheckOutcome out;
+    out.broke = deadline->broke();
+    out.errors = checker.HasErrors();
+    if (checker.PDS() == nullptr) return out;
+    for (BOPDS_MapOfPair::Iterator it(checker.PDS()->Interferences()); it.More(); it.Next()) {
+        Standard_Integer a = 0, b = 0;
+        it.Value().Indices(a, b);
+        if (checker.PDS()->IsNewShape(a) || checker.PDS()->IsNewShape(b)) continue;
+        ++(a == b ? out.face_self : out.other);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("self-intersection check clears a fillet corner patch with a collapsed pole row") {
+    const TopoDS_Face patch = collapsed_row_corner_patch();
+    REQUIRE(BRepCheck_Analyzer(patch).IsValid());
+    // OCCT's own pass needs over 40 s here; the whole check must fit well inside the
+    // 20 s dress validation budget.
+    const SelfCheckOutcome out =
+        self_check<geom::SelfIntersectionChecker>(patch, std::chrono::seconds(10));
+    CHECK_FALSE(out.broke);
+    CHECK_FALSE(out.errors);
+    CHECK(out.face_self == 0);
+    CHECK(out.other == 0);
+}
+
+TEST_CASE("self-intersection check still rejects a self-crossing face with a collapsed pole row") {
+    for (const bool apex_first : {false, true}) {
+        CAPTURE(apex_first);
+        const TopoDS_Face cone = looped_cone(apex_first);
+        const SelfCheckOutcome stock =
+            self_check<BOPAlgo_CheckerSI>(cone, std::chrono::seconds(30));
+        const SelfCheckOutcome ours =
+            self_check<geom::SelfIntersectionChecker>(cone, std::chrono::seconds(30));
+        REQUIRE_FALSE(stock.broke);
+        REQUIRE(stock.face_self == 1);
+        CHECK_FALSE(ours.broke);
+        CHECK_FALSE(ours.errors);
+        CHECK(ours.face_self == 1);
+    }
 }

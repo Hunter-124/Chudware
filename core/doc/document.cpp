@@ -2108,7 +2108,7 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape, bool* timed_out 
             return "self-intersection validation incomplete (20 s budget exceeded)";
         };
         for (int si = 1; si <= solids.Extent(); ++si) {
-            BOPAlgo_CheckerSI checker;
+            ::geom::SelfIntersectionChecker checker;
             TopTools_ListOfShape one;
             one.Append(solids(si));
             checker.SetArguments(one);
@@ -6341,7 +6341,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     // staying B-rep valid and near the volume estimate: a 50 mm strap round a
                     // 20 mm bend (HERC BOM07f harness, 2026-11-15). Other CAD refuses to build
                     // it and it meshes badly, so run the full self-intersection check.
-                    BOPAlgo_CheckerSI ck;
+                    ::geom::SelfIntersectionChecker ck;
                     TopTools_ListOfShape one;
                     one.Append(solid);
                     ck.SetArguments(one);

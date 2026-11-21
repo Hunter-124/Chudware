@@ -25664,7 +25664,11 @@ static void schedule_cache_verification(Session& live) {
                     s.integrity_memo.reset();
                     s.cached_assembly_response = json();
                     s.cache_verification_pending = false;
-                    s.cache_trust = built.contains("skipped_reason") ? "unverified" : "verified";
+                    // The session now shows this feature-history rebuild whether or not its
+                    // build state could be saved (an assembly that does not converge, or has
+                    // a failed component, saves none). Left "unverified", every response
+                    // scheduled the same verification again, without end.
+                    s.cache_trust = "verified";
                     s.cache_verification = {{"mismatch", mismatch}, {"completed", true}};
                     if (mismatch) s.cache_warnings.push_back(
                         "cache_mismatch: unverified cached geometry replaced by feature-history rebuild");

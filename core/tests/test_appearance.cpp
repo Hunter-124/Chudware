@@ -18,7 +18,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <future>
+#include <mutex>
 #include <thread>
 
 #include <miniz.h>
@@ -2094,6 +2096,78 @@ TEST_CASE("cache provenance: foreign assembly display stays warm until its backg
     CHECK(warm.at("cache_trust") == "verified");
     CHECK(warm.at("cache_hit") == true);
     REQUIRE(doc_close(warm.at("doc_id").get<std::string>()));
+}
+
+TEST_CASE("cache provenance: an assembly that can save no build state is verified once") {
+    using namespace chudware::doc;
+    const std::string source = make_box_doc();
+    const std::string donor = make_box_doc();
+    AppearanceFiles files(source);
+    const auto leaf = files.dir / "once_leaf.step+";
+    const auto donor_path = files.dir / "once_donor.step+";
+    const std::string feature = doc_tree(donor).at("tree").at("features").at(0).at("id");
+    doc_apply_ops(donor, -1, json::array({
+        {{"op", "edit_feature"}, {"id", feature}, {"params", {{"length", 80.0}}}}
+    }), false);
+    doc_save(source, leaf.string());
+    doc_save(donor, donor_path.string());
+    REQUIRE(doc_close(source));
+    REQUIRE(doc_close(donor));
+    // A usable BREP with no trusted signature, as a part saved on another machine has.
+    auto members = zip_members(leaf);
+    members["cache.brep"] = zip_members(donor_path).at("cache.brep");
+    members.erase("cache.provenance");
+    mz_zip_archive archive{};
+    REQUIRE(mz_zip_writer_init_file(&archive, leaf.string().c_str(), 0));
+    for (const auto& [name, bytes] : members)
+        REQUIRE(mz_zip_writer_add_mem(&archive, name.c_str(), bytes.data(), bytes.size(),
+                                     MZ_NO_COMPRESSION));
+    REQUIRE(mz_zip_writer_finalize_archive(&archive));
+    mz_zip_writer_end(&archive);
+
+    // The second component never loads, so the assembly has no build state to save.
+    const json identity = {1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                           0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+    const json assembly{{"schema", "aicad.asm/1"}, {"mates", json::array()},
+        {"components", json::array({
+            {{"id", "leaf"}, {"fixed", true}, {"transform", identity},
+             {"source", {{"path", leaf.string()}}}},
+            {{"id", "absent"}, {"fixed", true}, {"transform", identity},
+             {"source", {{"path", (files.dir / "once_absent.step+").string()}}}}})}};
+    const auto outer = files.dir / "once_outer.step+";
+    stepplus_save(assembly, outer.string(), {});
+
+    struct RefreshSinkGuard { ~RefreshSinkGuard() { set_cache_refresh_sink({}); } } guard;
+    auto verifications = std::make_shared<std::atomic<int>>(0);
+    auto last = std::make_shared<json>();
+    auto last_mutex = std::make_shared<std::mutex>();
+    set_cache_refresh_sink([=](const std::string&, const json& result) {
+        std::lock_guard<std::mutex> lock(*last_mutex);
+        *last = result;
+        verifications->fetch_add(1);
+    });
+    const json opened = doc_open(outer.string());
+    const std::string id = opened.at("doc_id");
+    CHECK(opened.at("cache_trust") == "unverified");
+    CHECK(opened.at("cache_verification_pending") == true);
+    std::uint64_t active = 0, dirty = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (verifications->load() == 0 || !activity_counts(active, dirty) || active != 0) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // It used to stay "unverified" and verify again after every response, without end.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    REQUIRE(activity_counts(active, dirty));
+    CHECK(active == 0);
+    CHECK(verifications->load() == 1);
+    {
+        std::lock_guard<std::mutex> lock(*last_mutex);
+        INFO(last->dump());
+        CHECK(last->at("cache_trust") == "verified");
+        CHECK(last->at("cache_verification").at("completed") == true);
+    }
+    REQUIRE(doc_close(id));
 }
 
 TEST_CASE("cache provenance: nested foreign component bodies require assembly verification") {
